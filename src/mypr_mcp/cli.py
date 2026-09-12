@@ -14,7 +14,7 @@ from mcp.server import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import __version__
-from .transport import attachment, rpc, socket_path
+from .transport import attachment, find_runtime, manager_running, rpc, socket_path
 
 INSTRUCTIONS = """Use execute to run Python and poll to read a submitted cell's status and output.
 Python runs in one persistent kernel shared by every client of this workspace.
@@ -76,16 +76,21 @@ async def ensure(workspace):
     lock = (root / "startup.lock").open("a")
     await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)
     try:
-        try:
-            state = await rpc(path, op="status")
-        except OSError, ConnectionError:
-            state = None
-        if state is not None:
+        found = await find_runtime(workspace)
+        if found is not None:
+            path, state = found
             if state["version"] != __version__:
                 raise RuntimeError(
                     "Runtime version mismatch; stop it explicitly before reconnecting"
                 )
+            if not state.get("workspace_available", True):
+                raise RuntimeError("The workspace moved; stop its manager and reconnect")
             return path
+        if manager_running(workspace):
+            raise RuntimeError(
+                "Workspace already has a running manager, but its socket is unreachable. "
+                "Make the manager's runtime directory accessible to this client."
+            )
         log = (root / "manager.log").open("ab")
         try:
             proc = await asyncio.to_thread(
@@ -187,7 +192,10 @@ async def serve(workspace, client_id: str | None = None, client_name: str | None
 
 
 async def logs(workspace, client_id: str | None, limit: int, follow: bool) -> None:
-    path = socket_path(workspace)
+    found = await find_runtime(workspace)
+    if found is None:
+        raise RuntimeError("No reachable workspace manager")
+    path, _ = found
     cursor: int | None = None
     while True:
         result = await rpc(path, op="logs", cursor=cursor, filter_client_id=client_id, limit=limit)
@@ -225,11 +233,15 @@ def main():
         else:
 
             async def admin():
-                path = socket_path(workspace)
-                if args.command == "reset":
-                    path = await ensure(workspace)
                 if args.command == "logs":
                     return await logs(workspace, args.client_id, args.limit, args.follow)
+                if args.command == "reset":
+                    path = await ensure(workspace)
+                else:
+                    found = await find_runtime(workspace)
+                    if found is None:
+                        raise RuntimeError("No reachable workspace manager")
+                    path, _ = found
                 return await rpc(path, op=args.command, force=args.force)
 
             result = asyncio.run(admin())

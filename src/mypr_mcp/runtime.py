@@ -19,7 +19,7 @@ from jupyter_client.kernelspec import KernelSpec
 from . import __version__
 from .history import History
 from .services import MCPBridge, Shells
-from .transport import MAX_MESSAGE, socket_path
+from .transport import MAX_MESSAGE, socket_path, workspace_id
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
 MCP_MUTATIONS = {"configure", "remove", "restart", "reload"}
@@ -30,6 +30,7 @@ class Runtime:
         self.workspace = Path(workspace).resolve()
         self.root = self.workspace / ".mypr"
         self.root.mkdir(exist_ok=True)
+        self.workspace_id = workspace_id(self.workspace)
         self.socket = socket_path(self.workspace)
         self.generation = uuid.uuid4().hex
         self.execs = {}
@@ -151,6 +152,12 @@ class Runtime:
         self.monitor = asyncio.create_task(self.watch_kernel())
         self.write_info()
 
+    def workspace_available(self):
+        try:
+            return workspace_id(self.workspace) == self.workspace_id
+        except OSError:
+            return False
+
     def write_info(self):
         (self.root / "runtime.json").write_text(
             json.dumps(
@@ -160,6 +167,7 @@ class Runtime:
                     "generation": self.generation,
                     "version": __version__,
                     "workspace": str(self.workspace),
+                    "workspace_id": self.workspace_id,
                 }
             )
         )
@@ -378,6 +386,9 @@ class Runtime:
                 )
             return {
                 "version": __version__,
+                "workspace_id": self.workspace_id,
+                "workspace": str(self.workspace),
+                "workspace_available": self.workspace_available(),
                 "generation": self.generation,
                 "healthy": self.healthy,
                 "resetting": self.resetting,
@@ -414,6 +425,8 @@ class Runtime:
         if generation and generation != self.generation:
             raise RuntimeError("Expired kernel generation")
         if op == "execute":
+            if not self.workspace_available():
+                raise RuntimeError("The workspace moved; stop its manager and reconnect")
             if not self.healthy or self.resetting:
                 raise RuntimeError("Kernel unavailable; use CLI reset")
             code = req["code"]
@@ -608,6 +621,8 @@ class Runtime:
         return {k: v for k, v in rec.items() if k not in {"done", "idle", "events"}}
 
     async def attach(self, reader, writer, req):
+        if not self.workspace_available():
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
         client_id = req.get("client_id")
         connection_id = req.get("connection_id")
         for value in (client_id, connection_id):

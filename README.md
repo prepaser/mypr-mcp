@@ -61,8 +61,24 @@ in `--directory` and pass the workspace separately:
 }
 ```
 
-Use a canonical absolute workspace path. Symlinked paths resolve to the same
-workspace runtime.
+Symlink and bind-mount aliases of the same directory connect to the same
+workspace runtime. Discovery uses the directory's filesystem device and inode,
+not its path string. The identity is visible as `workspace_id` in runtime status
+and `.mypr/runtime.json`; copying a workspace creates a separate identity.
+
+Clients must run as the same OS user and be able to reach the runtime socket.
+When using separate mount namespaces or containers, share the runtime directory
+(`$XDG_RUNTIME_DIR/mypr`, or `/tmp/mypr-<uid>/mypr` when unset). The recorded socket
+also allows discovery when clients use different runtime-directory settings,
+provided that socket remains accessible. An unreachable existing manager is
+reported instead of launching a duplicate.
+
+Stop the manager before moving a workspace, then start it at the new location.
+A same-filesystem rename preserves directory identity, but Python objects, venv
+entry points, and external MCP configurations can contain old absolute paths;
+these are not rewritten automatically. If the original directory is moved or
+replaced while running, new attachments and cells are rejected with a restart
+instruction. Status and stop remain available through the discovered socket.
 
 ## MCP tools
 

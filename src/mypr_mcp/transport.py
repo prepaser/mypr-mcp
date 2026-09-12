@@ -1,11 +1,20 @@
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
+import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 MAX_MESSAGE = 32 * 1024 * 1024
+
+
+def workspace_id(workspace: Path) -> str:
+    info = workspace.stat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError(workspace)
+    return f"{info.st_dev:x}:{info.st_ino:x}"
 
 
 def socket_path(workspace: Path) -> Path:
@@ -14,7 +23,7 @@ def socket_path(workspace: Path) -> Path:
     if root.stat().st_uid != os.getuid():
         raise PermissionError(root)
     root.chmod(0o700)
-    key = hashlib.sha256(os.fsencode(workspace.resolve())).hexdigest()[:32]
+    key = hashlib.sha256(f"workspace:{workspace_id(workspace)}".encode()).hexdigest()[:32]
     return root / f"{key}.sock"
 
 
@@ -33,6 +42,53 @@ async def rpc(path: Path | str, **request):
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+def manager_running(workspace: Path) -> bool:
+    try:
+        lock = (workspace / ".mypr" / "manager.lock").open("r+")
+    except FileNotFoundError:
+        return False
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
+async def find_runtime(workspace: Path):
+    identity = workspace_id(workspace)
+    primary = socket_path(workspace)
+    candidates = [(primary, None)]
+    try:
+        metadata = json.loads((workspace / ".mypr" / "runtime.json").read_text())
+        saved_path = Path(metadata["socket"])
+        saved_identity = metadata.get("workspace_id")
+        matches = saved_identity == identity
+        if saved_identity is None:
+            matches = await asyncio.to_thread(workspace.samefile, metadata["workspace"])
+        if matches and saved_path != primary and manager_running(workspace):
+            candidates.append((saved_path, metadata))
+    except OSError, ValueError, KeyError, TypeError:
+        pass
+    for path, metadata in candidates:
+        try:
+            state = await asyncio.wait_for(rpc(path, op="status"), 5)
+        except OSError, ConnectionError, TimeoutError:
+            continue
+        actual = state.get("workspace_id")
+        if actual == identity:
+            return path, state
+        if (
+            actual is None
+            and metadata is not None
+            and state.get("generation") == metadata.get("generation")
+        ):
+            return path, state
+        raise RuntimeError("Workspace manager identity mismatch; refusing to attach")
+    return None
 
 
 class Attachment:
