@@ -16,29 +16,51 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 from . import __version__
 from .transport import attachment, rpc, socket_path
 
-INSTRUCTIONS = """This is one persistent Python workspace shared by every connected agent.
-Only execute and poll are MCP tools. Variables, imports, functions and ws handles persist.
-ws.client.id/name/connection_id identify this caller. Store private state in ws.local,
-which is scoped to the logical client ID and survives reconnects with that ID.
-Ordinary globals remain shared; use them only when sharing is intentional.
-Use short cells. Start commands with ws.local["job"] = await ws.shell.start("command").
-Start async I/O with ws.local["job"] = ws.tasks.start(coroutine); both return handles.
-In later cells call ws.local["job"].status(), .output(), .result(), or await ws.local["job"].cancel().
-Background tasks retain their creator's client context while other clients execute.
-await ws.status() reports connection_count, client_count, and connection/activity details.
-await ws.history.list(client_id=ws.client.id) lists owned executions and tasks.
-await ws.history.get(id) reads details; await ws.history.logs(client_id=ws.client.id)
-reads lifecycle/output events. History persists across resets and manager restarts.
-Use ws.tasks.list()/get(id) to rediscover jobs. Awaiting a job waits for completion and holds
-that cell; execute returning a running ID does NOT release the kernel for another cell.
-Use poll only to collect a cell's output. Use Python handles to inspect background jobs.
-ws.mcp exposes configured external MCP servers; await ws.mcp.list_servers() to discover them.
-ws.skills.list()/read(name) discover workspace SKILL.md instructions. Read before applying.
-Save reusable Python modules under ws.root / "lib/ws_lib" and import from ws_lib.
-Use pathlib for edits, importlib.reload for explicit reloads, and ws.inspect() to rediscover state.
-await ws.status() inspects runtime; await ws.reset() resets shared memory for ALL agents.
-Reset terminates its cell and returns completion through execute/poll, preserving saved files.
-Current OS user permissions apply. Changes and exceptions do not roll back shared state.
+INSTRUCTIONS = """Use execute to run Python and poll to read a submitted cell's status and output.
+Python runs in one persistent kernel shared by every client of this workspace.
+
+State and identity
+- Variables, imports, functions, and task handles survive calls and client disconnects.
+- ws.client.id is your logical identity; ws.client.connection_id identifies this connection.
+- Store your working values in ws.local, a dict scoped to your logical client ID.
+  Reconnecting with the same ID restores access while the kernel remains alive.
+- Ordinary globals are shared. Background tasks retain their creator's client context.
+- Keep large results in Python and return only the information needed for the next decision.
+
+Execution and background work
+Cells execute sequentially. Keep them short so other clients can use the kernel.
+wait_ms limits the MCP call's wait, not Python execution. A running cell still occupies
+the kernel after execute returns; use poll with its exec_id and output cursor to follow it.
+
+Start long work without waiting for completion:
+    ws.local["job"] = await ws.shell.start("command")
+    ws.local["task"] = ws.tasks.start(coroutine)
+
+In later cells, use ws.local["job"].status(), ws.local["job"].output(), or
+ws.local["job"].result(). result() raises NotReady until the job finishes.
+Use await ws.local["job"].cancel() to request cancellation. Awaiting the handle itself
+waits for completion and occupies the cell. poll reads cells; handles manage jobs.
+Run long CPU-bound or blocking work in separate scripts through ws.shell.start().
+
+Discover and reuse capabilities
+- ws.inspect(): inspect variables, tasks, and skills without dumping their values.
+- ws.tasks.list() and ws.tasks.get(task_id): find existing job handles.
+- await ws.status(): inspect connections, activity, and the execution queue.
+- await ws.mcp.list_servers() and await ws.mcp.list_tools("server"): discover external tools.
+  Call them with await ws.mcp.call_tool("server", "tool", {"argument": "value"}).
+- ws.skills.list() and ws.skills.read("name"): discover and read skill instructions.
+  Read a skill before using it; edit its files under ws.root / "skills" with Python.
+- Save reusable modules under ws.root / "lib/ws_lib" and import them from ws_lib.
+  Reload edited modules explicitly with importlib.reload().
+- ws.local["install"] = await ws.packages.add("package"): start a workspace venv install.
+- await ws.history.list(client_id=ws.client.id): find your executions and jobs.
+  await ws.history.get(record_id) reads details; await ws.history.logs() reads events.
+
+Lifecycle
+Code runs with the current OS user's permissions. Exceptions do not undo earlier changes.
+await ws.reset() clears Python memory for every client and ends its calling cell;
+completion arrives through execute/poll. Saved files, packages, and history remain.
+Kernel or manager crashes lose in-memory state; history persists and code is not replayed.
 """
 
 
