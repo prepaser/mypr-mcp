@@ -540,6 +540,28 @@ class Shell:
 
 
 class MCP:
+    async def get_config(self, server: str) -> dict[str, Any]:
+        """Read the active configuration for a server."""
+        return await self.request("get_config", server=server)
+
+    async def configure(
+        self, server: str, config: Mapping[str, Any], *, force: bool = False
+    ) -> Any:
+        """Persist a complete server configuration and replace only its connection."""
+        return await self.request("configure", server=server, config=dict(config), force=force)
+
+    async def remove(self, server: str, *, force: bool = False) -> Any:
+        """Remove a server and its saved configuration."""
+        return await self.request("remove", server=server, force=force)
+
+    async def restart(self, server: str, *, force: bool = False) -> Any:
+        """Reconnect a server using its active configuration, preserving kernel state."""
+        return await self.request("restart", server=server, force=force)
+
+    async def reload(self, *, force: bool = False) -> Any:
+        """Read edited config.toml and replace only changed connections."""
+        return await self.request("reload", force=force)
+
     async def request(self, method: str, **args: Any) -> Any:
         return await _rpc("mcp", method=method, args=args)
 

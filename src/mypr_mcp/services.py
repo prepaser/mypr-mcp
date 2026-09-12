@@ -9,9 +9,9 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
+import copy
 import os
 import signal
-import tomllib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +21,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
+
+from .config import MCPConfig, validate_name, validate_servers
 
 
 @dataclass
@@ -283,28 +285,72 @@ class _Request:
 
 class _MCPConnection:
     def __init__(self, config: dict[str, Any], workspace: Path):
-        self.config = config
+        self.config = copy.deepcopy(config)
         self.workspace = workspace
         self.queue: asyncio.Queue[_Request | None] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
         self.current: _Request | None = None
         self._closed = False
+        self._admissions_blocked = False
+        self._initializing = False
+        self._initialized = False
+        self._ready = asyncio.Event()
+        self._ready_error: BaseException | None = None
+
+    @property
+    def busy(self) -> bool:
+        """Whether initialization or any admitted request is in progress."""
+
+        return self._initializing or self.current is not None or not self.queue.empty()
+
+    @property
+    def connected(self) -> bool:
+        return self._initialized and not self._closed
+
+    def block_admissions(self) -> None:
+        self._admissions_blocked = True
+
+    def unblock_admissions(self) -> None:
+        if not self._closed:
+            self._admissions_blocked = False
+
+    def admit(self, method: str, args: dict[str, Any]) -> asyncio.Future[Any]:
+        if self._closed:
+            raise RuntimeError("MCP connection is closed")
+        if self._admissions_blocked:
+            raise RuntimeError("MCP connection is being reconfigured")
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._owner())
+        self.queue.put_nowait(_Request(method, args, future))
+        return future
 
     async def request(self, method: str, args: dict[str, Any]) -> Any:
+        return await self.admit(method, args)
+
+    async def ensure_ready(self, timeout_seconds: float = 30.0) -> None:
         if self._closed:
             raise RuntimeError("MCP connection is closed")
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._owner())
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        await self.queue.put(_Request(method, args, future))
-        return await future
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout_seconds)
+        except TimeoutError as exc:
+            raise TimeoutError("MCP connection initialization timed out") from exc
+        if self._ready_error is not None:
+            raise RuntimeError(f"MCP connection initialization failed: {self._ready_error}") from (
+                self._ready_error if isinstance(self._ready_error, Exception) else None
+            )
 
-    async def close(self) -> None:
+    async def close(self, force: bool = True) -> None:
+        if not force and self.busy:
+            raise RuntimeError("MCP connection has active requests")
         self._closed = True
+        self._admissions_blocked = True
+        error = RuntimeError("MCP connection closed by reconfiguration")
         if self.task is None:
             return
-        error = RuntimeError("MCP connection closed")
         while not self.queue.empty():
             request = self.queue.get_nowait()
             if request is not None and not request.future.done():
@@ -314,9 +360,18 @@ class _MCPConnection:
         self.task = None
 
     async def _owner(self) -> None:
+        self._ready.clear()
+        self._ready_error = None
+        self._initialized = False
         try:
             async with contextlib.AsyncExitStack() as stack:
-                session = await self._open(stack)
+                self._initializing = True
+                try:
+                    session = await self._open(stack)
+                finally:
+                    self._initializing = False
+                self._initialized = True
+                self._ready.set()
                 while True:
                     request = await self.queue.get()
                     if request is None:
@@ -338,7 +393,7 @@ class _MCPConnection:
                     try:
                         result = await operation
                     except asyncio.CancelledError:
-                        if request.future.cancelled():
+                        if request.future.cancelled() and not self._closed:
                             continue
                         if not request.future.done():
                             request.future.set_exception(RuntimeError("MCP connection closed"))
@@ -351,11 +406,20 @@ class _MCPConnection:
                             request.future.set_result(result)
                     finally:
                         self.current = None
-        except Exception as exc:
+        except BaseException as exc:
+            self._initialized = False
+            if self._closed:
+                error = RuntimeError("MCP connection closed by reconfiguration")
+            elif isinstance(exc, Exception):
+                error = exc
+            else:
+                error = RuntimeError("MCP connection interrupted")
+            self._ready_error = error
+            self._ready.set()
             while not self.queue.empty():
                 request = self.queue.get_nowait()
                 if request is not None and not request.future.done():
-                    request.future.set_exception(exc)
+                    request.future.set_exception(error)
         finally:
             if self.current is not None and not self.current.future.done():
                 self.current.future.set_exception(RuntimeError("MCP connection closed"))
@@ -400,9 +464,13 @@ class MCPBridge:
 
     def __init__(self, workspace: Path):
         self.workspace = Path(workspace).resolve()
-        self.config = self._read_config()
+        self.store = MCPConfig(self.workspace)
+        self.config, self._revision = self.store.load()
+        self.config = _copy_configs(self.config)
         self._connections: dict[str, _MCPConnection] = {}
         self._lock = asyncio.Lock()
+        self._mutation_lock = asyncio.Lock()
+        self._changing: set[str] = set()
         self._closed = False
 
     async def dispatch(self, method: str, args: dict[str, Any] | None = None) -> Any:
@@ -411,42 +479,227 @@ class MCPBridge:
         args = dict(args or {})
         if method == "list_servers":
             return _page_servers(self.config, args)
+        if method == "get_config":
+            return self.get_config(args.get("server", args.get("server_name")))
+        if method == "configure":
+            return await self.configure(
+                args.get("server", args.get("server_name")),
+                args.get("config"),
+                force=bool(args.get("force", False)),
+            )
+        if method == "remove":
+            return await self.remove(
+                args.get("server", args.get("server_name")), force=bool(args.get("force", False))
+            )
+        if method == "restart":
+            return await self.restart(
+                args.get("server", args.get("server_name")), force=bool(args.get("force", False))
+            )
+        if method == "reload":
+            return await self.reload(force=bool(args.get("force", False)))
         server_name = args.pop("server", args.pop("server_name", None))
         if not isinstance(server_name, str) or server_name not in self.config:
             raise ValueError(f"unknown MCP server: {server_name!r}")
-        connection = await self._connection(server_name)
-        return await connection.request(method, args)
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("MCP bridge is closed")
+            if server_name in self._changing:
+                raise RuntimeError("MCP server is being reconfigured")
+            connection = self._connection(server_name)
+            future = connection.admit(method, args)
+        return await future
+
+    def get_config(self, server: str) -> dict[str, Any]:
+        self._check_server_name(server)
+        if server not in self.config:
+            raise ValueError(f"unknown MCP server: {server!r}")
+        return copy.deepcopy(self.config[server])
+
+    async def configure(
+        self, server: str, config: dict[str, Any], force: bool = False
+    ) -> dict[str, Any]:
+        validate_name(server)
+        config = validate_servers({server: config})[server]
+        async with self._mutation_lock:
+            self._ensure_open()
+            old = self.config.get(server)
+            action = "added" if old is None else "unchanged" if old == config else "updated"
+            if action == "unchanged":
+                _, revision = self.store.load()
+                if revision != self._revision:
+                    raise RuntimeError(
+                        "MCP configuration changed on disk; call ws.mcp.reload() first"
+                    )
+                connected = self._connections.get(server)
+                return {
+                    "server": server,
+                    "action": action,
+                    "connected": bool(connected and connected.connected),
+                }
+            try:
+                connection = await self._block_affected({server}, force)
+                servers = _copy_configs(self.config)
+                servers[server] = copy.deepcopy(config)
+                revision = self.store.save(servers, self._revision)
+                await self._close_connections(connection, force)
+                async with self._lock:
+                    self.config = servers
+                    self._revision = revision
+                    self._connections.pop(server, None)
+                return {"server": server, "action": action, "connected": False}
+            finally:
+                await self._unblock(connection if "connection" in locals() else {})
+                await self._clear_changing({server})
+
+    async def remove(self, server: str, force: bool = False) -> dict[str, Any]:
+        self._check_server_name(server)
+        async with self._mutation_lock:
+            self._ensure_open()
+            if server not in self.config:
+                raise ValueError(f"unknown MCP server: {server!r}")
+            try:
+                connection = await self._block_affected({server}, force)
+                servers = _copy_configs(self.config)
+                del servers[server]
+                revision = self.store.save(servers, self._revision)
+                await self._close_connections(connection, force)
+                async with self._lock:
+                    self.config = servers
+                    self._revision = revision
+                    self._connections.pop(server, None)
+                return {
+                    "server": server,
+                    "action": "removed",
+                    "removed": True,
+                    "connected": False,
+                }
+            finally:
+                await self._unblock(connection if "connection" in locals() else {})
+                await self._clear_changing({server})
+
+    async def restart(self, server: str, force: bool = False) -> dict[str, Any]:
+        self._check_server_name(server)
+        async with self._mutation_lock:
+            self._ensure_open()
+            if server not in self.config:
+                raise ValueError(f"unknown MCP server: {server!r}")
+            try:
+                affected = await self._block_affected({server}, force)
+                await self._close_connections(affected, force)
+                connection = _MCPConnection(self.config[server], self.workspace)
+                connection.block_admissions()
+                async with self._lock:
+                    self._connections[server] = connection
+                await connection.ensure_ready()
+                connection.unblock_admissions()
+                return {
+                    "server": server,
+                    "action": "restarted",
+                    "restarted": True,
+                    "connected": True,
+                }
+            except Exception:
+                if "connection" in locals():
+                    await connection.close()
+                    async with self._lock:
+                        if self._connections.get(server) is connection:
+                            self._connections.pop(server, None)
+                raise
+            finally:
+                await self._clear_changing({server})
+
+    async def reload(self, force: bool = False) -> dict[str, list[str]]:
+        async with self._mutation_lock:
+            self._ensure_open()
+            servers, revision = self.store.load()
+            servers = _copy_configs(servers)
+            current = self.config
+            added = sorted(set(servers) - set(current))
+            removed = sorted(set(current) - set(servers))
+            updated = sorted(
+                name for name in set(servers) & set(current) if servers[name] != current[name]
+            )
+            changed = set(added) | set(removed) | set(updated)
+            try:
+                connections = await self._block_affected(changed, force)
+                await self._close_connections(connections, force)
+                async with self._lock:
+                    self.config = servers
+                    self._revision = revision
+                    for name in removed + updated:
+                        self._connections.pop(name, None)
+                return {"added": added, "updated": updated, "removed": removed}
+            finally:
+                await self._clear_changing(changed)
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await asyncio.gather(
-            *(connection.close() for connection in self._connections.values()),
-            return_exceptions=True,
-        )
-        self._connections.clear()
+        async with self._mutation_lock:
+            if self._closed:
+                return
+            self._closed = True
+            async with self._lock:
+                connections = dict(self._connections)
+                self._changing.update(connections)
+                for connection in connections.values():
+                    connection.block_admissions()
+            await asyncio.gather(
+                *(connection.close() for connection in connections.values()),
+                return_exceptions=True,
+            )
+            async with self._lock:
+                self._connections.clear()
+                self._changing.clear()
 
-    async def _connection(self, name: str) -> _MCPConnection:
+    def _connection(self, name: str) -> _MCPConnection:
+        connection = self._connections.get(name)
+        if connection is None:
+            connection = _MCPConnection(self.config[name], self.workspace)
+            self._connections[name] = connection
+        return connection
+
+    async def _block_affected(self, names: set[str], force: bool) -> dict[str, _MCPConnection]:
         async with self._lock:
-            connection = self._connections.get(name)
-            if connection is None:
-                connection = _MCPConnection(self.config[name], self.workspace)
-                self._connections[name] = connection
-            return connection
+            self._ensure_open()
+            affected = {
+                name: connection for name, connection in self._connections.items() if name in names
+            }
+            busy = [name for name, connection in affected.items() if connection.busy]
+            if busy and not force:
+                raise RuntimeError(
+                    "MCP servers have active requests; pass force=True: " + ", ".join(sorted(busy))
+                )
+            for connection in affected.values():
+                connection.block_admissions()
+            self._changing.update(names)
+            return affected
 
-    def _read_config(self) -> dict[str, dict[str, Any]]:
-        path = self.workspace / ".mypr" / "config.toml"
-        if not path.exists():
-            return {}
-        with path.open("rb") as file:
-            raw = tomllib.load(file)
-        servers = raw.get("mcp", {}).get("servers", {})
-        if not isinstance(servers, dict):
-            raise ValueError("[mcp.servers] must be a table")
-        return {
-            str(name): dict(config) for name, config in servers.items() if isinstance(config, dict)
-        }
+    async def _unblock(self, connections: dict[str, _MCPConnection]) -> None:
+        async with self._lock:
+            for connection in connections.values():
+                connection.unblock_admissions()
+
+    async def _clear_changing(self, names: set[str]) -> None:
+        async with self._lock:
+            self._changing.difference_update(names)
+
+    @staticmethod
+    async def _close_connections(connections: dict[str, _MCPConnection], force: bool) -> None:
+        await asyncio.gather(
+            *(connection.close(force=force) for connection in connections.values()),
+            return_exceptions=False,
+        )
+
+    @staticmethod
+    def _check_server_name(server: str) -> None:
+        validate_name(server)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("MCP bridge is closed")
+
+
+def _copy_configs(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return copy.deepcopy(config)
 
 
 async def _session_dispatch(

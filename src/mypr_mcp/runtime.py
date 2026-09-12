@@ -22,6 +22,7 @@ from .services import MCPBridge, Shells
 from .transport import MAX_MESSAGE, socket_path
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
+MCP_MUTATIONS = {"configure", "remove", "restart", "reload"}
 
 
 class Runtime:
@@ -59,7 +60,7 @@ class Runtime:
         if min(self.output_limit, self.response_limit) < 1024:
             raise ValueError("Output limits must be at least 1024 bytes")
         self.shells = Shells(self.workspace, output_limit=self.output_limit)
-        self.mcp = MCPBridge(self.workspace)
+        self.mcp = None
         self.background = set()
 
     def spawn(self, coro):
@@ -85,6 +86,7 @@ class Runtime:
         config = self.root / "config.toml"
         if not config.exists():
             config.write_text("[mcp.servers]\n")
+        self.mcp = MCPBridge(self.workspace)
         py = self.root / "venv/bin/python"
         if not py.exists():
             await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
@@ -471,7 +473,24 @@ class Runtime:
         if op == "shell_cancel":
             return await self.shells.cancel(req["id"])
         if op == "mcp":
-            return await self.mcp.dispatch(req["method"], req.get("args", {}))
+            method = req["method"]
+            args = req.get("args", {})
+            if method not in MCP_MUTATIONS:
+                return await self.mcp.dispatch(method, args)
+            event = {
+                "client_id": client,
+                "connection_id": connection_id,
+                "exec_id": req.get("exec_id"),
+                "server": args.get("server"),
+            }
+            self.history.append("mcp", method, dict(event, state="running"))
+            try:
+                result = await self.mcp.dispatch(method, args)
+            except Exception as exc:
+                self.history.append("mcp", method, dict(event, state="failed", error=str(exc)))
+                raise
+            self.history.append("mcp", method, dict(event, state="succeeded"))
+            return result
         if op == "packages_add":
             import shlex
 
@@ -698,7 +717,7 @@ class Runtime:
             if req.get("op") == "attach":
                 await self.attach(reader, writer, req)
                 return
-            if req.get("op") == "mcp":
+            if req.get("op") == "mcp" and req.get("method") not in MCP_MUTATIONS:
                 operation = asyncio.create_task(self.dispatch(req))
                 disconnected = asyncio.create_task(reader.read(1))
                 try:

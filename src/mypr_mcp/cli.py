@@ -48,6 +48,11 @@ Discover and reuse capabilities
 - await ws.status(): inspect connections, activity, and the execution queue.
 - await ws.mcp.list_servers() and await ws.mcp.list_tools("server"): discover external tools.
   Call them with await ws.mcp.call_tool("server", "tool", {"argument": "value"}).
+- await ws.mcp.configure("server", config): add or replace a saved server configuration.
+  Read it with await ws.mcp.get_config("server") before changing selected fields.
+  Use await ws.mcp.restart("server") after editing its code; await ws.mcp.reload()
+  applies config.toml edits. await ws.mcp.remove("server") disconnects and removes it.
+  These preserve Python state. Busy connections require force=True to interrupt their calls.
 - ws.skills.list() and ws.skills.read("name"): discover and read skill instructions.
   Read a skill before using it; edit its files under ws.root / "skills" with Python.
 - Save reusable modules under ws.root / "lib/ws_lib" and import them from ws_lib.

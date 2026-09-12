@@ -151,8 +151,54 @@ await ws.mcp.get_prompt("reports", "summary", {"id": "42"})
 Results are JSON-compatible MCP models. Start a call with
 `ws.tasks.start(...)` when it should run while the kernel accepts later cells.
 Calls whose completion or external side effect is uncertain are not retried
-automatically. Editing MCP configuration takes effect after `await ws.reset()`;
-changing authentication environment variables requires restarting the manager.
+automatically. Authentication variable names refer to the manager's environment;
+changing their values still requires restarting the manager.
+
+### Change MCP capabilities without resetting Python
+
+Add or replace a server from the kernel:
+
+```python
+await ws.mcp.configure("reports", {
+    "command": "/absolute/path/to/server-venv/bin/python",
+    "args": ["/absolute/path/to/reports_server.py"],
+})
+await ws.mcp.list_tools("reports")
+```
+
+`configure` persists a complete replacement of that server's configuration to
+`.mypr/config.toml`. To change selected fields, read the active configuration first:
+
+```python
+ws.local["server_config"] = await ws.mcp.get_config("reports")
+ws.local["server_config"]["args"] = ["/absolute/path/to/new_server.py"]
+await ws.mcp.configure("reports", ws.local["server_config"])
+
+await ws.mcp.restart("reports")  # Reload edited server code using the active config.
+await ws.mcp.reload()            # Apply direct edits to config.toml's MCP servers.
+await ws.mcp.remove("reports")  # Disconnect and remove the saved server entry.
+```
+
+The shared kernel, variables, `ws.local`, and unrelated server connections stay
+alive. New or changed configurations connect lazily on the next call; `restart`
+establishes a fresh initialized connection. It does not reread the config file.
+This lets an agent write or improve a local MCP server, reconnect it, and use
+its updated tools in the same Python session.
+
+Changes affecting active or queued calls are rejected by default. Use
+`force=True` on these management methods to close the affected connections and
+fail their pending calls. Other servers remain usable. Closing a connection does
+not undo completed external side effects.
+
+Configuration is validated before changes are applied. Writes are atomic and
+preserve unrelated TOML sections and comments. If the file changed since the last
+load, `configure` and `remove` ask for `reload()` rather than overwriting those
+edits. `reload()` applies only added, changed, or removed MCP entries; unchanged
+connections stay open. A valid configuration does not guarantee that its server
+can start or authenticate: connection failures are reported when connecting.
+Management changes and their outcomes are recorded in workspace history. Once
+accepted, a management operation completes even if its caller disconnects or
+stops waiting; inspect configuration and history to confirm the outcome.
 
 ### Client-local state and history
 
@@ -292,6 +338,6 @@ excludes the virtual environment, run records, artifacts, locks, logs, and
 the SQLite history, and other runtime metadata; reusable modules, skills, configuration, and
 `requirements.txt` remain available for version control as desired.
 
-When upgrading from 0.1, explicitly stop the older manager before reconnecting
-with 0.2. Running managers are not silently replaced. Existing execution files
+When upgrading, explicitly stop an older manager before reconnecting with the
+new version. Running managers are not silently replaced. Existing execution files
 are imported into history; legacy client IDs remain attached to those records.
