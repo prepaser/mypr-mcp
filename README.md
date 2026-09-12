@@ -1,6 +1,6 @@
 # mypr-mcp
 
-`mypr-mcp` puts a persistent, workspace-scoped Python environment between an
+`mypr-mcp` provides a persistent, workspace-scoped Python layer between an
 LLM agent and the workstation. Each workspace has one Python kernel. Every
 MCP connection opened for that workspace shares the same variables, imports,
 functions, and background-task handles.
