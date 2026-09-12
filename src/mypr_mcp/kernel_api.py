@@ -11,13 +11,22 @@ import os
 import shlex
 import time
 from collections.abc import Awaitable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 _output_buffer: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
     "mypr_task_output", default=None
 )
+_client_context: contextvars.ContextVar[ClientInfo | None] = contextvars.ContextVar(
+    "mypr_client_context", default=None
+)
+_exec_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mypr_exec_context", default=None
+)
 RPC_LIMIT = 32 * 1024 * 1024
+HISTORY_OUTPUT_LIMIT = 64 * 1024
 try:
     OUTPUT_LIMIT = max(1024, int(os.environ.get("MYPR_OUTPUT_LIMIT", 16 * 1024 * 1024)))
 except ValueError:
@@ -34,6 +43,45 @@ class RPCError(RuntimeError):
 
 class ResetRequested(BaseException):
     """Used to stop the current IPython cell after a kernel reset request."""
+
+
+@dataclass(frozen=True, slots=True)
+class ClientInfo:
+    """Immutable identity of the client that submitted the current cell."""
+
+    id: str
+    name: str | None = None
+    connection_id: str | None = None
+
+
+def _client_from_metadata(metadata: Mapping[str, Any] | None) -> ClientInfo | None:
+    if not metadata:
+        return None
+    client_id = metadata.get("client_id")
+    if client_id is None:
+        return None
+    return ClientInfo(
+        id=str(client_id),
+        name=str(metadata["client_name"]) if metadata.get("client_name") is not None else None,
+        connection_id=(
+            str(metadata["connection_id"]) if metadata.get("connection_id") is not None else None
+        ),
+    )
+
+
+@contextmanager
+def execution_context(metadata: Mapping[str, Any] | None):
+    """Install an execution identity; child asyncio tasks inherit it."""
+
+    client_token = _client_context.set(_client_from_metadata(metadata))
+    exec_token = _exec_context.set(
+        str(metadata["exec_id"]) if metadata and metadata.get("exec_id") is not None else None
+    )
+    try:
+        yield
+    finally:
+        _exec_context.reset(exec_token)
+        _client_context.reset(client_token)
 
 
 class OutputBuffer:
@@ -96,11 +144,30 @@ class MultiplexStream:
         return getattr(self.stream, name)
 
 
+def _bounded_history_output(value: str) -> str:
+    raw = value.encode("utf-8", "replace")
+    if len(raw) <= HISTORY_OUTPUT_LIMIT:
+        return value
+    return raw[:HISTORY_OUTPUT_LIMIT].decode("utf-8", "ignore")
+
+
 async def _rpc(op: str, **fields: Any) -> Any:
     socket_name = os.environ.get("MYPR_SOCKET")
     if not socket_name:
         raise RPCError("MYPR_SOCKET is not configured")
     payload = {"op": op, **fields}
+    client = _client_context.get()
+    if client is not None:
+        payload.update(
+            {
+                "client_id": client.id,
+                "client_name": client.name,
+                "connection_id": client.connection_id,
+            }
+        )
+    exec_id = _exec_context.get()
+    if exec_id is not None:
+        payload["exec_id"] = exec_id
     generation = os.environ.get("MYPR_GENERATION")
     if generation is not None:
         try:
@@ -144,10 +211,14 @@ class TaskHandle:
         self._source = source
         self._run_state = run_state or {"started": True}
         self._created = time.time()
+        self._finished_at: float | None = None
         self._cancel_requested = False
+        self._client = _client_context.get()
+        self._exec_id = _exec_context.get()
         self._task.add_done_callback(self._finished)
 
     def _finished(self, task: asyncio.Task[Any]) -> None:
+        self._finished_at = time.time()
         if task.cancelled():
             if not self._run_state["started"] and inspect.iscoroutine(self._source):
                 self._source.close()
@@ -163,7 +234,19 @@ class TaskHandle:
             state = "failed"
         else:
             state = "succeeded"
-        return {"id": self.id, "status": state, "created_at": self._created}
+        result = {
+            "id": self.id,
+            "status": state,
+            "created_at": self._created,
+            "client_id": self._client.id if self._client else None,
+            "connection_id": self._client.connection_id if self._client else None,
+            "exec_id": self._exec_id,
+        }
+        if self._client is not None:
+            result["client_name"] = self._client.name
+        if self._finished_at is not None:
+            result["finished_at"] = self._finished_at
+        return result
 
     def output(self, cursor: int | None = None) -> str | dict[str, Any]:
         text = self._buffer.get()
@@ -188,6 +271,65 @@ class TaskHandle:
         self._task.cancel()
         return True
 
+    async def _report(self) -> None:
+        """Publish task lifecycle without exposing the awaitable or its arguments."""
+
+        identity = {
+            "id": self.id,
+            "created": self._created,
+            "client_id": self._client.id if self._client else None,
+            "connection_id": self._client.connection_id if self._client else None,
+            "exec_id": self._exec_id,
+            "kind": "python",
+        }
+
+        async def publish(state: str, **extra: Any) -> None:
+            event = {**identity, "state": state, **extra}
+            try:
+                await _rpc("task_event", event=event)
+            except RPCError, OSError:
+                # Reporting must never alter the task's result or lifetime.
+                pass
+
+        await publish("running")
+        cursor = 0
+        while True:
+            text = self.output()
+            while cursor < len(text):
+                chunk = text[cursor : cursor + 8192]
+                await publish("running", output_delta=chunk)
+                cursor += len(chunk)
+            if self._task.done():
+                break
+            await asyncio.wait({self._task}, timeout=0.25)
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            await publish(
+                "cancelled",
+                finished=time.time(),
+                output=_bounded_history_output(self.output()),
+                output_delta="",
+                output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+            )
+        except Exception as exc:
+            await publish(
+                "failed",
+                finished=time.time(),
+                error=f"{type(exc).__name__}: {exc}",
+                output=_bounded_history_output(self.output()),
+                output_delta="",
+                output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+            )
+        else:
+            await publish(
+                "succeeded",
+                finished=time.time(),
+                output=_bounded_history_output(self.output()),
+                output_delta="",
+                output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+            )
+
     async def _wait(self) -> Any:
         return await self._task
 
@@ -199,6 +341,7 @@ class TaskManager:
     def __init__(self) -> None:
         self._handles: dict[str, TaskHandle] = {}
         self._counter = 0
+        self._reporters: set[asyncio.Task[None]] = set()
 
     def start(
         self,
@@ -231,10 +374,16 @@ class TaskManager:
         handle = TaskHandle(ident, task, buffer, awaitable, run_state)
         if visible:
             self._handles[ident] = handle
+            reporter = asyncio.create_task(handle._report(), name=f"mypr:report:{ident}")
+            self._reporters.add(reporter)
+            reporter.add_done_callback(self._reporters.discard)
         return handle
 
-    def list(self) -> list[dict[str, Any]]:
-        return [handle.status() for handle in self._handles.values()]
+    def list(self, client_id: str | None = None) -> list[dict[str, Any]]:
+        items = [handle.status() for handle in self._handles.values()]
+        if client_id is not None:
+            items = [item for item in items if item.get("client_id") == client_id]
+        return items
 
     def active(self) -> list[TaskHandle]:
         return [
@@ -256,6 +405,9 @@ class RemoteTask(TaskHandle):
         self._manager = manager
         self._buffer = OutputBuffer()
         self._created = time.time()
+        self._finished_at: float | None = None
+        self._client = _client_context.get()
+        self._exec_id = _exec_context.get()
         self._state = "queued"
         self._result: Any = None
         self._error: str | None = None
@@ -315,14 +467,24 @@ class RemoteTask(TaskHandle):
             self._result = result["result"]
         if result.get("error"):
             self._error = str(result["error"])
+        if self._state in {"succeeded", "failed", "cancelled", "lost"}:
+            self._finished_at = self._finished_at or time.time()
 
     def status(self) -> dict[str, Any]:
-        return {
+        status = {
             "id": self.id,
             "status": self._state,
             "created_at": self._created,
             "error": self._error,
+            "client_id": self._client.id if self._client else None,
+            "connection_id": self._client.connection_id if self._client else None,
+            "exec_id": self._exec_id,
         }
+        if self._client is not None:
+            status["client_name"] = self._client.name
+        if self._finished_at is not None:
+            status["finished_at"] = self._finished_at
+        return status
 
     async def _wait(self) -> Any:
         await self._monitor
@@ -486,6 +648,37 @@ class Skills:
         return self._path(name).read_text(encoding="utf-8")
 
 
+class History:
+    async def list(
+        self,
+        client_id: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> Any:
+        fields: dict[str, Any] = {"limit": limit}
+        if client_id is not None:
+            fields["filter_client_id"] = client_id
+        if cursor is not None:
+            fields["cursor"] = cursor
+        return await _rpc("history_list", **fields)
+
+    async def get(self, exec_id: str) -> Any:
+        return await _rpc("history_get", id=exec_id)
+
+    async def logs(
+        self,
+        client_id: str | None = None,
+        limit: int = 20,
+        cursor: int | str | None = None,
+    ) -> Any:
+        fields: dict[str, Any] = {"limit": limit}
+        if client_id is not None:
+            fields["filter_client_id"] = client_id
+        if cursor is not None:
+            fields["cursor"] = cursor
+        return await _rpc("logs", **fields)
+
+
 class Workspace:
     def __init__(
         self,
@@ -495,11 +688,25 @@ class Workspace:
         self.workspace = Path(workspace or os.environ.get("MYPR_WORKSPACE", os.getcwd())).resolve()
         self.root = self.workspace / ".mypr"
         self._namespace = namespace
+        self._locals: dict[str, dict[str, Any]] = {}
         self.tasks = TaskManager()
         self.shell = Shell(self.tasks)
         self.mcp = MCP()
         self.packages = Packages(self.tasks)
         self.skills = Skills(self.workspace)
+        self.history = History()
+
+    @property
+    def client(self) -> ClientInfo | None:
+        return _client_context.get()
+
+    @property
+    def local(self) -> dict[str, Any]:
+        """Return the persistent scratch dictionary for the current client."""
+
+        client = _client_context.get()
+        key = client.id if client is not None else "__anonymous__"
+        return self._locals.setdefault(key, {})
 
     async def status(self) -> Any:
         return await _rpc("status")
@@ -540,6 +747,15 @@ class Workspace:
         return {
             "workspace": str(self.workspace),
             "generation": os.environ.get("MYPR_GENERATION"),
+            "client": (
+                {
+                    "id": self.client.id,
+                    "name": self.client.name,
+                    "connection_id": self.client.connection_id,
+                }
+                if self.client is not None
+                else None
+            ),
             "variables": values,
             "tasks": self.tasks.list(),
             "skills": self.skills.list(),
@@ -563,6 +779,8 @@ def create_workspace(
 
 __all__ = [
     "MCP",
+    "ClientInfo",
+    "History",
     "NotReady",
     "RPCError",
     "RemoteTask",
@@ -571,4 +789,5 @@ __all__ = [
     "TaskManager",
     "Workspace",
     "create_workspace",
+    "execution_context",
 ]

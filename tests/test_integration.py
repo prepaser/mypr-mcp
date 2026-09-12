@@ -192,11 +192,11 @@ async def test_request_id_does_not_repeat_side_effect_after_manager_restart(work
         "counter.write_text(str(value + 1))\n"
         "value + 1"
     )
-    async with mcp_session(workspace) as session:
+    async with mcp_session(workspace, client_id="retry-client") as session:
         first = await execute(session, code, request_id="idempotent-side-effect")
         assert result_text(first).strip() == "1"
         await stop_manager(workspace)
-    async with mcp_session(workspace) as session:
+    async with mcp_session(workspace, client_id="retry-client") as session:
         repeated = await execute(session, code, request_id="idempotent-side-effect")
         assert result_text(repeated).strip() == "1"
     assert (workspace / "counter.txt").read_text() == "1"

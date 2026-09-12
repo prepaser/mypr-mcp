@@ -9,12 +9,12 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from .kernel_api import MultiplexStream, create_workspace
+    from .kernel_api import MultiplexStream, create_workspace, execution_context
 else:
     _source = Path(__file__).resolve().parents[1]
     if str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
-    from mypr_mcp.kernel_api import MultiplexStream, create_workspace
+    from mypr_mcp.kernel_api import MultiplexStream, create_workspace, execution_context
 
 
 def _parent_death_signal() -> None:
@@ -35,6 +35,19 @@ def _parent_death_signal() -> None:
         raise RuntimeError("kernel parent changed during startup")
 
 
+def _kernel_class():
+    from ipykernel.ipkernel import IPythonKernel
+
+    class WorkspaceKernel(IPythonKernel):
+        async def execute_request(self, stream, ident, parent):
+            metadata = (parent or {}).get("metadata", {})
+            request = metadata.get("mypr") if isinstance(metadata, dict) else None
+            with execution_context(request if isinstance(request, dict) else None):
+                await super().execute_request(stream, ident, parent)
+
+    return WorkspaceKernel
+
+
 def main(argv: list[str] | None = None) -> None:
     _parent_death_signal()
     workspace = Path(os.environ.get("MYPR_WORKSPACE", os.getcwd())).resolve()
@@ -45,6 +58,7 @@ def main(argv: list[str] | None = None) -> None:
     from ipykernel.kernelapp import IPKernelApp
 
     app = IPKernelApp.instance()
+    app.kernel_class = _kernel_class()
     app.initialize(argv)
     namespace = app.shell.user_ns
     ws = create_workspace(workspace, namespace)

@@ -23,6 +23,21 @@ Start the MCP server with an absolute workspace path:
 uv run mypr-mcp serve --workspace /absolute/path/to/workspace
 ```
 
+Each server process gets a random logical client ID by default and a fresh
+connection ID for every connection. Pass `--client-id` to keep the same
+logical identity across reconnects, and `--client-name` to make it easier to
+recognize in status and history output:
+
+```sh
+uv run mypr-mcp serve --workspace /absolute/path/to/workspace \
+  --client-id conversation-a --client-name "Review agent"
+```
+
+Client IDs identify callers for attribution and coordination. They are not an
+authentication mechanism or a security boundary. If several conversations
+share a logical ID, use a unique ID for each conversation when per-conversation
+ownership and filtering are needed.
+
 The first start creates `/absolute/path/to/workspace/.mypr/`, its Python
 environment, and a manager process. The manager and kernel continue running
 after an MCP client disconnects, so another client for the same workspace
@@ -139,6 +154,49 @@ Calls whose completion or external side effect is uncertain are not retried
 automatically. Editing MCP configuration takes effect after `await ws.reset()`;
 changing authentication environment variables requires restarting the manager.
 
+### Client-local state and history
+
+The shared Python namespace is deliberately common to every client. Use the
+client identity and local mapping for values that belong to the current agent:
+
+```python
+ws.client.id
+ws.client.name
+ws.local["review_job"] = ws.tasks.start(do_review())
+```
+
+`ws.local` is persisted in the running kernel and is namespaced by logical
+client ID. `ws.client.id` and `ws.client.name` identify the caller that
+submitted the current cell; `connection_id` identifies this particular MCP
+connection. They prevent accidental name reuse only when code follows the
+`ws.local` convention; ordinary globals remain shared.
+
+Use `await ws.status()` for the current manager, kernel, active execution,
+queue, and connected-client information. Use `ws.history.list(...)` and
+`ws.history.get(exec_id)` to inspect execution records from Python. History
+records include the logical client and connection IDs, timestamps, state, and
+output metadata. A task inherits its creator's identity even while another
+client executes. IDs are organizational labels, not access-control boundaries.
+
+```python
+state = await ws.status()
+state["connection_count"], state["client_count"]
+await ws.history.list(client_id=ws.client.id, limit=20)
+await ws.history.get(exec_id)  # Also accepts a background task ID.
+await ws.history.logs(client_id=ws.client.id, limit=20)
+```
+
+`connections` contains names, connection and activity timestamps, the active
+execution, and owned task IDs. Open IPC connections determine liveness, so a
+killed client is removed without cancelling its workspace jobs.
+
+History is stored in `.mypr/history.sqlite3`. Lists return `items` and
+`next_cursor`; logs return ascending events and a cursor for subsequent reads.
+Execution details include a paged output view (continue with MCP `poll`).
+Background task details retain up to 64 KiB of output and mark truncation;
+live handles retain their normal output buffers. Logs stream cell, shell, and
+Python task output while work is running.
+
 ### Skills and reusable Python
 
 Workspace skills live at `.mypr/skills/<name>/SKILL.md`. Discover and read
@@ -195,19 +253,26 @@ the workspace. It terminates the reset cell; its completion is reported by the
 `execute`/`poll` result. Saved files, skills, modules, package environment,
 and run records remain. Pass `force=True` to cancel active Python tasks and
 reset. The kernel generation changes and old Python job handles expire. Historical MCP
-execution IDs remain readable; reusing a request ID returns its original execution
-instead of repeating side effects, including after reset or manager restart.
+execution IDs remain readable. Request IDs are scoped to the logical client:
+reusing the same client ID and request ID returns the original execution instead
+of repeating side effects, including after reset or manager restart.
 
 The CLI also provides operational controls:
 
 ```sh
 uv run mypr-mcp status --workspace /absolute/path/to/workspace
+uv run mypr-mcp logs --workspace /absolute/path/to/workspace
+uv run mypr-mcp logs --workspace /absolute/path/to/workspace \
+  --client-id conversation-a --limit 50 --follow
 uv run mypr-mcp reset --workspace /absolute/path/to/workspace
 uv run mypr-mcp stop --workspace /absolute/path/to/workspace
 ```
 
-These are local administration commands, not MCP tools. `reset` and `stop`
-reject active work unless `--force` is supplied.
+`logs` prints JSONL lifecycle and output events. Without `--follow` it prints
+the most recent 20 events; `--limit` changes the page size (1–200), and `--client-id`
+filters by logical caller. `--follow` waits for new records until interrupted.
+The commands are local administration commands, not MCP tools. `reset` and
+`stop` reject active work unless `--force` is supplied.
 
 Python memory and running handles survive normal client disconnects, but they
 cannot be restored after a manager or kernel crash. In that case unfinished
@@ -224,5 +289,9 @@ data is stored under `.mypr/artifacts/`.
 
 Runtime files are created under `.mypr/`. The generated `.mypr/.gitignore`
 excludes the virtual environment, run records, artifacts, locks, logs, and
-other runtime metadata; reusable modules, skills, configuration, and
+the SQLite history, and other runtime metadata; reusable modules, skills, configuration, and
 `requirements.txt` remain available for version control as desired.
+
+When upgrading from 0.1, explicitly stop the older manager before reconnecting
+with 0.2. Running managers are not silently replaced. Existing execution files
+are imported into history; legacy client IDs remain attached to those records.

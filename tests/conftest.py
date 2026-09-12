@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -46,13 +47,24 @@ async def workspace(tmp_path: Path) -> AsyncIterator[Path]:
         yield path
     finally:
         await stop_manager(path)
+        await asyncio.to_thread(shutil.rmtree, path / ".mypr" / "venv", True)
 
 
 @asynccontextmanager
-async def mcp_session(workspace: Path) -> AsyncIterator[ClientSession]:
+async def mcp_session(
+    workspace: Path,
+    *,
+    client_id: str | None = None,
+    client_name: str | None = None,
+) -> AsyncIterator[ClientSession]:
+    args = ["-m", "mypr_mcp.cli", "serve", "--workspace", str(workspace)]
+    if client_id is not None:
+        args.extend(["--client-id", client_id])
+    if client_name is not None:
+        args.extend(["--client-name", client_name])
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "mypr_mcp.cli", "serve", "--workspace", str(workspace)],
+        args=args,
         env=dict(os.environ),
     )
     async with stdio_client(params) as (read_stream, write_stream):

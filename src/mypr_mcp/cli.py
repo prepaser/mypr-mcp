@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import base64
-import contextlib
 import fcntl
 import json
 import os
@@ -15,13 +14,21 @@ from mcp.server import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import __version__
-from .transport import rpc, socket_path
+from .transport import attachment, rpc, socket_path
 
 INSTRUCTIONS = """This is one persistent Python workspace shared by every connected agent.
 Only execute and poll are MCP tools. Variables, imports, functions and ws handles persist.
-Use short cells. Start long commands with job = await ws.shell.start("command").
-Start async I/O with job = ws.tasks.start(coroutine). These return handles, not final results.
-In later cells use job.status(), job.output(), job.result(), await job.cancel().
+ws.client.id/name/connection_id identify this caller. Store private state in ws.local,
+which is scoped to the logical client ID and survives reconnects with that ID.
+Ordinary globals remain shared; use them only when sharing is intentional.
+Use short cells. Start commands with ws.local["job"] = await ws.shell.start("command").
+Start async I/O with ws.local["job"] = ws.tasks.start(coroutine); both return handles.
+In later cells call ws.local["job"].status(), .output(), .result(), or await ws.local["job"].cancel().
+Background tasks retain their creator's client context while other clients execute.
+await ws.status() reports connection_count, client_count, and connection/activity details.
+await ws.history.list(client_id=ws.client.id) lists owned executions and tasks.
+await ws.history.get(id) reads details; await ws.history.logs(client_id=ws.client.id)
+reads lifecycle/output events. History persists across resets and manager restarts.
 Use ws.tasks.list()/get(id) to rediscover jobs. Awaiting a job waits for completion and holds
 that cell; execute returning a running ID does NOT release the kernel for another cell.
 Use poll only to collect a cell's output. Use Python handles to inspect background jobs.
@@ -100,10 +107,10 @@ def tool_result(result):
     )
 
 
-async def serve(workspace):
+async def serve(workspace, client_id: str | None = None, client_name: str | None = None):
     path = await ensure(workspace)
-    client_id = uuid.uuid4().hex
-    await rpc(path, op="attach", client_id=client_id)
+    client_id = client_id or uuid.uuid4().hex
+    connection_id = uuid.uuid4().hex
     mcp = MCPServer("mypr-mcp", version=__version__, instructions=INSTRUCTIONS)
 
     @mcp.tool()
@@ -118,34 +125,72 @@ async def serve(workspace):
             wait_ms=wait_ms,
             request_id=request_id,
             client_id=client_id,
+            connection_id=connection_id,
         )
         return tool_result(result)
 
     @mcp.tool()
     async def poll(exec_id: str, cursor: int | None = None, wait_ms: int = 1000) -> CallToolResult:
         """Read a submitted cell's state and output; use Python handles for background jobs."""
-        result = await rpc(path, op="poll", exec_id=exec_id, cursor=cursor, wait_ms=wait_ms)
+        result = await rpc(
+            path,
+            op="poll",
+            exec_id=exec_id,
+            cursor=cursor,
+            wait_ms=wait_ms,
+            client_id=client_id,
+            connection_id=connection_id,
+        )
         return tool_result(result)
 
-    try:
-        await mcp.run_stdio_async()
-    finally:
-        with contextlib.suppress(OSError, ConnectionError):
-            await rpc(path, op="detach", client_id=client_id)
+    async with attachment(path, client_id, connection_id, client_name) as attached:
+        mcp_task = asyncio.create_task(mcp.run_stdio_async())
+        manager_task = asyncio.create_task(attached.wait_closed())
+        try:
+            done, _ = await asyncio.wait(
+                (mcp_task, manager_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if manager_task in done:
+                raise ConnectionError("Workspace manager disconnected")
+            await mcp_task
+        finally:
+            for task in (mcp_task, manager_task):
+                task.cancel()
+            await asyncio.gather(mcp_task, manager_task, return_exceptions=True)
+
+
+async def logs(workspace, client_id: str | None, limit: int, follow: bool) -> None:
+    path = socket_path(workspace)
+    cursor: int | None = None
+    while True:
+        result = await rpc(path, op="logs", cursor=cursor, filter_client_id=client_id, limit=limit)
+        for event in result.get("events", []):
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+        next_cursor = result.get("cursor", cursor)
+        if not follow:
+            return
+        cursor = next_cursor
+        await asyncio.sleep(0.5)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Persistent workspace Python over MCP")
-    parser.add_argument("command", choices=["serve", "status", "reset", "stop", "_manager"])
+    parser.add_argument("command", choices=["serve", "status", "logs", "reset", "stop", "_manager"])
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--client-id")
+    parser.add_argument("--client-name")
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
     workspace = args.workspace.resolve(strict=True)
     if not workspace.is_dir():
         parser.error("workspace must be a directory")
+    if args.limit < 1:
+        parser.error("--limit must be greater than zero")
     try:
         if args.command == "serve":
-            asyncio.run(serve(workspace))
+            asyncio.run(serve(workspace, args.client_id, args.client_name))
         elif args.command == "_manager":
             from .runtime import Runtime
 
@@ -156,12 +201,18 @@ def main():
                 path = socket_path(workspace)
                 if args.command == "reset":
                     path = await ensure(workspace)
+                if args.command == "logs":
+                    return await logs(workspace, args.client_id, args.limit, args.follow)
                 return await rpc(path, op=args.command, force=args.force)
 
-            print(json.dumps(asyncio.run(admin()), indent=2))
+            result = asyncio.run(admin())
+            if result is not None:
+                print(json.dumps(result, indent=2))
     except (RuntimeError, OSError, TimeoutError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":
