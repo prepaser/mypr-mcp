@@ -9,57 +9,92 @@ The runtime is intended for Linux, Python 3.14, and [uv](https://docs.astral.sh/
 Commands run with the current OS user's permissions; mypr-mcp does not provide
 a sandbox.
 
-## Install
+## Run
 
-From this repository:
-
-```sh
-uv sync
-```
-
-Start the MCP server with an absolute workspace path:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
+configure your MCP client to launch:
 
 ```sh
-uv run mypr-mcp serve --workspace /absolute/path/to/workspace
+uvx mypr-mcp serve
 ```
 
-Each server process gets a random logical client ID by default and a fresh
-connection ID for every connection. Pass `--client-id` to keep the same
-logical identity across reconnects, and `--client-name` to make it easier to
-recognize in status and history output:
+The client communicates with the server over stdio. The server's working
+directory becomes the workspace, so configure the client to launch it from
+the directory where the agent should work. `uvx` downloads and runs the
+package automatically.
 
-```sh
-uv run mypr-mcp serve --workspace /absolute/path/to/workspace \
-  --client-id conversation-a --client-name "Review agent"
-```
-
-Client IDs identify callers for attribution and coordination. They are not an
-authentication mechanism or a security boundary. If several conversations
-share a logical ID, use a unique ID for each conversation when per-conversation
-ownership and filtering are needed.
-
-The first start creates `/absolute/path/to/workspace/.mypr/`, its Python
-environment, and a manager process. The manager and kernel continue running
-after an MCP client disconnects, so another client for the same workspace
-reconnects to the same in-memory environment.
-
-For an MCP host that starts commands from JSON, use the repository directory
-in `--directory` and pass the workspace separately:
+For clients using `mcpServers` JSON configuration:
 
 ```json
 {
   "mcpServers": {
     "mypr": {
-      "command": "uv",
-      "args": [
-        "--directory", "/absolute/path/to/mypr-mcp",
-        "run", "mypr-mcp", "serve",
-        "--workspace", "/absolute/path/to/workspace"
-      ]
+      "command": "uvx",
+      "args": ["mypr-mcp", "serve"]
     }
   }
 }
 ```
+
+Make sure `uvx` is on the client's `PATH`, or use its absolute executable path.
+To pin a version, use `mypr-mcp@0.4.0` as the first argument.
+
+### Codex
+
+With `uv` installed, add the following table to the target workspace's
+`.codex/config.toml`. Codex loads project configuration for
+trusted projects. Use `~/.codex/config.toml` instead for a user-wide registration.
+See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp).
+
+```toml
+[mcp_servers.mypr]
+command = "uvx"
+args = ["mypr-mcp", "serve"]
+startup_timeout_sec = 180
+tool_timeout_sec = 60
+required = true
+```
+
+Start Codex in the target workspace. The MCP process uses its launch directory
+as the workspace. `uvx` must be on Codex's `PATH`; use its absolute
+executable path if needed.
+
+The startup allowance covers the first package download and workspace venv creation. `required = true`
+makes Codex wait for this server and report a startup failure if it cannot
+initialize. The tool timeout covers individual `execute`/`poll` calls, not the
+lifetime of background jobs.
+
+Alternatively, register the launch command through the CLI:
+
+```sh
+codex mcp add mypr -- uvx mypr-mcp serve
+```
+
+This creates a user-wide entry. Add the timeout and `required` settings above
+to its `[mcp_servers.mypr]` table in `~/.codex/config.toml`; do not add the same
+table twice. A user-wide entry can serve different projects using each launch
+directory; use project-scoped configuration for project-specific settings.
+
+Restart the Codex client after changing its configuration. Check registration
+with `codex mcp get mypr` or `codex mcp list`, then use `/mcp` in the Codex CLI
+to inspect the live connection. The server exposes only `execute` and `poll`.
+Ask the agent to run `ws.client.id` and `await ws.status()` through `execute`
+to verify the selected workspace and client identity.
+
+These examples let mypr-mcp generate its client ID. Add `--client-id` only when
+intentionally reusing a logical identity: a fixed ID also shares `ws.local`
+across clients using it. The ID is not automatically a Codex conversation ID.
+
+Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers
+called from Python belong in the workspace's `.mypr/config.toml`, or can be
+registered dynamically with `await ws.mcp.configure(...)`.
+
+## Workspace runtime
+
+The first start creates `.mypr/` in the launch workspace, its Python
+environment, and a manager process. The manager and kernel continue running
+after an MCP client disconnects, so another client for the same workspace
+reconnects to the same in-memory environment.
 
 Symlink and bind-mount aliases of the same directory connect to the same
 workspace runtime. Discovery uses the directory's filesystem device and inode,
@@ -114,32 +149,100 @@ its submitted cells or background jobs.
 
 ## Python workspace API
 
-The kernel injects `ws`, a `Workspace` instance. Ordinary file and data work
-uses standard Python and `pathlib`.
+The kernel injects `ws`, a `Workspace` instance, into every Python cell.
+Methods shown with `await` are asynchronous; property access, inspection,
+skill reads, and task-handle inspection are synchronous.
+
+| Entry point | Purpose |
+| --- | --- |
+| `ws.workspace`, `ws.root` | `Path` objects for the workspace and its `.mypr/` directory |
+| `ws.client`, `ws.local` | Current caller identity and its in-memory scratch dictionary |
+| `ws.shell`, `ws.tasks` | Start and inspect background work |
+| `ws.mcp` | Call and reconfigure external MCP servers |
+| `ws.skills`, `ws.packages` | Read skills and install kernel packages |
+| `ws.history` | Query saved execution and task records |
+| `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
+| `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
+
+Use ordinary Python for file and data work. `ws.workspace` stays anchored to
+the workspace even if code changes the kernel's current directory:
+
+```python
+(ws.workspace / "notes.txt").write_text("Hello from Python.\n", encoding="utf-8")
+```
+
+All clients share imports, globals, and filesystem changes. Store caller-specific
+values in `ws.local`; they survive reconnects with the same client ID, but not
+a kernel reset or crash.
 
 ### Shell and async tasks
 
 `await ws.shell.start(command, *, cwd=None, env=None)` starts a command in its
-own process group and returns a handle. `command` may be a string or a list of
-arguments. The default working directory is the kernel's current directory (initially the workspace). Shell output is
-captured by the handle.
+own process group and returns a handle immediately. A string is interpreted by
+`/bin/sh`; a list quotes each argument literally. Standard input is closed, and
+stdout and stderr are captured together in the handle's output.
 
-`ws.tasks.start(awaitable, *, task_id=None, visible=True)` starts an awaitable
-in the persistent kernel event loop and returns a handle. This is useful for
-non-blocking async I/O:
+The default `cwd` is the kernel's current directory. The default environment is
+the kernel's environment; an explicit `env` replaces it rather than merging it.
+To override one variable while retaining the others:
 
 ```python
-job = ws.tasks.start(ws.mcp.call_tool("reports", "fetch", {"id": "42"}))
+import os
+
+ws.local["job"] = await ws.shell.start(
+    ["python", "--version"],
+    cwd=ws.workspace,
+    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+)
 ```
 
-### Configured MCP services
+`ws.tasks.start(awaitable, *, task_id=None, visible=True)` schedules an awaitable
+in the kernel's event loop and returns a handle without `await`:
+
+```python
+import asyncio
+
+ws.local["job"] = ws.tasks.start(asyncio.sleep(2, result="done"))
+```
+
+Async tasks must yield to the event loop. Blocking or CPU-heavy work should run
+in a separate process, for example through `ws.shell.start(...)`.
+
+Inspect the handle in a later cell:
+
+```python
+ws.local["job"].status()
+ws.local["job"].output()
+ws.tasks.list(client_id=ws.client.id)
+ws.tasks.get(ws.local["job"].id)
+```
+
+| Handle operation | Result |
+| --- | --- |
+| `job.status()` | Dictionary with `id`, `status`, owner IDs, and timestamps |
+| `job.output()` | Captured text so far |
+| `job.output(cursor=0)` | Dictionary with `output`, the next character `cursor`, and `truncated` |
+| `job.result()` | Completed result; raises `NotReady` while still running |
+| `await job` | Waits for completion and returns the result |
+| `await job.cancel()` | Requests cancellation; inspect status for completion |
+
+Async jobs return the awaitable's value and propagate its exception. Successful
+shell jobs return `{"returncode": 0}`; a failed shell job raises `RPCError` when
+its result is retrieved. Cancelled jobs raise `asyncio.CancelledError`.
+Waiting with `await job` occupies the current cell until completion.
+
+Task IDs are shared across the kernel; omit `task_id` to generate one.
+`ws.tasks.list()` includes completed visible tasks, while `ws.tasks.active()`
+returns active handles. `visible=False` omits an async task from discovery,
+history reporting, and the reset guard; keep the default for managed work.
+
+### MCP services
 
 External MCP servers are configured in `.mypr/config.toml`:
 
 ```toml
 [mcp.servers.reports]
-command = "uv"
-args = ["--directory", "/absolute/path/to/reports", "run", "reports-mcp"]
+command = "reports-mcp"
 cwd = "/absolute/path/to/workspace"
 
 [mcp.servers.reports.env_from]
@@ -150,7 +253,21 @@ The stdio service uses `command`, optional `args`, optional `cwd`, and
 optional `env_from`. `command` can also be an argument list. HTTP services use
 `url`, optional `headers_from`, and are connected lazily. Environment mappings
 name variables in the manager's environment; their secret values are not
-written to the config.
+written to the config. A stdio server's default `cwd` is the workspace;
+a relative `cwd` is resolved against it.
+
+For an HTTP server:
+
+```toml
+[mcp.servers.remote]
+url = "https://example.com/mcp"
+
+[mcp.servers.remote.headers_from]
+Authorization = "REMOTE_AUTHORIZATION"
+```
+
+`REMOTE_AUTHORIZATION` must contain the complete header value, including any
+required scheme such as `Bearer `.
 
 The API is:
 
@@ -164,15 +281,24 @@ await ws.mcp.list_prompts("reports")
 await ws.mcp.get_prompt("reports", "summary", {"id": "42"})
 ```
 
-Results are JSON-compatible MCP models. Start a call with
+Remote results are dictionaries serialized from MCP models. Tool responses may
+contain `content`, `structuredContent`, and `isError`; check `isError` before
+using a tool result. A tool-reported error can be returned normally, while a
+transport or bridge failure raises `RPCError`.
+
+Tool, resource, and prompt listing methods require a server name and accept
+`cursor=` for pagination. Pass the response's `nextCursor` to the next call
+when it is non-null. Server discovery uses `servers` and `next_cursor` instead;
+for additional pages use
+`await ws.mcp.request("list_servers", cursor=next_cursor, limit=50)`.
+
+Start a call with
 `ws.tasks.start(...)` when it should run while the kernel accepts later cells.
 Calls whose completion or external side effect is uncertain are not retried
 automatically. Authentication variable names refer to the manager's environment;
 changing their values still requires restarting the manager.
 
-### Change MCP capabilities without resetting Python
-
-Add or replace a server from the kernel:
+Add or replace a server directly from the kernel without resetting Python:
 
 ```python
 await ws.mcp.configure("reports", {
@@ -218,24 +344,36 @@ stops waiting; inspect configuration and history to confirm the outcome.
 
 ### Client-local state and history
 
+Each server process gets a random logical client ID by default and a fresh
+connection ID for every connection. Pass `--client-id` to keep the same
+logical identity across reconnects:
+
+```sh
+uvx mypr-mcp serve --client-id conversation-a
+```
+
+Client IDs identify callers for attribution and coordination. They are not an
+authentication mechanism or a security boundary. If several conversations
+share a logical ID, use a unique ID for each conversation when per-conversation
+ownership and filtering are needed.
+
 The shared Python namespace is deliberately common to every client. Use the
 client identity and local mapping for values that belong to the current agent:
 
 ```python
 ws.client.id
-ws.client.name
 ws.local["review_job"] = ws.tasks.start(do_review())
 ```
 
 `ws.local` is persisted in the running kernel and is namespaced by logical
-client ID. `ws.client.id` and `ws.client.name` identify the caller that
-submitted the current cell; `connection_id` identifies this particular MCP
-connection. They prevent accidental name reuse only when code follows the
+client ID. `ws.client.id` identifies the caller that submitted the current
+cell; `connection_id` identifies this particular MCP connection. They prevent
+accidental name reuse only when code follows the
 `ws.local` convention; ordinary globals remain shared.
 
 Use `await ws.status()` for the current manager, kernel, active execution,
-queue, and connected-client information. Use `ws.history.list(...)` and
-`ws.history.get(exec_id)` to inspect execution records from Python. History
+queue, and connected-client information. Use `await ws.history.list(...)` and
+`await ws.history.get(exec_id)` to inspect execution records from Python. History
 records include the logical client and connection IDs, timestamps, state, and
 output metadata. A task inherits its creator's identity even while another
 client executes. IDs are organizational labels, not access-control boundaries.
@@ -248,7 +386,28 @@ await ws.history.get(exec_id)  # Also accepts a background task ID.
 await ws.history.logs(client_id=ws.client.id, limit=20)
 ```
 
-`connections` contains names, connection and activity timestamps, the active
+History methods accept `limit=1..200` (default 20). Omit `client_id` to include
+all callers. Continue `list()` with its `next_cursor` until it is null. For logs,
+reuse the returned cursor with the same filter:
+
+```python
+ws.local["logs"] = await ws.history.logs(client_id=ws.client.id)
+```
+
+In a later cell:
+
+```python
+ws.local["logs"] = await ws.history.logs(
+    client_id=ws.client.id, cursor=ws.local["logs"]["cursor"],
+)
+ws.local["logs"]["events"]
+```
+
+Without a cursor, `logs()` returns recent events; `cursor=0` starts at the
+beginning. Log cursors, history-list cursors, task-output cursors, and MCP
+`poll` cursors belong to different APIs and must not be interchanged.
+
+`connections` contains connection and activity timestamps, the active
 execution, and owned task IDs. Open IPC connections determine liveness, so a
 killed client is removed without cancelling its workspace jobs.
 
@@ -269,11 +428,28 @@ ws.skills.list()
 ws.skills.read("review")
 ```
 
-Skill instructions are read by the agent. Skill files and helper scripts can
-be created or edited with `pathlib` in the shared workspace.
+`list()` returns metadata from YAML front matter plus each file's `path`,
+defaulting `name` to the directory name. `read(name)` returns the full Markdown.
+Both read from disk, so edits are visible on the next call without a reload.
 
-For reusable Python, put modules under `.mypr/lib/ws_lib/`. That directory is
-already on the kernel's import path:
+Create or edit a skill with ordinary file operations:
+
+```python
+ws.local["skill"] = ws.skills.root / "review" / "SKILL.md"
+ws.local["skill"].parent.mkdir(parents=True, exist_ok=True)
+ws.local["skill"].write_text(
+    "---\nname: review\ndescription: Review workspace changes.\n---\n\n"
+    "Read the diff, check affected callers, and report concrete issues.\n",
+    encoding="utf-8",
+)
+ws.skills.read("review")
+```
+
+Skill text is interpreted by the agent; reading it does not execute its
+instructions or scripts.
+
+For reusable Python, put modules under `.mypr/lib/ws_lib/`. Its parent,
+`.mypr/lib/`, is on the kernel's import path:
 
 ```python
 from pathlib import Path
@@ -295,9 +471,13 @@ module remain unchanged.
 workspace's `.mypr/venv` and returns a background handle. For example:
 
 ```python
-job = await ws.packages.add("httpx", "rich>=13")
-await job
+ws.local["install"] = await ws.packages.add("httpx", "rich>=13")
+ws.local["install"].status()
 ```
+
+Retrieve the result in a later cell with `await ws.local["install"]` before
+importing the new packages. Installation changes the kernel environment, not
+the environments of separately launched MCP servers.
 
 The installation uses `uv pip` and writes the resulting freeze to
 `.mypr/requirements.txt`. Packages already imported by the current kernel may
@@ -319,15 +499,16 @@ execution IDs remain readable. Request IDs are scoped to the logical client:
 reusing the same client ID and request ID returns the original execution instead
 of repeating side effects, including after reset or manager restart.
 
-The CLI also provides operational controls:
+The CLI also provides operational controls. Run them from the workspace:
 
 ```sh
-uv run mypr-mcp status --workspace /absolute/path/to/workspace
-uv run mypr-mcp logs --workspace /absolute/path/to/workspace
-uv run mypr-mcp logs --workspace /absolute/path/to/workspace \
+cd /absolute/path/to/workspace
+uvx mypr-mcp status
+uvx mypr-mcp logs
+uvx mypr-mcp logs \
   --client-id conversation-a --limit 50 --follow
-uv run mypr-mcp reset --workspace /absolute/path/to/workspace
-uv run mypr-mcp stop --workspace /absolute/path/to/workspace
+uvx mypr-mcp reset
+uvx mypr-mcp stop
 ```
 
 `logs` prints JSONL lifecycle and output events. Without `--follow` it prints
@@ -357,3 +538,20 @@ the SQLite history, and other runtime metadata; reusable modules, skills, config
 When upgrading, explicitly stop an older manager before reconnecting with the
 new version. Running managers are not silently replaced. Existing execution files
 are imported into history; legacy client IDs remain attached to those records.
+
+## Development and publishing
+
+For development, run `uv sync` in the checkout, then launch its
+`.venv/bin/mypr-mcp` executable from the target workspace.
+
+To publish a release, update the package version and build the distributions:
+
+```sh
+uv build --no-sources
+uv publish
+```
+
+`uv publish` uploads the distributions in `dist/` to PyPI. Ensure that directory
+contains only the intended release artifacts. Authenticate with `UV_PUBLISH_TOKEN`
+or configure Trusted Publishing for CI. See the
+[uv publishing guide](https://docs.astral.sh/uv/guides/package/).

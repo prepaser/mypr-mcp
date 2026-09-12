@@ -95,7 +95,8 @@ async def ensure(workspace):
         try:
             proc = await asyncio.to_thread(
                 subprocess.Popen,
-                [sys.executable, "-m", "mypr_mcp.cli", "_manager", "--workspace", str(workspace)],
+                [sys.executable, "-m", "mypr_mcp.cli", "_manager"],
+                cwd=workspace,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
@@ -139,7 +140,7 @@ def tool_result(result):
     )
 
 
-async def serve(workspace, client_id: str | None = None, client_name: str | None = None):
+async def serve(workspace, client_id: str | None = None):
     path = await ensure(workspace)
     client_id = client_id or uuid.uuid4().hex
     connection_id = uuid.uuid4().hex
@@ -175,7 +176,7 @@ async def serve(workspace, client_id: str | None = None, client_name: str | None
         )
         return tool_result(result)
 
-    async with attachment(path, client_id, connection_id, client_name) as attached:
+    async with attachment(path, client_id, connection_id) as attached:
         mcp_task = asyncio.create_task(mcp.run_stdio_async())
         manager_task = asyncio.create_task(attached.wait_closed())
         try:
@@ -211,21 +212,17 @@ async def logs(workspace, client_id: str | None, limit: int, follow: bool) -> No
 def main():
     parser = argparse.ArgumentParser(description="Persistent workspace Python over MCP")
     parser.add_argument("command", choices=["serve", "status", "logs", "reset", "stop", "_manager"])
-    parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--client-id")
-    parser.add_argument("--client-name")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
-    workspace = args.workspace.resolve(strict=True)
-    if not workspace.is_dir():
-        parser.error("workspace must be a directory")
+    workspace = Path.cwd()
     if args.limit < 1:
         parser.error("--limit must be greater than zero")
     try:
         if args.command == "serve":
-            asyncio.run(serve(workspace, args.client_id, args.client_name))
+            asyncio.run(serve(workspace, args.client_id))
         elif args.command == "_manager":
             from .runtime import Runtime
 

@@ -208,9 +208,7 @@ class Runtime:
             self.save(rec)
             self.history.record("execution", self.public_record(rec), event="running")
             try:
-                context = {
-                    key: rec.get(key) for key in ("client_id", "connection_id", "client_name")
-                }
+                context = {key: rec.get(key) for key in ("client_id", "connection_id")}
                 context["exec_id"] = rec["id"]
                 msg = self.kc.session.msg(
                     "execute_request",
@@ -450,9 +448,6 @@ class Runtime:
                     client=client,
                     client_id=client,
                     connection_id=connection_id,
-                    client_name=connection.get("client_name")
-                    if connection
-                    else req.get("client_name"),
                     request_id=request_id,
                     state="queued",
                     events=[],
@@ -630,13 +625,9 @@ class Runtime:
                 raise ValueError("Client and connection IDs must be 1..128 identifier characters")
         if connection_id in self.clients:
             raise ValueError("Connection ID already attached")
-        name = req.get("client_name")
-        if name is not None and (not isinstance(name, str) or len(name) > 128):
-            raise ValueError("Client name must be at most 128 characters")
         info = dict(
             client_id=client_id,
             connection_id=connection_id,
-            client_name=name,
             connected_at=time.time(),
             last_activity=time.time(),
         )

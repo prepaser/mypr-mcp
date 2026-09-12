@@ -25,16 +25,14 @@ async def status(session) -> dict:
 
 
 async def test_clients_have_logical_identity_and_isolated_local_state(workspace: Path):
-    async with mcp_session(workspace, client_id="agent-a", client_name="Agent A") as first:
+    async with mcp_session(workspace, client_id="agent-a") as first:
         identity = await execute(
             first,
             "import json\n"
-            "json.dumps({'id': ws.client.id, 'name': ws.client.name, "
-            "'connection_id': ws.client.connection_id})",
+            "json.dumps({'id': ws.client.id, 'connection_id': ws.client.connection_id})",
         )
         identity = json_output(identity)
         assert identity["id"] == "agent-a"
-        assert identity["name"] == "Agent A"
         assert identity["connection_id"]
 
         await execute(
@@ -49,7 +47,7 @@ async def test_clients_have_logical_identity_and_isolated_local_state(workspace:
             "ws.local['job'] = ws.tasks.start(emit_owner())",
         )
 
-        async with mcp_session(workspace, client_id="agent-b", client_name="Agent B") as second:
+        async with mcp_session(workspace, client_id="agent-b") as second:
             await execute(second, "shared_from_a = 'shared'\nws.local['value'] = 'B'")
             # Keep B's cell active while A's coroutine inherits A's execution context.
             await execute(second, "await asyncio.sleep(0.25)")
@@ -77,7 +75,7 @@ async def test_clients_have_logical_identity_and_isolated_local_state(workspace:
 
 
 async def test_reconnect_preserves_local_state_but_changes_connection(workspace: Path):
-    async with mcp_session(workspace, client_id="stable-client", client_name="first") as first:
+    async with mcp_session(workspace, client_id="stable-client") as first:
         created = await execute(
             first,
             "ws.local['persisted'] = 73\n"
@@ -86,20 +84,17 @@ async def test_reconnect_preserves_local_state_but_changes_connection(workspace:
         )
         first_info = json_output(created)
 
-    async with mcp_session(
-        workspace, client_id="stable-client", client_name="reconnected"
-    ) as second:
+    async with mcp_session(workspace, client_id="stable-client") as second:
         observed = await execute(
             second,
             "import json\n"
-            "json.dumps({'id': ws.client.id, 'name': ws.client.name, "
-            "'connection_id': ws.client.connection_id, 'persisted': ws.local['persisted']})",
+            "json.dumps({'id': ws.client.id, 'connection_id': ws.client.connection_id, "
+            "'persisted': ws.local['persisted']})",
         )
         second_info = json_output(observed)
 
     assert second_info["id"] == first_info["id"] == "stable-client"
     assert second_info["connection_id"] != first_info["connection_id"]
-    assert second_info["name"] == "reconnected"
     assert second_info["persisted"] == 73
 
 
@@ -241,8 +236,6 @@ async def test_cli_logs_follow_prints_new_events(workspace: Path):
             "-m",
             "mypr_mcp.cli",
             "logs",
-            "--workspace",
-            str(workspace),
             "--client-id",
             "logs-cli",
             "--limit",
@@ -250,6 +243,7 @@ async def test_cli_logs_follow_prints_new_events(workspace: Path):
             "--follow",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(workspace),
             env=dict(os.environ),
         )
         try:

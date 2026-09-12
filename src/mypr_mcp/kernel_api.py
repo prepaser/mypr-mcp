@@ -50,7 +50,6 @@ class ClientInfo:
     """Immutable identity of the client that submitted the current cell."""
 
     id: str
-    name: str | None = None
     connection_id: str | None = None
 
 
@@ -62,7 +61,6 @@ def _client_from_metadata(metadata: Mapping[str, Any] | None) -> ClientInfo | No
         return None
     return ClientInfo(
         id=str(client_id),
-        name=str(metadata["client_name"]) if metadata.get("client_name") is not None else None,
         connection_id=(
             str(metadata["connection_id"]) if metadata.get("connection_id") is not None else None
         ),
@@ -161,7 +159,6 @@ async def _rpc(op: str, **fields: Any) -> Any:
         payload.update(
             {
                 "client_id": client.id,
-                "client_name": client.name,
                 "connection_id": client.connection_id,
             }
         )
@@ -242,8 +239,6 @@ class TaskHandle:
             "connection_id": self._client.connection_id if self._client else None,
             "exec_id": self._exec_id,
         }
-        if self._client is not None:
-            result["client_name"] = self._client.name
         if self._finished_at is not None:
             result["finished_at"] = self._finished_at
         return result
@@ -480,8 +475,6 @@ class RemoteTask(TaskHandle):
             "connection_id": self._client.connection_id if self._client else None,
             "exec_id": self._exec_id,
         }
-        if self._client is not None:
-            status["client_name"] = self._client.name
         if self._finished_at is not None:
             status["finished_at"] = self._finished_at
         return status
@@ -772,7 +765,6 @@ class Workspace:
             "client": (
                 {
                     "id": self.client.id,
-                    "name": self.client.name,
                     "connection_id": self.client.connection_id,
                 }
                 if self.client is not None

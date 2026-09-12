@@ -126,7 +126,6 @@ async def attachment(
     path: Path | str,
     client_id: str,
     connection_id: str,
-    client_name: str | None = None,
 ):
     """Attach a client and keep its manager connection open until shutdown."""
     reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_MESSAGE)
@@ -137,7 +136,6 @@ async def attachment(
                     "op": "attach",
                     "client_id": client_id,
                     "connection_id": connection_id,
-                    "client_name": client_name,
                 },
                 separators=(",", ":"),
             ).encode()
