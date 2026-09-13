@@ -28,9 +28,11 @@ State and identity
 - Keep large results in Python and return only the information needed for the next decision.
 
 Execution and background work
-Cells execute sequentially. Keep them short so other clients can use the kernel.
-wait_ms limits the MCP call's wait, not Python execution. A running cell still occupies
-the kernel after execute returns; use poll with its exec_id and output cursor to follow it.
+Cells run as independent asyncio tasks in the shared kernel, including cells from the
+same client. A pending await yields to other cells; synchronous code, synchronous
+IPython magics, and CPU-heavy work block the event loop. Cells can finish out of order,
+so wait for or poll dependencies before submitting dependent code. wait_ms limits how
+long the MCP call waits, not Python execution or task lifetime.
 
 Start long work without waiting for completion:
     ws.local["job"] = await ws.shell.start("command")
@@ -39,13 +41,15 @@ Start long work without waiting for completion:
 In later cells, use ws.local["job"].status(), ws.local["job"].output(), or
 ws.local["job"].result(). result() raises NotReady until the job finishes.
 Use await ws.local["job"].cancel() to request cancellation. Awaiting the handle itself
-waits for completion and occupies the cell. poll reads cells; handles manage jobs.
+waits for that job; other async cells continue. Every cell is also a task handle, so
+ws.tasks.get(exec_id) exposes its status (kind="cell") and actual last-expression result.
+A cell cannot await its own handle. poll reads cell output; handles manage cells and jobs.
 Run long CPU-bound or blocking work in separate scripts through ws.shell.start().
 
 Discover and reuse capabilities
 - ws.inspect(): inspect variables, tasks, and skills without dumping their values.
 - ws.tasks.list() and ws.tasks.get(task_id): find existing job handles.
-- await ws.status(): inspect connections, activity, and the execution queue.
+- await ws.status(): inspect connections, active execution IDs, and the execution queue.
 - await ws.mcp.list_servers() and await ws.mcp.list_tools("server"): discover external tools.
   Call them with await ws.mcp.call_tool("server", "tool", {"argument": "value"}).
 - await ws.mcp.configure("server", config): add or replace a saved server configuration.
@@ -63,8 +67,9 @@ Discover and reuse capabilities
 
 Lifecycle
 Code runs with the current OS user's permissions. Exceptions do not undo earlier changes.
-await ws.reset() clears Python memory for every client and ends its calling cell;
-completion arrives through execute/poll. Saved files, packages, and history remain.
+await ws.reset() clears Python memory for every client. It is rejected while other cells
+or managed jobs are active unless force=True, which cancels them first. Completion arrives
+through execute/poll. Saved files, packages, and history remain.
 Kernel or manager crashes lose in-memory state; history persists and code is not replayed.
 """
 
@@ -150,7 +155,7 @@ async def serve(workspace, client_id: str | None = None):
     async def execute(
         code: str, wait_ms: int = 1000, request_id: str | None = None
     ) -> CallToolResult:
-        """Execute a Python cell in the shared workspace. Long jobs should return handles."""
+        """Execute an async-capable Python cell in the shared workspace."""
         result = await rpc(
             path,
             op="execute",

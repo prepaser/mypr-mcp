@@ -37,7 +37,6 @@ For clients using `mcpServers` JSON configuration:
 ```
 
 Make sure `uvx` is on the client's `PATH`, or use its absolute executable path.
-To pin a version, use `mypr-mcp@0.4.0` as the first argument.
 
 ### Codex
 
@@ -125,9 +124,15 @@ Only two tools are exposed to the agent:
 - `poll(exec_id, cursor=None, wait_ms=1000)` reads a submitted cell's state and
   output. Use the returned cursor to read later output.
 
-Cells execute one at a time in FIFO order. Keep cells short. A normal cell
-that waits for a long operation keeps the shared kernel occupied, so start
-long work through a background handle instead:
+Submitted cells run as independent asyncio tasks in the shared kernel. They
+may complete in a different order from submission, including cells from the
+same client. An `await` that is still pending yields to other cells; synchronous
+code, synchronous IPython magics, and CPU-heavy work continue to occupy the
+event loop. If one cell depends on another, wait for the prerequisite to complete
+before submitting the dependent cell.
+
+Use a background handle when work should remain detached from the submitting
+cell:
 
 ```python
 job = await ws.shell.start("make -j2")
@@ -143,9 +148,10 @@ await job.cancel()
 ```
 
 `result()` raises `NotReady` until completion. `await job` explicitly waits
-for completion. Use `ws.tasks.list()` and `ws.tasks.get(task_id)` to find
-handles created in another session. A disconnected MCP client does not cancel
-its submitted cells or background jobs.
+for completion of that job; other async cells continue to run. Use
+`ws.tasks.list()` and `ws.tasks.get(task_id)` to find handles created in
+another session. A disconnected MCP client does not cancel its submitted
+cells or background jobs.
 
 ## Python workspace API
 
@@ -196,8 +202,8 @@ ws.local["job"] = await ws.shell.start(
 )
 ```
 
-`ws.tasks.start(awaitable, *, task_id=None, visible=True)` schedules an awaitable
-in the kernel's event loop and returns a handle without `await`:
+`ws.tasks.start(awaitable, *, task_id=None, visible=True)` schedules a detached
+awaitable in the kernel's event loop and returns a handle without `await`:
 
 ```python
 import asyncio
@@ -229,7 +235,13 @@ ws.tasks.get(ws.local["job"].id)
 Async jobs return the awaitable's value and propagate its exception. Successful
 shell jobs return `{"returncode": 0}`; a failed shell job raises `RPCError` when
 its result is retrieved. Cancelled jobs raise `asyncio.CancelledError`.
-Waiting with `await job` occupies the current cell until completion.
+Waiting with `await job` suspends the current cell until completion while
+other runnable cells continue.
+
+Every submitted cell also has a task handle. Retrieve it with
+`ws.tasks.get(exec_id)`. Its status has `kind="cell"`, and `result()` returns
+the cell's actual last-expression value. `await` on a cell handle waits for
+that cell only; a cell cannot await its own handle.
 
 Task IDs are shared across the kernel; omit `task_id` to generate one.
 `ws.tasks.list()` includes completed visible tasks, while `ws.tasks.active()`
@@ -292,9 +304,10 @@ when it is non-null. Server discovery uses `servers` and `next_cursor` instead;
 for additional pages use
 `await ws.mcp.request("list_servers", cursor=next_cursor, limit=50)`.
 
-Start a call with
-`ws.tasks.start(...)` when it should run while the kernel accepts later cells.
-Calls whose completion or external side effect is uncertain are not retried
+Calls on the same external MCP connection may run concurrently, with each
+response kept with its requesting cell. Start a call with `ws.tasks.start(...)`
+when it should remain detached while the kernel accepts later cells. Calls
+whose completion or external side effect is uncertain are not retried
 automatically. Authentication variable names refer to the manager's environment;
 changing their values still requires restarting the manager.
 
@@ -371,8 +384,9 @@ cell; `connection_id` identifies this particular MCP connection. They prevent
 accidental name reuse only when code follows the
 `ws.local` convention; ordinary globals remain shared.
 
-Use `await ws.status()` for the current manager, kernel, active execution,
-queue, and connected-client information. Use `await ws.history.list(...)` and
+Use `await ws.status()` for the current manager, kernel, active executions,
+queue, and connected-client information. `active` is an array of execution IDs;
+each connection also reports its active execution IDs. Use `await ws.history.list(...)` and
 `await ws.history.get(exec_id)` to inspect execution records from Python. History
 records include the logical client and connection IDs, timestamps, state, and
 output metadata. A task inherits its creator's identity even while another
@@ -407,8 +421,8 @@ Without a cursor, `logs()` returns recent events; `cursor=0` starts at the
 beginning. Log cursors, history-list cursors, task-output cursors, and MCP
 `poll` cursors belong to different APIs and must not be interchanged.
 
-`connections` contains connection and activity timestamps, the active
-execution, and owned task IDs. Open IPC connections determine liveness, so a
+`connections` contains connection and activity timestamps, active execution
+IDs, and owned task IDs. Open IPC connections determine liveness, so a
 killed client is removed without cancelling its workspace jobs.
 
 History is stored in `.mypr/history.sqlite3`. Lists return `items` and
@@ -485,16 +499,17 @@ need a kernel reset before an upgrade is visible.
 
 `ws.inspect()` returns the workspace path, kernel generation, visible variable
 names and types, task summaries, and discovered skills. `await ws.status()`
-returns manager health, generation, connections, active execution, and queued
-executions.
+returns manager health, generation, connections, active execution IDs, and
+queued executions.
 
 ## Reset and lifecycle
 
 `await ws.reset()` resets the shared Python memory for every agent connected to
-the workspace. It terminates the reset cell; its completion is reported by the
-`execute`/`poll` result. Saved files, skills, modules, package environment,
-and run records remain. Pass `force=True` to cancel active Python tasks and
-reset. The kernel generation changes and old Python job handles expire. Historical MCP
+the workspace. By default it is rejected while any other cell or managed job
+is active. Pass `force=True` to cancel that work and reset. The reset cell's
+completion is reported by `execute`/`poll`. Saved files, skills, modules,
+package environment, and run records remain. The kernel generation changes
+and old Python job handles expire. Historical MCP
 execution IDs remain readable. Request IDs are scoped to the logical client:
 reusing the same client ID and request ID returns the original execution instead
 of repeating side effects, including after reset or manager restart.

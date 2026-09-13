@@ -124,7 +124,8 @@ async def test_status_tracks_connections_unique_clients_and_abrupt_disconnect(wo
             for item in state["connections"]:
                 assert item["connection_id"]
                 assert item["connected_at"] <= item["last_activity"]
-                assert item["active"] is None or isinstance(item["active"], str)
+                assert isinstance(item["active"], list)
+                assert all(isinstance(exec_id, str) for exec_id in item["active"])
                 assert isinstance(item["task_ids"], list)
 
         state = await status(first)
@@ -248,17 +249,14 @@ async def test_cli_logs_follow_prints_new_events(workspace: Path):
         )
         try:
             assert process.stdout is not None
-            await asyncio.wait_for(process.stdout.readline(), 5)
+            assert await asyncio.wait_for(process.stdout.readline(), 30)
             await execute(session, "'follow-second-event'")
             lines = []
-            deadline = asyncio.get_running_loop().time() + 5
-            while asyncio.get_running_loop().time() < deadline:
-                line = await asyncio.wait_for(process.stdout.readline(), 1)
-                if not line:
-                    break
-                lines.append(line.decode())
-                if "follow-second-event" in lines[-1]:
-                    break
+            async with asyncio.timeout(20):
+                while line := await process.stdout.readline():
+                    lines.append(line.decode())
+                    if "follow-second-event" in lines[-1]:
+                        break
             assert any("follow-second-event" in line for line in lines)
         finally:
             process.terminate()

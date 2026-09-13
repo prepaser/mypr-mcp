@@ -19,6 +19,9 @@ from typing import Any
 _output_buffer: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
     "mypr_task_output", default=None
 )
+_cell_output: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
+    "mypr_cell_output", default=None
+)
 _client_context: contextvars.ContextVar[ClientInfo | None] = contextvars.ContextVar(
     "mypr_client_context", default=None
 )
@@ -121,6 +124,9 @@ class MultiplexStream:
         buffer = _output_buffer.get()
         if buffer is not None:
             return buffer.write(value)
+        cell = _cell_output.get()
+        if cell is not None:
+            cell.write(value)
         return self.stream.write(value)
 
     def flush(self) -> None:
@@ -326,7 +332,9 @@ class TaskHandle:
             )
 
     async def _wait(self) -> Any:
-        return await self._task
+        if asyncio.current_task() is self._task:
+            raise RuntimeError("A task cannot await itself")
+        return await asyncio.shield(self._task)
 
     def __await__(self) -> Iterator[Any]:
         return self._wait().__await__()
@@ -729,20 +737,13 @@ class Workspace:
     async def reset(self, force: bool = False) -> Any:
         if _output_buffer.get() is not None:
             raise RuntimeError("Request reset from a foreground Python cell")
-        active = self.tasks.active()
+        exec_id = _exec_context.get()
+        current = self.tasks._handles.get(exec_id)
+        if current is None or getattr(current, "_task", None) is not asyncio.current_task():
+            raise RuntimeError("Request reset from a foreground Python cell")
+        active = [handle for handle in self.tasks.active() if handle.id != exec_id]
         if active and not force:
-            raise RuntimeError("Workspace has active Python tasks; pass force=True to reset")
-        if force:
-            await asyncio.gather(*(handle.cancel() for handle in active), return_exceptions=True)
-        parent = self._namespace.get("get_ipython") if self._namespace is not None else None
-        if not callable(parent):
-            try:
-                from IPython import get_ipython as parent
-            except ImportError:
-                parent = None
-        ip = parent() if callable(parent) else None
-        header = getattr(ip, "parent_header", {}) or {}
-        exec_id = header.get("msg_id") or os.environ.get("MYPR_EXEC_ID")
+            raise RuntimeError("Workspace has active tasks; pass force=True to reset")
         result = await _rpc(
             "reset",
             force=bool(force),
@@ -750,6 +751,8 @@ class Workspace:
             generation=os.environ.get("MYPR_GENERATION"),
             exec_id=exec_id,
         )
+        if force:
+            await asyncio.gather(*(handle.cancel() for handle in active), return_exceptions=True)
         raise ResetRequested(result)
 
     def inspect(self) -> dict[str, Any]:

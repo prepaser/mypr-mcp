@@ -9,11 +9,13 @@ import sys
 from pathlib import Path
 
 if __package__:
+    from .cells import CellExecutor, install_context_displayhook
     from .kernel_api import MultiplexStream, create_workspace, execution_context
 else:
     _source = Path(__file__).resolve().parents[1]
     if str(_source) not in sys.path:
         sys.path.insert(0, str(_source))
+    from mypr_mcp.cells import CellExecutor, install_context_displayhook
     from mypr_mcp.kernel_api import MultiplexStream, create_workspace, execution_context
 
 
@@ -42,6 +44,35 @@ def _kernel_class():
         async def execute_request(self, stream, ident, parent):
             metadata = (parent or {}).get("metadata", {})
             request = metadata.get("mypr") if isinstance(metadata, dict) else None
+            content = (parent or {}).get("content", {})
+            executor = getattr(self, "_mypr_cells", None)
+            if isinstance(request, dict) and executor is not None and request.get("exec_id"):
+                handle = executor.submit(
+                    content.get("code", ""),
+                    request,
+                    parent,
+                    ident,
+                    stream,
+                    silent=bool(content.get("silent", False)),
+                    store_history=bool(content.get("store_history", True)),
+                    user_expressions=content.get("user_expressions", {}),
+                    allow_stdin=bool(content.get("allow_stdin", False)),
+                    stop_on_error=bool(content.get("stop_on_error", False)),
+                )
+                self.set_parent(ident, parent)
+                self.session.send(
+                    stream,
+                    "execute_reply",
+                    {
+                        "status": "ok",
+                        "execution_count": handle.execution_count,
+                        "user_expressions": {},
+                        "payload": [],
+                    },
+                    parent,
+                    ident=ident,
+                )
+                return
             with execution_context(request if isinstance(request, dict) else None):
                 await super().execute_request(stream, ident, parent)
 
@@ -64,6 +95,8 @@ def main(argv: list[str] | None = None) -> None:
     ws = create_workspace(workspace, namespace)
     namespace.update({"ws": ws, "workspace": workspace})
     app.shell.user_ns.setdefault("__name__", "__main__")
+    install_context_displayhook(app.shell)
+    app.kernel._mypr_cells = CellExecutor(app.kernel, app.shell, ws.tasks)
     sys.stdout = MultiplexStream(sys.stdout)
     sys.stderr = MultiplexStream(sys.stderr)
     app.start()

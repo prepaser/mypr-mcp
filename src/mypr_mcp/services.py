@@ -289,7 +289,8 @@ class _MCPConnection:
         self.workspace = workspace
         self.queue: asyncio.Queue[_Request | None] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
-        self.current: _Request | None = None
+        self._pending: dict[asyncio.Future[Any], asyncio.Task[Any] | None] = {}
+        self._operations: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._admissions_blocked = False
         self._initializing = False
@@ -301,7 +302,7 @@ class _MCPConnection:
     def busy(self) -> bool:
         """Whether initialization or any admitted request is in progress."""
 
-        return self._initializing or self.current is not None or not self.queue.empty()
+        return self._initializing or bool(self._pending)
 
     @property
     def connected(self) -> bool:
@@ -321,6 +322,7 @@ class _MCPConnection:
             raise RuntimeError("MCP connection is being reconfigured")
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        self._pending[future] = None
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._owner())
         self.queue.put_nowait(_Request(method, args, future))
@@ -349,14 +351,21 @@ class _MCPConnection:
         self._closed = True
         self._admissions_blocked = True
         error = RuntimeError("MCP connection closed by reconfiguration")
-        if self.task is None:
-            return
+        for future, operation in tuple(self._pending.items()):
+            if not future.done():
+                future.set_exception(error)
+            if operation is not None and not operation.done():
+                operation.cancel()
         while not self.queue.empty():
             request = self.queue.get_nowait()
-            if request is not None and not request.future.done():
-                request.future.set_exception(error)
-        self.task.cancel()
-        await asyncio.gather(self.task, return_exceptions=True)
+            if request is not None:
+                self._pending.pop(request.future, None)
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        await asyncio.gather(*self._operations, return_exceptions=True)
+        self._pending.clear()
+        self._operations.clear()
         self.task = None
 
     async def _owner(self) -> None:
@@ -372,40 +381,35 @@ class _MCPConnection:
                     self._initializing = False
                 self._initialized = True
                 self._ready.set()
-                while True:
-                    request = await self.queue.get()
-                    if request is None:
-                        break
-                    if request.future.cancelled():
-                        continue
-                    self.current = request
-                    operation = asyncio.create_task(
-                        _session_dispatch(session, request.method, request.args)
-                    )
-
-                    def cancel_operation(
-                        future: asyncio.Future[Any], operation: asyncio.Task[Any] = operation
-                    ) -> None:
-                        if future.cancelled() and not operation.done():
-                            operation.cancel()
-
-                    request.future.add_done_callback(cancel_operation)
-                    try:
-                        result = await operation
-                    except asyncio.CancelledError:
-                        if request.future.cancelled() and not self._closed:
+                try:
+                    while True:
+                        request = await self.queue.get()
+                        if request is None:
+                            break
+                        if request.future.cancelled():
+                            self._pending.pop(request.future, None)
                             continue
-                        if not request.future.done():
-                            request.future.set_exception(RuntimeError("MCP connection closed"))
-                        raise
-                    except Exception as exc:
-                        if not request.future.done():
-                            request.future.set_exception(exc)
-                    else:
-                        if not request.future.done():
-                            request.future.set_result(result)
-                    finally:
-                        self.current = None
+                        operation = asyncio.create_task(self._run_request(session, request))
+                        self._pending[request.future] = operation
+                        self._operations.add(operation)
+
+                        def cancel_operation(
+                            future: asyncio.Future[Any], operation: asyncio.Task[Any] = operation
+                        ) -> None:
+                            if future.cancelled() and not operation.done():
+                                operation.cancel()
+
+                        def finish_operation(
+                            operation: asyncio.Task[Any],
+                            future: asyncio.Future[Any] = request.future,
+                        ) -> None:
+                            self._operations.discard(operation)
+                            self._pending.pop(future, None)
+
+                        request.future.add_done_callback(cancel_operation)
+                        operation.add_done_callback(finish_operation)
+                finally:
+                    await self._finish_operations(RuntimeError("MCP connection closed"))
         except BaseException as exc:
             self._initialized = False
             if self._closed:
@@ -416,18 +420,46 @@ class _MCPConnection:
                 error = RuntimeError("MCP connection interrupted")
             self._ready_error = error
             self._ready.set()
-            while not self.queue.empty():
-                request = self.queue.get_nowait()
-                if request is not None and not request.future.done():
-                    request.future.set_exception(error)
+            self._drain_queue(error)
         finally:
-            if self.current is not None and not self.current.future.done():
-                self.current.future.set_exception(RuntimeError("MCP connection closed"))
-            self.current = None
-            while not self.queue.empty():
-                request = self.queue.get_nowait()
-                if request is not None and not request.future.done():
-                    request.future.set_exception(RuntimeError("MCP connection closed"))
+            self._drain_queue(RuntimeError("MCP connection closed"))
+            self._pending.clear()
+            self._operations.clear()
+
+    def _drain_queue(self, error: BaseException) -> None:
+        while not self.queue.empty():
+            request = self.queue.get_nowait()
+            if request is None:
+                continue
+            self._pending.pop(request.future, None)
+            if not request.future.done():
+                request.future.set_exception(error)
+
+    async def _finish_operations(self, error: BaseException) -> None:
+        for future, operation in tuple(self._pending.items()):
+            if not future.done():
+                future.set_exception(error)
+            if operation is not None and not operation.done():
+                operation.cancel()
+        await asyncio.gather(*self._operations, return_exceptions=True)
+        for future in tuple(self._pending):
+            self._pending.pop(future, None)
+        self._operations.clear()
+
+    async def _run_request(self, session: ClientSession, request: _Request) -> None:
+        try:
+            result = await _session_dispatch(session, request.method, request.args)
+        except asyncio.CancelledError:
+            if not request.future.cancelled() and not request.future.done():
+                request.future.set_exception(RuntimeError("MCP connection closed"))
+        except Exception as exc:
+            if not request.future.done():
+                request.future.set_exception(exc)
+        else:
+            if not request.future.done():
+                request.future.set_result(result)
+        finally:
+            self._pending.pop(request.future, None)
 
     async def _open(self, stack: contextlib.AsyncExitStack) -> ClientSession:
         config = self.config
@@ -460,7 +492,7 @@ class _MCPConnection:
 
 
 class MCPBridge:
-    """Lazy, serialized client connections to configured MCP servers."""
+    """Lazy client connections to configured MCP servers."""
 
     def __init__(self, workspace: Path):
         self.workspace = Path(workspace).resolve()

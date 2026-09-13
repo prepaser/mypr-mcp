@@ -37,7 +37,7 @@ class Runtime:
         self.requests = {}
         self.history_requests = {}
         self.queue = asyncio.Queue()
-        self.active = None
+        self.active = {}
         self.clients = {}
         self.attachments = {}
         self.history = None
@@ -50,6 +50,8 @@ class Runtime:
         self.kc = None
         self.worker = None
         self.iopub = None
+        self.replies = None
+        self.by_msg = {}
         self.monitor = None
         self.config = {}
         config = self.root / "config.toml"
@@ -147,7 +149,10 @@ class Runtime:
         self.kc.start_channels()
         await self.kc.wait_for_ready(timeout=60)
         self.healthy = True
+        self.by_msg = {}
+        self.active = {}
         self.iopub = asyncio.create_task(self.read_output())
+        self.replies = asyncio.create_task(self.read_replies())
         self.worker = asyncio.create_task(self.run_queue())
         self.monitor = asyncio.create_task(self.watch_kernel())
         self.write_info()
@@ -182,6 +187,10 @@ class Runtime:
             self.history.record("execution", data)
 
     def finish(self, rec, state, error=None):
+        if rec["state"] in TERMINAL:
+            return
+        self.active.pop(rec["id"], None)
+        self.by_msg.pop(rec.get("msg_id"), None)
         rec.update(state=state, error=error, finished=time.time())
         rec["done"].set()
         self.save(rec)
@@ -201,14 +210,12 @@ class Runtime:
     async def run_queue(self):
         while True:
             rec = await self.queue.get()
-            if rec["state"] in TERMINAL:
+            if rec["state"] in TERMINAL or self.resetting:
                 continue
-            self.active = rec
-            rec.update(state="running", started=time.time())
-            self.save(rec)
-            self.history.record("execution", self.public_record(rec), event="running")
             try:
-                context = {key: rec.get(key) for key in ("client_id", "connection_id")}
+                context = {
+                    key: rec.get(key) for key in ("client_id", "connection_id", "generation")
+                }
                 context["exec_id"] = rec["id"]
                 msg = self.kc.session.msg(
                     "execute_request",
@@ -222,41 +229,55 @@ class Runtime:
                     },
                     metadata={"mypr": context},
                 )
-                msg_id = msg["header"]["msg_id"]
-                rec["msg_id"] = msg_id
+                rec["msg_id"] = msg["header"]["msg_id"]
+                self.by_msg[rec["msg_id"]] = rec
+                rec.update(state="running", started=time.time())
+                self.active[rec["id"]] = rec
+                self.save(rec)
+                self.history.record("execution", self.public_record(rec), event="running")
                 self.kc.shell_channel.send(msg)
-                while True:
-                    reply = await self.kc.get_shell_msg()
-                    if reply.get("parent_header", {}).get("msg_id") == msg_id:
-                        break
-                await rec["idle"].wait()
-                if not self.resetting and rec["state"] not in TERMINAL:
-                    content = reply["content"]
-                    self.finish(
-                        rec,
-                        "succeeded" if content["status"] == "ok" else "failed",
-                        content.get("evalue"),
-                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if rec["state"] not in TERMINAL:
-                    self.finish(rec, "lost", str(exc))
-            finally:
-                self.active = None
-            if self.resetting:
-                await asyncio.Future()
+                self.finish(rec, "lost", str(exc))
+
+    async def read_replies(self):
+        while True:
+            reply = await self.kc.get_shell_msg()
+            rec = self.by_msg.get(reply.get("parent_header", {}).get("msg_id"))
+            if rec is None or rec["generation"] != self.generation:
+                continue
+            content = reply.get("content", {})
+            if content.get("status") == "error":
+                self.finish(rec, "failed", content.get("evalue", "Cell submission failed"))
 
     async def read_output(self):
         while True:
             msg = await self.kc.get_iopub_msg()
             parent = msg.get("parent_header", {}).get("msg_id")
-            rec = next((r for r in self.execs.values() if r.get("msg_id") == parent), None)
-            if rec is None:
+            rec = self.by_msg.get(parent)
+            if rec is None or rec["generation"] != self.generation:
                 continue
             kind, content = msg["msg_type"], msg["content"]
-            if kind == "status" and content["execution_state"] == "idle":
-                rec["idle"].set()
+            if kind == "mypr_cell":
+                if (
+                    content.get("exec_id") != rec["id"]
+                    or content.get("generation") != self.generation
+                    or rec["state"] in TERMINAL
+                ):
+                    continue
+                state = content.get("state")
+                if state == "running" and rec["state"] == "queued":
+                    rec.update(state="running", started=time.time())
+                    self.active[rec["id"]] = rec
+                    self.save(rec)
+                    self.history.record("execution", self.public_record(rec), event="running")
+                elif state == "reset":
+                    rec["idle"].set()
+                elif state in {"succeeded", "failed", "cancelled"}:
+                    self.finish(rec, state, content.get("error"))
+                continue
+            if rec["state"] in TERMINAL:
                 continue
             event = None
             if kind == "stream":
@@ -374,14 +395,12 @@ class Runtime:
                     for r in self.task_records.values()
                     if r.get("client_id") == info["client_id"] and r["state"] not in TERMINAL
                 ]
-                active = (
-                    self.active
-                    if self.active and self.active.get("connection_id") == info["connection_id"]
-                    else None
-                )
-                connections.append(
-                    dict(info, active=active["id"] if active else None, task_ids=owned)
-                )
+                active = [
+                    rec["id"]
+                    for rec in self.active.values()
+                    if rec.get("connection_id") == info["connection_id"]
+                ]
+                connections.append(dict(info, active=active, task_ids=owned))
             return {
                 "version": __version__,
                 "workspace_id": self.workspace_id,
@@ -393,7 +412,7 @@ class Runtime:
                 "connections": connections,
                 "connection_count": len(connections),
                 "client_count": len({c["client_id"] for c in connections}),
-                "active": self.active["id"] if self.active else None,
+                "active": list(self.active),
                 "queued": [r["id"] for r in self.execs.values() if r["state"] == "queued"],
             }
         if op in {"history_list", "logs"}:
@@ -548,21 +567,36 @@ class Runtime:
             return None
         if op == "reset":
             from_kernel = req.get("from_kernel", False)
-            others = any(r["state"] == "queued" for r in self.execs.values())
-            busy = self.active is not None and not from_kernel
+            current = self.execs.get(req.get("exec_id")) if from_kernel else None
+            if from_kernel and (
+                current is None
+                or current["state"] in TERMINAL
+                or current["generation"] != self.generation
+            ):
+                raise RuntimeError("Reset must originate from a running cell")
+            busy = any(
+                rec is not current and rec["state"] not in TERMINAL for rec in self.execs.values()
+            )
+            # Kernel callers check live handles; their history reports may lag.
+            python_busy = not from_kernel and any(
+                rec["kind"] == "python" and rec["state"] not in TERMINAL
+                for rec in self.task_records.values()
+            )
             if self.resetting:
                 raise RuntimeError("Reset already in progress")
-            if not req.get("force", False) and (others or busy or self.shells.active):
+            if not req.get("force", False) and (busy or python_busy or self.shells.active):
                 raise RuntimeError("Workspace has active work; pass force=True to reset")
             self.resetting = True
-            current = self.active if from_kernel else None
             if from_kernel:
                 self.spawn(self.reset(current))
                 return {"accepted": True}
             await self.reset(None)
             return {"generation": self.generation, "reset": True}
         if op == "stop":
-            if not req.get("force") and (self.active or self.shells.active):
+            if not req.get("force") and (
+                any(rec["state"] not in TERMINAL for rec in self.execs.values())
+                or self.shells.active
+            ):
                 raise RuntimeError("Workspace has active work; pass --force")
             self.stopping.set()
             return {"stopped": True}
@@ -599,11 +633,12 @@ class Runtime:
 
     async def close_kernel(self):
         self.healthy = False
-        for task in [self.worker, self.iopub, self.monitor]:
+        for task in [self.worker, self.iopub, self.replies, self.monitor]:
             if task:
                 task.cancel()
         await asyncio.gather(
-            *(t for t in [self.worker, self.iopub, self.monitor] if t), return_exceptions=True
+            *(t for t in [self.worker, self.iopub, self.replies, self.monitor] if t),
+            return_exceptions=True,
         )
         if self.kc:
             self.kc.stop_channels()

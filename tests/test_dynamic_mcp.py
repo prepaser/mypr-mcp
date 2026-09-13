@@ -398,3 +398,117 @@ async def test_connection_close_finishes_when_caller_cancels_at_same_time(worksp
         if connection.task is not None:
             connection.task.cancel()
         await asyncio.gather(closing, return_exceptions=True)
+
+
+async def test_connection_runs_same_server_requests_concurrently(workspace, monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    admitted: set[str] = set()
+
+    async def opened(self, stack):
+        return object()
+
+    async def dispatch(session, method, args):
+        del session, method
+        admitted.add(args["token"])
+        if len(admitted) == 2:
+            started.set()
+        await release.wait()
+        return args["token"]
+
+    monkeypatch.setattr(services._MCPConnection, "_open", opened)
+    monkeypatch.setattr(services, "_session_dispatch", dispatch)
+    connection = services._MCPConnection({"command": "unused"}, workspace)
+    first = connection.admit("call_tool", {"token": "first"})
+    second = connection.admit("call_tool", {"token": "second"})
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        assert connection.busy
+        release.set()
+        assert await asyncio.gather(first, second) == ["first", "second"]
+        assert not connection.busy
+    finally:
+        await connection.close()
+
+
+async def test_connection_request_cancellation_and_errors_are_independent(workspace, monkeypatch):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def opened(self, stack):
+        return object()
+
+    async def dispatch(session, method, args):
+        del session, method
+        if args["token"] == "error":
+            raise ValueError("request failed")
+        if args["token"] == "cancel":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        started.set()
+        await release.wait()
+        return "completed"
+
+    monkeypatch.setattr(services._MCPConnection, "_open", opened)
+    monkeypatch.setattr(services, "_session_dispatch", dispatch)
+    connection = services._MCPConnection({"command": "unused"}, workspace)
+    failed = connection.admit("call_tool", {"token": "error"})
+    to_cancel = connection.admit("call_tool", {"token": "cancel"})
+    live = connection.admit("call_tool", {"token": "live"})
+    try:
+        with pytest.raises(ValueError, match="request failed"):
+            await failed
+        await asyncio.wait_for(started.wait(), 5)
+        to_cancel.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await to_cancel
+        await asyncio.wait_for(cancelled.wait(), 5)
+        assert connection.busy
+        release.set()
+        assert await live == "completed"
+        assert not connection.busy
+    finally:
+        await connection.close()
+
+
+async def test_force_reconfigure_cancels_all_requests_on_one_connection(workspace, monkeypatch):
+    started = asyncio.Event()
+    active: set[str] = set()
+
+    async def opened(self, stack):
+        return object()
+
+    async def dispatch(session, method, args):
+        del session, method
+        active.add(args["token"])
+        if len(active) == 2:
+            started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(services._MCPConnection, "_open", opened)
+    monkeypatch.setattr(services, "_session_dispatch", dispatch)
+    bridge = MCPBridge(workspace)
+    config = {"command": "server-v1"}
+    try:
+        await bridge.configure("target", config)
+        first = asyncio.create_task(
+            bridge.dispatch("call_tool", {"server": "target", "token": "first"})
+        )
+        second = asyncio.create_task(
+            bridge.dispatch("call_tool", {"server": "target", "token": "second"})
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        with pytest.raises(RuntimeError, match="active requests"):
+            await bridge.configure("target", {"command": "server-v2"})
+        result = await bridge.configure("target", {"command": "server-v2"}, force=True)
+        assert result["action"] == "updated"
+        outcomes = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
+        assert bridge.config["target"] == {"command": "server-v2"}
+        assert "target" not in bridge._connections
+    finally:
+        await bridge.close()
