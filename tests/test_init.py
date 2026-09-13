@@ -170,13 +170,14 @@ async def test_uninitialized_connection_does_not_count_as_client(workspace: Path
     assert after == during
 
 
-async def test_resume_after_manager_restart_keeps_history_and_clears_memory(workspace: Path):
+@pytest.mark.parametrize("request_id", ["restart-request", ""])
+async def test_resume_after_manager_restart_keeps_history_and_clears_memory(
+    workspace: Path, request_id: str
+):
     client_id = "restart-client"
     async with mcp_session(workspace, initialize_client=False) as first:
         await init(first, client_id)
-        saved = await execute(
-            first, "memory_value = 42\nmemory_value", request_id="restart-request"
-        )
+        saved = await execute(first, "memory_value = 42\nmemory_value", request_id=request_id)
         saved_id = saved["exec_id"]
     await stop_manager(workspace)
 
@@ -184,10 +185,9 @@ async def test_resume_after_manager_restart_keeps_history_and_clears_memory(work
         await init(second, client_id)
         memory = await execute(second, "'memory_value' in globals()")
         assert result_text(memory).strip() == "False"
-        replayed = await execute(
-            second, "memory_value = 42\nmemory_value", request_id="restart-request"
-        )
+        replayed = await execute(second, "memory_value = 42\nmemory_value", request_id=request_id)
         assert replayed["exec_id"] == saved_id
+        assert result_text(await execute(second, "'memory_value' in globals()")).strip() == "False"
         records = json_output(
             await execute(second, f"await ws.history.list(client_id={client_id!r}, limit=100)")
         )

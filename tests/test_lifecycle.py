@@ -34,6 +34,47 @@ async def test_kernel_death_is_reported_and_explicit_reset_recovers(workspace):
         assert recovered["generation"] != failed["generation"]
 
 
+@pytest.mark.parametrize("force", [False, True])
+async def test_stop_protects_detached_python_tasks(workspace, force):
+    path = socket_path(workspace)
+    async with mcp_session(workspace, client_id="background-owner") as session:
+        started = await execute(
+            session,
+            "import asyncio\nbackground = ws.tasks.start(asyncio.Event().wait())\nbackground.id",
+        )
+        assert started["state"] == "succeeded"
+        task_id = result_text(started).strip(" '\n")
+        async with asyncio.timeout(5):
+            while True:
+                records = await rpc(path, op="history_list")
+                if any(
+                    item["id"] == task_id and item["state"] == "running"
+                    for item in records["items"]
+                ):
+                    break
+                await asyncio.sleep(0.01)
+
+    if not force:
+        with pytest.raises(RuntimeError, match="active work"):
+            await rpc(path, op="stop")
+        async with mcp_session(workspace, client_id="background-owner") as session:
+            assert "running" in result_text(await execute(session, "background.status()"))
+            cancelled = await execute(session, "await background.cancel()")
+            assert cancelled["state"] == "succeeded"
+            async with asyncio.timeout(5):
+                while True:
+                    if (await rpc(path, op="history_get", id=task_id))["state"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.01)
+
+    assert await rpc(path, op="stop", force=force) == {"stopped": True}
+    async with asyncio.timeout(10):
+        while True:
+            if not path.exists():
+                break
+            await asyncio.sleep(0.01)
+
+
 async def test_packages_install_into_workspace_venv(workspace):
     async with mcp_session(workspace) as session:
         started = await execute(session, 'package = await ws.packages.add("pyyaml==6.0.3")')

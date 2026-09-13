@@ -469,7 +469,11 @@ ws.skills.read("review")
 ```
 
 `list()` returns metadata from YAML front matter plus each file's `path`,
-defaulting `name` to the directory name. `read(name)` returns the full Markdown.
+defaulting `name` to the directory name. Invalid YAML is reported on that
+item through an `error` field while the other skills remain available. Skills
+whose files resolve outside `.mypr/skills` through a symlink are skipped;
+links that stay inside the skills root are supported. `read(name)` returns the
+full Markdown.
 Both read from disk, so edits are visible on the next call without a reload.
 
 Create or edit a skill with ordinary file operations:

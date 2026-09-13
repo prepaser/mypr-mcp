@@ -645,15 +645,23 @@ class Skills:
             if marker:
                 try:
                     import yaml
-
-                    parsed = yaml.safe_load(front)
-                    if isinstance(parsed, Mapping):
-                        metadata.update(parsed)
-                except ImportError, ValueError, TypeError:
+                except ImportError:
                     for line in front.splitlines():
                         if ":" in line:
                             key, value = line.split(":", 1)
                             metadata[key.strip()] = value.strip().strip("'\"")
+                else:
+                    try:
+                        parsed = yaml.safe_load(front)
+                    except yaml.YAMLError as exc:
+                        detail = str(exc).strip() or exc.__class__.__name__
+                        metadata["error"] = f"Invalid YAML front matter: {detail}"
+                    except (TypeError, ValueError) as exc:
+                        detail = str(exc).strip() or exc.__class__.__name__
+                        metadata["error"] = f"Invalid skill metadata: {detail}"
+                    else:
+                        if isinstance(parsed, Mapping):
+                            metadata.update(parsed)
         return metadata
 
     def list(self) -> list[dict[str, Any]]:
@@ -661,7 +669,15 @@ class Skills:
             return []
         found = []
         for path in sorted(self.root.glob("*/SKILL.md")):
-            item = self._metadata(path)
+            try:
+                resolved = self._path(path.parent.name)
+            except OSError, ValueError:
+                continue
+            try:
+                item = self._metadata(resolved)
+            except (OSError, UnicodeError) as exc:
+                detail = str(exc).strip() or exc.__class__.__name__
+                item = {"error": f"Unable to read skill: {detail}"}
             item.setdefault("name", path.parent.name)
             item["path"] = str(path)
             found.append(item)

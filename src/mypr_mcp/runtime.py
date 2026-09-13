@@ -102,7 +102,7 @@ class Runtime:
         for path in (self.root / "runs").glob("*.json"):
             try:
                 old = json.loads(path.read_text())
-                if old.get("request_id"):
+                if old.get("request_id") is not None:
                     owner = old.get("client_id", old.get("client")) or "legacy"
                     self.history_requests[(owner, old["request_id"])] = old
                 if old["state"] not in TERMINAL:
@@ -604,6 +604,10 @@ class Runtime:
         if op == "stop":
             if not req.get("force") and (
                 any(rec["state"] not in TERMINAL for rec in self.execs.values())
+                or any(
+                    rec["kind"] == "python" and rec["state"] not in TERMINAL
+                    for rec in self.task_records.values()
+                )
                 or self.shells.active
             ):
                 raise RuntimeError("Workspace has active work; pass --force")
