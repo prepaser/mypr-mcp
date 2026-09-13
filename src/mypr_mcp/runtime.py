@@ -11,12 +11,14 @@ import sys
 import time
 import tomllib
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 from jupyter_client import AsyncKernelManager
 from jupyter_client.kernelspec import KernelSpec
 
 from . import __version__
+from .diagnostics import safe_error
 from .history import History
 from .messages import MessageStore
 from .services import MCPBridge, Shells
@@ -35,8 +37,8 @@ class Runtime:
         self.socket = socket_path(self.workspace)
         self.generation = uuid.uuid4().hex
         self.execs = {}
-        self.requests = {}
-        self.history_requests = {}
+        self.completed = OrderedDict()
+        self.completed_bytes = 0
         self.queue = asyncio.Queue()
         self.active = {}
         self.clients = {}
@@ -49,6 +51,7 @@ class Runtime:
         self.stopping = asyncio.Event()
         self.resetting = False
         self.healthy = False
+        self.health_error = None
         self.km = None
         self.kc = None
         self.worker = None
@@ -63,11 +66,62 @@ class Runtime:
         limits = self.config.get("limits", {})
         self.output_limit = int(limits.get("output_bytes", 16 * 1024 * 1024))
         self.response_limit = int(limits.get("response_bytes", 32768))
+        self.completed_tasks = int(limits.get("completed_tasks", 128))
+        self.completed_records = int(limits.get("completed_records", 128))
+        self.cache_bytes = int(limits.get("cache_bytes", 32 * 1024 * 1024))
+        if min(self.completed_tasks, self.completed_records) < 1 or self.cache_bytes < 1024:
+            raise ValueError("Retention limits must be positive")
         if min(self.output_limit, self.response_limit) < 1024:
             raise ValueError("Output limits must be at least 1024 bytes")
-        self.shells = Shells(self.workspace, output_limit=self.output_limit)
+        self.shells = self.new_shells()
         self.mcp = None
         self.background = set()
+
+    def new_shells(self):
+        return Shells(
+            self.workspace,
+            output_limit=self.output_limit,
+            completed_records=self.completed_records,
+            cache_bytes=self.cache_bytes // 2,
+        )
+
+    def retain_completed(self, kind, rec):
+        key = (kind, rec["id"])
+        size = len(json.dumps(self.public_record(rec), ensure_ascii=True).encode())
+        size += len(json.dumps(rec.get("events", []), ensure_ascii=True).encode())
+        self.completed_bytes -= self.completed.pop(key, 0)
+        self.completed[key] = size
+        self.completed_bytes += size
+        while (
+            len(self.completed) > self.completed_records
+            or self.completed_bytes > self.cache_bytes - self.cache_bytes // 2
+        ):
+            (old_kind, ident), size = self.completed.popitem(last=False)
+            self.completed_bytes -= size
+            records = self.execs if old_kind == "execution" else self.task_records
+            records.pop(ident, None)
+
+    def critical_done(self, task):
+        if self.stopping.is_set() or self.resetting or not self.healthy:
+            return
+        error = (
+            "cancelled"
+            if task.cancelled()
+            else safe_error(task.exception() or RuntimeError("exited"))
+        )
+        self.healthy = False
+        self.health_error = f"Runtime worker {task.get_name()} failed: {error}"
+        print(self.health_error, file=sys.stderr)
+        for rec in list(self.execs.values()):
+            if rec["state"] not in TERMINAL:
+                try:
+                    self.finish(rec, "lost", self.health_error)
+                except Exception as exc:
+                    print(safe_error(exc), file=sys.stderr)
+        try:
+            self.lose_python_tasks(self.health_error)
+        except Exception as exc:
+            print(safe_error(exc), file=sys.stderr)
 
     def spawn(self, coro):
         task = asyncio.create_task(coro)
@@ -106,9 +160,6 @@ class Runtime:
         for path in (self.root / "runs").glob("*.json"):
             try:
                 old = json.loads(path.read_text())
-                if old.get("request_id") is not None:
-                    owner = old.get("client_id", old.get("client")) or "legacy"
-                    self.history_requests[(owner, old["request_id"])] = old
                 if old["state"] not in TERMINAL:
                     old.update(state="lost", error="Manager stopped before completion")
                     path.write_text(json.dumps(old))
@@ -130,6 +181,7 @@ class Runtime:
             MYPR_GENERATION=self.generation,
             MYPR_PARENT_PID=str(os.getpid()),
             MYPR_OUTPUT_LIMIT=str(self.output_limit),
+            MYPR_COMPLETED_TASKS=str(self.completed_tasks),
             PYTHONDONTWRITEBYTECODE="1",
             IPYTHONDIR=str(self.root / "ipython"),
             JUPYTER_RUNTIME_DIR=str(self.root / "jupyter"),
@@ -153,12 +205,17 @@ class Runtime:
         self.kc.start_channels()
         await self.kc.wait_for_ready(timeout=60)
         self.healthy = True
+        self.health_error = None
         self.by_msg = {}
         self.active = {}
         self.iopub = asyncio.create_task(self.read_output())
         self.replies = asyncio.create_task(self.read_replies())
         self.worker = asyncio.create_task(self.run_queue())
         self.monitor = asyncio.create_task(self.watch_kernel())
+        for name in ("iopub", "replies", "worker", "monitor"):
+            task = getattr(self, name)
+            task.set_name(f"mypr:{name}")
+            task.add_done_callback(self.critical_done)
         self.write_info()
 
     def workspace_available(self):
@@ -195,10 +252,15 @@ class Runtime:
             return
         self.active.pop(rec["id"], None)
         self.by_msg.pop(rec.get("msg_id"), None)
+        if error is not None:
+            full = str(error)
+            error = full.encode(errors="replace")[:1024].decode(errors="ignore")
+            rec["error_truncated"] = rec.get("error_truncated", False) or error != full
         rec.update(state=state, error=error, finished=time.time())
         rec["done"].set()
         self.save(rec)
         self.history.record("execution", self.public_record(rec), event=state)
+        self.retain_completed("execution", rec)
 
     async def watch_kernel(self):
         while True:
@@ -206,7 +268,8 @@ class Runtime:
             if not await self.km.is_alive():
                 self.healthy = False
                 self.lose_python_tasks("Kernel exited")
-                for rec in self.execs.values():
+                self.health_error = "Python kernel exited; use CLI reset"
+                for rec in list(self.execs.values()):
                     if rec["state"] not in TERMINAL:
                         self.finish(rec, "lost", "Python kernel exited; use CLI reset")
                 return
@@ -279,6 +342,7 @@ class Runtime:
                 elif state == "reset":
                     rec["idle"].set()
                 elif state in {"succeeded", "failed", "cancelled"}:
+                    rec["error_truncated"] = content.get("error_truncated", False)
                     self.finish(rec, state, content.get("error"))
                 continue
             if rec["state"] in TERMINAL:
@@ -297,20 +361,47 @@ class Runtime:
                     if mime == "text/plain":
                         continue
                     binary = mime in {"image/png", "image/jpeg", "audio/wav"}
-                    raw = base64.b64decode(value) if binary else json.dumps(value).encode()
-                    if rec["bytes"] + len(raw) > self.output_limit:
-                        rec["truncated"] = True
+                    try:
+                        raw = (
+                            base64.b64decode(value, validate=True)
+                            if binary
+                            else json.dumps(value).encode()
+                        )
+                        if rec["bytes"] + len(raw) > self.output_limit:
+                            rec["truncated"] = True
+                            continue
+                        path = self.root / "artifacts" / uuid.uuid4().hex
+                        path.write_bytes(raw)
+                    except (ValueError, TypeError, OSError) as exc:
+                        self.warn(rec, "artifact_error", safe_error(exc, limit=256))
                         continue
-                    path = self.root / "artifacts" / uuid.uuid4().hex
-                    path.write_bytes(raw)
                     rec["bytes"] += len(raw)
                     artifacts.append({"mime": mime, "path": str(path)})
                 event["artifacts"] = artifacts
             if event:
-                self.append(rec, event)
+                if not isinstance(event.get("text"), str):
+                    self.warn(rec, "invalid_output", "text/plain output must be a string")
+                    event["text"] = ""
+                text = event["text"]
+                for start in range(0, max(1, len(text)), 16384):
+                    piece = {**event, "text": text[start : start + 16384]}
+                    if start:
+                        piece.pop("artifacts", None)
+                    self.append(rec, piece)
+                    await asyncio.sleep(0)
+
+    def warn(self, rec, code, text):
+        warnings = rec.setdefault("warnings", [])
+        if len(warnings) < 4:
+            warnings.append(
+                {"code": code, "text": text.encode(errors="replace")[:256].decode(errors="ignore")}
+            )
+        else:
+            rec["warnings_truncated"] = True
+        self.save(rec)
 
     def append(self, rec, event):
-        raw = event.get("text", "").encode()
+        raw = event.get("text", "").encode(errors="replace")
         room = max(0, self.output_limit - rec["bytes"])
         was_truncated = rec["truncated"]
         if len(raw) > room:
@@ -321,6 +412,7 @@ class Runtime:
                 self.save(rec)
             return
         step = min(1024, max(1, (self.response_limit - 256) // 12))
+        batch = []
         with (self.root / "runs" / f"{rec['id']}.jsonl").open("a") as file:
             for start in range(0, max(1, len(text)), step):
                 piece = dict(event, text=text[start : start + step])
@@ -328,17 +420,16 @@ class Runtime:
                     piece.pop("artifacts", None)
                 rec["events"].append(piece)
                 file.write(json.dumps(piece) + "\n")
-                self.history.append(
-                    "execution",
-                    "output",
+                batch.append(
                     {
                         "id": rec["id"],
                         "exec_id": rec["id"],
                         "client_id": rec.get("client_id"),
                         "connection_id": rec.get("connection_id"),
                         **piece,
-                    },
+                    }
                 )
+        self.history.append_many("execution", "output", batch)
         rec["bytes"] += min(len(raw), room)
         self.save(rec)
 
@@ -387,7 +478,11 @@ class Runtime:
                 )
         if cursor < 0 or cursor > len(rec["events"]):
             raise ValueError("Invalid output cursor")
-        output, size = [], 0
+        error = rec.get("error")
+        error_limit = min(1024, self.response_limit // 4)
+        if error is not None:
+            error = error.encode(errors="replace")[:error_limit].decode(errors="ignore")
+        output, size = [], len(json.dumps(error).encode())
         for event in rec["events"][cursor:]:
             n = len(json.dumps(event).encode())
             if output and size + n > self.response_limit:
@@ -405,7 +500,14 @@ class Runtime:
             "cursor": cursor + len(output),
             "has_more": cursor + len(output) < len(rec["events"]),
             "truncated": rec["truncated"],
-            "error": rec.get("error"),
+            "error": error,
+            **(
+                {"error_truncated": True}
+                if rec.get("error_truncated") or error != rec.get("error")
+                else {}
+            ),
+            **({"warnings": rec["warnings"]} if rec.get("warnings") else {}),
+            **({"warnings_truncated": True} if rec.get("warnings_truncated") else {}),
         }
 
     async def dispatch(self, req):
@@ -427,6 +529,15 @@ class Runtime:
         requested_client = req.pop("client_id", None)
         connection_id = req.pop("connection_id", None)
         connection = self.clients.get(connection_id)
+        if self.stopping.is_set() and op in {
+            "init",
+            "execute",
+            "shell_start",
+            "packages_add",
+            "reset",
+            "mcp",
+        }:
+            raise RuntimeError("Workspace manager is stopping")
         if op == "init":
             return self.initialize_client(connection_id, requested_client)
         if connection:
@@ -452,11 +563,13 @@ class Runtime:
                 connections.append(dict(info, active=active, task_ids=owned))
             return {
                 "version": __version__,
+                "pid": os.getpid(),
                 "workspace_id": self.workspace_id,
                 "workspace": str(self.workspace),
                 "workspace_available": self.workspace_available(),
                 "generation": self.generation,
                 "healthy": self.healthy,
+                "health_error": self.health_error,
                 "resetting": self.resetting,
                 "connections": connections,
                 "connection_count": len(connections),
@@ -492,6 +605,18 @@ class Runtime:
         generation = req.pop("generation", None)
         if generation and generation != self.generation:
             raise RuntimeError("Expired kernel generation")
+        if op == "cell_terminal":
+            rec = self.execs.get(req.get("exec_id"))
+            if rec is None or rec["generation"] != self.generation:
+                raise ValueError("Unknown current cell")
+            if req.get("state") == "reset":
+                rec["idle"].set()
+                return None
+            if req.get("state") not in TERMINAL:
+                raise ValueError("Expected a terminal cell state")
+            rec["error_truncated"] = req.get("error_truncated", False)
+            self.finish(rec, req["state"], req.get("error"))
+            return None
         if op in {"message_send", "message_read", "message_ack"}:
             if not (connection and connection["client_id"]) and not requested_client:
                 raise RuntimeError("Messages require a client identity")
@@ -526,16 +651,13 @@ class Runtime:
                 raise RuntimeError("Call init on an active connection before execute")
             code = req["code"]
             request_id = req.get("request_id")
-            key = (client, request_id) if request_id is not None else None
-            if key and key in self.history_requests:
-                old = self.history_requests[key]
+            old = self.history.find_request(client, request_id) if request_id is not None else None
+            if old is not None:
                 if old["code"] != code:
                     raise ValueError("request_id already used for different code")
-                return await self.poll(old["id"], wait_ms=0)
-            if key and key in self.requests:
-                rec = self.execs[self.requests[key]]
-                if rec["code"] != code:
-                    raise ValueError("request_id already used for different code")
+                return await self.poll(
+                    old["id"], wait_ms=req.get("wait_ms", 1000), inbox_client=client
+                )
             else:
                 ident = uuid.uuid4().hex
                 rec = dict(
@@ -555,8 +677,6 @@ class Runtime:
                     created=time.time(),
                 )
                 self.execs[ident] = rec
-                if key:
-                    self.requests[key] = ident
                 self.save(rec)
                 self.history.record("execution", self.public_record(rec), event="queued")
                 self.queue.put_nowait(rec)
@@ -615,15 +735,19 @@ class Runtime:
                 job["id"], client, connection_id, req.get("exec_id"), kind="package", specs=specs
             )
             return job
-        if op == "task_event":
+        if op in {"task_event", "task_terminal"}:
             event = dict(req["event"])
+            if op == "task_terminal" and event.get("state") not in TERMINAL:
+                raise ValueError("Expected a terminal task state")
             event.update(
                 client_id=client,
                 connection_id=connection_id,
                 exec_id=req.get("exec_id"),
                 generation=self.generation,
             )
-            old = self.task_records.get(event["id"], {})
+            old = self.task_records.get(event["id"]) or self.history.get(event["id"]) or {}
+            if old.get("state") in TERMINAL:
+                return None
             self.task_records[event["id"]] = {**old, **event, "kind": "python"}
             delta = event.pop("output_delta", None)
             self.task_records[event["id"]].pop("output_delta", None)
@@ -647,6 +771,8 @@ class Runtime:
                 self.task_records[event["id"]],
                 event=event["state"] if old.get("state") != event["state"] else None,
             )
+            if event["state"] in TERMINAL:
+                self.retain_completed("python", self.task_records[event["id"]])
             return None
         if op == "reset":
             from_kernel = req.get("from_kernel", False)
@@ -676,6 +802,8 @@ class Runtime:
             await self.reset(None)
             return {"generation": self.generation, "reset": True}
         if op == "stop":
+            if req.get("manager_pid", os.getpid()) != os.getpid():
+                raise RuntimeError("Workspace manager changed before stop")
             if not req.get("force") and (
                 any(rec["state"] not in TERMINAL for rec in self.execs.values())
                 or any(
@@ -686,7 +814,7 @@ class Runtime:
             ):
                 raise RuntimeError("Workspace has active work; pass --force")
             self.stopping.set()
-            return {"stopped": True}
+            return {"stopping": True, "pid": os.getpid()}
         raise ValueError(f"Unknown operation: {op}")
 
     async def reset(self, current):
@@ -694,7 +822,7 @@ class Runtime:
             if current:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(current["idle"].wait(), 3)
-            for rec in self.execs.values():
+            for rec in list(self.execs.values()):
                 if rec is not current and rec["state"] not in TERMINAL:
                     self.finish(rec, "cancelled", "Workspace reset")
             await self.close_kernel()
@@ -702,7 +830,7 @@ class Runtime:
             await self.close_shells()
             await self.mcp.close()
             self.mcp = MCPBridge(self.workspace)
-            self.shells = Shells(self.workspace, output_limit=self.output_limit)
+            self.shells = self.new_shells()
             self.queue = asyncio.Queue()
             self.generation = uuid.uuid4().hex
             await self.start_kernel()
@@ -769,6 +897,8 @@ class Runtime:
         return {"client_id": client_id}
 
     async def attach(self, reader, writer, req):
+        if self.stopping.is_set():
+            raise RuntimeError("Workspace manager is stopping")
         if not self.workspace_available():
             raise RuntimeError("The workspace moved; stop its manager and reconnect")
         if "client_id" in req:
@@ -864,13 +994,15 @@ class Runtime:
         self.history.record(
             record["kind"], record, event=full["state"] if previous != full["state"] else None
         )
+        self.retain_completed(record["kind"], record)
         return record
 
     def lose_python_tasks(self, error, state="lost"):
-        for record in self.task_records.values():
+        for record in list(self.task_records.values()):
             if record["kind"] == "python" and record["state"] not in TERMINAL:
                 record.update(state=state, error=error, finished=time.time())
                 self.history.record("python", record, event=state)
+                self.retain_completed("python", record)
 
     async def connection(self, reader, writer):
         try:
@@ -933,7 +1065,7 @@ class Runtime:
                 self.stopping.set()
                 server.close()
                 await server.wait_closed()
-                for rec in self.execs.values():
+                for rec in list(self.execs.values()):
                     if rec["state"] not in TERMINAL:
                         self.finish(rec, "lost", "Manager stopped")
                 await self.close_kernel()

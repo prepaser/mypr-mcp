@@ -10,8 +10,11 @@ import asyncio
 import codecs
 import contextlib
 import copy
+import json
 import os
 import signal
+import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,14 +43,32 @@ class _Job:
     result: dict[str, int] | None = None
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     waiter: asyncio.Task[None] | None = None
+    journal: Path | None = None
+    metadata: Path | None = None
+    finished_at: float | None = None
+    memory_bytes: int = 0
 
 
 class Shells:
     """Run and supervise workspace commands in their own process groups."""
 
-    def __init__(self, workspace: Path, output_limit: int = 16 * 1024 * 1024):
+    def __init__(
+        self,
+        workspace: Path,
+        output_limit: int = 16 * 1024 * 1024,
+        completed_records: int = 128,
+        cache_bytes: int = 32 * 1024 * 1024,
+    ):
         self.workspace = Path(workspace).resolve()
         self.output_limit = max(0, int(output_limit))
+        if completed_records < 0:
+            raise ValueError("completed_records must be non-negative")
+        if cache_bytes < 0:
+            raise ValueError("cache_bytes must be non-negative")
+        self.completed_records = completed_records
+        self.cache_bytes = cache_bytes
+        self.jobs_root = self.workspace / ".mypr" / "jobs"
+        self.jobs_root.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, _Job] = {}
         self._closed = False
         self._lock = asyncio.Lock()
@@ -75,10 +96,10 @@ class Shells:
             else {str(key): str(value) for key, value in env.items()}
         )
         try:
+            command_args = self._guard_command(command)
             if isinstance(command, str):
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    executable="/bin/sh",
+                process = await asyncio.create_subprocess_exec(
+                    *command_args,
                     cwd=workdir,
                     env=merged_env,
                     stdin=asyncio.subprocess.DEVNULL,
@@ -88,7 +109,7 @@ class Shells:
                 )
             elif command:
                 process = await asyncio.create_subprocess_exec(
-                    *map(str, command),
+                    *command_args,
                     cwd=workdir,
                     env=merged_env,
                     stdin=asyncio.subprocess.DEVNULL,
@@ -100,13 +121,15 @@ class Shells:
                 raise ValueError("command must not be empty")
         except (OSError, ValueError) as exc:
             job_id = uuid.uuid4().hex
-            job = _Job(job_id, _NoProcess(), 0, self.output_limit, state="failed", error=str(exc))
+            job = self._new_job(job_id, _NoProcess(), 0, state="failed", error=str(exc))
             job.result = {"returncode": -1}
+            self._write_metadata(job)
             self._jobs[job_id] = job
+            self._prune_completed()
             return {"id": job_id}
 
         job_id = uuid.uuid4().hex
-        job = _Job(job_id, process, process.pid, self.output_limit)
+        job = self._new_job(job_id, process, process.pid)
         self._jobs[job_id] = job
         assert process.stdout is not None and process.stderr is not None
         job.readers = [
@@ -119,6 +142,22 @@ class Shells:
     async def poll(self, job_id: str, cursor: int = 0) -> dict[str, Any]:
         job = self._jobs.get(job_id)
         if job is None:
+            return self._poll_persisted(job_id, cursor)
+        cursor = self._validate_cursor(cursor, len(job.output))
+        return self._poll_job(job, cursor)
+
+    def _poll_persisted(self, job_id: str, cursor: int) -> dict[str, Any]:
+        if (
+            not isinstance(job_id, str)
+            or len(job_id) != 32
+            or any(char not in "0123456789abcdef" for char in job_id)
+        ):
+            raise ValueError("invalid shell job ID")
+        metadata_path = self.jobs_root / f"{job_id}.json"
+        journal_path = self.jobs_root / f"{job_id}.jsonl"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             return {
                 "id": job_id,
                 "state": "unknown",
@@ -127,14 +166,26 @@ class Shells:
                 "result": None,
                 "error": "unknown job",
             }
-        cursor = int(cursor)
-        if cursor < 0 or cursor > len(job.output):
-            raise ValueError("invalid shell output cursor")
-        output = job.output[cursor:]
+        if not isinstance(metadata, dict):
+            raise RuntimeError("invalid persisted shell metadata")
+        output = self._read_journal(journal_path)
+        cursor = self._validate_cursor(cursor, len(output))
+        return {
+            "id": job_id,
+            "state": metadata.get("state", "unknown"),
+            "output": output[cursor:],
+            "cursor": len(output),
+            "result": metadata.get("result"),
+            "error": metadata.get("error"),
+            "truncated": bool(metadata.get("truncated", False)),
+        }
+
+    @staticmethod
+    def _poll_job(job: _Job, cursor: int) -> dict[str, Any]:
         return {
             "id": job.id,
             "state": job.state,
-            "output": output,
+            "output": job.output[cursor:],
             "cursor": len(job.output),
             "result": job.result,
             "error": job.error,
@@ -183,6 +234,101 @@ class Shells:
         path = Path(cwd)
         return str(path if path.is_absolute() else self.workspace / path)
 
+    def _new_job(
+        self,
+        job_id: str,
+        process: asyncio.subprocess.Process | _NoProcess,
+        group_id: int,
+        *,
+        state: str = "running",
+        error: str | None = None,
+    ) -> _Job:
+        return _Job(
+            job_id,
+            process,
+            group_id,
+            self.output_limit,
+            state=state,
+            error=error,
+            journal=self.jobs_root / f"{job_id}.jsonl",
+            metadata=self.jobs_root / f"{job_id}.json",
+        )
+
+    def _guard_command(self, command: str | list[str]) -> list[str]:
+        if isinstance(command, str):
+            original = ["/bin/sh", "-c", command]
+        elif command:
+            original = [*map(str, command)]
+        else:
+            raise ValueError("command must not be empty")
+        guard = Path(__file__).with_name("process_guard.py")
+        return [
+            sys.executable,
+            str(guard),
+            "--parent-pid",
+            str(os.getpid()),
+            "--",
+            *original,
+        ]
+
+    @staticmethod
+    def _validate_cursor(cursor: int, size: int) -> int:
+        if isinstance(cursor, bool) or not isinstance(cursor, int):
+            raise ValueError("invalid shell output cursor")
+        if cursor < 0 or cursor > size:
+            raise ValueError("invalid shell output cursor")
+        return cursor
+
+    @staticmethod
+    def _read_journal(path: Path) -> list[dict[str, str]]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        output = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("invalid persisted shell journal") from exc
+            if not isinstance(event, dict):
+                raise RuntimeError("invalid persisted shell journal")
+            output.append(event)
+        return output
+
+    @staticmethod
+    def _write_output(job: _Job, event: dict[str, str]) -> None:
+        if job.journal is None:
+            return
+        with job.journal.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    @staticmethod
+    def _write_metadata(job: _Job) -> None:
+        if job.metadata is None:
+            return
+        data = {
+            "id": job.id,
+            "state": job.state,
+            "result": job.result,
+            "error": job.error,
+            "truncated": job.truncated,
+        }
+        temporary = job.metadata.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, job.metadata)
+
+    def _prune_completed(self) -> None:
+        completed = [
+            job for job in self._jobs.values() if job.state not in {"running", "cancelling"}
+        ]
+        completed.sort(key=lambda job: job.finished_at or 0)
+        memory = sum(job.memory_bytes for job in completed)
+        while len(completed) > self.completed_records or memory > self.cache_bytes:
+            job = completed.pop(0)
+            memory -= job.memory_bytes
+            self._jobs.pop(job.id, None)
+
     async def _drain(self, job: _Job, stream: asyncio.StreamReader, name: str) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         while True:
@@ -200,12 +346,18 @@ class Shells:
             if keep:
                 text = decoder.decode(keep)
                 if text:
-                    job.output.append({"stream": name, "text": text})
+                    event = {"stream": name, "text": text}
+                    job.output.append(event)
+                    job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
+                    self._write_output(job, event)
             if len(keep) < len(chunk):
                 job.truncated = True
         text = decoder.decode(b"", final=True)
         if text and job.output_bytes < job.output_limit:
-            job.output.append({"stream": name, "text": text})
+            event = {"stream": name, "text": text}
+            job.output.append(event)
+            job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
+            self._write_output(job, event)
 
     async def _wait(self, job: _Job) -> None:
         try:
@@ -214,6 +366,9 @@ class Shells:
             job.state = "failed"
             job.error = str(exc)
             job.result = {"returncode": -1}
+            job.finished_at = time.time()
+            self._write_metadata(job)
+            self._prune_completed()
             return
         await asyncio.gather(*job.readers, return_exceptions=True)
         tick = asyncio.Event()
@@ -225,6 +380,9 @@ class Shells:
             job.state = "cancelled"
         else:
             job.state = "succeeded" if returncode == 0 else "failed"
+        job.finished_at = time.time()
+        self._write_metadata(job)
+        self._prune_completed()
 
     @staticmethod
     def _signal_group(job: _Job, sig: signal.Signals) -> None:
@@ -478,6 +636,16 @@ class _MCPConnection:
                 command, args = command[0], [*map(str, command[1:]), *args]
             if not isinstance(command, str) or not command:
                 raise ValueError("MCP server command must be a non-empty string")
+            guard = Path(__file__).with_name("process_guard.py")
+            args = [
+                str(guard),
+                "--parent-pid",
+                str(os.getpid()),
+                "--",
+                command,
+                *args,
+            ]
+            command = sys.executable
             params = StdioServerParameters(
                 command=command,
                 args=args,

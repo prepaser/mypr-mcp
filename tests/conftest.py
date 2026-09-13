@@ -15,7 +15,8 @@ import pytest_asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from mypr_mcp.transport import rpc, socket_path
+from mypr_mcp.cli import stop_runtime
+from mypr_mcp.transport import socket_path
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -76,7 +77,7 @@ async def mcp_session(
 
 async def stop_manager(workspace: Path) -> None:
     with contextlib.suppress(Exception):
-        await asyncio.wait_for(rpc(socket_path(workspace), op="stop", force=True), 10)
+        await asyncio.wait_for(stop_runtime(socket_path(workspace), force=True), 35)
     for _ in range(100):
         if not socket_path(workspace).exists():
             return

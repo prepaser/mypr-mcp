@@ -62,6 +62,10 @@ class History:
                 );
                 CREATE INDEX IF NOT EXISTS entities_kind_idx
                     ON entities(kind, entity_seq DESC);
+                CREATE INDEX IF NOT EXISTS execution_request_idx ON entities(
+                    COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client')),
+                    json_extract(data, '$.request_id'), entity_seq
+                ) WHERE kind = 'execution';
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     time REAL NOT NULL,
@@ -178,32 +182,43 @@ class History:
 
     def append(self, kind: str, event: str, data: Any) -> dict[str, Any]:
         """Append a bounded event payload and return its materialized event."""
+        return self.append_many(kind, event, [data])[0]
+
+    def append_many(self, kind: str, event: str, items: list[Any]) -> list[dict[str, Any]]:
+        """Commit an ordered batch of bounded events in one transaction."""
         self._ensure_open()
         if not isinstance(kind, str) or not kind:
             raise ValueError("kind must be a non-empty string")
         if not isinstance(event, str) or not event:
             raise ValueError("event must be a non-empty string")
-        payload = _bounded(data)
-        metadata = data if isinstance(data, Mapping) else {}
-        row_data = {
-            "id": _optional_string(metadata.get("id")),
-            "client_id": _optional_string(metadata.get("client_id")),
-            "connection_id": _optional_string(metadata.get("connection_id")),
-            "exec_id": _optional_string(metadata.get("exec_id")),
-            "state": _optional_string(metadata.get("state")),
-            "error": _optional_string(metadata.get("error")),
-        }
-        now = time.time()
+        rows = []
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                seq = self._insert_event(event, kind, row_data, now=now, data=payload)
+                for data in items:
+                    metadata = data if isinstance(data, Mapping) else {}
+                    seq = self._insert_event(
+                        event, kind, metadata, now=time.time(), data=_bounded(data)
+                    )
+                    rows.append(
+                        self._db.execute("SELECT * FROM events WHERE seq = ?", (seq,)).fetchone()
+                    )
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
-            row = self._db.execute("SELECT * FROM events WHERE seq = ?", (seq,)).fetchone()
-        return _event(row)
+        return [_event(row) for row in rows]
+
+    def find_request(self, client_id: str, request_id: str) -> dict[str, Any] | None:
+        self._ensure_open()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT data FROM entities WHERE kind = 'execution' AND "
+                "COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client')) = ? "
+                "AND json_extract(data, '$.request_id') = ? ORDER BY entity_seq LIMIT 1",
+                (client_id, request_id),
+            ).fetchone()
+        return _load(row["data"]) if row else None
 
     def list(
         self,
@@ -273,32 +288,33 @@ class History:
         if client_id is not None and not isinstance(client_id, str):
             raise TypeError("client_id must be a string or None")
         with self._lock:
+            high = int(self._db.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0])
             if cursor_value is None:
                 if client_id is None:
                     rows = self._db.execute(
-                        "SELECT * FROM events ORDER BY seq DESC LIMIT ?", (limit,)
+                        "SELECT * FROM events WHERE seq <= ? ORDER BY seq DESC LIMIT ?",
+                        (high, limit),
                     ).fetchall()
                 else:
                     rows = self._db.execute(
-                        "SELECT * FROM events WHERE client_id = ? ORDER BY seq DESC LIMIT ?",
-                        (client_id, limit),
+                        "SELECT * FROM events WHERE client_id = ? AND seq <= ? "
+                        "ORDER BY seq DESC LIMIT ?",
+                        (client_id, high, limit),
                     ).fetchall()
                 rows.reverse()
-                next_cursor = int(
-                    self._db.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
-                )
+                next_cursor = high
             else:
-                rows = []
-                scanned = cursor_value
-                query = "SELECT * FROM events WHERE seq > ? ORDER BY seq ASC"
-                params = (cursor_value,)
-                for row in self._db.execute(query, params):
-                    scanned = int(row["seq"])
-                    if client_id is None or row["client_id"] == client_id:
-                        rows.append(row)
-                        if len(rows) >= limit:
-                            break
-                next_cursor = scanned
+                where = "seq > ? AND seq <= ?"
+                params = [cursor_value, high]
+                if client_id is not None:
+                    where += " AND client_id = ?"
+                    params.append(client_id)
+                rows = self._db.execute(
+                    f"SELECT * FROM events WHERE {where} ORDER BY seq LIMIT ?", (*params, limit)
+                ).fetchall()
+                next_cursor = (
+                    int(rows[-1]["seq"]) if len(rows) == limit else max(cursor_value, high)
+                )
         return {"events": [_event(row) for row in rows], "cursor": next_cursor}
 
     def recover(self) -> int:

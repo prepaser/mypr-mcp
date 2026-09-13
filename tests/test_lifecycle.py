@@ -67,7 +67,7 @@ async def test_stop_protects_detached_python_tasks(workspace, force):
                         break
                     await asyncio.sleep(0.01)
 
-    assert await rpc(path, op="stop", force=force) == {"stopped": True}
+    assert (await rpc(path, op="stop", force=force))["stopping"] is True
     async with asyncio.timeout(10):
         while True:
             if not path.exists():

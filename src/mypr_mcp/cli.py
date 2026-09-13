@@ -16,6 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import __version__
+from .diagnostics import safe_error
 from .transport import attachment, find_runtime, manager_running, rpc, socket_path
 
 INSTRUCTIONS = """Call init once per connection. Use execute for Python and poll for cell output.
@@ -27,11 +28,13 @@ resume. Poll is available before init.
 Python runs in one persistent kernel shared by every client of this workspace.
 
 State and identity
-- Variables, imports, functions, and task handles survive calls and client disconnects.
+- Variables, imports, functions, and active tasks survive calls and client disconnects.
 - ws.client.id is your logical identity; ws.client.connection_id identifies this connection.
 - Store your working values in ws.local, a dict scoped to your logical client ID.
   Resuming an ID restores its ws.local while the same kernel remains alive.
 - Ordinary globals are shared. Background tasks retain their creator's client context.
+- Completed handles are cached up to limits.completed_tasks (default 128). Keep a
+  handle in ws.local if you need it longer; use ws.history for evicted job records.
 - Keep large results in Python and return only the information needed for the next decision.
 
 Execution and background work
@@ -51,6 +54,8 @@ Use await ws.local["job"].cancel() to request cancellation. Awaiting the handle 
 waits for that job; other async cells continue. Every cell is also a task handle, so
 ws.tasks.get(exec_id) exposes its status (kind="cell") and actual last-expression result.
 A cell cannot await its own handle. poll reads cell output; handles manage cells and jobs.
+Use ws.tasks.start() for detached work; raw asyncio.create_task() output after the
+parent cell finishes is not retained. cancel() returns False for terminal handles.
 Run long CPU-bound or blocking work in separate scripts through ws.shell.start().
 
 Client messages
@@ -91,6 +96,10 @@ await ws.reset() clears Python memory for every client. It is rejected while oth
 or managed jobs are active unless force=True, which cancels them first. Completion arrives
 through execute/poll. Saved files, packages, and history remain.
 Kernel or manager crashes lose in-memory state; history persists and code is not replayed.
+Malformed or missing display artifacts produce warnings without changing Python success.
+error is a bounded summary; error_truncated indicates shortening. Read paged output
+for traceback details. Essential runtime worker failure is reported as unhealthy/lost;
+use explicit CLI reset to recover. CLI stop waits for manager exit before success.
 """
 
 
@@ -147,22 +156,72 @@ async def ensure(workspace):
 
 
 def tool_result(result):
-    content = [TextContent(text=json.dumps(result, ensure_ascii=False))]
+    result = dict(result)
+    warnings = list(result.get("warnings", []))
+    images = []
     for event in result.get("output", []):
         for artifact in event.get("artifacts", []):
             path = Path(artifact["path"])
-            if (
-                artifact["mime"] in {"image/png", "image/jpeg"}
-                and path.stat().st_size <= 2 * 1024 * 1024
-            ):
-                content.append(
+            try:
+                if (
+                    artifact["mime"] not in {"image/png", "image/jpeg"}
+                    or path.stat().st_size > 2 * 1024 * 1024
+                ):
+                    continue
+                images.append(
                     ImageContent(
                         data=base64.b64encode(path.read_bytes()).decode(), mimeType=artifact["mime"]
                     )
                 )
+            except OSError as exc:
+                if len(warnings) < 4:
+                    warnings.append(
+                        {"code": "artifact_unavailable", "text": safe_error(exc, limit=256)}
+                    )
+                else:
+                    result["warnings_truncated"] = True
+    if warnings:
+        result["warnings"] = warnings
+    content = [TextContent(text=json.dumps(result, ensure_ascii=False)), *images]
     return CallToolResult(
         content=content, structuredContent=result, isError=result.get("state") in {"failed", "lost"}
     )
+
+
+async def stop_runtime(path, force=False, *, workspace=None):
+    state = await rpc(path, op="status")
+    pid = state.get("pid")
+    if pid is None:
+        try:
+            metadata = json.loads(((workspace or Path.cwd()) / ".mypr/runtime.json").read_text())
+            if metadata["generation"] != state["generation"] or metadata["socket"] != str(path):
+                raise ValueError("Runtime metadata does not match the connected manager")
+            pid = metadata["pid"]
+        except (OSError, ValueError, KeyError) as exc:
+            raise RuntimeError("Cannot identify the workspace manager for shutdown") from exc
+    if type(pid) is not int or pid <= 1:
+        raise RuntimeError("Invalid workspace manager PID")
+    pidfd = os.pidfd_open(pid)
+    loop = asyncio.get_running_loop()
+    exited = loop.create_future()
+
+    def ready():
+        if not exited.done():
+            exited.set_result(None)
+
+    loop.add_reader(pidfd, ready)
+    try:
+        await rpc(path, op="stop", force=force, manager_pid=pid)
+        try:
+            await asyncio.wait_for(exited, 30)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "Workspace manager did not finish stopping within 30 seconds"
+            ) from exc
+        return {"stopped": True}
+    finally:
+        loop.remove_reader(pidfd)
+        os.close(pidfd)
 
 
 async def serve(workspace):
@@ -274,6 +333,8 @@ def main():
                     if found is None:
                         raise RuntimeError("No reachable workspace manager")
                     path, _ = found
+                if args.command == "stop":
+                    return await stop_runtime(path, args.force, workspace=workspace)
                 return await rpc(path, op=args.command, force=args.force)
 
             result = asyncio.run(admin())

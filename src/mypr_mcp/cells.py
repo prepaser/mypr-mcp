@@ -14,12 +14,14 @@ from typing import Any
 
 from IPython.core.interactiveshell import ExecutionInfo, ExecutionResult, InteractiveShell
 
+from .diagnostics import safe_error, safe_error_details
 from .kernel_api import (
     NotReady,
     OutputBuffer,
     ResetRequested,
     TaskHandle,
     _cell_output,
+    _rpc,
     execution_context,
 )
 
@@ -118,6 +120,7 @@ class CellHandle(TaskHandle):
         self._cell_error: BaseException | None = None
         self._cell_value: Any = None
         self._parent: dict[str, Any] | None = None
+        self._terminal_report_pending = False
 
     def set_state(self, state: str, error: BaseException | None = None) -> None:
         self._cell_state = state
@@ -138,7 +141,9 @@ class CellHandle(TaskHandle):
             }
         )
         if self._cell_error is not None:
-            result["error"] = f"{type(self._cell_error).__name__}: {self._cell_error}"
+            error, error_truncated = safe_error_details(self._cell_error)
+            result["error"] = error
+            result["error_truncated"] = error_truncated
         return result
 
     def result(self) -> Any:
@@ -232,7 +237,7 @@ class CellExecutor:
             )
         holder["handle"] = handle
         handle._parent = parent
-        self.tasks._handles[exec_id] = handle
+        self.tasks._track(handle)
         task.add_done_callback(lambda task: self._task_done(handle, task))
         return handle
 
@@ -245,7 +250,9 @@ class CellExecutor:
         }:
             handle.set_state("cancelled", asyncio.CancelledError())
             if handle._parent is not None:
-                self._send_event(handle, handle._parent, "cancelled")
+                self._send_terminal(handle, handle._parent, "cancelled")
+        if not handle._terminal_report_pending:
+            self.tasks._completed_handle(handle)
 
     async def _run(
         self,
@@ -268,7 +275,10 @@ class CellExecutor:
         count_token = _cell_execution_count.set(execution_count)
         source_token = _cell_source.set(code)
         handle.set_state("running")
-        self._send_event(handle, parent, "running")
+        try:
+            self._send_event(handle, parent, "running")
+        except Exception:
+            pass
         result: CellResult | None = None
         terminal = "succeeded"
         error: BaseException | None = None
@@ -301,7 +311,11 @@ class CellExecutor:
             terminal, error = "failed", exc
         finally:
             if error is not None and terminal == "failed":
-                output.write("".join(traceback.format_exception(error)))
+                try:
+                    formatted = "".join(traceback.format_exception(error))
+                except BaseException:
+                    formatted = safe_error(error)
+                output.write(formatted)
             try:
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -311,7 +325,7 @@ class CellExecutor:
             _cell_source.reset(source_token)
             _cell_output.reset(cell_token)
             handle.set_state(terminal, error)
-            self._send_event(handle, parent, terminal, error)
+            self._send_terminal(handle, parent, terminal, error)
         if result is None:
             if terminal == "reset":
                 return CellResult(None, execution_count, {})
@@ -447,5 +461,53 @@ class CellExecutor:
             "state": state,
         }
         if error is not None and state not in {"cancelled", "reset"}:
-            content["error"] = f"{type(error).__name__}: {error}"
+            text, truncated = safe_error_details(error)
+            content["error"] = text
+            content["error_truncated"] = truncated
         self.kernel.session.send(self.kernel.iopub_socket, "mypr_cell", content, parent=parent)
+
+    def _send_terminal(
+        self,
+        handle: CellHandle,
+        parent: dict[str, Any],
+        state: str,
+        error: BaseException | None = None,
+    ) -> None:
+        handle._terminal_report_pending = True
+        try:
+            self._send_event(handle, parent, state, error)
+        except Exception:
+            fallback = asyncio.create_task(
+                self._terminal_fallback(handle, state, error),
+                name=f"mypr:cell-terminal:{handle.id}",
+            )
+            fallback.add_done_callback(_consume_task_exception)
+        else:
+            handle._terminal_report_pending = False
+            if handle._task.done():
+                self.tasks._completed_handle(handle)
+
+    async def _terminal_fallback(
+        self, handle: CellHandle, state: str, error: BaseException | None
+    ) -> None:
+        fields: dict[str, Any] = {
+            "exec_id": handle.id,
+            "generation": handle.generation,
+            "state": state,
+        }
+        if error is not None and state not in {"cancelled", "reset"}:
+            text, truncated = safe_error_details(error)
+            fields["error"] = text
+            fields["error_truncated"] = truncated
+        try:
+            await _rpc("cell_terminal", **fields)
+        except Exception:
+            pass
+        finally:
+            handle._terminal_report_pending = False
+            self.tasks._completed_handle(handle)
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()

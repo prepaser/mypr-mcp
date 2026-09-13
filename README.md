@@ -241,6 +241,9 @@ ws.local["job"] = ws.tasks.start(asyncio.sleep(2, result="done"))
 
 Async tasks must yield to the event loop. Blocking or CPU-heavy work should run
 in a separate process, for example through `ws.shell.start(...)`.
+Use `ws.tasks.start()` for detached work that needs managed status and captured
+output. Raw `asyncio.create_task()` children are not managed; output emitted
+after their submitting cell finishes is not retained by that cell.
 
 Inspect the handle in a later cell:
 
@@ -258,7 +261,7 @@ ws.tasks.get(ws.local["job"].id)
 | `job.output(cursor=0)` | Dictionary with `output`, the next character `cursor`, and `truncated` |
 | `job.result()` | Completed result; raises `NotReady` while still running |
 | `await job` | Waits for completion and returns the result |
-| `await job.cancel()` | Requests cancellation; inspect status for completion |
+| `await job.cancel()` | Returns `False` if already terminal, otherwise requests cancellation and returns `True` |
 
 Async jobs return the awaitable's value and propagate its exception. Successful
 shell jobs return `{"returncode": 0}`; a failed shell job raises `RPCError` when
@@ -611,6 +614,17 @@ the most recent 20 events; `--limit` changes the page size (1–200).
 inside Python to filter by caller.
 The commands are local administration commands, not MCP tools. `reset` and
 `stop` reject active work unless `--force` is supplied.
+CLI `stop` reports success only after the original manager exits, so it is safe
+to reconnect immediately. Shutdown taking more than 30 seconds reports an error.
+Status includes the manager `pid` and a `health_error` when an essential runtime
+worker fails. Such a failure marks unfinished executions lost and rejects new
+executions until an explicit reset; Python code is never automatically replayed.
+
+Shell/package commands and local stdio MCP servers run through a supervisor.
+If the manager dies, their process groups receive SIGTERM, followed by SIGKILL
+after two seconds if needed. Same-group descendants remain supervised even
+after the original command exits. Processes that deliberately start a separate
+session are outside this boundary. HTTP MCP shutdown closes the local connection.
 
 Python memory and running handles survive normal client disconnects, but they
 cannot be restored after a manager or kernel crash. In that case unfinished
@@ -626,6 +640,38 @@ Execution output is retained up to 16 MiB per run by default. Text events are pa
 to retrieve later events. PNG/JPEG displays up to 2 MiB are also returned as
 MCP images. Excess output is consumed and marked as truncated. Non-text display
 data is stored under `.mypr/artifacts/`.
+Malformed display items and unavailable image files produce bounded `warnings`
+without changing successful Python execution to failure. Valid text, execution
+state, cursors, and inbox data remain available. Excess warnings are indicated
+by `warnings_truncated`.
+The `error` field is a bounded summary (at most 1 KiB, smaller for small response
+budgets); `error_truncated` marks shortened summaries. Detailed traceback output
+is paged subject to the normal output limit.
+
+### Completed-work retention
+
+Configure retention in `.mypr/config.toml`; changes apply on manager restart:
+
+```toml
+[limits]
+completed_tasks = 128
+completed_records = 128
+cache_bytes = 33554432
+```
+
+The kernel retains the most recently completed `completed_tasks` handles, in
+addition to all active handles. Older handles disappear from `ws.tasks.list()`
+and `ws.tasks.get()`; use `ws.history` for saved records. A handle saved in your
+own variable or `ws.local` remains usable. These limits release internal cache
+references, not arbitrary objects retained by Python code.
+
+Manager record and shell-output caches each retain at most `completed_records`
+completed entries and share the serialized-byte budget equally. Counts must be
+positive and `cache_bytes` must be at least 1024. Active work is never evicted.
+Execution output and shell/package journals remain on disk under `.mypr/runs/`
+and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache
+eviction. Request deduplication uses SQLite and survives eviction and restart,
+including empty request IDs. Retention does not delete saved files or messages.
 
 Runtime files are created under `.mypr/`. The generated `.mypr/.gitignore`
 excludes the virtual environment, run records, artifacts, locks, logs, and

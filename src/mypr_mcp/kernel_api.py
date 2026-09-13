@@ -10,11 +10,14 @@ import json
 import os
 import shlex
 import time
+from collections import deque
 from collections.abc import Awaitable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .diagnostics import safe_error, safe_error_details
 
 _output_buffer: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
     "mypr_task_output", default=None
@@ -34,6 +37,10 @@ try:
     OUTPUT_LIMIT = max(1024, int(os.environ.get("MYPR_OUTPUT_LIMIT", 16 * 1024 * 1024)))
 except ValueError:
     OUTPUT_LIMIT = 16 * 1024 * 1024
+try:
+    COMPLETED_TASKS = max(0, int(os.environ.get("MYPR_COMPLETED_TASKS", "128")))
+except ValueError:
+    COMPLETED_TASKS = 128
 
 
 class NotReady(RuntimeError):
@@ -106,7 +113,7 @@ class OutputBuffer:
             self.size += len(kept.encode("utf-8"))
             self.truncated = True
         else:
-            self._text.write(value)
+            self._text.write(raw.decode("utf-8"))
             self.size += len(raw)
         return len(value)
 
@@ -151,7 +158,7 @@ class MultiplexStream:
 def _bounded_history_output(value: str) -> str:
     raw = value.encode("utf-8", "replace")
     if len(raw) <= HISTORY_OUTPUT_LIMIT:
-        return value
+        return raw.decode("utf-8")
     return raw[:HISTORY_OUTPUT_LIMIT].decode("utf-8", "ignore")
 
 
@@ -268,6 +275,8 @@ class TaskHandle:
         return self._task.result()
 
     async def cancel(self) -> bool:
+        if self._task.done():
+            return False
         self._cancel_requested = True
         self._task.cancel()
         return True
@@ -284,15 +293,26 @@ class TaskHandle:
             "kind": "python",
         }
 
-        async def publish(state: str, **extra: Any) -> None:
+        async def publish(state: str, **extra: Any) -> bool:
             event = {**identity, "state": state, **extra}
             try:
                 await _rpc("task_event", event=event)
-            except RPCError, OSError:
+                return True
+            except Exception:
                 # Reporting must never alter the task's result or lifetime.
+                return False
+
+        async def publish_terminal(state: str, **extra: Any) -> None:
+            event = {**identity, "state": state, **extra}
+            if await publish(state, **extra):
+                return
+            try:
+                await _rpc("task_terminal", event=event)
+            except Exception:
                 pass
 
-        await publish("running")
+        if not self._task.done():
+            await publish("running")
         cursor = 0
         while True:
             text = self.output()
@@ -306,24 +326,26 @@ class TaskHandle:
         try:
             await self._task
         except asyncio.CancelledError:
-            await publish(
+            await publish_terminal(
                 "cancelled",
                 finished=time.time(),
                 output=_bounded_history_output(self.output()),
                 output_delta="",
                 output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
             )
-        except Exception as exc:
-            await publish(
+        except BaseException as exc:
+            error, error_truncated = safe_error_details(exc)
+            await publish_terminal(
                 "failed",
                 finished=time.time(),
-                error=f"{type(exc).__name__}: {exc}",
+                error=error,
+                error_truncated=error_truncated,
                 output=_bounded_history_output(self.output()),
                 output_delta="",
                 output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
             )
         else:
-            await publish(
+            await publish_terminal(
                 "succeeded",
                 finished=time.time(),
                 output=_bounded_history_output(self.output()),
@@ -345,6 +367,26 @@ class TaskManager:
         self._handles: dict[str, TaskHandle] = {}
         self._counter = 0
         self._reporters: set[asyncio.Task[None]] = set()
+        self._completed: deque[tuple[str, TaskHandle]] = deque()
+        self._completed_ids: set[str] = set()
+        self._used_ids: set[str] = set()
+
+    def _track(self, handle: TaskHandle) -> None:
+        self._handles[handle.id] = handle
+
+    def _completed_handle(self, handle: TaskHandle) -> None:
+        task = getattr(handle, "_task", None)
+        if task is not None and not task.done():
+            return
+        if self._handles.get(handle.id) is not handle or handle.id in self._completed_ids:
+            return
+        self._completed.append((handle.id, handle))
+        self._completed_ids.add(handle.id)
+        while len(self._completed) > COMPLETED_TASKS:
+            ident, old = self._completed.popleft()
+            self._completed_ids.discard(ident)
+            if self._handles.get(ident) is old:
+                self._handles.pop(ident, None)
 
     def start(
         self,
@@ -355,13 +397,20 @@ class TaskManager:
     ) -> TaskHandle:
         if not inspect.isawaitable(awaitable):
             raise TypeError("tasks.start expects an awaitable")
-        self._counter += 1
         generation = os.environ.get("MYPR_GENERATION", "local")
-        ident = task_id or f"task-{generation}-{self._counter}"
-        if ident in self._handles:
+        if task_id is None:
+            while True:
+                self._counter += 1
+                ident = f"task-{generation}-{self._counter}"
+                if ident not in self._used_ids:
+                    break
+        else:
+            ident = task_id
+        if ident in self._used_ids:
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
             raise ValueError(f"Task ID already exists: {ident}")
+        self._used_ids.add(ident)
         buffer = OutputBuffer()
         run_state = {"started": False}
 
@@ -376,8 +425,15 @@ class TaskManager:
         task = asyncio.create_task(runner(), name=f"mypr:{ident}")
         handle = TaskHandle(ident, task, buffer, awaitable, run_state)
         if visible:
-            self._handles[ident] = handle
-            reporter = asyncio.create_task(handle._report(), name=f"mypr:report:{ident}")
+            self._track(handle)
+
+            async def report() -> None:
+                try:
+                    await handle._report()
+                finally:
+                    self._completed_handle(handle)
+
+            reporter = asyncio.create_task(report(), name=f"mypr:report:{ident}")
             self._reporters.add(reporter)
             reporter.add_done_callback(self._reporters.discard)
         return handle
@@ -420,21 +476,25 @@ class RemoteTask(TaskHandle):
         self._monitor = manager.start(
             self._watch(), task_id=f"remote-watch:{task_id}", visible=False
         )
-        manager._handles[task_id] = self
+        manager._track(self)
 
     async def _watch(self) -> None:
-        while self._state in {"queued", "running", "cancelling"}:
-            try:
-                async with self._lock:
-                    result = await _rpc("shell_poll", id=self.id, cursor=self._cursor)
-                    self._merge(result)
-            except RPCError as exc:
-                self._state = "lost"
-                self._error = str(exc)
-                return
-            if self._state not in {"queued", "running", "cancelling"}:
-                return
-            await asyncio.sleep(0.25)
+        try:
+            while self._state in {"queued", "running", "cancelling"}:
+                try:
+                    async with self._lock:
+                        result = await _rpc("shell_poll", id=self.id, cursor=self._cursor)
+                        self._merge(result)
+                except RPCError as exc:
+                    self._state = "lost"
+                    self._error = safe_error(exc)
+                    return
+                if self._state not in {"queued", "running", "cancelling"}:
+                    return
+                await asyncio.sleep(0.25)
+        finally:
+            if self._state in {"succeeded", "failed", "cancelled", "lost"}:
+                self._manager._completed_handle(self)
 
     def _merge(self, result: Any) -> None:
         if not isinstance(result, Mapping):
