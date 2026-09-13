@@ -452,7 +452,7 @@ wheels = [
 
 [[package]]
 name = "mypr-mcp"
-version = "0.5.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "ipykernel" },

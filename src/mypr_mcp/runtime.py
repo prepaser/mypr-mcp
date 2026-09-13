@@ -380,20 +380,25 @@ class Runtime:
 
     async def dispatch(self, req):
         op = req.pop("op")
-        client = req.pop("client_id", None) or "anonymous"
+        requested_client = req.pop("client_id", None)
         connection_id = req.pop("connection_id", None)
         connection = self.clients.get(connection_id)
+        if op == "init":
+            return self.initialize_client(connection_id, requested_client)
         if connection:
-            if connection["client_id"] != client:
+            if requested_client is not None and connection["client_id"] != requested_client:
                 raise ValueError("Connection belongs to another client")
             connection["last_activity"] = time.time()
+        client = (connection["client_id"] if connection else requested_client) or "anonymous"
         if op == "status":
             connections = []
             for info in self.clients.values():
                 owned = [
                     r["id"]
                     for r in self.task_records.values()
-                    if r.get("client_id") == info["client_id"] and r["state"] not in TERMINAL
+                    if info["client_id"] is not None
+                    and r.get("client_id") == info["client_id"]
+                    and r["state"] not in TERMINAL
                 ]
                 active = [
                     rec["id"]
@@ -411,7 +416,9 @@ class Runtime:
                 "resetting": self.resetting,
                 "connections": connections,
                 "connection_count": len(connections),
-                "client_count": len({c["client_id"] for c in connections}),
+                "client_count": len(
+                    {c["client_id"] for c in connections if c["client_id"] is not None}
+                ),
                 "active": list(self.active),
                 "queued": [r["id"] for r in self.execs.values() if r["state"] == "queued"],
             }
@@ -446,6 +453,8 @@ class Runtime:
                 raise RuntimeError("The workspace moved; stop its manager and reconnect")
             if not self.healthy or self.resetting:
                 raise RuntimeError("Kernel unavailable; use CLI reset")
+            if connection is None or connection["client_id"] is None:
+                raise RuntimeError("Call init on an active connection before execute")
             code = req["code"]
             request_id = req.get("request_id")
             key = (client, request_id) if request_id is not None else None
@@ -650,26 +659,59 @@ class Runtime:
     def public_record(rec):
         return {k: v for k, v in rec.items() if k not in {"done", "idle", "events"}}
 
+    def initialize_client(self, connection_id, requested_id):
+        connection = self.clients.get(connection_id)
+        if connection is None:
+            raise RuntimeError("Connection is no longer attached")
+        if not self.workspace_available():
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
+        if requested_id is not None and (
+            not isinstance(requested_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", requested_id)
+        ):
+            raise ValueError("Client ID must be 1..128 identifier characters")
+        current = connection["client_id"]
+        if current is not None:
+            if requested_id is not None and requested_id != current:
+                raise RuntimeError(
+                    "This connection is already initialized with a different client ID"
+                )
+            connection["last_activity"] = time.time()
+            return {"client_id": current}
+        if requested_id is not None and any(
+            info["client_id"] == requested_id for info in self.clients.values()
+        ):
+            raise RuntimeError("Client ID is already bound to another connection")
+        client_id = requested_id if requested_id is not None else self.history.allocate_client_id()
+        if requested_id is not None:
+            self.history.reserve_client_id(client_id)
+        initialized = dict(connection, client_id=client_id, last_activity=time.time())
+        self.history.append("connection", "initialized", initialized)
+        connection.update(initialized)
+        return {"client_id": client_id}
+
     async def attach(self, reader, writer, req):
         if not self.workspace_available():
             raise RuntimeError("The workspace moved; stop its manager and reconnect")
-        client_id = req.get("client_id")
+        if "client_id" in req:
+            raise ValueError("Client IDs are assigned by the workspace manager")
         connection_id = req.get("connection_id")
-        for value in (client_id, connection_id):
-            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
-                raise ValueError("Client and connection IDs must be 1..128 identifier characters")
+        if not isinstance(connection_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{1,128}", connection_id
+        ):
+            raise ValueError("Connection ID must be 1..128 identifier characters")
         if connection_id in self.clients:
             raise ValueError("Connection ID already attached")
         info = dict(
-            client_id=client_id,
+            client_id=None,
             connection_id=connection_id,
             connected_at=time.time(),
             last_activity=time.time(),
         )
         self.clients[connection_id] = info
         self.attachments[connection_id] = writer
-        self.history.append("connection", "connected", info)
         try:
+            self.history.append("connection", "connected", info)
             status = await self.dispatch({"op": "status"})
             writer.write(json.dumps({"ok": True, "result": status}).encode() + b"\n")
             await writer.drain()

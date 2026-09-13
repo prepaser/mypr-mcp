@@ -23,6 +23,8 @@ async def test_serve_uses_current_directory_as_workspace(workspace: Path):
     async with stdio_client(server_parameters(workspace)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            result = await session.call_tool("init", {})
+            assert not result.is_error, result
             result = await execute(session, "str(ws.workspace), __import__('os').getcwd()")
             assert result["state"] == "succeeded"
             assert ast.literal_eval(result_text(result)) == (str(workspace), str(workspace))
@@ -33,6 +35,8 @@ async def test_status_uses_current_directory(workspace: Path):
     async with stdio_client(server_parameters(workspace)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            result = await session.call_tool("init", {})
+            assert not result.is_error, result
             process = await asyncio.create_subprocess_exec(
                 str(CLI),
                 "status",
@@ -51,6 +55,7 @@ async def test_status_uses_current_directory(workspace: Path):
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
+        ("--client-id", "agent"),
         ("--client-name", "agent"),
         ("--workspace", "/tmp/other-workspace"),
         ("--directory", "/tmp/other-project"),

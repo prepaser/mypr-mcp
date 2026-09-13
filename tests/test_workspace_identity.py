@@ -90,7 +90,7 @@ import sys
 from pathlib import Path
 
 from mypr_mcp.cli import ensure
-from mypr_mcp.transport import rpc, socket_path, workspace_id
+from mypr_mcp.transport import attachment, rpc, socket_path, workspace_id
 
 
 async def wait_for_socket_to_disappear(path):
@@ -120,23 +120,20 @@ async def main():
         assert states[0]["generation"] == states[1]["generation"]
         assert states[0]["workspace_id"] == workspace_id(source)
 
-        first = await rpc(
-            paths[0],
-            op="execute",
-            code="bind_mount_shared = 'source'\nbind_mount_shared",
-            wait_ms=10_000,
-            client_id="bind-source",
-            connection_id="bind-source-connection",
+        async def run_cell(path, client_id, code):
+            connection_id = client_id + "-connection"
+            async with attachment(path, connection_id):
+                await rpc(path, op="init", client_id=client_id, connection_id=connection_id)
+                return await rpc(
+                    path, op="execute", code=code, wait_ms=10_000,
+                    connection_id=connection_id,
+                )
+
+        first = await run_cell(
+            paths[0], "bind-source", "bind_mount_shared = 'source'\nbind_mount_shared"
         )
         assert first["state"] == "succeeded", first
-        second = await rpc(
-            paths[1],
-            op="execute",
-            code="bind_mount_shared",
-            wait_ms=10_000,
-            client_id="bind-alias",
-            connection_id="bind-alias-connection",
-        )
+        second = await run_cell(paths[1], "bind-alias", "bind_mount_shared")
         assert second["state"] == "succeeded", second
         assert any(
             event.get("text", "").strip().strip("\'") == "source"

@@ -54,11 +54,10 @@ async def workspace(tmp_path: Path) -> AsyncIterator[Path]:
 async def mcp_session(
     workspace: Path,
     *,
+    initialize_client: bool = True,
     client_id: str | None = None,
 ) -> AsyncIterator[ClientSession]:
     args = ["-m", "mypr_mcp.cli", "serve"]
-    if client_id is not None:
-        args.extend(["--client-id", client_id])
     params = StdioServerParameters(
         command=sys.executable,
         args=args,
@@ -68,6 +67,10 @@ async def mcp_session(
     async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
+            if initialize_client:
+                arguments = {} if client_id is None else {"client_id": client_id}
+                result = await session.call_tool("init", arguments)
+                assert not result.is_error, result
             yield session
 
 

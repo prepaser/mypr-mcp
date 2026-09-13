@@ -24,7 +24,7 @@ async def test_concurrent_cells_call_one_real_mcp_connection(workspace):
         "    return 'release-sent'\n"
         "asyncio.run(server.run_stdio_async())\n"
     )
-    async with mcp_session(workspace, client_id="waiter") as first:
+    async with mcp_session(workspace) as first:
         configured = await execute(
             first,
             f"await ws.mcp.configure('gate', "
@@ -37,7 +37,7 @@ async def test_concurrent_cells_call_one_real_mcp_connection(workspace):
                 {"code": "await ws.mcp.call_tool('gate', 'wait_for_release')", "wait_ms": 0},
             )
         )
-        async with mcp_session(workspace, client_id="releaser") as second:
+        async with mcp_session(workspace) as second:
             released = await execute(second, "await ws.mcp.call_tool('gate', 'release')")
             assert released["state"] == "succeeded"
             assert "release-sent" in result_text(released)

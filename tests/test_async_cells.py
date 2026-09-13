@@ -28,35 +28,37 @@ async def wait_until_running(session, exec_id: str) -> dict:
 
 
 async def test_cells_overlap_across_clients_and_keep_output_owner(workspace: Path):
-    async with mcp_session(workspace, client_id="cell-a") as first:
-        await execute(first, "import asyncio\ngate = asyncio.Event()")
+    async with mcp_session(workspace) as first:
+        setup = await execute(first, "import asyncio\ngate = asyncio.Event()")
+        first_id = setup["client_id"]
         first_cell = await submit(
             first,
             "await gate.wait()\nprint('released-by:' + ws.client.id)\n'a-result'",
         )
         await wait_until_running(first, first_cell["exec_id"])
 
-        async with mcp_session(workspace, client_id="cell-b") as second:
+        async with mcp_session(workspace) as second:
             second_cell = await submit(
                 second,
                 "gate.set()\nprint('set-by:' + ws.client.id)\n'b-result'",
             )
+            second_id = second_cell["client_id"]
             second_done = await poll_until_done(second, second_cell["exec_id"])
 
         first_done = await poll_until_done(first, first_cell["exec_id"])
 
     assert second_done["state"] == "succeeded"
     assert first_done["state"] == "succeeded"
-    assert "set-by:cell-b" in result_text(second_done)
-    assert "released-by:cell-a" not in result_text(second_done)
-    assert "released-by:cell-a" in result_text(first_done)
-    assert "set-by:cell-b" not in result_text(first_done)
-    assert first_done["client_id"] == "cell-a"
-    assert second_done["client_id"] == "cell-b"
+    assert f"set-by:{second_id}" in result_text(second_done)
+    assert f"released-by:{first_id}" not in result_text(second_done)
+    assert f"released-by:{first_id}" in result_text(first_done)
+    assert f"set-by:{second_id}" not in result_text(first_done)
+    assert first_done["client_id"] == first_id
+    assert second_done["client_id"] == second_id
 
 
 async def test_same_client_cells_overlap_and_share_globals_and_functions(workspace: Path):
-    async with mcp_session(workspace, client_id="same-client") as session:
+    async with mcp_session(workspace) as session:
         await execute(
             session,
             "import asyncio\n"
@@ -92,7 +94,7 @@ async def test_same_client_cells_overlap_and_share_globals_and_functions(workspa
 
 
 async def test_cell_handles_expose_result_and_cancel_finally(workspace: Path):
-    async with mcp_session(workspace, client_id="handle-client") as session:
+    async with mcp_session(workspace) as session:
         completed = await execute(session, "40 + 2")
         handle = await execute(
             session,
@@ -134,7 +136,7 @@ async def test_cell_handles_expose_result_and_cancel_finally(workspace: Path):
 
 
 async def test_cell_cannot_await_itself(workspace: Path):
-    async with mcp_session(workspace, client_id="self-await") as session:
+    async with mcp_session(workspace) as session:
         pending = await submit(
             session,
             "active = (await ws.status())['active']\n"
@@ -175,7 +177,7 @@ async def test_reset_uses_live_tasks_instead_of_delayed_history(workspace: Path)
 
 
 async def test_reset_rejects_busy_and_force_resets_generation(workspace: Path):
-    async with mcp_session(workspace, client_id="reset-client") as session:
+    async with mcp_session(workspace) as session:
         rejected = await execute(
             session,
             "import asyncio\n"
@@ -216,7 +218,7 @@ async def test_reset_rejects_busy_and_force_resets_generation(workspace: Path):
 
 
 async def test_rich_display_errors_and_history_preserve_cell_output(workspace: Path):
-    async with mcp_session(workspace, client_id="output-a") as first:
+    async with mcp_session(workspace) as first:
         await execute(first, "import asyncio\ngate = asyncio.Event()")
         first_cell = await submit(
             first,
@@ -227,7 +229,7 @@ async def test_rich_display_errors_and_history_preserve_cell_output(workspace: P
             "raise ValueError('a-error')",
         )
         await wait_until_running(first, first_cell["exec_id"])
-        async with mcp_session(workspace, client_id="output-b") as second:
+        async with mcp_session(workspace) as second:
             second_cell = await submit(
                 second,
                 "from IPython.display import HTML, display\n"
@@ -272,7 +274,7 @@ async def test_rich_display_errors_and_history_preserve_cell_output(workspace: P
 async def test_ipython_magics_keep_workspace_and_output_semantics(workspace: Path):
     script = workspace / "magic_script.py"
     script.write_text("magic_value = 17\n")
-    async with mcp_session(workspace, client_id="magic-client") as session:
+    async with mcp_session(workspace) as session:
         pwd = await execute(session, "%pwd")
         timed = await execute(session, "%time 1 + 1")
         ran = await execute(session, "%run magic_script.py\nmagic_value")

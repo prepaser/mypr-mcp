@@ -11,19 +11,25 @@ import uuid
 from pathlib import Path
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import __version__
 from .transport import attachment, find_runtime, manager_running, rpc, socket_path
 
-INSTRUCTIONS = """Use execute to run Python and poll to read a submitted cell's status and output.
+INSTRUCTIONS = """Call init once per connection. Use execute for Python and poll for cell output.
+init() creates a new adjective-animal client ID; init(client_id="...") creates or resumes
+that logical session. The ID is bound to this connection; do not pass it to execute.
+Repeated init returns the current ID. Switching IDs and sharing an ID across live
+connections are rejected. After disconnecting, reconnect and init with the same ID to
+resume. Poll is available before init.
 Python runs in one persistent kernel shared by every client of this workspace.
 
 State and identity
 - Variables, imports, functions, and task handles survive calls and client disconnects.
 - ws.client.id is your logical identity; ws.client.connection_id identifies this connection.
 - Store your working values in ws.local, a dict scoped to your logical client ID.
-  Reconnecting with the same ID restores access while the kernel remains alive.
+  Resuming an ID restores its ws.local while the same kernel remains alive.
 - Ordinary globals are shared. Background tasks retain their creator's client context.
 - Keep large results in Python and return only the information needed for the next decision.
 
@@ -145,43 +151,54 @@ def tool_result(result):
     )
 
 
-async def serve(workspace, client_id: str | None = None):
+async def serve(workspace):
     path = await ensure(workspace)
-    client_id = client_id or uuid.uuid4().hex
     connection_id = uuid.uuid4().hex
+    bound_client: str | None = None
     mcp = MCPServer("mypr-mcp", version=__version__, instructions=INSTRUCTIONS)
+
+    async def request(op, **fields):
+        try:
+            return await rpc(path, op=op, connection_id=connection_id, **fields)
+        except RuntimeError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool()
+    async def init(client_id: str | None = None) -> dict[str, str]:
+        """Bind this connection to a new or existing client ID before executing Python."""
+        nonlocal bound_client
+        result = await request("init", client_id=client_id)
+        bound_client = result["client_id"]
+        return result
 
     @mcp.tool()
     async def execute(
         code: str, wait_ms: int = 1000, request_id: str | None = None
     ) -> CallToolResult:
-        """Execute an async-capable Python cell in the shared workspace."""
-        result = await rpc(
-            path,
-            op="execute",
+        """Execute an async-capable Python cell after init has bound a client ID."""
+        if bound_client is None:
+            raise ToolError("Call init before execute")
+        result = await request(
+            "execute",
             code=code,
             wait_ms=wait_ms,
             request_id=request_id,
-            client_id=client_id,
-            connection_id=connection_id,
+            client_id=bound_client,
         )
         return tool_result(result)
 
     @mcp.tool()
     async def poll(exec_id: str, cursor: int | None = None, wait_ms: int = 1000) -> CallToolResult:
         """Read a submitted cell's state and output; use Python handles for background jobs."""
-        result = await rpc(
-            path,
-            op="poll",
+        result = await request(
+            "poll",
             exec_id=exec_id,
             cursor=cursor,
             wait_ms=wait_ms,
-            client_id=client_id,
-            connection_id=connection_id,
         )
         return tool_result(result)
 
-    async with attachment(path, client_id, connection_id) as attached:
+    async with attachment(path, connection_id) as attached:
         mcp_task = asyncio.create_task(mcp.run_stdio_async())
         manager_task = asyncio.create_task(attached.wait_closed())
         try:
@@ -197,14 +214,14 @@ async def serve(workspace, client_id: str | None = None):
             await asyncio.gather(mcp_task, manager_task, return_exceptions=True)
 
 
-async def logs(workspace, client_id: str | None, limit: int, follow: bool) -> None:
+async def logs(workspace, limit: int, follow: bool) -> None:
     found = await find_runtime(workspace)
     if found is None:
         raise RuntimeError("No reachable workspace manager")
     path, _ = found
     cursor: int | None = None
     while True:
-        result = await rpc(path, op="logs", cursor=cursor, filter_client_id=client_id, limit=limit)
+        result = await rpc(path, op="logs", cursor=cursor, limit=limit)
         for event in result.get("events", []):
             print(json.dumps(event, ensure_ascii=False), flush=True)
         next_cursor = result.get("cursor", cursor)
@@ -218,7 +235,6 @@ def main():
     parser = argparse.ArgumentParser(description="Persistent workspace Python over MCP")
     parser.add_argument("command", choices=["serve", "status", "logs", "reset", "stop", "_manager"])
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--client-id")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
@@ -227,7 +243,7 @@ def main():
         parser.error("--limit must be greater than zero")
     try:
         if args.command == "serve":
-            asyncio.run(serve(workspace, args.client_id))
+            asyncio.run(serve(workspace))
         elif args.command == "_manager":
             from .runtime import Runtime
 
@@ -236,7 +252,7 @@ def main():
 
             async def admin():
                 if args.command == "logs":
-                    return await logs(workspace, args.client_id, args.limit, args.follow)
+                    return await logs(workspace, args.limit, args.follow)
                 if args.command == "reset":
                     path = await ensure(workspace)
                 else:

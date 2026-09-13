@@ -37,6 +37,7 @@ For clients using `mcpServers` JSON configuration:
 ```
 
 Make sure `uvx` is on the client's `PATH`, or use its absolute executable path.
+To pin a version, use `mypr-mcp@0.7.0` as the first argument.
 
 ### Codex
 
@@ -60,7 +61,7 @@ executable path if needed.
 
 The startup allowance covers the first package download and workspace venv creation. `required = true`
 makes Codex wait for this server and report a startup failure if it cannot
-initialize. The tool timeout covers individual `execute`/`poll` calls, not the
+initialize. The tool timeout covers individual `init`/`execute`/`poll` calls, not the
 lifetime of background jobs.
 
 Alternatively, register the launch command through the CLI:
@@ -76,13 +77,9 @@ directory; use project-scoped configuration for project-specific settings.
 
 Restart the Codex client after changing its configuration. Check registration
 with `codex mcp get mypr` or `codex mcp list`, then use `/mcp` in the Codex CLI
-to inspect the live connection. The server exposes only `execute` and `poll`.
-Ask the agent to run `ws.client.id` and `await ws.status()` through `execute`
-to verify the selected workspace and client identity.
-
-These examples let mypr-mcp generate its client ID. Add `--client-id` only when
-intentionally reusing a logical identity: a fixed ID also shares `ws.local`
-across clients using it. The ID is not automatically a Codex conversation ID.
+to inspect the live connection. After connecting, the agent must call `init`
+once to bind the connection to a logical client identity before it can run
+Python code.
 
 Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers
 called from Python belong in the workspace's `.mypr/config.toml`, or can be
@@ -116,13 +113,37 @@ instruction. Status and stop remain available through the discovered socket.
 
 ## MCP tools
 
-Only two tools are exposed to the agent:
+Three tools are exposed to the agent:
+
+- `init(client_id=None)` binds this MCP connection to a logical client. With no
+  argument, it allocates a new readable ID such as `calm-otter`; with an
+  argument, it creates or resumes that ID. The returned ID is bound to the
+  connection, so later calls do not repeat it.
 
 - `execute(code, wait_ms=1000, request_id=None)` submits a Python cell and
-  returns its execution state and output. `wait_ms` only controls how long the
-  MCP call waits; it does not set a Python timeout.
+  returns its execution state and output. The connection must be initialized
+  first. `wait_ms` only controls how long the MCP call waits; it does not set a
+  Python timeout.
 - `poll(exec_id, cursor=None, wait_ms=1000)` reads a submitted cell's state and
-  output. Use the returned cursor to read later output.
+  output. Use the returned cursor to read later output. Polling an existing
+  execution is allowed before `init`, since the execution ID identifies the
+  target.
+
+Call `init()` before the first `execute`:
+
+```text
+init()                         -> {"client_id": "calm-otter"}
+execute(code="...", ...)      -> uses calm-otter automatically
+poll(exec_id="...", ...)      -> reads the execution
+```
+
+Repeating `init()` or specifying the currently bound ID returns that same ID.
+Trying to bind an
+initialized connection to a different ID is rejected. Only one live MCP
+connection may use a logical client ID at a time; after disconnecting, another
+connection can call `init(client_id="calm-otter")` to resume it. A connection
+that has not called `init` can still be counted and inspected by operational
+status, but it cannot submit Python code.
 
 Submitted cells run as independent asyncio tasks in the shared kernel. They
 may complete in a different order from submission, including cells from the
@@ -178,8 +199,8 @@ the workspace even if code changes the kernel's current directory:
 ```
 
 All clients share imports, globals, and filesystem changes. Store caller-specific
-values in `ws.local`; they survive reconnects with the same client ID, but not
-a kernel reset or crash.
+values in `ws.local`; they persist across cells from the same logical client.
+Kernel resets and crashes clear all in-memory local dictionaries.
 
 ### Shell and async tasks
 
@@ -357,18 +378,20 @@ stops waiting; inspect configuration and history to confirm the outcome.
 
 ### Client-local state and history
 
-Each server process gets a random logical client ID by default and a fresh
-connection ID for every connection. Pass `--client-id` to keep the same
-logical identity across reconnects:
+The first `init()` call assigns a readable logical client ID such as
+`calm-otter` or `swift-fox`. It randomly combines one of 256 adjectives with one
+of 256 animal names, giving 65,536 possible IDs per workspace. Automatically
+issued IDs are reserved in `.mypr/history.sqlite3` and never reused while that
+database is retained, even after disconnects or manager restarts. Explicit IDs
+can create a new client or resume an existing one; IDs in history remain
+reserved. If every automatic combination has been used, allocation fails with
+an explicit exhaustion error.
 
-```sh
-uvx mypr-mcp serve --client-id conversation-a
-```
-
-Client IDs identify callers for attribution and coordination. They are not an
-authentication mechanism or a security boundary. If several conversations
-share a logical ID, use a unique ID for each conversation when per-conversation
-ownership and filtering are needed.
+Connection IDs remain random UUIDs. Read the bound identity through
+`ws.client.id` and this particular connection through `ws.client.connection_id`.
+Before `init`, the connection has no logical client ID. These IDs identify
+callers for attribution and coordination; they are not authentication or
+security boundaries.
 
 The shared Python namespace is deliberately common to every client. Use the
 client identity and local mapping for values that belong to the current agent:
@@ -381,12 +404,15 @@ ws.local["review_job"] = ws.tasks.start(do_review())
 `ws.local` is persisted in the running kernel and is namespaced by logical
 client ID. `ws.client.id` identifies the caller that submitted the current
 cell; `connection_id` identifies this particular MCP connection. They prevent
-accidental name reuse only when code follows the
-`ws.local` convention; ordinary globals remain shared.
+accidental name reuse only when code follows the `ws.local` convention;
+ordinary globals remain shared. Reconnecting with the same ID resumes the same
+local dictionary while the kernel remains alive.
 
 Use `await ws.status()` for the current manager, kernel, active executions,
 queue, and connected-client information. `active` is an array of execution IDs;
-each connection also reports its active execution IDs. Use `await ws.history.list(...)` and
+each connection also reports its active execution IDs. `connection_count`
+includes connections waiting to call `init`; `client_count` includes only
+initialized logical clients. Use `await ws.history.list(...)` and
 `await ws.history.get(exec_id)` to inspect execution records from Python. History
 records include the logical client and connection IDs, timestamps, state, and
 output metadata. A task inherits its creator's identity even while another
@@ -510,9 +536,12 @@ is active. Pass `force=True` to cancel that work and reset. The reset cell's
 completion is reported by `execute`/`poll`. Saved files, skills, modules,
 package environment, and run records remain. The kernel generation changes
 and old Python job handles expire. Historical MCP
-execution IDs remain readable. Request IDs are scoped to the logical client:
-reusing the same client ID and request ID returns the original execution instead
-of repeating side effects, including after reset or manager restart.
+execution IDs remain readable. Reusing a request ID within the same client
+returns the original execution instead of repeating side effects, including
+after a kernel reset or reconnecting with the same ID. Resuming that ID after
+a manager restart also retains request deduplication. A newly allocated ID
+starts a separate request-ID scope; use history to check earlier executions
+before retrying an uncertain operation.
 
 The CLI also provides operational controls. Run them from the workspace:
 
@@ -520,15 +549,15 @@ The CLI also provides operational controls. Run them from the workspace:
 cd /absolute/path/to/workspace
 uvx mypr-mcp status
 uvx mypr-mcp logs
-uvx mypr-mcp logs \
-  --client-id conversation-a --limit 50 --follow
+uvx mypr-mcp logs --limit 50 --follow
 uvx mypr-mcp reset
 uvx mypr-mcp stop
 ```
 
 `logs` prints JSONL lifecycle and output events. Without `--follow` it prints
-the most recent 20 events; `--limit` changes the page size (1–200), and `--client-id`
-filters by logical caller. `--follow` waits for new records until interrupted.
+the most recent 20 events; `--limit` changes the page size (1–200).
+`--follow` waits for new records until interrupted. Use `ws.history.logs(client_id=...)`
+inside Python to filter by caller.
 The commands are local administration commands, not MCP tools. `reset` and
 `stop` reject active work unless `--force` is supplied.
 
@@ -536,7 +565,9 @@ Python memory and running handles survive normal client disconnects, but they
 cannot be restored after a manager or kernel crash. In that case unfinished
 executions are marked `lost`; mypr-mcp never silently re-runs code or external
 MCP calls. The saved `.mypr/runs/` records and files remain available for
-inspection.
+inspection. The logical client ID and its history remain available, so a new
+connection can call `init(client_id="calm-otter")` after the runtime is healthy;
+in-memory variables and local state must be recreated after a crash.
 
 ## Output limits
 

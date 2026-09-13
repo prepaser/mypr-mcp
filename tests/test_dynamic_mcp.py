@@ -63,7 +63,7 @@ async def test_dynamic_configure_preserves_kernel_state_and_restart_reloads_code
     python = sys.executable
     config = _config(python, server)
 
-    async with mcp_session(workspace, client_id="dynamic-client") as session:
+    async with mcp_session(workspace) as session:
         before = await execute(
             session,
             "import asyncio\n"

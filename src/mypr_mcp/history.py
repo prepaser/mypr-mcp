@@ -9,12 +9,15 @@ second process during recovery or inspection.
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from .client_ids import ADJECTIVES, ANIMALS
 
 _KINDS = {"execution", "python", "shell", "package"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
@@ -46,6 +49,9 @@ class History:
         with self._lock:
             self._db.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS client_ids (
+                    id TEXT PRIMARY KEY NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS entities (
                     entity_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     id TEXT NOT NULL UNIQUE,
@@ -71,8 +77,54 @@ class History:
                 );
                 CREATE INDEX IF NOT EXISTS events_client_idx
                     ON events(client_id, seq);
+                INSERT OR IGNORE INTO client_ids(id)
+                    SELECT client_id FROM events WHERE client_id IS NOT NULL;
+                INSERT OR IGNORE INTO client_ids(id)
+                    SELECT json_extract(data, '$.client_id') FROM entities
+                    WHERE json_extract(data, '$.client_id') IS NOT NULL;
+                INSERT OR IGNORE INTO client_ids(id)
+                    SELECT json_extract(data, '$.client') FROM entities
+                    WHERE json_extract(data, '$.client') IS NOT NULL;
                 """
             )
+
+    def allocate_client_id(self) -> str:
+        """Reserve a readable ID permanently, including connections that do no work."""
+        self._ensure_open()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                used = {row[0] for row in self._db.execute("SELECT id FROM client_ids")}
+                for _ in range(64):
+                    client_id = f"{secrets.choice(ADJECTIVES)}-{secrets.choice(ANIMALS)}"
+                    if client_id not in used:
+                        break
+                else:
+                    available = [
+                        name
+                        for adjective in ADJECTIVES
+                        for animal in ANIMALS
+                        if (name := f"{adjective}-{animal}") not in used
+                    ]
+                    if not available:
+                        raise RuntimeError("No unused client IDs remain in this workspace")
+                    client_id = secrets.choice(available)
+                self._db.execute("INSERT INTO client_ids(id) VALUES (?)", (client_id,))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return client_id
+
+    def reserve_client_id(self, client_id: str) -> None:
+        """Reserve a caller-selected ID, or retain its existing reservation."""
+        self._ensure_open()
+        with self._lock:
+            self._remember_client(client_id)
+
+    def _remember_client(self, value: Any) -> None:
+        if value is not None:
+            self._db.execute("INSERT OR IGNORE INTO client_ids(id) VALUES (?)", (str(value),))
 
     def record(self, kind: str, record: dict[str, Any], event: str | None = None) -> dict[str, Any]:
         """Merge an entity update and optionally append its lifecycle event."""
@@ -113,6 +165,8 @@ class History:
                         "UPDATE entities SET updated = ?, data = ? WHERE id = ?",
                         (now, _dump(merged), ident),
                     )
+                self._remember_client(merged.get("client_id"))
+                self._remember_client(merged.get("client"))
                 result = dict(merged)
                 if event is not None:
                     self._insert_event(event, kind, result, now=now)
@@ -301,6 +355,7 @@ class History:
         now: float,
         data: Any = None,
     ) -> int:
+        self._remember_client(record.get("client_id"))
         ident = _optional_string(record.get("id"))
         exec_id = _optional_string(record.get("exec_id")) or ident
         values = (

@@ -7,10 +7,10 @@ from pathlib import Path
 from conftest import decode_result, execute, mcp_session, result_text, stop_manager
 
 
-async def test_only_execute_and_poll_tools_and_expression_result(workspace: Path):
+async def test_init_execute_and_poll_tools_and_expression_result(workspace: Path):
     async with mcp_session(workspace) as session:
         tools = await session.list_tools()
-        assert {tool.name for tool in tools.tools} == {"execute", "poll"}
+        assert {tool.name for tool in tools.tools} == {"init", "execute", "poll"}
 
         payload = await execute(session, "answer = 41\nanswer + 1")
         assert payload["state"] == "succeeded"
@@ -184,7 +184,7 @@ async def test_burst_output_can_be_collected_across_poll_cursors(workspace: Path
         assert "z" * 5000 in "".join(chunks)
 
 
-async def test_request_id_does_not_repeat_side_effect_after_manager_restart(workspace: Path):
+async def test_new_client_has_separate_request_scope_after_manager_restart(workspace: Path):
     code = (
         "from pathlib import Path\n"
         "counter = Path('counter.txt')\n"
@@ -192,14 +192,19 @@ async def test_request_id_does_not_repeat_side_effect_after_manager_restart(work
         "counter.write_text(str(value + 1))\n"
         "value + 1"
     )
-    async with mcp_session(workspace, client_id="retry-client") as session:
+    async with mcp_session(workspace) as session:
         first = await execute(session, code, request_id="idempotent-side-effect")
         assert result_text(first).strip() == "1"
         await stop_manager(workspace)
-    async with mcp_session(workspace, client_id="retry-client") as session:
+    async with mcp_session(workspace) as session:
         repeated = await execute(session, code, request_id="idempotent-side-effect")
-        assert result_text(repeated).strip() == "1"
-    assert (workspace / "counter.txt").read_text() == "1"
+        assert result_text(repeated).strip() == "2"
+        assert repeated["client_id"] != first["client_id"]
+        again = await execute(session, code, request_id="idempotent-side-effect")
+        assert again["exec_id"] == repeated["exec_id"]
+        old = decode_result(await session.call_tool("poll", {"exec_id": first["exec_id"]}))
+        assert result_text(old).strip() == "1"
+    assert (workspace / "counter.txt").read_text() == "2"
 
 
 async def test_external_stdio_mcp_is_available_inside_python(workspace: Path):

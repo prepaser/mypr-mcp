@@ -124,7 +124,6 @@ class Attachment:
 @asynccontextmanager
 async def attachment(
     path: Path | str,
-    client_id: str,
     connection_id: str,
 ):
     """Attach a client and keep its manager connection open until shutdown."""
@@ -134,7 +133,6 @@ async def attachment(
             json.dumps(
                 {
                     "op": "attach",
-                    "client_id": client_id,
                     "connection_id": connection_id,
                 },
                 separators=(",", ":"),
