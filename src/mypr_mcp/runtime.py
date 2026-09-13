@@ -18,6 +18,7 @@ from jupyter_client.kernelspec import KernelSpec
 
 from . import __version__
 from .history import History
+from .messages import MessageStore
 from .services import MCPBridge, Shells
 from .transport import MAX_MESSAGE, socket_path, workspace_id
 
@@ -41,6 +42,8 @@ class Runtime:
         self.clients = {}
         self.attachments = {}
         self.history = None
+        self.messages = None
+        self.message_waiters = {}
         self.task_records = {}
         self.shell_watchers = set()
         self.stopping = asyncio.Event()
@@ -75,6 +78,7 @@ class Runtime:
     async def prepare(self):
         self.history = History(self.workspace)
         self.history.recover()
+        self.messages = MessageStore(self.workspace)
         for name in ["lib/ws_lib", "skills", "runs", "artifacts", "ipython", "jupyter"]:
             (self.root / name).mkdir(parents=True, exist_ok=True)
         (self.root / "lib/ws_lib/__init__.py").touch(exist_ok=True)
@@ -338,7 +342,32 @@ class Runtime:
         rec["bytes"] += min(len(raw), room)
         self.save(rec)
 
-    async def poll(self, ident, cursor=0, wait_ms=1000):
+    async def wait_activity(self, client, wait_seconds, done=None, *, after=None):
+        notification = asyncio.get_running_loop().create_future() if client else None
+        tasks = []
+        if notification is not None:
+            self.message_waiters.setdefault(client, set()).add(notification)
+            tasks.append(notification)
+        try:
+            if client and self.messages.read(client, limit=1, after=after)["messages"]:
+                return
+            tasks.append(asyncio.create_task(self.stopping.wait()))
+            if done:
+                tasks.append(asyncio.create_task(done.wait()))
+            await asyncio.wait(tasks, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+            if self.stopping.is_set():
+                raise RuntimeError("Workspace manager is stopping")
+        finally:
+            if notification is not None:
+                waiters = self.message_waiters[client]
+                waiters.discard(notification)
+                if not waiters:
+                    del self.message_waiters[client]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def poll(self, ident, cursor=0, wait_ms=1000, *, inbox_client=None):
         if ident not in self.execs:
             if len(ident) != 32 or any(c not in "0123456789abcdef" for c in ident):
                 raise ValueError("Invalid execution ID")
@@ -353,8 +382,9 @@ class Runtime:
         else:
             rec = self.execs[ident]
             if rec["state"] not in TERMINAL and wait_ms:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(rec["done"].wait(), min(30000, max(0, wait_ms)) / 1000)
+                await self.wait_activity(
+                    inbox_client, min(30000, max(0, wait_ms)) / 1000, rec["done"]
+                )
         if cursor < 0 or cursor > len(rec["events"]):
             raise ValueError("Invalid output cursor")
         output, size = [], 0
@@ -379,6 +409,20 @@ class Runtime:
         }
 
     async def dispatch(self, req):
+        op = req.get("op")
+        connection_id = req.get("connection_id")
+        result = await self._dispatch(req)
+        connection = self.clients.get(connection_id)
+        if (
+            op in {"init", "execute", "poll"}
+            and connection
+            and connection["client_id"] is not None
+            and self.messages is not None
+        ):
+            result = {**result, "inbox": self.messages.inbox(connection["client_id"])}
+        return result
+
+    async def _dispatch(self, req):
         op = req.pop("op")
         requested_client = req.pop("client_id", None)
         connection_id = req.pop("connection_id", None)
@@ -448,6 +492,31 @@ class Runtime:
         generation = req.pop("generation", None)
         if generation and generation != self.generation:
             raise RuntimeError("Expired kernel generation")
+        if op in {"message_send", "message_read", "message_ack"}:
+            if not (connection and connection["client_id"]) and not requested_client:
+                raise RuntimeError("Messages require a client identity")
+            if self.stopping.is_set():
+                raise RuntimeError("Workspace manager is stopping")
+            if op == "message_send":
+                message = self.messages.send(client, req["to"], req["text"])
+                for waiter in self.message_waiters.get(req["to"], ()):
+                    if not waiter.done():
+                        waiter.set_result(None)
+                return message
+            if op == "message_ack":
+                return self.messages.ack(client, req["ids"])
+            wait_ms = req.get("wait_ms", 0)
+            if type(wait_ms) is not int or not 0 <= wait_ms <= 30000:
+                raise ValueError("wait_ms must be an integer between 0 and 30000")
+            deadline = asyncio.get_running_loop().time() + wait_ms / 1000
+            while True:
+                page = self.messages.read(
+                    client, limit=req.get("limit", 20), after=req.get("after")
+                )
+                remaining = deadline - asyncio.get_running_loop().time()
+                if page["messages"] or remaining <= 0:
+                    return page
+                await self.wait_activity(client, remaining, after=req.get("after"))
         if op == "execute":
             if not self.workspace_available():
                 raise RuntimeError("The workspace moved; stop its manager and reconnect")
@@ -491,9 +560,14 @@ class Runtime:
                 self.save(rec)
                 self.history.record("execution", self.public_record(rec), event="queued")
                 self.queue.put_nowait(rec)
-            return await self.poll(rec["id"], wait_ms=req.get("wait_ms", 1000))
+            return await self.poll(rec["id"], wait_ms=req.get("wait_ms", 1000), inbox_client=client)
         if op == "poll":
-            return await self.poll(req["exec_id"], req.get("cursor") or 0, req.get("wait_ms", 1000))
+            return await self.poll(
+                req["exec_id"],
+                req.get("cursor") or 0,
+                req.get("wait_ms", 1000),
+                inbox_client=connection["client_id"] if connection else None,
+            )
         if op == "shell_start":
             job = await self.shells.start(
                 req["command"],
@@ -804,7 +878,9 @@ class Runtime:
             if req.get("op") == "attach":
                 await self.attach(reader, writer, req)
                 return
-            if req.get("op") == "mcp" and req.get("method") not in MCP_MUTATIONS:
+            if req.get("op") in {"message_read", "execute", "poll"} or (
+                req.get("op") == "mcp" and req.get("method") not in MCP_MUTATIONS
+            ):
                 operation = asyncio.create_task(self.dispatch(req))
                 disconnected = asyncio.create_task(reader.read(1))
                 try:
@@ -820,7 +896,8 @@ class Runtime:
                     result = await operation
                 finally:
                     disconnected.cancel()
-                    await asyncio.gather(disconnected, return_exceptions=True)
+                    operation.cancel()
+                    await asyncio.gather(operation, disconnected, return_exceptions=True)
             else:
                 result = await self.dispatch(req)
             response = {"ok": True, "result": result}
@@ -853,6 +930,7 @@ class Runtime:
                 async with server:
                     await self.stopping.wait()
             finally:
+                self.stopping.set()
                 server.close()
                 await server.wait_closed()
                 for rec in self.execs.values():
@@ -866,6 +944,9 @@ class Runtime:
             for writer in list(self.attachments.values()):
                 writer.close()
             self.socket.unlink(missing_ok=True)
+            if self.messages:
+                self.messages.close()
+                self.messages = None
             if self.history:
                 self.history.close()
                 self.history = None

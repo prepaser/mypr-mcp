@@ -129,6 +129,12 @@ Three tools are exposed to the agent:
   execution is allowed before `init`, since the execution ID identifies the
   target.
 
+The `init`, `execute`, and `poll` responses include a small preview of the
+current client's unacknowledged inbox. Previews contain up to five messages and
+fit within a 4 KiB JSON budget; reading a preview does not acknowledge its messages.
+Use `ws.messages.read()` to page through full messages. Before `init`, `poll`
+omits the inbox.
+
 Call `init()` before the first `execute`:
 
 ```text
@@ -186,6 +192,7 @@ skill reads, and task-handle inspection are synchronous.
 | `ws.client`, `ws.local` | Current caller identity and its in-memory scratch dictionary |
 | `ws.shell`, `ws.tasks` | Start and inspect background work |
 | `ws.mcp` | Call and reconfigure external MCP servers |
+| `ws.messages` | Send and receive persistent client messages |
 | `ws.skills`, `ws.packages` | Read skills and install kernel packages |
 | `ws.history` | Query saved execution and task records |
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
@@ -457,6 +464,46 @@ Execution details include a paged output view (continue with MCP `poll`).
 Background task details retain up to 64 KiB of output and mark truncation;
 live handles retain their normal output buffers. Logs stream cell, shell, and
 Python task output while work is running.
+
+### Client messages
+
+Every logical client has a persistent inbox in the workspace SQLite history.
+Messages remain available when the recipient is offline, across Python resets,
+and after a manager restart. The recipient must already be registered in the
+workspace, but does not need to remain connected.
+
+```python
+await ws.messages.send("bright-fox", "The review is complete.")
+ws.local["inbox"] = await ws.messages.read()
+# Handle the messages before acknowledging them.
+await ws.messages.ack([message["id"] for message in ws.local["inbox"]["messages"]])
+```
+
+`send(to, text)` uses the current logical client as the sender and accepts
+non-empty text up to 16 KiB in UTF-8. It returns `id`, `from`, `to`, `text`, and
+`created_at`; text whose JSON escaping would exceed a 32 KiB page is rejected.
+`read(limit=20, after=None, wait_ms=0)` returns
+unacknowledged messages in ID order with `messages`, `next_cursor`, and
+`has_more`. The limit is 1–100, the serialized page is at most 32 KiB, and
+`wait_ms` is limited to 30 seconds. Use the returned `next_cursor` as `after`
+to continue paging. A non-zero `wait_ms` waits only when no messages match the cursor.
+
+`ack(ids)` explicitly acknowledges messages belonging to the current client.
+Acknowledgement is idempotent, and reading or previewing a message never marks
+it as read. It returns the number newly acknowledged; unknown or foreign IDs
+reject the entire batch. These methods require an initialized client because messages are
+scoped to its logical ID.
+
+The MCP responses from `init`, `execute`, and `poll` include up to five short
+inbox previews (within a 4 KiB budget), plus the total unacknowledged count.
+The `inbox` field contains `unacked`, `messages`, and `has_more`; each preview has
+`id`, `from`, `text`, and `truncated`. Use `read()` for full text when truncated.
+Messages can end an `execute` or `poll` wait early without cancelling the cell:
+check its state and continue polling if needed. Polling another client's execution
+still returns your own inbox. Before `init`, `poll` omits the inbox.
+They do not acknowledge the previews automatically. An agent that is not
+calling an MCP tool is not woken when a message arrives; use `read(wait_ms=...)`
+from a running Python task when a bounded wait is useful.
 
 ### Skills and reusable Python
 

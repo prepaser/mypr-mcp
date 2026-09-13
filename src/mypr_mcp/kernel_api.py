@@ -609,6 +609,37 @@ class MCP:
         )
 
 
+class Messages:
+    """Persistent, client-scoped messages for workspace collaboration."""
+
+    @staticmethod
+    def _require_client() -> ClientInfo:
+        client = _client_context.get()
+        if client is None:
+            raise RPCError("ws.messages requires an initialized client")
+        return client
+
+    async def send(self, to: str, text: str) -> dict[str, Any]:
+        self._require_client()
+        return await _rpc("message_send", to=to, text=text)
+
+    async def read(
+        self,
+        limit: int = 20,
+        after: int | None = None,
+        wait_ms: int = 0,
+    ) -> dict[str, Any]:
+        self._require_client()
+        fields: dict[str, Any] = {"limit": limit, "wait_ms": wait_ms}
+        if after is not None:
+            fields["after"] = after
+        return await _rpc("message_read", **fields)
+
+    async def ack(self, ids: list[int]) -> int:
+        self._require_client()
+        return await _rpc("message_ack", ids=list(ids))
+
+
 class Packages:
     def __init__(self, tasks: TaskManager) -> None:
         self._tasks = tasks
@@ -731,6 +762,7 @@ class Workspace:
         self.tasks = TaskManager()
         self.shell = Shell(self.tasks)
         self.mcp = MCP()
+        self.messages = Messages()
         self.packages = Packages(self.tasks)
         self.skills = Skills(self.workspace)
         self.history = History()
@@ -812,6 +844,7 @@ def create_workspace(
 
 __all__ = [
     "MCP",
+    "Messages",
     "ClientInfo",
     "History",
     "NotReady",
