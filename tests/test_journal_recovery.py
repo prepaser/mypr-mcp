@@ -1,11 +1,13 @@
 import json
-from types import SimpleNamespace
 
 from mypr_mcp.runtime import Runtime
 
 
 async def test_cold_execution_poll_recovers_damaged_output(tmp_path):
-    runs = tmp_path / "runs"
+    runtime = Runtime(tmp_path)
+    runtime.generation = "new"
+    runtime.response_limit = 4096
+    runs = runtime.root / "runs"
     runs.mkdir()
     ident = "a" * 32
     (runs / f"{ident}.json").write_text(
@@ -20,7 +22,6 @@ async def test_cold_execution_poll_recovers_damaged_output(tmp_path):
     journal = runs / f"{ident}.jsonl"
     original = b'{"text":"saved"}\n{"text":"cut'
     journal.write_bytes(original)
-    runtime = SimpleNamespace(root=tmp_path, execs={}, generation="new", response_limit=4096)
     result = await Runtime.poll(runtime, ident)
     assert result["state"] == "succeeded"
     assert result["execution_generation"] == "old"

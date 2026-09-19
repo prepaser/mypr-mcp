@@ -28,6 +28,7 @@ async def test_execute_requires_init_without_creating_record(workspace: Path):
         assert rejected.is_error
         assert "Call init before execute" in " ".join(block.text for block in rejected.content)
 
+        await session.call_tool("poll", {"exec_id": "0" * 32, "wait_ms": 0})
         records = await rpc(socket_path(workspace), op="history_list", limit=100)
         assert not any(item["kind"] == "execution" for item in records["items"])
 
@@ -154,7 +155,8 @@ async def test_uninitialized_connection_does_not_count_as_client(workspace: Path
     history_path = workspace / ".mypr" / "history.sqlite3"
     before = None
     during = None
-    async with mcp_session(workspace, initialize_client=False):
+    async with mcp_session(workspace, initialize_client=False) as uninitialized:
+        await uninitialized.call_tool("poll", {"exec_id": "0" * 32, "wait_ms": 0})
         with sqlite3.connect(history_path) as database:
             before = database.execute("SELECT COUNT(*) FROM client_ids").fetchone()[0]
         async with mcp_session(workspace) as initialized:

@@ -26,6 +26,8 @@ from .history import History
 from .journal import append_events, read_page
 from .managed_commands import ManagedCommands
 from .messages import MessageStore
+from .protocol import descriptor, runtime_info
+from .restart_records import poll_restart
 from .scan_service import ScanService
 from .search import Search
 from .services import MCPBridge, Shells
@@ -57,6 +59,7 @@ class Runtime:
         self.shell_watchers = set()
         self.stopping = asyncio.Event()
         self.resetting = False
+        self.restarting = None
         self.healthy = False
         self.health_error = None
         self.km = None
@@ -66,6 +69,7 @@ class Runtime:
         self.replies = None
         self.by_msg = {}
         self.control_waiters = {}
+        self.submit_waiters = {}
         self.monitor = None
         self.config = {}
         config = self.root / "config.toml"
@@ -184,7 +188,7 @@ class Runtime:
         for path in (self.root / "runs").glob("*.json"):
             try:
                 old = json.loads(path.read_text())
-                if old["state"] not in TERMINAL:
+                if old["state"] not in TERMINAL and old["state"] != "restarting":
                     old.update(state="lost", error="Manager stopped before completion")
                     path.write_text(json.dumps(old))
                 old.setdefault("client_id", old.get("client") or "legacy")
@@ -326,7 +330,13 @@ class Runtime:
                 self.active[rec["id"]] = rec
                 self.save(rec)
                 self.history.record("execution", self.public_record(rec), event="running")
-                self.kc.shell_channel.send(msg)
+                submitted = asyncio.get_running_loop().create_future()
+                self.submit_waiters[rec["msg_id"]] = submitted
+                try:
+                    self.kc.shell_channel.send(msg)
+                    await submitted
+                finally:
+                    self.submit_waiters.pop(rec["msg_id"], None)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -336,6 +346,9 @@ class Runtime:
         while True:
             reply = await self.kc.get_shell_msg()
             ident = reply.get("parent_header", {}).get("msg_id")
+            accepted = self.submit_waiters.get(ident)
+            if accepted is not None and not accepted.done():
+                accepted.set_result(None)
             waiter = self.control_waiters.get(ident)
             if waiter is not None:
                 if not waiter.done():
@@ -507,6 +520,9 @@ class Runtime:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def poll(self, ident, cursor=0, wait_ms=1000, *, inbox_client=None):
+        restarted = await asyncio.to_thread(poll_restart, self.workspace, ident, cursor)
+        if restarted is not None:
+            return {**restarted, "generation": self.generation}
         cold = ident not in self.execs
         if cold:
             if len(ident) != 32 or any(c not in "0123456789abcdef" for c in ident):
@@ -594,6 +610,15 @@ class Runtime:
         requested_client = req.pop("client_id", None)
         connection_id = req.pop("connection_id", None)
         connection = self.clients.get(connection_id)
+        if self.restarting and op in {
+            "execute",
+            "reset",
+            "shell_start",
+            "packages_add",
+            "scan_start",
+            "browser_server",
+        }:
+            raise RuntimeError(f"Workspace is restarting: {self.restarting}")
         if self.stopping.is_set() and op in {
             "init",
             "execute",
@@ -627,7 +652,13 @@ class Runtime:
                 ]
                 connections.append(dict(info, active=active, task_ids=owned))
             return {
-                "version": __version__,
+                **descriptor(),
+                **(
+                    runtime_info(descriptor(), connection["target"]["version"])
+                    if connection and connection.get("target")
+                    else {}
+                ),
+                "restarting": self.restarting,
                 "pid": os.getpid(),
                 "workspace_id": self.workspace_id,
                 "workspace": str(self.workspace),
@@ -1066,6 +1097,59 @@ class Runtime:
             if event["state"] in TERMINAL:
                 self.retain_completed("python", record)
             return None
+        if op == "restart":
+            from .restart import request_restart
+
+            current = self.execs.get(req.get("exec_id"))
+            if (
+                current is None
+                or current["state"] in TERMINAL
+                or current["generation"] != self.generation
+                or current.get("connection_id") != connection_id
+                or generation != self.generation
+            ):
+                raise RuntimeError("Restart must originate from a running foreground cell")
+            if self.restarting or self.resetting:
+                raise RuntimeError(
+                    f"Workspace restart/reset already in progress: {self.restarting}"
+                )
+            force = req.get("force", False)
+            if type(force) is not bool:
+                raise TypeError("force must be a boolean")
+            self._check_restart_busy(current, force)
+            target = self.clients.get(connection_id, {}).get("target")
+            if target is None:
+                raise RuntimeError(
+                    "This MCP connection cannot restart; reconnect using the new client"
+                )
+            origin = {
+                "exec_id": current["id"],
+                "client_id": client,
+                "connection_id": connection_id,
+                "generation": self.generation,
+                "request_id": current.get("request_id"),
+            }
+            ticket = await request_restart(self.workspace, target, force=force, origin=origin)
+            self._reserve_restart(ticket["id"], current)
+            return {"accepted": True, "restart_id": ticket["id"]}
+        if op == "restart_prepare":
+            from .restart import read_ticket
+
+            ident = req.get("restart_id")
+            ticket = read_ticket(self.workspace, ident)
+            if (
+                not ticket
+                or ticket.get("old_pid") != os.getpid()
+                or ticket.get("old_generation") != self.generation
+            ):
+                raise RuntimeError("Expired restart request")
+            if self.resetting or (self.restarting and self.restarting != ident):
+                raise RuntimeError("Workspace restart/reset already in progress")
+            origin = ticket.get("origin") or {}
+            current = self.execs.get(origin.get("exec_id"))
+            self._check_restart_busy(current, ticket.get("force", False))
+            self._reserve_restart(ident, current)
+            return {"prepared": True, "restart_id": ident}
         if op == "reset":
             from_kernel = req.get("from_kernel", False)
             current = self.execs.get(req.get("exec_id")) if from_kernel else None
@@ -1094,20 +1178,95 @@ class Runtime:
             await self.reset(None)
             return {"generation": self.generation, "reset": True}
         if op == "stop":
+            restart_id = req.get("restart_id")
+            planned = restart_id is not None and restart_id == self.restarting
+            if restart_id is not None and not planned:
+                raise RuntimeError("Restart reservation does not match")
+            if planned:
+                origin = next(
+                    (rec for rec in self.execs.values() if rec.get("restart_id") == restart_id),
+                    None,
+                )
+                if origin is not None:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(origin["idle"].wait(), 3)
             if req.get("manager_pid", os.getpid()) != os.getpid():
                 raise RuntimeError("Workspace manager changed before stop")
-            if not req.get("force") and (
-                any(rec["state"] not in TERMINAL for rec in self.execs.values())
-                or any(
-                    rec["kind"] == "python" and rec["state"] not in TERMINAL
-                    for rec in self.task_records.values()
+            if (
+                not planned
+                and not req.get("force")
+                and (
+                    any(rec["state"] not in TERMINAL for rec in self.execs.values())
+                    or any(
+                        rec["kind"] == "python" and rec["state"] not in TERMINAL
+                        for rec in self.task_records.values()
+                    )
+                    or self.shells.active
                 )
-                or self.shells.active
             ):
                 raise RuntimeError("Workspace has active work; pass --force")
             self.stopping.set()
             return {"stopping": True, "pid": os.getpid()}
         raise ValueError(f"Unknown operation: {op}")
+
+    def _check_restart_busy(self, current, force):
+        if not force and (
+            any(rec is not current and rec["state"] not in TERMINAL for rec in self.execs.values())
+            or (
+                current is None
+                and any(
+                    rec["kind"] == "python" and rec["state"] not in TERMINAL
+                    for rec in self.task_records.values()
+                )
+            )
+            or self.shells.active
+        ):
+            raise RuntimeError("Workspace has active work; pass force=True to restart")
+
+    def _reserve_restart(self, ident, current):
+        if current is not None:
+            current.update(restart_id=ident, state="restarting")
+            self.save(current)
+        if self.restarting != ident:
+            self.restarting = ident
+            self.spawn(self._watch_restart(ident, current))
+
+    async def _watch_restart(self, ident, current):
+        from .restart import active_ticket, recover_ticket, wait_ticket
+
+        try:
+            while True:
+                try:
+                    ticket = await wait_ticket(self.workspace, ident)
+                    break
+                except TimeoutError:
+                    if active_ticket(self.workspace) is not None:
+                        continue
+                    ticket = await recover_ticket(self.workspace)
+                    if ticket is None or ticket.get("state") != "failed":
+                        raise
+                except Exception:
+                    if active_ticket(self.workspace) is not None:
+                        await asyncio.sleep(0.1)
+                        continue
+                    ticket = await recover_ticket(self.workspace)
+                    if ticket is None or ticket.get("state") != "failed":
+                        raise
+            if ticket["state"] == "failed" and not self.stopping.is_set():
+                if current is not None:
+                    saved = json.loads((self.root / "runs" / f"{current['id']}.json").read_text())
+                    current.update(
+                        {
+                            key: saved[key]
+                            for key in ("restart_finalized", "restart_result")
+                            if key in saved
+                        }
+                    )
+                    self.finish(current, "failed", ticket.get("error"))
+                if self.restarting == ident:
+                    self.restarting = None
+        except Exception as exc:
+            self.health_error = f"Restart monitoring failed: {safe_error(exc)}"
 
     async def reset(self, current):
         try:
@@ -1261,6 +1420,14 @@ class Runtime:
             connected_at=time.time(),
             last_activity=time.time(),
         )
+        target = req.get("target")
+        if target is not None:
+            if not isinstance(target, dict) or any(
+                not isinstance(target.get(key), str)
+                for key in ("python", "package_root", "version")
+            ):
+                raise ValueError("Invalid MCP installation descriptor")
+            info["target"] = target
         self.clients[connection_id] = info
         self.attachments[connection_id] = writer
         try:
@@ -1425,19 +1592,25 @@ class Runtime:
                 await self.start_kernel()
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     asyncio.get_running_loop().add_signal_handler(sig, self.stopping.set)
-                async with server:
-                    await self.stopping.wait()
+                await self.stopping.wait()
             finally:
                 self.stopping.set()
                 server.close()
-                await server.wait_closed()
+                for writer in list(self.attachments.values()):
+                    writer.close()
                 for rec in list(self.execs.values()):
-                    if rec["state"] not in TERMINAL:
-                        self.finish(rec, "lost", "Manager stopped")
+                    if rec["state"] not in TERMINAL and not rec.get("restart_id"):
+                        self.finish(
+                            rec,
+                            "cancelled" if self.restarting else "lost",
+                            "Workspace restarted" if self.restarting else "Manager stopped",
+                        )
                 await self.close_kernel()
                 self.lose_python_tasks("Manager stopped")
                 await self.close_shells()
                 await self.mcp.close()
+                server.close_clients()
+                await server.wait_closed()
         finally:
             for writer in list(self.attachments.values()):
                 writer.close()

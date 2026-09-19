@@ -12,12 +12,12 @@ from mypr_mcp.transport import find_runtime, manager_running, socket_path, works
 
 
 @asynccontextmanager
-async def legacy_manager(workspace):
+async def legacy_manager(workspace, version="0.3.0"):
     root = workspace / ".mypr"
     root.mkdir(exist_ok=True)
     key = hashlib.sha256(os.fsencode(workspace.resolve())).hexdigest()[:32]
     path = socket_path(workspace).with_name(f"{key}.sock")
-    state = {"version": "0.3.0", "generation": "legacy-generation"}
+    state = {"version": version, "generation": "legacy-generation"}
     metadata = dict(state, workspace=str(workspace), socket=str(path))
     (root / "runtime.json").write_text(json.dumps(metadata))
     lock = (root / "manager.lock").open("a")
@@ -46,7 +46,7 @@ async def legacy_manager(workspace):
 async def test_legacy_socket_is_discovered_but_not_silently_upgraded(workspace):
     async with legacy_manager(workspace) as expected:
         assert await find_runtime(workspace) == expected
-        with pytest.raises(RuntimeError, match="version mismatch"):
+        with pytest.raises(RuntimeError, match="Incompatible workspace protocol"):
             await ensure(workspace)
 
 
@@ -85,3 +85,9 @@ async def test_other_runtime_directory_finds_existing_manager(workspace, monkeyp
         assert found[0] == original
         assert found[1]["workspace_id"] == workspace_id(workspace)
         assert await ensure(workspace) == original
+
+
+async def test_known_legacy_manager_is_reused_without_restart(workspace):
+    async with legacy_manager(workspace, version="0.9.0") as (path, state):
+        assert await ensure(workspace) == path
+        assert (await find_runtime(workspace))[1]["generation"] == state["generation"]

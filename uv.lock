@@ -538,13 +538,14 @@ wheels = [
 
 [[package]]
 name = "mypr-mcp"
-version = "0.8.1"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx2", extra = ["http2", "socks"] },
     { name = "ipykernel" },
     { name = "jupyter-client" },
     { name = "mcp" },
+    { name = "packaging" },
     { name = "playwright" },
     { name = "pyyaml" },
     { name = "tomlkit" },
@@ -563,6 +564,7 @@ requires-dist = [
     { name = "ipykernel", specifier = ">=7.3,<8" },
     { name = "jupyter-client", specifier = ">=8.10,<9" },
     { name = "mcp", specifier = ">=2.2,<3" },
+    { name = "packaging", specifier = ">=26,<27" },
     { name = "playwright", specifier = ">=1.58,<2" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "tomlkit", specifier = ">=0.15,<1" },

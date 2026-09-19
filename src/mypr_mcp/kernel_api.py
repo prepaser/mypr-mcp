@@ -1663,6 +1663,28 @@ class Workspace:
             await asyncio.gather(*(handle.cancel() for handle in active), return_exceptions=True)
         raise ResetRequested(result)
 
+    async def restart(self, force: bool = False) -> Any:
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
+        exec_id = _exec_context.get()
+        current = self.tasks._handles.get(exec_id)
+        if (
+            _output_buffer.get() is not None
+            or current is None
+            or getattr(current, "_task", None) is not asyncio.current_task()
+        ):
+            raise RuntimeError("Request restart from a foreground Python cell")
+        active = [handle for handle in self.tasks.active() if handle.id != exec_id]
+        if active and not force:
+            raise RuntimeError("Workspace has active tasks; pass force=True to restart")
+        result = await _rpc(
+            "restart",
+            force=force,
+            exec_id=exec_id,
+            generation=os.environ.get("MYPR_GENERATION"),
+        )
+        raise ResetRequested(result)
+
     def inspect(self) -> dict[str, Any]:
         namespace = self._namespace.items() if self._namespace is not None else ()
         values = {

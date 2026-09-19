@@ -4,7 +4,7 @@ version = "0.9.0"
 description = "A persistent, workspace-shared Python environment for MCP agents"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["mcp>=2.2,<3", "ipykernel>=7.3,<8", "jupyter-client>=8.10,<9", "pyyaml>=6,<7", "tomlkit>=0.15,<1", "httpx2[http2,socks]>=2.12,<3", "playwright>=1.58,<2"]
+dependencies = ["mcp>=2.2,<3", "ipykernel>=7.3,<8", "jupyter-client>=8.10,<9", "pyyaml>=6,<7", "tomlkit>=0.15,<1", "httpx2[http2,socks]>=2.12,<3", "playwright>=1.58,<2", "packaging>=26,<27"]
 
 [project.scripts]
 mypr-mcp = "mypr_mcp.cli:main"

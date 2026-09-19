@@ -37,7 +37,7 @@ For clients using `mcpServers` JSON configuration:
 ```
 
 Make sure `uvx` is on the client's `PATH`, or use its absolute executable path.
-To pin a version, use `mypr-mcp@0.7.0` as the first argument.
+To pin a version, use `mypr-mcp@<version>` as the first argument.
 
 ### Codex
 
@@ -204,6 +204,7 @@ skill reads, and task-handle inspection are synchronous.
 | `ws.history` | Query saved execution and task records |
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
+| `await ws.restart()` | Replace the manager and kernel with this installation; see [Reset and lifecycle](#reset-and-lifecycle) |
 
 Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths
 stay anchored to the workspace even if code changes the kernel's current directory:
@@ -938,6 +939,40 @@ a manager restart also retains request deduplication. A newly allocated ID
 starts a separate request-ID scope; use history to check earlier executions
 before retrying an uncertain operation.
 
+`reset` only resets shared kernel memory. It does not update the installed
+package or replace the manager process. Globals, imports, functions, `ws.local`,
+and in-memory handles are lost; files, skills, modules, the package environment,
+messages, history, and saved task output remain.
+
+Use `await ws.restart()` when a running workspace must apply the installation
+that made the request. This replaces the manager and kernel through a detached
+workspace coordinator, then reconnects planned MCP clients. It is explicit:
+package resolution and downloads belong to the command that launched the client
+(for example, `uvx mypr-mcp@latest`); restart does not resolve a new version from
+the network by itself. The default refuses while another cell, shell, scan,
+package job, or Python task is active. Use `await ws.restart(force=True)` to
+cancel active work first. The restart call's execution result is recorded and
+can be retrieved with `poll`; its Python code is never replayed.
+
+The equivalent CLI command is:
+
+```sh
+cd /absolute/path/to/workspace
+uvx mypr-mcp@latest restart
+# Use --force only when cancelling active work is intended.
+uvx mypr-mcp@latest restart --force
+```
+
+The new manager starts only after the old one exits and passes its health check.
+The coordinator records its ID, phase, old and new generation, target
+installation, and failure details under `.mypr/`. A failed start is reported
+without automatic rollback or an unbounded restart loop; inspect
+`.mypr/manager.log`, `uvx` diagnostics, and the restart record before retrying.
+External browser processes and pre-existing tabs remain owned by their launcher.
+Managed resources close during a normal replacement. In-memory Python state is
+always lost, while files, skills, modules, the package environment, messages,
+history, saved output, and completed scan records persist.
+
 The CLI also provides operational controls. Run them from the workspace:
 
 ```sh
@@ -946,6 +981,7 @@ uvx mypr-mcp status
 uvx mypr-mcp logs
 uvx mypr-mcp logs --limit 50 --follow
 uvx mypr-mcp reset
+uvx mypr-mcp restart
 uvx mypr-mcp stop
 ```
 
@@ -957,9 +993,25 @@ The commands are local administration commands, not MCP tools. `reset` and
 `stop` reject active work unless `--force` is supplied.
 CLI `stop` reports success only after the original manager exits, so it is safe
 to reconnect immediately. Shutdown taking more than 30 seconds reports an error.
-Status includes the manager `pid` and a `health_error` when an essential runtime
-worker fails. Such a failure marks unfinished executions lost and rejects new
-executions until an explicit reset; Python code is never automatically replayed.
+Status includes the manager `pid`, `protocol_version`, manager and client
+installation versions, capabilities, `update_pending`, and a `health_error`
+when an essential runtime worker fails. Compatible package versions reuse the
+existing manager and kernel, so installing a newer `uvx` package alone does not
+clear Python memory. A protocol mismatch or an unknown legacy manager is
+reported through initialization with an actionable restart instruction rather
+than being hidden as a generic MCP handshake failure. The legacy 0.9.0 runtime
+has no `ws.restart()`; run the CLI `restart` once from the new installation to
+perform the first explicit replacement.
+
+Automatic reconnection requires the updated MCP frontend; older frontend processes
+must be reopened once after installation.
+
+Planned restart keeps the MCP stdio connection alive. After replacement, the
+connection receives a new connection ID and generation and rebinds its existing
+logical client ID. Other clients reconnect the same way. No submitted cell is
+replayed; use its recorded execution ID with `poll`. An ordinary crash,
+unplanned stop, or unreachable runtime does not trigger this reconnect path:
+unfinished executions become `lost`, and Python memory must be recreated.
 
 Shell/package commands and local stdio MCP servers run through a supervisor.
 The supervisor's Python interpreter ignores Python-specific environment
@@ -1040,9 +1092,11 @@ excludes the virtual environment, run records, artifacts, locks, logs, and
 the SQLite history, and other runtime metadata; reusable modules, skills, configuration, and
 `requirements.txt` remain available for version control as desired.
 
-When upgrading, explicitly stop an older manager before reconnecting with the
-new version. Running managers are not silently replaced. Existing execution files
-are imported into history; legacy client IDs remain attached to those records.
+When upgrading, launching a newer compatible package is enough to reconnect to
+an existing manager; running managers are not silently replaced. Use the
+explicit `restart` command or `ws.restart()` when the new code must be loaded.
+Existing execution files are imported into history, and logical client IDs remain
+attached to those records.
 
 ## Development and publishing
 

@@ -150,13 +150,10 @@ async def test_history_task_read_preserves_generation_and_owner_metadata(tmp_pat
     history_id = "python:oldgen:task-1"
     history.record("python", record, entity_id=history_id)
     (root / ".mypr" / "runs").mkdir(parents=True)
-    runtime = Runtime.__new__(Runtime)
+    runtime = Runtime(root)
     runtime.history = history
-    runtime.root = root / ".mypr"
     runtime.output_limit = 1024 * 1024
     runtime.response_limit = 32768
-    runtime.stopping = asyncio.Event()
-    runtime.clients = {}
     journal = runtime.task_journal_path(record)
     append_events(journal, [{"type": "stream", "stream": "stdout", "text": "saved"}])
 

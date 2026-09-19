@@ -98,6 +98,7 @@ class Attachment:
         self.reader = reader
         self.writer = writer
         self.closed = asyncio.Event()
+        self.status = None
         self._watcher: asyncio.Task[None] | None = None
 
     async def wait_closed(self) -> None:
@@ -125,6 +126,8 @@ class Attachment:
 async def attachment(
     path: Path | str,
     connection_id: str,
+    *,
+    target: dict | None = None,
 ):
     """Attach a client and keep its manager connection open until shutdown."""
     reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_MESSAGE)
@@ -134,6 +137,7 @@ async def attachment(
                 {
                     "op": "attach",
                     "connection_id": connection_id,
+                    **({"target": target} if target is not None else {}),
                 },
                 separators=(",", ":"),
             ).encode()
@@ -147,6 +151,7 @@ async def attachment(
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "Workspace manager attach failed"))
         attached = Attachment(reader, writer)
+        attached.status = response.get("result")
         attached._watcher = asyncio.create_task(attached._watch())
         yield attached
     finally:
