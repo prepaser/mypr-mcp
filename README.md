@@ -704,14 +704,16 @@ are imported into history; legacy client IDs remain attached to those records.
 For development, run `uv sync` in the checkout, then launch its
 `.venv/bin/mypr-mcp` executable from the target workspace.
 
-To publish a release, update the package version and build the distributions:
+To publish a release, update the package version, remove previous distributions,
+and rebuild:
 
 ```sh
+rm -f dist/mypr_mcp-*.whl dist/mypr_mcp-*.tar.gz
 uv build --no-sources
 uv publish
 ```
 
-`uv publish` uploads the distributions in `dist/` to PyPI. Ensure that directory
-contains only the intended release artifacts. Authenticate with `UV_PUBLISH_TOKEN`
+`uv publish` uploads the distributions in `dist/` to PyPI; individual filenames
+are unnecessary when it contains only the intended release. Authenticate with `UV_PUBLISH_TOKEN`
 or configure Trusted Publishing for CI. See the
 [uv publishing guide](https://docs.astral.sh/uv/guides/package/).
