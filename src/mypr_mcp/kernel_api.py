@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import inspect
 import io
@@ -18,9 +19,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .browser_tools import BrowserTools
 from .diagnostics import safe_error, safe_error_details
 from .filesystem import Filesystem
+from .http_tools import HTTPTools
+from .locks import WorkspaceLocks
+from .modules import ModuleManager
+from .network_tools import NetworkTools
+from .skill_tools import SkillsWriting
 from .terminal import validate_size as _terminal_size
+from .workspace_tools import Git
 
 _output_buffer: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
     "mypr_task_output", default=None
@@ -65,6 +73,10 @@ class NotReady(RuntimeError):
 
 class RPCError(RuntimeError):
     """An error returned by the workspace manager."""
+
+
+class ResultUnavailable(RPCError):
+    """Raised when a persisted task cannot restore its Python return value."""
 
 
 class ResetRequested(BaseException):
@@ -114,13 +126,21 @@ class OutputBuffer:
         self._text = io.StringIO()
         self.size = 0
         self.truncated = False
+        self.changed = asyncio.Event()
+        self._streams: dict[str, io.StringIO] = {}
+        self._stream_truncated: dict[str, bool] = {}
+        self._labels = bytearray()
 
-    def write(self, value: str) -> int:
+    def write(self, value: str, *, stream: str | None = None) -> int:
+        stream = "stderr" if stream == "stderr" else "stdout"
         if not value:
             return 0
         remaining = self.limit - self.size
         if remaining <= 0:
             self.truncated = True
+            if stream in {"stdout", "stderr"}:
+                self._stream_truncated[stream] = True
+            self.changed.set()
             return len(value)
         raw = value.encode("utf-8", "replace")
         if len(raw) > remaining:
@@ -131,10 +151,53 @@ class OutputBuffer:
         else:
             self._text.write(raw.decode("utf-8"))
             self.size += len(raw)
+        label = 1 if stream == "stderr" else 0
+        kept = raw[:remaining].decode("utf-8", "ignore")
+        self._labels.extend(bytes([label]) * len(kept))
+        if stream in {"stdout", "stderr"}:
+            target = self._streams.setdefault(stream, io.StringIO())
+            target.write(kept)
+            if len(raw) > remaining:
+                self._stream_truncated[stream] = True
+        self.changed.set()
         return len(value)
 
-    def get(self) -> str:
+    def get(self, stream: str | None = None) -> str:
+        if stream in {"stdout", "stderr"}:
+            return self._streams.setdefault(stream, io.StringIO()).getvalue()
         return self._text.getvalue()
+
+    def view(self, stream: str) -> OutputBufferView:
+        return OutputBufferView(self, stream)
+
+    def segments(self, cursor: int = 0, limit: int = 8192) -> list[tuple[str, str]]:
+        text = self.get()
+        end = min(len(text), cursor + limit)
+        if cursor < 0 or cursor > len(text):
+            raise ValueError("invalid output cursor")
+        result: list[tuple[str, str]] = []
+        while cursor < end:
+            label = self._labels[cursor] if cursor < len(self._labels) else 0
+            next_pos = cursor + 1
+            while next_pos < end and self._labels[next_pos] == label:
+                next_pos += 1
+            result.append(("stderr" if label == 1 else "stdout", text[cursor:next_pos]))
+            cursor = next_pos
+        return result
+
+
+class OutputBufferView:
+    def __init__(self, parent: OutputBuffer, stream: str) -> None:
+        self._parent = parent
+        self._stream = stream
+        self.changed = parent.changed
+
+    def get(self) -> str:
+        return self._parent.get(self._stream)
+
+    @property
+    def truncated(self) -> bool:
+        return self._parent._stream_truncated.get(self._stream, False)
 
 
 class MultiplexStream:
@@ -146,10 +209,12 @@ class MultiplexStream:
     def write(self, value: str) -> int:
         buffer = _output_buffer.get()
         if buffer is not None:
-            return buffer.write(value)
+            name = getattr(self.stream, "name", None)
+            return buffer.write(value, stream=name if name in {"stdout", "stderr"} else None)
         cell = _cell_output.get()
         if cell is not None:
-            cell.write(value)
+            name = getattr(self.stream, "name", None)
+            cell.write(value, stream=name if name in {"stdout", "stderr"} else None)
         return self.stream.write(value)
 
     def flush(self) -> None:
@@ -241,10 +306,12 @@ class TaskHandle:
         self._cancel_requested = False
         self._client = _client_context.get()
         self._exec_id = _exec_context.get()
+        self._generation = os.environ.get("MYPR_GENERATION", "local")
         self._task.add_done_callback(self._finished)
 
     def _finished(self, task: asyncio.Task[Any]) -> None:
         self._finished_at = time.time()
+        self._buffer.changed.set()
         if task.cancelled():
             if not self._run_state["started"] and inspect.iscoroutine(self._source):
                 self._source.close()
@@ -282,6 +349,208 @@ class TaskHandle:
                 "truncated": self._buffer.truncated,
             }
         return text
+
+    def _output_buffer_for(self, stream: str | None) -> OutputBuffer:
+        if stream not in (None, "all", "stdout", "stderr"):
+            raise ValueError("stream must be 'all', 'stdout', or 'stderr'")
+        if stream in {"stdout", "stderr"} and hasattr(self._buffer, "view"):
+            return self._buffer.view(stream)
+        return self._buffer
+
+    def _cursor_generation(self) -> str:
+        return getattr(self, "_generation", os.environ.get("MYPR_GENERATION", "local"))
+
+    def _encode_output_cursor(self, stream: str, offset: int) -> str:
+        payload = json.dumps(
+            {
+                "v": 1,
+                "id": self.id,
+                "generation": self._cursor_generation(),
+                "stream": stream,
+                "offset": offset,
+            },
+            separators=(",", ":"),
+        ).encode()
+        return "mypr1." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+    def _decode_output_cursor(self, cursor: str | None, stream: str) -> int:
+        if cursor is None:
+            return 0
+        if not isinstance(cursor, str) or not cursor.startswith("mypr1."):
+            raise ValueError("invalid output cursor")
+        try:
+            raw = base64.urlsafe_b64decode(cursor[6:] + "=" * (-len(cursor[6:]) % 4))
+            value = json.loads(raw)
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid output cursor") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("v") != 1
+            or value.get("id") != self.id
+            or value.get("generation") != self._cursor_generation()
+            or value.get("stream") != stream
+            or type(value.get("offset")) is not int
+            or value["offset"] < 0
+        ):
+            raise ValueError("output cursor does not belong to this task")
+        return value["offset"]
+
+    @staticmethod
+    def _page_text(text: str, offset: int, max_bytes: int) -> tuple[str, int]:
+        raw = text.encode("utf-8")
+        if offset > len(raw):
+            raise ValueError("invalid output cursor")
+        try:
+            raw[:offset].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid output cursor") from exc
+        if max_bytes == 0:
+            return "", offset
+        page = raw[offset : offset + max_bytes]
+        value = page.decode("utf-8", "ignore")
+        if not value and page:
+            raise ValueError("max_bytes is too small for the next UTF-8 character")
+        consumed = len(value.encode("utf-8"))
+        return value, offset + consumed
+
+    async def read(
+        self,
+        cursor: str | None = None,
+        *,
+        stream: str | None = None,
+        max_bytes: int = 32768,
+        wait_ms: int = 0,
+    ) -> dict[str, Any]:
+        if type(max_bytes) is not int or not 0 <= max_bytes <= RPC_LIMIT:
+            raise ValueError("max_bytes must be an integer between 0 and the RPC limit")
+        if type(wait_ms) is not int or not 0 <= wait_ms <= 30000:
+            raise ValueError("wait_ms must be an integer between 0 and 30000")
+        selected = "all" if stream is None else stream
+        buffer = self._output_buffer_for(stream)
+        offset = self._decode_output_cursor(cursor, selected)
+        deadline = time.monotonic() + wait_ms / 1000
+        while True:
+            text, next_offset = self._page_text(buffer.get(), offset, max_bytes)
+            status = self.status()
+            terminal = status.get("status") in {"succeeded", "failed", "cancelled", "lost"}
+            if text or terminal or wait_ms == 0 or time.monotonic() >= deadline:
+                result = {
+                    "id": self.id,
+                    "output": text,
+                    "cursor": self._encode_output_cursor(selected, next_offset),
+                    "has_more": next_offset < len(buffer.get().encode("utf-8")),
+                    "state": status.get("status"),
+                    "truncated": bool(getattr(buffer, "truncated", False)),
+                }
+                if status.get("warnings"):
+                    result["warnings"] = list(status["warnings"])
+                if status.get("error"):
+                    result["error"] = status["error"]
+                return result
+            changed = buffer.changed
+            changed.clear()
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                continue
+            try:
+                await asyncio.wait_for(changed.wait(), remaining)
+            except TimeoutError:
+                pass
+
+    async def expect(
+        self,
+        pattern: str,
+        cursor: str | None = None,
+        *,
+        stream: str | None = None,
+        regex: bool = False,
+        timeout: float = 30,  # noqa: ASYNC109
+        max_scan_bytes: int = 65536,
+    ) -> dict[str, Any]:
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError("pattern must be a non-empty string")
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout < 0
+            or not math.isfinite(timeout)
+        ):
+            raise ValueError("timeout must be a finite non-negative number")
+        if type(max_scan_bytes) is not int or max_scan_bytes < 0:
+            raise ValueError("max_scan_bytes must be a non-negative integer")
+        selected = "all" if stream is None else stream
+        buffer = self._output_buffer_for(stream)
+        origin = self._decode_output_cursor(cursor, selected)
+        deadline = time.monotonic() + min(timeout, 30)
+        expression = re.compile(pattern) if regex else None
+        while True:
+            text = buffer.get()
+            raw = text.encode("utf-8")
+            available = raw[origin : origin + max_scan_bytes].decode("utf-8", "ignore")
+            match = expression.search(available) if expression else None
+            if not regex:
+                found = available.find(pattern)
+                if found >= 0:
+                    match_end = found + len(pattern)
+                else:
+                    match_end = -1
+            elif match is not None:
+                match_end = match.end()
+            else:
+                match_end = -1
+            if match_end >= 0:
+                consumed = len(available[:match_end].encode("utf-8"))
+                return {
+                    "id": self.id,
+                    "matched": True,
+                    "reason": "match",
+                    "match": (match.group(0) if regex else pattern),
+                    "cursor": self._encode_output_cursor(selected, origin + consumed),
+                    "scanned_cursor": self._encode_output_cursor(
+                        selected, origin + len(available.encode("utf-8"))
+                    ),
+                    "state": self.status().get("status"),
+                }
+            if len(raw) - origin > max_scan_bytes:
+                return {
+                    "id": self.id,
+                    "matched": False,
+                    "reason": "limit",
+                    "cursor": self._encode_output_cursor(selected, origin),
+                    "scanned_cursor": self._encode_output_cursor(
+                        selected, origin + len(available.encode("utf-8"))
+                    ),
+                    "state": self.status().get("status"),
+                }
+            status = self.status()
+            if status.get("status") in {"succeeded", "failed", "cancelled", "lost"}:
+                return {
+                    "id": self.id,
+                    "matched": False,
+                    "reason": "eof",
+                    "cursor": self._encode_output_cursor(selected, origin),
+                    "scanned_cursor": self._encode_output_cursor(
+                        selected, origin + len(available.encode("utf-8"))
+                    ),
+                    "state": status.get("status"),
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "id": self.id,
+                    "matched": False,
+                    "reason": "timeout",
+                    "cursor": self._encode_output_cursor(selected, origin),
+                    "scanned_cursor": self._encode_output_cursor(
+                        selected, origin + len(available.encode("utf-8"))
+                    ),
+                    "state": status.get("status"),
+                }
+            changed = buffer.changed
+            changed.clear()
+            try:
+                await asyncio.wait_for(changed.wait(), max(0.0, deadline - time.monotonic()))
+            except TimeoutError:
+                pass
 
     def result(self) -> Any:
         if not self._task.done():
@@ -331,10 +600,8 @@ class TaskHandle:
             await publish("running")
         cursor = 0
         while True:
-            text = self.output()
-            while cursor < len(text):
-                chunk = text[cursor : cursor + 8192]
-                await publish("running", output_delta=chunk)
+            for name, chunk in self._buffer.segments(cursor):
+                await publish("running", output_delta=chunk, output_stream=name)
                 cursor += len(chunk)
             if self._task.done():
                 break
@@ -408,6 +675,8 @@ class TaskManager:
             self._explicit_ids.add(handle.id)
 
     def _completed_handle(self, handle: TaskHandle) -> None:
+        if handle.status()["status"] not in {"succeeded", "failed", "cancelled", "lost", "reset"}:
+            return
         task = getattr(handle, "_task", None)
         if task is not None and not task.done():
             return
@@ -504,6 +773,218 @@ class TaskManager:
         except KeyError as exc:
             raise KeyError(f"unknown task: {task_id}") from exc
 
+    async def attach(self, task_id: str) -> TaskHandle:
+        """Attach to a live handle or a persisted workspace task record."""
+
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task ID must be a non-empty string")
+        current = self._handles.get(task_id)
+        if current is not None:
+            return current
+        if task_id.startswith("python:"):
+            parts = task_id.split(":", 2)
+            if len(parts) == 3:
+                current = self._handles.get(parts[2])
+                if current is not None and getattr(current, "_generation", None) == parts[1]:
+                    return current
+        record = await _rpc("history_get", id=task_id)
+        if not isinstance(record, Mapping):
+            raise RPCError("invalid persisted task record")
+        kind = record.get("kind")
+        current = self._handles.get(str(record.get("id")))
+        if current is not None and (
+            kind in {"shell", "package", "scan"}
+            or getattr(current, "_generation", None) == record.get("generation")
+        ):
+            return current
+        if kind in {"shell", "package", "scan"}:
+            if kind == "scan":
+                from .scan_api import make_scan_task
+
+                handle = make_scan_task(str(record["id"]), self, _rpc)
+            else:
+                handle = RemoteTask(str(record["id"]), self)
+            handle._generation = str(record.get("generation") or handle._cursor_generation())
+            handle._created = record.get("created", handle._created)
+            handle._exec_id = record.get("exec_id")
+            handle._client = (
+                ClientInfo(str(record["client_id"]), record.get("connection_id"))
+                if record.get("client_id") is not None
+                else None
+            )
+            self._handles[task_id] = handle
+            return handle
+        if kind in {"python", "execution"}:
+            return HistoricalTask(record)
+        raise ValueError(f"task {task_id!r} is not attachable")
+
+
+class HistoricalTask(TaskHandle):
+    """Read-only handle backed by a persisted Python task record."""
+
+    def __init__(self, record: Mapping[str, Any]) -> None:
+        self.id = str(record["id"])
+        self._task = None
+        self._source = None
+        self._buffer = OutputBuffer()
+        self._streams = {name: OutputBuffer() for name in ("stdout", "stderr")}
+        self._history_lock = asyncio.Lock()
+        self._generation = str(record.get("generation") or "local")
+        self._created = float(record.get("created", time.time()))
+        self._finished_at = record.get("finished") or record.get("finished_at")
+        self._cancel_requested = False
+        self._remote_has_more = False
+        self._client = (
+            ClientInfo(str(record["client_id"]), record.get("connection_id"))
+            if record.get("client_id") is not None
+            else None
+        )
+        self._exec_id = record.get("exec_id")
+        self._state = str(record.get("state", "lost"))
+        self._error = record.get("error")
+        self._history_id = record.get("history_id") or record.get("id")
+        self._history_event_cursor = int(record.get("cursor", 0) or 0)
+        self._history_has_more = bool(record.get("has_more"))
+        output = record.get("output", "")
+        if isinstance(output, list):
+            for event in output:
+                if not isinstance(event, Mapping) or not event.get("text"):
+                    continue
+                text = str(event["text"])
+                self._buffer.write(text)
+                stream = event.get("stream")
+                self._streams[stream if stream in self._streams else "stdout"].write(text)
+        elif output:
+            text = str(output)
+            self._buffer.write(text)
+            self._streams["stdout"].write(text)
+        self._buffer.truncated = bool(record.get("truncated") or record.get("output_truncated"))
+
+    async def _load_more(self, max_bytes: int = 32768) -> bool:
+        async with self._history_lock:
+            if not self._history_has_more or not self._history_id:
+                return False
+            result = await _rpc(
+                "history_task_read",
+                id=self._history_id,
+                cursor=self._history_event_cursor,
+                max_bytes=min(max_bytes, OUTPUT_LIMIT),
+            )
+            if not isinstance(result, Mapping):
+                raise RPCError("invalid persisted task output response")
+            events = result.get("output", [])
+            if not isinstance(events, list):
+                raise RPCError("invalid persisted task output events")
+            next_cursor = result.get("cursor", self._history_event_cursor)
+            if type(next_cursor) is not int or next_cursor < self._history_event_cursor:
+                raise RPCError("invalid persisted task output cursor")
+            if result.get("has_more") and next_cursor == self._history_event_cursor:
+                raise RPCError("persisted task output cursor did not advance")
+            for event in events:
+                if not isinstance(event, Mapping) or not event.get("text"):
+                    continue
+                text = str(event["text"])
+                self._buffer.write(text)
+                stream = event.get("stream")
+                if stream in self._streams:
+                    self._streams[stream].write(text)
+                else:
+                    self._streams["stdout"].write(text)
+            progressed = next_cursor != self._history_event_cursor
+            self._history_event_cursor = next_cursor
+            self._history_has_more = bool(result.get("has_more")) and progressed
+            self._buffer.truncated |= bool(result.get("truncated"))
+            for stream in self._streams.values():
+                stream.truncated |= bool(result.get("truncated"))
+            return bool(events)
+
+    def _output_buffer_for(self, stream: str | None) -> OutputBuffer:
+        if stream in (None, "all"):
+            return self._buffer
+        if stream not in self._streams:
+            raise ValueError("stream must be 'all', 'stdout', or 'stderr'")
+        return self._streams[stream]
+
+    async def read(self, cursor: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        selected = kwargs.get("stream")
+        offset = self._decode_output_cursor(cursor, "all" if selected is None else selected)
+        buffer = self._output_buffer_for(selected)
+        max_bytes = kwargs.get("max_bytes", 32768)
+        if type(max_bytes) is not int or not 0 <= max_bytes <= RPC_LIMIT:
+            raise ValueError("max_bytes must be an integer between 0 and the RPC limit")
+        while (
+            max_bytes > 0
+            and self._history_has_more
+            and len(buffer.get().encode("utf-8")) - offset < max_bytes
+            and await self._load_more(max_bytes)
+        ):
+            buffer = self._output_buffer_for(selected)
+        result = await super().read(cursor, **kwargs)
+        result["has_more"] = bool(result.get("has_more") or self._history_has_more)
+        return result
+
+    async def expect(
+        self,
+        pattern: str,
+        cursor: str | None = None,
+        *,
+        stream: str | None = None,
+        regex: bool = False,
+        timeout: float = 30,  # noqa: ASYNC109
+        max_scan_bytes: int = 65536,
+    ) -> dict[str, Any]:
+        if type(timeout) not in (int, float) or timeout < 0 or not math.isfinite(timeout):
+            raise ValueError("timeout must be a finite non-negative number")
+        origin = self._decode_output_cursor(cursor, "all" if stream is None else stream)
+        deadline = time.monotonic() + timeout
+        while True:
+            result = await super().expect(
+                pattern,
+                cursor,
+                stream=stream,
+                regex=regex,
+                timeout=0,
+                max_scan_bytes=max_scan_bytes,
+            )
+            if result["matched"] or result["reason"] == "limit" or not self._history_has_more:
+                return result
+            available = self._output_buffer_for(stream).size - origin
+            if available >= max_scan_bytes:
+                return {**result, "reason": "limit"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {**result, "reason": "timeout"}
+            try:
+                async with asyncio.timeout(remaining):
+                    loaded = await self._load_more(min(32768, max_scan_bytes - max(0, available)))
+            except TimeoutError:
+                return {**result, "reason": "timeout"}
+            if not loaded:
+                return result
+
+    async def _wait(self) -> Any:
+        return self.result()
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "history_id": self._history_id,
+            "status": self._state,
+            "created_at": self._created,
+            "finished_at": self._finished_at,
+            "exec_id": self._exec_id,
+            "client_id": self._client.id if self._client else None,
+            "connection_id": self._client.connection_id if self._client else None,
+            "error": self._error,
+            "read_only": True,
+        }
+
+    def result(self) -> Any:
+        raise ResultUnavailable(f"result for persisted Python task {self.id} is unavailable")
+
+    async def cancel(self) -> bool:
+        return False
+
 
 class RemoteTask(TaskHandle):
     def __init__(self, task_id: str, manager: TaskManager) -> None:
@@ -523,6 +1004,7 @@ class RemoteTask(TaskHandle):
         self._terminal: dict[str, Any] = {}
         self._cursor = 0
         self._cancel_requested = False
+        self._remote_has_more = False
         self._lock = asyncio.Lock()
         manager._validate_new_id(task_id, generated=True)
         self._monitor = manager.start(self._watch(), visible=False)
@@ -530,17 +1012,36 @@ class RemoteTask(TaskHandle):
 
     async def _watch(self) -> None:
         try:
-            while self._state in {"queued", "running", "cancelling"}:
+            while True:
+                if (
+                    self._state not in {"queued", "running", "cancelling"}
+                    and not self._remote_has_more
+                ):
+                    return
                 try:
-                    async with self._lock:
-                        result = await _rpc("shell_poll", id=self.id, cursor=self._cursor)
+                    cursor = self._cursor
+                    try:
+                        result = await _rpc(
+                            "shell_read",
+                            id=self.id,
+                            cursor=cursor,
+                            max_bytes=1024 * 1024,
+                            wait_ms=30000,
+                        )
+                    except RPCError, AssertionError:
+                        result = await _rpc("shell_poll", id=self.id, cursor=cursor)
+                    if cursor == self._cursor:
                         self._merge(result)
                 except RPCError as exc:
                     self._state = "lost"
                     self._error = safe_error(exc)
+                    self._remote_has_more = False
+                    self._buffer.changed.set()
+                    for buffer in self._streams.values():
+                        buffer.changed.set()
                     return
                 if self._state not in {"queued", "running", "cancelling"}:
-                    return
+                    continue
                 await asyncio.sleep(0.25)
         finally:
             if self._state in {"succeeded", "failed", "cancelled", "lost"}:
@@ -559,6 +1060,7 @@ class RemoteTask(TaskHandle):
                 else:
                     self._warnings_truncated = True
         self._warnings_truncated |= bool(result.get("warnings_truncated"))
+        self._remote_has_more = bool(result.get("has_more"))
         self._buffer.truncated |= bool(result.get("truncated"))
         state = str(result.get("status", result.get("state", self._state)))
         if self._cancel_requested and self._state in {"cancelled", "failed", "lost"}:
@@ -575,7 +1077,8 @@ class RemoteTask(TaskHandle):
         if isinstance(output, str):
             self._buffer.write(output)
             self._streams["stdout"].write(output)
-            self._cursor = int(result.get("cursor", self._cursor + len(output)))
+            value = result.get("cursor")
+            self._cursor = value if value is not None else self._cursor + len(output)
         elif isinstance(output, list):
             for event in output:
                 if isinstance(event, Mapping):
@@ -584,24 +1087,29 @@ class RemoteTask(TaskHandle):
                         self._buffer.write(str(text))
                         stream = str(event.get("stream", "stdout"))
                         self._streams.get(stream, self._streams["stdout"]).write(str(text))
-            self._cursor = int(result.get("cursor", self._cursor + len(output)))
+            value = result.get("cursor")
+            self._cursor = value if value is not None else self._cursor + len(output)
         elif isinstance(output, Mapping):
             text = output.get("text", output.get("output", ""))
             if text:
                 self._buffer.write(str(text))
                 self._streams["stdout"].write(str(text))
-            self._cursor = int(result.get("cursor", output.get("cursor", self._cursor)))
+            value = result.get("cursor", output.get("cursor", self._cursor))
+            self._cursor = value
         if "result" in result:
             self._result = result["result"]
         if result.get("error"):
             self._error = str(result["error"])
         if self._state in {"succeeded", "failed", "cancelled", "lost"}:
             self._finished_at = self._finished_at or time.time()
+            self._buffer.changed.set()
+            for buffer in self._streams.values():
+                buffer.changed.set()
 
     def status(self) -> dict[str, Any]:
         status = {
             "id": self.id,
-            "status": self._state,
+            "status": "running" if self._remote_has_more else self._state,
             "created_at": self._created,
             "error": self._error,
             **self._terminal,
@@ -624,12 +1132,24 @@ class RemoteTask(TaskHandle):
                 result["warnings_truncated"] = True
         return result
 
+    def _output_buffer_for(self, stream: str | None) -> OutputBuffer:
+        if stream in (None, "all"):
+            return self._buffer
+        if stream not in self._streams:
+            raise ValueError("stream must be 'all', 'stdout', or 'stderr'")
+        return self._streams[stream]
+
+    async def read(self, cursor: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        result = await super().read(cursor, **kwargs)
+        result["has_more"] = bool(result.get("has_more") or self._remote_has_more)
+        return result
+
     async def _wait(self) -> Any:
         await self._monitor
         return self.result()
 
     def result(self) -> Any:
-        if self._state in {"queued", "running", "cancelling"}:
+        if self._remote_has_more or self._state in {"queued", "running", "cancelling"}:
             raise NotReady(f"task {self.id} is still running")
         if self._state in {"failed", "lost"}:
             raise RPCError(self._error or f"task {self.id} failed")
@@ -644,8 +1164,13 @@ class RemoteTask(TaskHandle):
         self._state = "cancelling"
         async with self._lock:
             await _rpc("shell_cancel", id=self.id)
-            result = await _rpc("shell_poll", id=self.id, cursor=self._cursor)
-            self._merge(result)
+            cursor = self._cursor
+            try:
+                result = await _rpc("shell_read", id=self.id, cursor=cursor)
+            except RPCError, AssertionError:
+                result = await _rpc("shell_poll", id=self.id, cursor=cursor)
+            if cursor == self._cursor:
+                self._merge(result)
         return True
 
     async def write(self, text: str = "", *, eof: bool = False) -> dict[str, Any]:
@@ -878,20 +1403,49 @@ class Messages:
             raise RPCError("ws.messages requires an initialized client")
         return client
 
-    async def send(self, to: str, text: str) -> dict[str, Any]:
+    async def send(
+        self,
+        to: str,
+        text: str,
+        data: Any = None,
+        reply_to: int | None = None,
+    ) -> dict[str, Any]:
         self._require_client()
-        return await _rpc("message_send", to=to, text=text)
+        fields: dict[str, Any] = {"to": to, "text": text}
+        if data is not None:
+            fields["data"] = data
+        if reply_to is not None:
+            fields["reply_to"] = reply_to
+        return await _rpc("message_send", **fields)
+
+    async def reply(
+        self,
+        message_id: int,
+        text: str,
+        data: Any = None,
+    ) -> dict[str, Any]:
+        self._require_client()
+        fields: dict[str, Any] = {"message_id": message_id, "text": text}
+        if data is not None:
+            fields["data"] = data
+        return await _rpc("message_reply", **fields)
 
     async def read(
         self,
         limit: int = 20,
         after: int | None = None,
         wait_ms: int = 0,
+        sender: str | None = None,
+        reply_to: int | None = None,
     ) -> dict[str, Any]:
         self._require_client()
         fields: dict[str, Any] = {"limit": limit, "wait_ms": wait_ms}
         if after is not None:
             fields["after"] = after
+        if sender is not None:
+            fields["sender"] = sender
+        if reply_to is not None:
+            fields["reply_to"] = reply_to
         return await _rpc("message_read", **fields)
 
     async def ack(self, ids: list[int]) -> int:
@@ -913,9 +1467,10 @@ class Packages:
         return RemoteTask(str(task_id), self._tasks)
 
 
-class Skills:
-    def __init__(self, workspace: Path) -> None:
+class Skills(SkillsWriting):
+    def __init__(self, workspace: Path, fs: Filesystem | None = None) -> None:
         self.root = workspace / ".mypr" / "skills"
+        self._fs = fs or Filesystem(workspace)
 
     def _path(self, name: str) -> Path:
         candidate = (self.root / name / "SKILL.md").resolve()
@@ -1020,12 +1575,57 @@ class Workspace:
         self._locals: dict[str, dict[str, Any]] = {}
         self.tasks = TaskManager()
         self.shell = Shell(self.tasks)
-        self.fs = Filesystem(self.workspace, self.shell)
+        self.fs = Filesystem(self.workspace, self.shell, self._search)
         self.mcp = MCP()
         self.messages = Messages()
         self.packages = Packages(self.tasks)
-        self.skills = Skills(self.workspace)
+        self.skills = Skills(self.workspace, self.fs)
+        self.modules = ModuleManager(self.workspace, self.fs, self.shell)
+        self.git = Git(_rpc)
+        self.locks = WorkspaceLocks(self._lock_identity)
         self.history = History()
+        self.http = HTTPTools(self.workspace, lambda: self.client)
+        self.net = NetworkTools(self.workspace, self.tasks, _rpc)
+        self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
+        self._closing = False
+
+    async def _close_resources(self):
+        if self._closing:
+            return
+        self._closing = True
+        current = asyncio.current_task()
+        handles = [
+            handle
+            for handle in self.tasks.active()
+            if getattr(handle, "_task", None) is not current
+        ]
+        await asyncio.gather(*(handle.cancel() for handle in handles), return_exceptions=True)
+        pending = [
+            handle._task
+            for handle in handles
+            if getattr(handle, "_task", None) is not None and not handle._task.done()
+        ]
+        if pending:
+            await asyncio.wait(pending, timeout=2)
+        resources = [getattr(self, name, None) for name in ("browser", "http")]
+        results = await asyncio.gather(
+            *(resource.aclose() for resource in resources if resource is not None),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise ExceptionGroup("Workspace resource cleanup failed", failures)
+
+    async def _search(self, **args):
+        return await _rpc("search", args=args)
+
+    def _lock_identity(self):
+        client = self.client
+        return {
+            "client_id": client.id if client else None,
+            "connection_id": client.connection_id if client else None,
+            "exec_id": _exec_context.get(),
+        }
 
     @property
     def client(self) -> ClientInfo | None:
@@ -1098,8 +1698,12 @@ def create_workspace(
     ws = Workspace(workspace, namespace)
     ws.tasks = _TASKS
     ws.shell = Shell(_TASKS)
-    ws.fs = Filesystem(ws.workspace, ws.shell)
+    ws.fs = Filesystem(ws.workspace, ws.shell, ws._search)
+    ws.skills = Skills(ws.workspace, ws.fs)
+    ws.modules = ModuleManager(ws.workspace, ws.fs, ws.shell)
     ws.packages = Packages(_TASKS)
+    ws.net = NetworkTools(ws.workspace, _TASKS, _rpc)
+    ws.browser = BrowserTools(ws.workspace, ws._lock_identity, _rpc, ws.fs)
     return ws
 
 
@@ -1110,6 +1714,7 @@ __all__ = [
     "History",
     "NotReady",
     "RPCError",
+    "ResultUnavailable",
     "Filesystem",
     "Shell",
     "ShellError",

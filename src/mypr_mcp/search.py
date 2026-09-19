@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -10,12 +11,14 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .snapshots import SnapshotStore
+
 _DEFAULT_MAX_MATCHES = 100
 _DEFAULT_MAX_BYTES = 32 * 1024
 _MAX_CONTEXT = 100
 _MAX_MATCHES = 10_000
 _MAX_BYTES = 16 * 1024 * 1024
-_SCAN_BYTES = 4 * 1024 * 1024
+_QUERY_BYTES = 16 * 1024 * 1024
 
 
 class Search:
@@ -24,6 +27,7 @@ class Search:
     def __init__(self, workspace: Path, shell: Any):
         self.workspace = Path(workspace).expanduser().resolve()
         self.shell = shell
+        self.snapshots = SnapshotStore(self.workspace / ".mypr", name="searches")
 
     async def search(
         self,
@@ -38,6 +42,7 @@ class Search:
         context: int = 0,
         max_matches: int = _DEFAULT_MAX_MATCHES,
         max_bytes: int = _DEFAULT_MAX_BYTES,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """Run a bounded regex or fixed-string search.
 
@@ -45,6 +50,10 @@ class Search:
         elements and may be absolute or relative to the workspace.
         """
 
+        if cursor is not None:
+            snapshot, offset = await asyncio.to_thread(self.snapshots.decode, cursor)
+            self._validate_options(context, max_matches, max_bytes)
+            return await asyncio.to_thread(self._page, snapshot, offset, max_bytes, max_matches)
         if pattern is not None and not isinstance(pattern, str):
             raise TypeError("pattern must be a string or None")
         self._validate_options(context, max_matches, max_bytes)
@@ -60,7 +69,7 @@ class Search:
             no_ignore=no_ignore,
             context=context,
         )
-        scan_bytes = min(_SCAN_BYTES, max(_DEFAULT_MAX_BYTES, max_bytes * 4))
+        scan_bytes = _QUERY_BYTES
         run = await self.shell.run(
             command,
             cwd=self.workspace,
@@ -77,18 +86,123 @@ class Search:
         stdout = str(run.get("stdout", ""))
         truncated = bool(run.get("truncated") or run.get("timed_out"))
         if pattern is None:
-            files, parsed_truncated = self._parse_files(stdout, max_matches, max_bytes)
-            matches: list[dict[str, Any]] = []
+            parse = self._parse_files
+            kind = "files"
         else:
-            matches, parsed_truncated = self._parse_matches(stdout, max_matches, max_bytes)
-            files = []
-        return {
-            "id": run.get("id"),
-            "matches": matches,
-            "files": files,
-            "truncated": truncated or parsed_truncated,
-            "warnings": list(run.get("warnings", [])),
+            parse = self._parse_matches
+            kind = "matches"
+        query = {
+            "pattern": pattern,
+            "paths": paths,
+            "glob": glob,
+            "fixed": fixed,
+            "ignore_case": ignore_case,
+            "hidden": hidden,
+            "no_ignore": no_ignore,
+            "context": context,
         }
+        ident, page = await asyncio.to_thread(
+            self._persist_page,
+            parse,
+            stdout,
+            query,
+            kind,
+            truncated,
+            run.get("id"),
+            max_bytes,
+            max_matches,
+            list(run.get("warnings", [])),
+        )
+        page.update(
+            id=run.get("id"),
+            snapshot_id=ident,
+            warnings=list(run.get("warnings", [])),
+        )
+        return page
+
+    def _persist_page(
+        self,
+        parser: Any,
+        stdout: str,
+        query: dict[str, Any],
+        kind: str,
+        truncated: bool,
+        run_id: str | None,
+        max_bytes: int,
+        max_matches: int,
+        warnings: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        items, parsed_truncated = parser(stdout, None, _QUERY_BYTES)
+        ident = self.snapshots.create(
+            query,
+            items,
+            kind=kind,
+            truncated=truncated or parsed_truncated,
+            run_id=run_id,
+            warnings=warnings,
+        )
+        snapshot = self.snapshots.load(ident)
+        return ident, self._page(snapshot, 0, max_bytes, max_matches)
+
+    def _page(
+        self, snapshot: dict[str, Any], offset: int, max_bytes: int, max_matches: int
+    ) -> dict[str, Any]:
+        items = snapshot["items"]
+        kind = snapshot.get("kind", "matches")
+        page: list[Any] = []
+        used = 0
+        index = offset
+        match_count = 0
+        clipped_any = False
+        while index < len(items):
+            item = items[index]
+            clipped = False
+            is_match = kind == "matches" and item.get("kind") == "match"
+            if is_match and match_count >= max_matches:
+                break
+            if kind == "matches":
+                full_cost = self._json_cost(item)
+                if page and used + full_cost > max_bytes:
+                    break
+                if not page and full_cost > max_bytes:
+                    item, cost, clipped = self._bounded_item(item, max_bytes)
+                    if item is None:
+                        item = dict(items[index])
+                        item["text"] = ""
+                        item["text_truncated"] = True
+                        cost = self._json_cost(item)
+                        clipped = True
+                else:
+                    cost = full_cost
+                clipped_any |= clipped
+            else:
+                cost = self._json_cost(item)
+            if not page and cost > max_bytes:
+                raise ValueError("max_bytes is too small for search metadata; increase the budget")
+            if page and used + cost > max_bytes:
+                break
+            page.append(item)
+            used += cost
+            index += 1
+            if is_match:
+                match_count += 1
+        more = index < len(items)
+        next_cursor = self.snapshots.cursor(snapshot["id"], index, kind) if more else None
+        result: dict[str, Any] = {
+            "matches": page if kind == "matches" else [],
+            "files": page if kind == "files" else [],
+            "cursor": next_cursor,
+            "next_cursor": next_cursor,
+            "has_more": more,
+            "truncated": bool(snapshot.get("truncated")) or more,
+            "scan_truncated": bool(snapshot.get("truncated")),
+            "id": snapshot.get("run_id"),
+            "snapshot_id": snapshot["id"],
+            "warnings": list(snapshot.get("warnings", [])),
+        }
+        if clipped_any:
+            result["truncated"] = True
+        return result
 
     def _command(
         self,
@@ -157,7 +271,9 @@ class Search:
             raise ValueError(f"max_bytes must be between 1 and {_MAX_BYTES}")
 
     @classmethod
-    def _parse_files(cls, text: str, max_files: int, max_bytes: int) -> tuple[list[str], bool]:
+    def _parse_files(
+        cls, text: str, max_files: int | None, max_bytes: int
+    ) -> tuple[list[str], bool]:
         files: list[str] = []
         used = 0
         truncated = not text.endswith("\0") and bool(text)
@@ -167,7 +283,7 @@ class Search:
         for path in paths:
             if not path:
                 continue
-            if len(files) >= max_files:
+            if max_files is not None and len(files) >= max_files:
                 return files, True
             cost = cls._json_cost(path)
             if used + cost > max_bytes:
@@ -178,7 +294,7 @@ class Search:
 
     @classmethod
     def _parse_matches(
-        cls, text: str, max_matches: int, max_bytes: int
+        cls, text: str, max_matches: int | None, max_bytes: int
     ) -> tuple[list[dict[str, Any]], bool]:
         matches: list[dict[str, Any]] = []
         used = 0
@@ -195,6 +311,7 @@ class Search:
                 continue
             if (
                 candidate["kind"] == "match"
+                and max_matches is not None
                 and sum(result["kind"] == "match" for result in matches) >= max_matches
             ):
                 return matches, True

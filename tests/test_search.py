@@ -60,6 +60,23 @@ async def test_search_returns_match_metadata_context_and_fixed_patterns(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_search_pages_count_matches_and_keep_trailing_context(tmp_path: Path):
+    (tmp_path / "context.txt").write_text(
+        "before\nneedle one\nbetween\nneedle two\nafter\n", encoding="utf-8"
+    )
+
+    search = Search(tmp_path, ShellRunner())
+    first = await search.search("needle", context=1, max_matches=1, max_bytes=4096)
+
+    assert [item["kind"] for item in first["matches"]] == ["context", "match", "context"]
+    assert first["has_more"] is True
+
+    second = await search.search(cursor=first["next_cursor"], max_bytes=4096)
+    assert [item["kind"] for item in second["matches"]] == ["match", "context"]
+    assert second["has_more"] is False
+
+
+@pytest.mark.asyncio
 async def test_file_listing_respects_ignore_and_hidden_options(tmp_path: Path):
     (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
     (tmp_path / "visible.txt").write_text("visible", encoding="utf-8")
@@ -138,3 +155,31 @@ async def test_search_reports_missing_ripgrep(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("mypr_mcp.search.shutil.which", lambda _: None)
     with pytest.raises(RuntimeError, match="ripgrep .*required"):
         await _search(tmp_path, pattern="anything")
+
+
+@pytest.mark.asyncio
+async def test_search_pages_from_persisted_snapshot_without_rerunning(tmp_path: Path):
+    (tmp_path / "many.txt").write_text("needle\n" * 20, encoding="utf-8")
+    runner = ShellRunner()
+    search = Search(tmp_path, runner)
+
+    first = await search.search(pattern="needle", max_matches=20, max_bytes=512)
+    assert first["has_more"] is True
+    first_matches = first["matches"]
+    cursor = first["next_cursor"]
+    assert cursor
+
+    second = await search.search(cursor=cursor, max_bytes=512)
+    assert second["matches"]
+    all_matches = first_matches + second["matches"]
+    assert (tmp_path / ".mypr" / "searches").is_dir()
+
+    # A new Search object can continue the same persisted query after a
+    # manager/kernel restart without invoking ripgrep again.
+    restarted = Search(tmp_path, runner)
+    final = second
+    while final["next_cursor"]:
+        final = await restarted.search(cursor=final["next_cursor"], max_bytes=512)
+        all_matches.extend(final["matches"])
+    assert final["has_more"] is False
+    assert len(all_matches) == 20

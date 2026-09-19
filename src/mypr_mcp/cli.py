@@ -34,7 +34,7 @@ State and identity
   Resuming an ID restores its ws.local while the same kernel remains alive.
 - Ordinary globals are shared. Background tasks retain their creator's client context.
 - Completed handles are cached up to limits.completed_tasks (default 128). Keep a
-  handle in ws.local if you need it longer; use ws.history for evicted job records.
+  handle in ws.local if you need it longer; await ws.tasks.attach(id) reopens saved jobs.
 - Keep large results in Python and return only the information needed for the next decision.
 
 Everyday workspace work
@@ -42,6 +42,10 @@ Everyday workspace work
   Long lines use next_cursor; continue with its line as start_line and byte as start_byte.
 - await ws.fs.search("pattern", paths="src", glob="*.py"): regex matches with locations.
   Use fixed=True for literal text, or omit pattern to list files. Requires ripgrep (rg).
+  Follow next_cursor with ws.fs.search(cursor=...) while has_more; pages use a saved snapshot.
+- await ws.fs.tree("src") and await ws.fs.stat("src/app.py"): bounded tree and metadata.
+- await ws.git.status(), await ws.git.diff(), await ws.git.show("HEAD", path="README.md"):
+  read-only Git views. Continue with cursor=next_cursor while has_more.
 - await ws.fs.write("notes.txt", "text"): create a file. Existing files require
   expected_hash=page["revision"] or explicit overwrite=True.
 - await ws.fs.patch("src/app.py", [{"old": "before", "new": "after"}],
@@ -77,6 +81,11 @@ In PTY mode eof=True sends the terminal EOF character; cancel() terminates the j
 
 In later cells, use ws.local["job"].status(), ws.local["job"].output(), or
 ws.local["job"].result(). result() raises NotReady until the job finishes.
+Use await job.read(cursor=None, stream=None, max_bytes=32768, wait_ms=0) for bounded
+output pages. Its opaque cursor is separate from output() character offsets.
+await job.expect("ready", timeout=30) waits for matching output; regex=True supports
+patterns. A failed match preserves its starting cursor; check reason for EOF/timeout/limit.
+Cancelling these waits does not cancel the job.
 Use await ws.local["job"].cancel() to request cancellation. Awaiting the handle itself
 waits for that job; other async cells continue. Every cell is also a task handle, so
 ws.tasks.get(exec_id) exposes its status (kind="cell") and actual last-expression result.
@@ -85,6 +94,11 @@ Use ws.tasks.start() for detached work; raw asyncio.create_task() output after t
 parent cell finishes is not retained. cancel() returns False for terminal handles.
 Run long CPU-bound or blocking work in separate scripts through ws.shell.start().
 
+Shared coordination
+Use async with ws.locks.acquire("name", timeout=10) for task-scoped cooperative locks.
+They release on context exit, task completion/cancellation, or reset; not disconnect.
+ws.locks.list() shows owners and waiters. Locks do not implicitly protect file writes.
+
 Client messages
 - await ws.messages.send("client-id", "text") sends to a registered workspace client,
   including disconnected clients. Use await ws.status() to find connected clients.
@@ -92,6 +106,9 @@ Client messages
   Messages can end the tool's wait early; check execution state before using its result.
 - await ws.messages.read(limit=20, after=None, wait_ms=0) reads unacknowledged messages.
   Follow next_cursor when has_more is true; use wait_ms up to 30000 to wait for messages.
+- send(..., data={...}) includes structured JSON. reply(message_id, text, data=None)
+  answers a message addressed to you, including after acknowledgment.
+  read(sender="client-id", reply_to=message_id, wait_ms=...) waits for matching messages.
 - After handling messages, await ws.messages.ack([message_id]) to acknowledge them.
   Reading or receiving a preview never acknowledges it; previews may repeat until ack.
   Long previews have truncated=True; read() returns the full text.
@@ -109,10 +126,33 @@ Discover and reuse capabilities
   Use await ws.mcp.restart("server") after editing its code; await ws.mcp.reload()
   applies config.toml edits. await ws.mcp.remove("server") disconnects and removes it.
   These preserve Python state. Busy connections require force=True to interrupt their calls.
+- ws.http provides named persistent HTTPX2 clients. Use await ws.http.get/post/... for
+  bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and
+  await ws.http.download(url, path) for atomic workspace downloads. The default limits
+  are 16 MiB for requests and 256 MiB for downloads. ws.http.client(name, ...) returns
+  the native client; close it before changing its options.
+- ws.browser.context(name, ...) returns a native async Playwright BrowserContext. Use
+  launch_options for the managed browser, ws.browser.connect(endpoint, protocol=...)
+  for an external Playwright/CDP browser, and context(..., connection=name) to use it.
+  The first managed use installs a missing browser engine automatically. Use
+  ws.browser.save_state/load_state for explicit auth persistence and
+  ws.browser.screenshot(page, path) for an artifact plus inline image output.
+  Managed resources close on reset; external browser processes and pre-existing tabs survive.
+- ws.net.resolve(), ws.net.connect(), and ws.net.tls() provide bounded DNS, TCP, and
+  verified TLS diagnostics. await ws.net.scan(targets, ports=...) starts a TCP scan;
+  await ws.net.nmap(targets, args=[...]) starts Nmap. Scan handles support status(),
+  read(), expect(), output(), result(), cancel(), await, summary(), and paged results().
+  Use await ws.tasks.attach(scan_id) after reconnecting. TCP/Nmap result files are
+  bounded and survive reset; active scans require force=True to reset. Nmap output options
+  are managed by mypr and cannot be supplied in args.
 - ws.skills.list() and ws.skills.read("name"): discover and read skill instructions.
-  Read a skill before using it; edit its files under ws.root / "skills" with Python.
-- Save reusable modules under ws.root / "lib/ws_lib" and import them from ws_lib.
-  Reload edited modules explicitly with importlib.reload().
+  Read a skill before using it. await ws.skills.validate(name, text) checks content;
+  await ws.skills.write(name, text, expected_hash=revision) saves it with revision checks.
+- ws.modules.list(), await ws.modules.read(name), and await ws.modules.write(name, source)
+  manage modules under ws.root / "lib/ws_lib". Existing files require expected_hash.
+  await ws.modules.check(name, test_code="...") validates in a separate Python process.
+  Saving does not activate code; use ws.modules.load(name) or ws.modules.reload(name).
+  Reload replaces the module; references already held elsewhere remain unchanged.
 - ws.local["install"] = await ws.packages.add("package"): start a workspace venv install.
 - await ws.history.list(client_id=ws.client.id): find your executions and jobs.
   await ws.history.get(record_id) reads details; await ws.history.logs() reads events.

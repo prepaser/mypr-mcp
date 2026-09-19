@@ -7,6 +7,7 @@ The manager owns these objects and the kernel accesses them over its IPC layer.
 from __future__ import annotations
 
 import asyncio
+import base64
 import codecs
 import contextlib
 import copy
@@ -27,7 +28,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
 from .config import MCPConfig, validate_name, validate_servers
-from .journal import decode_event
+from .journal import decode_event, read_page
 from .terminal import close as close_terminal
 from .terminal import eof_byte
 from .terminal import resize as resize_terminal
@@ -59,6 +60,7 @@ class _Job:
     warnings_truncated: bool = False
     journal_failed: bool = False
     metadata_failed: bool = False
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
     stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     waiter: asyncio.Task[None] | None = None
@@ -330,6 +332,199 @@ class Shells:
             return self._poll_persisted(job_id, cursor)
         cursor = self._validate_cursor(cursor, len(job.output))
         return self._poll_job(job, cursor)
+
+    async def read(
+        self,
+        job_id: str,
+        cursor: int = 0,
+        *,
+        stream: str | None = None,
+        max_bytes: int = 32768,
+        wait_ms: int = 0,
+    ) -> dict[str, Any]:
+        """Read a bounded output page, optionally waiting for new output."""
+
+        if type(max_bytes) is not int or not 0 <= max_bytes <= 32 * 1024 * 1024:
+            raise ValueError("max_bytes must be an integer between 0 and 33554432")
+        if type(wait_ms) is not int or not 0 <= wait_ms <= 30000:
+            raise ValueError("wait_ms must be an integer between 0 and 30000")
+        if stream not in (None, "all", "stdout", "stderr"):
+            raise ValueError("stream must be 'all', 'stdout', or 'stderr'")
+        job = self._jobs.get(job_id)
+        cursor_value = self._decode_read_cursor(cursor, job_id)
+        if job is None:
+            if (
+                not isinstance(job_id, str)
+                or len(job_id) != 32
+                or any(char not in "0123456789abcdef" for char in job_id)
+            ):
+                raise ValueError("invalid shell job ID")
+            metadata_path = self.jobs_root / f"{job_id}.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                raise ValueError("unknown job") from None
+            page, next_index, next_offset, has_more = await asyncio.to_thread(
+                self._read_journal_page,
+                self.jobs_root / f"{job_id}.jsonl",
+                *cursor_value,
+                stream=stream,
+                max_bytes=max_bytes,
+            )
+            return {
+                "id": job_id,
+                "state": metadata.get("state", "unknown"),
+                "output": page,
+                "cursor": self._encode_read_cursor(job_id, next_index, next_offset),
+                "has_more": has_more,
+                "result": metadata.get("result"),
+                "error": metadata.get("error"),
+                "truncated": bool(metadata.get("truncated", False)),
+                "warnings": metadata.get("warnings", []),
+                "warnings_truncated": bool(metadata.get("warnings_truncated", False)),
+                "pty": bool(metadata.get("pty", False)),
+                "rows": metadata.get("rows", 24),
+                "cols": metadata.get("cols", 80),
+            }
+        if cursor_value[0] > len(job.output):
+            raise ValueError("invalid shell output cursor")
+        deadline = time.monotonic() + wait_ms / 1000
+        while True:
+            page, next_index, next_offset = self._page_events(
+                job.output, *cursor_value, stream=stream, max_bytes=max_bytes
+            )
+            next_cursor = self._encode_read_cursor(job.id, next_index, next_offset)
+            has_more = next_index < len(job.output)
+            terminal = job.state not in {"running", "cancelling"}
+            if page or terminal or wait_ms == 0 or time.monotonic() >= deadline:
+                return {
+                    **self._poll_job(job, len(job.output)),
+                    "output": page,
+                    "cursor": next_cursor,
+                    "has_more": has_more,
+                }
+            changed = job.changed
+            changed.clear()
+            try:
+                await asyncio.wait_for(changed.wait(), max(0.0, deadline - time.monotonic()))
+            except TimeoutError:
+                pass
+
+    @classmethod
+    def _page_events(
+        cls,
+        events: list[dict[str, str]],
+        event_index: int,
+        event_offset: int,
+        *,
+        stream: str | None,
+        max_bytes: int,
+    ) -> tuple[list[dict[str, str]], int, int]:
+        if event_index > len(events):
+            raise ValueError("invalid shell output cursor")
+        if event_index == len(events) and event_offset:
+            raise ValueError("invalid shell output cursor")
+        page: list[dict[str, str]] = []
+        size = 0
+        next_index, next_offset = event_index, event_offset
+        for position, event in enumerate(events[event_index:], event_index):
+            if stream not in (None, "all") and event.get("stream") != stream:
+                next_index, next_offset = position + 1, 0
+                continue
+            if not page and max_bytes == 0:
+                break
+            raw = str(event.get("text", "")).encode("utf-8")
+            start = event_offset if position == event_index else 0
+            if start > len(raw) or (start < len(raw) and raw[start] & 0xC0 == 0x80):
+                raise ValueError("invalid shell output cursor")
+            remaining = max_bytes - size
+            if remaining <= 0:
+                break
+            kept = raw[start : start + remaining].decode("utf-8", "ignore")
+            if not kept and raw[start:]:
+                if page:
+                    break
+                raise ValueError("max_bytes is too small for the next UTF-8 character")
+            consumed = len(kept.encode("utf-8"))
+            if consumed:
+                page.append({**event, "text": kept})
+                size += consumed
+                if start + consumed < len(raw):
+                    next_index, next_offset = position, start + consumed
+                    break
+            next_index, next_offset = position + 1, 0
+        return page, next_index, next_offset
+
+    @classmethod
+    def _read_journal_page(
+        cls,
+        path: Path,
+        event_index: int,
+        event_offset: int,
+        *,
+        stream: str | None,
+        max_bytes: int,
+    ) -> tuple[list[dict[str, str]], int, int, bool]:
+        if event_index < 0 or event_offset < 0:
+            raise ValueError("invalid shell output cursor")
+        events, total = read_page(path, event_index, max_bytes + event_offset)
+        page, consumed, offset = cls._page_events(
+            events,
+            0,
+            event_offset,
+            stream=stream,
+            max_bytes=max_bytes,
+        )
+        next_index = event_index + consumed
+        return page, next_index, offset, next_index < total
+
+    @staticmethod
+    def _encode_read_cursor(job_id: str, event: int, offset: int) -> str:
+        raw = json.dumps(
+            {"v": 1, "id": job_id, "event": event, "offset": offset}, separators=(",", ":")
+        ).encode()
+        return "mypr-shell1." + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    @classmethod
+    def _decode_read_cursor(cls, cursor: int | str | None, job_id: str) -> tuple[int, int]:
+        if cursor is None:
+            return 0, 0
+        if type(cursor) is int:
+            if cursor < 0:
+                raise ValueError("invalid shell output cursor")
+            return cursor, 0
+        if not isinstance(cursor, str) or not cursor.startswith("mypr-shell1."):
+            raise ValueError("invalid shell output cursor")
+        try:
+            encoded = cursor[len("mypr-shell1.") :]
+            value = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid shell output cursor") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("v") != 1
+            or value.get("id") != job_id
+            or type(value.get("event")) is not int
+            or type(value.get("offset")) is not int
+            or value["event"] < 0
+            or value["offset"] < 0
+        ):
+            raise ValueError("invalid shell output cursor")
+        return value["event"], value["offset"]
+
+    async def wait(self, job_id: str) -> dict[str, Any]:
+        """Wait for a shell job to finish without coupling cancellation to it."""
+
+        job = self._jobs.get(job_id)
+        if job is None:
+            return await self.poll(job_id)
+        while job.state in {"running", "cancelling"}:
+            changed = job.changed
+            changed.clear()
+            if job.state not in {"running", "cancelling"}:
+                break
+            await changed.wait()
+        return self._poll_job(job, len(job.output))
 
     def _poll_persisted(self, job_id: str, cursor: int) -> dict[str, Any]:
         if (
@@ -624,6 +819,7 @@ class Shells:
                     job.output.append(event)
                     job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
                     self._persist_output(job, event)
+                    job.changed.set()
             if len(keep) < len(chunk):
                 job.truncated = True
         text = decoder.decode(b"", final=True)
@@ -632,6 +828,7 @@ class Shells:
             job.output.append(event)
             job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
             self._persist_output(job, event)
+            job.changed.set()
 
     async def _wait(self, job: _Job) -> None:
         try:
@@ -660,6 +857,7 @@ class Shells:
             job.state = "succeeded" if returncode == 0 else "failed"
         job.finished_at = time.time()
         self._persist_metadata(job)
+        job.changed.set()
         self._prune_completed()
         self._close_pty(job)
 

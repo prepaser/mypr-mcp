@@ -139,3 +139,62 @@ def test_inbox_caps_message_count_and_preserves_unicode(store: MessageStore):
     assert text.startswith(preview["text"])
     assert len(json.dumps([preview], ensure_ascii=False).encode()) <= 4096
     assert store.read("alice")["messages"] == [message]
+
+
+def test_structured_data_and_reply_validation(store: MessageStore):
+    original = store.send("alice", "bob", "question", data={"kind": "review"})
+    assert store.read("bob")["messages"] == [original]
+    reply = store.reply("bob", original["id"], "answer", data=[1, "ok"])
+    assert reply["to"] == "alice"
+    assert reply["reply_to"] == original["id"]
+    assert reply["data"] == [1, "ok"]
+    assert store.read("alice")["messages"] == [reply]
+
+    with pytest.raises(ValueError, match="not addressed"):
+        store.reply("carol", original["id"], "no")
+    with pytest.raises(ValueError, match="original sender"):
+        store.send("bob", "carol", "no", reply_to=original["id"])
+    with pytest.raises(ValueError, match="JSON"):
+        store.send("alice", "bob", "bad", data={"value": object()})
+    with pytest.raises(ValueError, match="16 KiB"):
+        store.send("alice", "bob", "bad", data="x" * (16 * 1024))
+    with pytest.raises(ValueError, match="payload"):
+        store.send("alice", "bob", "x" * 9000, data="y" * 8000)
+
+
+def test_read_filters_and_reply_survive_ack(store: MessageStore):
+    first = store.send("alice", "bob", "first")
+    second = store.send("carol", "bob", "second")
+    assert store.read("bob", sender="alice")["messages"] == [first]
+    assert store.read("bob", sender="carol")["messages"] == [second]
+    store.ack("bob", [first["id"]])
+    reply = store.reply("bob", first["id"], "after ack")
+    assert store.read("alice", reply_to=first["id"])["messages"] == [reply]
+
+
+def test_existing_message_schema_is_migrated(tmp_path: Path):
+    history = History(tmp_path)
+    for client in ("alice", "bob"):
+        history.reserve_client_id(client)
+    history.close()
+    import sqlite3
+
+    db = tmp_path / ".mypr" / "history.sqlite3"
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, "
+        "recipient TEXT NOT NULL, text TEXT NOT NULL, created REAL NOT NULL, acknowledged REAL)"
+    )
+    connection.execute(
+        "INSERT INTO messages(sender, recipient, text, created) VALUES ('alice', 'bob', 'old', 1)"
+    )
+    connection.commit()
+    connection.close()
+
+    store = MessageStore(tmp_path)
+    try:
+        page = store.read("bob")
+        assert page["messages"][0]["data"] is None
+        assert page["messages"][0]["reply_to"] is None
+    finally:
+        store.close()

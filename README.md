@@ -194,7 +194,13 @@ skill reads, and task-handle inspection are synchronous.
 | `ws.shell`, `ws.tasks` | Start and inspect background work |
 | `ws.mcp` | Call and reconfigure external MCP servers |
 | `ws.messages` | Send and receive persistent client messages |
-| `ws.skills`, `ws.packages` | Read skills and install kernel packages |
+| `ws.skills`, `ws.modules` | Validate, save, and reuse workspace capabilities |
+| `ws.git` | Read structured Git status, diffs, and committed files |
+| `ws.http` | Use named, persistent HTTPX2 clients and bounded requests |
+| `ws.browser` | Use native Playwright browser contexts and pages |
+| `ws.net` | Resolve hosts, inspect TCP/TLS endpoints, and run scans |
+| `ws.locks` | Coordinate shared work with task-scoped logical locks |
+| `ws.packages` | Install kernel packages |
 | `ws.history` | Query saved execution and task records |
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
@@ -232,7 +238,7 @@ cuts a line, continue using `next_cursor["line"]` as `start_line` and
 pages of a file that may change.
 
 `search(pattern=None, *, paths=None, glob=None, fixed=False, ignore_case=False,
-hidden=False, no_ignore=False, context=0, max_matches=100, max_bytes=32768)` uses
+hidden=False, no_ignore=False, context=0, max_matches=100, max_bytes=32768, cursor=None)` uses
 `rg` from the workstation's PATH. Install ripgrep to enable it. With a pattern,
 it returns `matches` containing file paths, line numbers, byte-based columns,
 text, and match/context kind. Without a pattern, it returns `files`. `paths` and
@@ -240,7 +246,20 @@ text, and match/context kind. Without a pattern, it returns `files`. `paths` and
 default. `truncated` reports incomplete results; `text_truncated` marks shortened
 match text. Search runs as a managed shell job and its captured scan output is
 bounded separately from the returned results. The returned `id` identifies its
-handle in `ws.tasks`.
+job; use `await ws.tasks.attach(result["id"])` to inspect it.
+The first request completes the query and saves a bounded snapshot. Continue with
+`await ws.fs.search(cursor=page["next_cursor"])` while `has_more` is true.
+`max_matches` and `max_bytes` apply to each page. Continuations read the saved
+snapshot without rerunning the search, even after a reset or restart. The scan
+is limited to 16 MiB; `scan_truncated` reports an incomplete retained query.
+`truncated` also covers remaining pages and shortened match text. A budget too
+small for a path and its metadata raises an error; increase `max_bytes`.
+
+`await ws.fs.tree(path=".", depth=3, max_entries=200, hidden=False)` returns
+a deterministic directory view with `entries` and `truncated`. Symlinks are
+listed without traversing their targets. `await ws.fs.stat(path,
+follow_symlinks=False)` returns file metadata, including kind, size, modification
+time, mode, and symlink target; it does not hash file contents.
 
 `write(path, text, *, expected_hash=None, overwrite=False, encoding="utf-8",
 create_parents=False)` creates a file. Replacing an existing file requires its
@@ -292,6 +311,144 @@ per resolved path, including across clients. Revision checks reject stale conten
 they do not lock out edits by external programs. Absolute paths are accepted under
 the current user's permissions. Ordinary Python remains available for other file
 and data operations.
+
+### Git
+
+```python
+await ws.git.status()
+await ws.git.diff(staged=True, paths=["src"])
+await ws.git.show("HEAD", path="README.md")
+```
+
+`status(*, cursor=None, max_entries=200, max_bytes=32768)` returns branch and
+file information, including index/worktree changes, conflicts, and renames.
+`diff(*, staged=False, rev=None, paths=None, cursor=None, max_bytes=32768)`
+returns file metadata and patch text. `show(ref="HEAD", *, path=None,
+cursor=None, max_bytes=32768)` reads a commit or a file at that revision.
+Input paths are relative to the workspace; returned file paths are relative to
+the reported repository `root`. `max_bytes` must be at least 1024. Collect both
+`files` and `patch` across diff pages; a page may contain only file metadata.
+
+These are read-only commands with paging, color, external diff programs, and
+textconv disabled. Follow `next_cursor` with the same method while `has_more`
+is true. Pages come from a saved snapshot, so later changes to the worktree do
+not alter an existing query. Snapshots survive kernel reset and manager restart.
+
+### HTTP
+
+`ws.http` keeps named native `httpx2.AsyncClient` instances alive in the Python
+kernel. Clients are private to the current logical client by default; pass
+`shared=True` when every client should use the same cookie jar and connection
+pool. The default HTTP timeout is 30 seconds. Client options are fixed after creation,
+so close a named client before
+changing its configuration:
+
+```python
+response = await ws.http.get("https://example.com/api", name="api")
+response.status_code, response.json()
+
+client = ws.http.client("upload", base_url="https://example.com", timeout=10)
+response = await client.post("/files", content=b"data")
+await ws.http.close("upload")
+```
+
+`get()`, `post()`, `put()`, `patch()`, `delete()`, `head()`, and `options()`
+return native responses after consuming the body. They enforce a 16 MiB decoded
+body limit by default; set `max_bytes=None` only when the caller can safely
+handle an unbounded response. `stream()` yields the native streaming response
+for incremental processing. `download()` writes atomically (relative paths use the workspace),
+refuses to overwrite by default, and limits the decoded response to 256 MiB;
+pass `overwrite=True` or another `max_bytes` when appropriate. Cancellation
+removes incomplete downloads. The raw client returned by `client()` is an
+escape hatch for full HTTPX2 behavior and does not apply the convenience
+request limit.
+
+### Browser automation
+
+`ws.browser` returns native async Playwright objects, so pages, locators,
+frames, requests, tracing, and other Playwright APIs remain available:
+
+```python
+context = await ws.browser.context(
+    "shop", browser="chromium", launch_options={"headless": True}
+)
+page = await context.new_page()
+await page.goto("https://example.com")
+await page.get_by_role("button", name="Continue").click()
+await ws.browser.screenshot(page, "artifacts/shop.png")
+```
+
+The first managed context automatically installs the requested Playwright
+browser engine when it is missing. Installation runs as a managed workspace
+job and reuses the configured Playwright browser cache. Set
+`PLAYWRIGHT_BROWSERS_PATH` before starting the manager to select that cache.
+Managed browsers, contexts, and pages belong to the workspace runtime and are
+closed during reset. Use `ws.browser.close(...)` to release them earlier.
+
+Use `save_state()` and `load_state()` to persist authentication explicitly;
+saved state includes IndexedDB by default and is kept under `.mypr/browser`.
+State is not saved automatically when a context closes:
+
+```python
+await ws.browser.save_state(context, name="login")
+state = await ws.browser.load_state("login")
+restored = await ws.browser.context("restored", storage_state=state)
+```
+
+`shared=True` gives all logical clients the same named context or connection;
+otherwise the name is private to the current client. Use `connect(endpoint,
+protocol="playwright"|"cdp", name="remote")` for an externally managed
+browser, then pass `connection="remote"` to `context()`. Closing or resetting
+mypr-mcp disconnects from external browsers and leaves their processes and
+pre-existing tabs running. `screenshot()` saves an artifact and returns it as
+inline image content, subject to the normal 2 MiB image limit. HAR and video
+paths supplied through Playwright context options are resolved below the
+workspace.
+
+### Network diagnostics and scans
+
+`ws.net.resolve(host, port=None)` returns deduplicated IPv4/IPv6 addresses.
+`connect(host, port, timeout=3)` reports `open`, `closed`, `timeout`, or
+`unreachable` without raising for ordinary connection failures. `tls()` uses
+certificate and hostname verification by default and reports the negotiated
+TLS version, cipher, peer certificate, and SHA-256 fingerprint. Set
+`verify=False` only for diagnostics; `cert_pem` or `fingerprint` can pin the
+peer certificate.
+
+TCP scans default to ports 1–1024, 64 concurrent connections, 200 probes per second,
+and a one-second connection timeout. TCP scans and Nmap runs are managed background jobs:
+
+```python
+scan = await ws.net.scan(
+    ["127.0.0.1"], ports="22,80,443", concurrency=64, rate=200, timeout=1
+)
+await scan.summary(wait_ms=30000)
+page = await scan.results(max_entries=100, max_bytes=32768)
+rows = page["results"]
+while page["has_more"]:
+    page = await scan.results(cursor=page["next_cursor"])
+    rows.extend(page["results"])
+
+nmap = await ws.net.nmap("127.0.0.1", args=["-sV"])
+summary = await nmap
+```
+
+Awaiting a scan returns its terminal summary, including failed or cancelled states;
+check `state` and `error`. `result()` returns that summary once it is ready.
+
+Scan handles support the normal task methods (`status()`, `read()`,
+`expect()`, `output()`, `result()`, `cancel()`, and `await handle`) as well as
+`summary()` and paged `results()`. `await ws.tasks.attach(scan_id)` reconnects
+to a retained scan after a reset or manager restart. TCP results and parsed
+Nmap results are retained under `.mypr/scans`; each result store is capped at
+16 MiB and each page defaults to 100 entries and 32 KiB. Nmap owns its XML
+output channel, so output flags such as `-oX`, `-oA`, and `-oN` are rejected;
+install Nmap and arrange privileges explicitly when a scan requires them.
+
+HTTP clients, managed browser resources, and active scans are attached to the
+workspace runtime. A reset closes clients and managed browser resources and
+cancels active scans; saved browser state, completed scan records, and files
+remain available afterward.
 
 ### Shell and async tasks
 
@@ -389,6 +546,8 @@ ws.tasks.get(ws.local["job"].id)
 | `job.status()` | Dictionary with `id`, `status`, owner IDs, and timestamps |
 | `job.output()` | Captured text so far |
 | `job.output(cursor=0)` | Dictionary with `output`, the next character `cursor`, and `truncated` |
+| `await job.read(cursor=None, stream=None, max_bytes=32768, wait_ms=0)` | Bounded output page and opaque continuation cursor |
+| `await job.expect(pattern, cursor=None, stream=None, regex=False, timeout=30, max_scan_bytes=65536)` | Wait for text or a regex across output chunks |
 | `job.result()` | Completed result; raises `NotReady` while still running |
 | `await job` | Waits for completion and returns the result |
 | `await job.cancel()` | Returns `False` if already terminal, otherwise requests cancellation and returns `True` |
@@ -398,6 +557,21 @@ shell jobs return `{"returncode": 0}`; a failed shell job raises `RPCError` when
 its result is retrieved. Cancelled jobs raise `asyncio.CancelledError`.
 Waiting with `await job` suspends the current cell until completion while
 other runnable cells continue.
+
+`read()` supports stdout/stderr selection and waits up to 30 seconds for output
+or completion. Its opaque cursor belongs to that job and stream; it is separate
+from the character cursor used by `output(cursor=...)`. Check `truncated` and
+`warnings` for output loss. `expect()` distinguishes a match, EOF, timeout, and
+scan limit. A match advances its cursor just past the matched text; an unmatched
+result keeps the starting cursor for retry. Cancelling a read or expect wait
+does not cancel the job.
+
+`await ws.tasks.attach(task_id_or_history_id)` returns an existing live handle
+or reconnects to retained shell/package output. Historical Python and cell
+handles expose saved output and status but cannot restore Python values;
+`result()` raises `ResultUnavailable`. Use generation-qualified `history_id`
+for a specific historical Python task. Legacy records may only contain a
+limited output prefix.
 
 Every submitted cell also has a task handle. Retrieve it with
 `ws.tasks.get(exec_id)`. Its status has `kind="cell"`, and `result()` returns
@@ -604,6 +778,21 @@ Background task details retain up to 64 KiB of output and mark truncation;
 live handles retain their normal output buffers. Logs stream cell, shell, and
 Python task output while work is running.
 
+### Coordinating shared work
+
+```python
+async with ws.locks.acquire("module:review", "file:report", timeout=10):
+    await ws.fs.write("report.txt", "Done.\n", overwrite=True)
+ws.locks.list()
+```
+
+Locks belong to the current asyncio task. Names are normalized and acquired
+together; reacquiring while the same task owns locks raises an error. Leaving
+the context, completing or cancelling the task, or resetting the kernel releases
+them. Disconnecting a client does not end its running tasks or release their locks.
+`list()` shows owners and waiters. These are cooperative locks: filesystem writes
+and other clients must explicitly use the same names to participate.
+
 ### Client messages
 
 Every logical client has a persistent inbox in the workspace SQLite history.
@@ -618,14 +807,19 @@ ws.local["inbox"] = await ws.messages.read()
 await ws.messages.ack([message["id"] for message in ws.local["inbox"]["messages"]])
 ```
 
-`send(to, text)` uses the current logical client as the sender and accepts
+`send(to, text, data=None, reply_to=None)` uses the current logical client as the sender and accepts
 non-empty text up to 16 KiB in UTF-8. It returns `id`, `from`, `to`, `text`, and
 `created_at`; text whose JSON escaping would exceed a 32 KiB page is rejected.
-`read(limit=20, after=None, wait_ms=0)` returns
+`data` accepts bounded JSON-serializable values. `reply(message_id, text, data=None)`
+sends to the original sender and records `reply_to`; only the original recipient
+can reply, including after acknowledging the original message.
+`read(limit=20, after=None, wait_ms=0, sender=None, reply_to=None)` returns
 unacknowledged messages in ID order with `messages`, `next_cursor`, and
 `has_more`. The limit is 1–100, the serialized page is at most 32 KiB, and
 `wait_ms` is limited to 30 seconds. Use the returned `next_cursor` as `after`
-to continue paging. A non-zero `wait_ms` waits only when no messages match the cursor.
+to continue paging. A non-zero `wait_ms` waits only when no messages match both
+the cursor and the optional sender/reply filters. Unrelated messages do not end
+a filtered wait.
 
 `ack(ids)` explicitly acknowledges messages belonging to the current client.
 Acknowledgement is idempotent, and reading or previewing a message never marks
@@ -636,7 +830,8 @@ scoped to its logical ID.
 The MCP responses from `init`, `execute`, and `poll` include up to five short
 inbox previews (within a 4 KiB budget), plus the total unacknowledged count.
 The `inbox` field contains `unacked`, `messages`, and `has_more`; each preview has
-`id`, `from`, `text`, and `truncated`. Use `read()` for full text when truncated.
+`id`, `from`, `text`, `reply_to`, and `truncated`. Structured `data` is omitted
+from previews; use `read()` for full content.
 Messages can end an `execute` or `poll` wait early without cancelling the cell:
 check its state and continue polling if needed. Polling another client's execution
 still returns your own inbox. Before `init`, `poll` omits the inbox.
@@ -662,38 +857,48 @@ links that stay inside the skills root are supported. `read(name)` returns the
 full Markdown.
 Both read from disk, so edits are visible on the next call without a reload.
 
-Create or edit a skill with ordinary file operations:
+Validate and edit a skill through the revision-aware helpers:
 
 ```python
-ws.local["skill"] = ws.skills.root / "review" / "SKILL.md"
-ws.local["skill"].parent.mkdir(parents=True, exist_ok=True)
-ws.local["skill"].write_text(
+skill = await ws.skills.write(
+    "review",
     "---\nname: review\ndescription: Review workspace changes.\n---\n\n"
     "Read the diff, check affected callers, and report concrete issues.\n",
-    encoding="utf-8",
 )
-ws.skills.read("review")
+skill["revision"]
+await ws.skills.validate("review")
 ```
 
 Skill text is interpreted by the agent; reading it does not execute its
-instructions or scripts.
+instructions or scripts. `validate()` accepts legacy Markdown without front
+matter with a warning, rejects malformed YAML and invalid metadata types, and
+reports missing or escaping local Markdown links. Existing skills require
+`expected_hash=page["revision"]` when updated. Pass `dry_run=True` to preview a
+bounded diff without writing.
 
-For reusable Python, put modules under `.mypr/lib/ws_lib/`. Its parent,
-`.mypr/lib/`, is on the kernel's import path:
+For reusable Python, use `ws.modules` for files under `.mypr/lib/ws_lib/`:
 
 ```python
-from pathlib import Path
-
-path = ws.workspace / ".mypr" / "lib" / "ws_lib" / "helpers.py"
-path.write_text("def answer(value):\n    return value * 2\n", encoding="utf-8")
-
-import ws_lib.helpers as helpers
-import importlib
-importlib.reload(helpers)
+await ws.modules.write("helpers", "def answer(value):\n    return value * 2\n")
+await ws.modules.check("helpers", test_code="assert answer(2) == 4")
+helpers = ws.modules.load("helpers")
+helpers.answer(2)
+await ws.modules.write(
+    "helpers", "def answer(value):\n    return value * 3\n",
+    expected_hash=(await ws.modules.read("helpers"))["revision"],
+)
+helpers = ws.modules.reload("helpers")
 ```
 
-Reload is explicit. Existing references to functions or objects from the old
-module remain unchanged.
+`modules.list()` is synchronous; `read()`, `check()`, and `write()` are async.
+Module names are public dotted Python names and cannot escape `ws_lib`. `check()`
+compiles the candidate and runs optional test code in the workspace Python
+environment with its own timeout. `write()` validates syntax, uses an atomic
+CAS write, and never activates the module. `load()` and `reload()` execute a
+fresh module and bind it only after successful execution; failed reloads leave
+the old module binding intact. References already held elsewhere keep pointing
+to the previous module after a successful reload. Imports can have external side
+effects; a failed reload does not undo those side effects.
 
 ### Packages and inspection
 
@@ -808,7 +1013,7 @@ cache_bytes = 33554432
 
 The kernel retains the most recently completed `completed_tasks` handles, in
 addition to all active handles. Older handles disappear from `ws.tasks.list()`
-and `ws.tasks.get()`; use `ws.history` for saved records. A handle saved in your
+and `ws.tasks.get()`; use `await ws.tasks.attach(id)` or `ws.history` for saved records. A handle saved in your
 own variable or `ws.local` remains usable. These limits release internal cache
 references, not arbitrary objects retained by Python code.
 
@@ -819,10 +1024,12 @@ If shell metadata cannot be saved, the most recent affected completed job is
 retained outside these cache limits so its result and warning remain inspectable.
 This fallback lasts only while the manager is alive and retains at most one job's
 output, subject to the normal per-job output limit.
-Execution output and shell/package journals remain on disk under `.mypr/runs/`
+Execution output, Python-task journals, and shell/package journals remain on disk under `.mypr/runs/`
 and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache
 eviction. Request deduplication uses SQLite and survives eviction and restart,
-including empty request IDs. Retention does not delete saved files or messages.
+including empty request IDs. Query snapshots remain under `.mypr/searches/` and
+`.mypr/git/`. Cache retention does not delete these snapshots, journals, saved
+files, or messages.
 Execution journals have rebuildable `.idx` byte-offset indexes. Historical
 polling seeks directly to the requested event cursor instead of loading the
 entire output file for each page. Older journals are indexed once on first

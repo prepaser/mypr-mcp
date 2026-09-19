@@ -57,6 +57,21 @@ def _kernel_class():
     class WorkspaceKernel(IPythonKernel):
         async def execute_request(self, stream, ident, parent):
             metadata = (parent or {}).get("metadata", {})
+            if isinstance(metadata, dict) and metadata.get("mypr_control") == "cleanup":
+                result = {
+                    "status": "ok",
+                    "execution_count": 0,
+                    "user_expressions": {},
+                    "payload": [],
+                }
+                try:
+                    if metadata.get("generation") != os.environ.get("MYPR_GENERATION"):
+                        raise RuntimeError("Expired cleanup generation")
+                    await self._mypr_workspace._close_resources()
+                except Exception as exc:
+                    result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
+                self.session.send(stream, "execute_reply", result, parent, ident=ident)
+                return
             request = metadata.get("mypr") if isinstance(metadata, dict) else None
             content = (parent or {}).get("content", {})
             executor = getattr(self, "_mypr_cells", None)
@@ -108,6 +123,7 @@ def main(argv: list[str] | None = None) -> None:
     namespace = app.shell.user_ns
     ws = create_workspace(workspace, namespace)
     namespace.update({"ws": ws, "workspace": workspace})
+    app.kernel._mypr_workspace = ws
     app.shell.user_ns.setdefault("__name__", "__main__")
     install_context_displayhook(app.shell)
     app.kernel._mypr_cells = CellExecutor(app.kernel, app.shell, ws.tasks)

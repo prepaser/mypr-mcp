@@ -90,6 +90,82 @@ async def test_read_wait_respects_cursor_and_timeout(runtime):
             )
 
 
+async def test_filtered_read_wait_ignores_unrelated_messages(runtime):
+    original = await runtime.dispatch(
+        {
+            "op": "message_send",
+            "client_id": "receiver",
+            "to": "sender",
+            "text": "original",
+        }
+    )
+    waiting = asyncio.create_task(
+        runtime.dispatch(
+            {
+                "op": "message_read",
+                "client_id": "receiver",
+                "sender": "sender",
+                "reply_to": original["id"],
+                "wait_ms": 30000,
+            }
+        )
+    )
+    await asyncio.sleep(0)
+    unrelated = await runtime.dispatch(
+        {
+            "op": "message_send",
+            "client_id": "sender",
+            "to": "receiver",
+            "text": "unrelated",
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert not waiting.done()
+    reply = await runtime.dispatch(
+        {
+            "op": "message_send",
+            "client_id": "receiver",
+            "to": "sender",
+            "text": "reply",
+            "reply_to": unrelated["id"],
+        }
+    )
+    # The reply above is addressed to the sender of the unrelated message,
+    # so it must not satisfy the requested reply_to value.
+    assert reply["reply_to"] == unrelated["id"]
+    await asyncio.sleep(0.02)
+    assert not waiting.done()
+    await runtime.dispatch(
+        {
+            "op": "message_send",
+            "client_id": "sender",
+            "to": "receiver",
+            "text": "target",
+            "reply_to": original["id"],
+        }
+    )
+    page = await asyncio.wait_for(waiting, 1)
+    assert [message["text"] for message in page["messages"]] == ["target"]
+
+
+async def test_filtered_wait_can_be_cancelled(runtime):
+    waiting = asyncio.create_task(
+        runtime.dispatch(
+            {
+                "op": "message_read",
+                "client_id": "receiver",
+                "sender": "sender",
+                "wait_ms": 30000,
+            }
+        )
+    )
+    await asyncio.sleep(0)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert not runtime.message_waiters
+
+
 async def test_cancelled_and_stopped_waiters_are_cleaned_up(runtime):
     baseline = asyncio.all_tasks()
     waiting = asyncio.create_task(runtime.wait_activity("receiver", 30))

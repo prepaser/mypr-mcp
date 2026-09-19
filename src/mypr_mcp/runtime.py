@@ -2,7 +2,7 @@ import asyncio
 import base64
 import contextlib
 import fcntl
-import importlib.metadata
+import hashlib
 import json
 import os
 import re
@@ -18,10 +18,16 @@ from jupyter_client import AsyncKernelManager
 from jupyter_client.kernelspec import KernelSpec
 
 from . import __version__
+from .bootstrap import ensure_runtime
+from .browser_service import BrowserService
 from .diagnostics import safe_error
+from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
+from .managed_commands import ManagedCommands
 from .messages import MessageStore
+from .scan_service import ScanService
+from .search import Search
 from .services import MCPBridge, Shells
 from .transport import MAX_MESSAGE, socket_path, workspace_id
 
@@ -59,6 +65,7 @@ class Runtime:
         self.iopub = None
         self.replies = None
         self.by_msg = {}
+        self.control_waiters = {}
         self.monitor = None
         self.config = {}
         config = self.root / "config.toml"
@@ -76,6 +83,9 @@ class Runtime:
             raise ValueError("Output limits must be at least 1024 bytes")
         self.shells = self.new_shells()
         self.mcp = None
+        self.browser = None
+        self.scans = None
+        self._resource_lock = asyncio.Lock()
         self.background = set()
 
     def new_shells(self):
@@ -140,13 +150,27 @@ class Runtime:
             (self.root / name).mkdir(parents=True, exist_ok=True)
         (self.root / "lib/ws_lib/__init__.py").touch(exist_ok=True)
         ignore = self.root / ".gitignore"
-        if not ignore.exists():
-            ignore.write_text(
-                "venv/\nruns/\nartifacts/\njobs/\nipython/\njupyter/\n*.json\nhistory.sqlite3*\n*.log\n*.lock\n"
-            )
-        elif "history.sqlite3*" not in ignore.read_text().splitlines():
+        entries = ignore.read_text().splitlines() if ignore.exists() else []
+        required = [
+            "venv/",
+            "runs/",
+            "artifacts/",
+            "jobs/",
+            "ipython/",
+            "jupyter/",
+            "*.json",
+            "history.sqlite3*",
+            "*.log",
+            "*.lock",
+            "browser/",
+            "scans/",
+        ]
+        missing = [entry for entry in required if entry not in entries]
+        if missing:
             with ignore.open("a") as file:
-                file.write("\nhistory.sqlite3*\n")
+                if entries:
+                    file.write("\n")
+                file.write("\n".join(missing) + "\n")
         config = self.root / "config.toml"
         if not config.exists():
             config.write_text("[mcp.servers]\n")
@@ -154,12 +178,9 @@ class Runtime:
         py = self.root / "venv/bin/python"
         if not py.exists():
             await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
-        marker = self.root / "venv/.mypr-version"
-        if not marker.exists() or marker.read_text() != __version__:
-            specs = [f"{p}=={importlib.metadata.version(p)}" for p in ["ipykernel", "pyyaml"]]
-            await self.command("uv", "pip", "install", "--python", str(py), *specs)
-            marker.write_text(__version__)
+        await ensure_runtime(py, self.command)
         self.py = py
+        self.scans = ScanService(self.workspace, self.shells, self.track_shell)
         for path in (self.root / "runs").glob("*.json"):
             try:
                 old = json.loads(path.read_text())
@@ -314,7 +335,13 @@ class Runtime:
     async def read_replies(self):
         while True:
             reply = await self.kc.get_shell_msg()
-            rec = self.by_msg.get(reply.get("parent_header", {}).get("msg_id"))
+            ident = reply.get("parent_header", {}).get("msg_id")
+            waiter = self.control_waiters.get(ident)
+            if waiter is not None:
+                if not waiter.done():
+                    waiter.set_result(reply.get("content", {}))
+                continue
+            rec = self.by_msg.get(ident)
             if rec is None or rec["generation"] != self.generation:
                 continue
             content = reply.get("content", {})
@@ -436,14 +463,32 @@ class Runtime:
         rec["bytes"] += min(len(raw), room)
         self.save(rec)
 
-    async def wait_activity(self, client, wait_seconds, done=None, *, after=None):
+    async def wait_activity(
+        self,
+        client,
+        wait_seconds,
+        done=None,
+        *,
+        after=None,
+        sender=None,
+        reply_to=None,
+    ):
         notification = asyncio.get_running_loop().create_future() if client else None
         tasks = []
         if notification is not None:
             self.message_waiters.setdefault(client, set()).add(notification)
             tasks.append(notification)
         try:
-            if client and self.messages.read(client, limit=1, after=after)["messages"]:
+            if (
+                client
+                and self.messages.read(
+                    client,
+                    limit=1,
+                    after=after,
+                    sender=sender,
+                    reply_to=reply_to,
+                )["messages"]
+            ):
                 return
             tasks.append(asyncio.create_task(self.stopping.wait()))
             if done:
@@ -611,7 +656,7 @@ class Runtime:
             if record is None:
                 raise ValueError("Unknown history ID")
             if (
-                record["kind"] in {"shell", "package"}
+                record["kind"] in {"shell", "package", "scan"}
                 and record["id"] in self.task_records
                 and record.get("generation") == self.generation
             ):
@@ -632,7 +677,75 @@ class Runtime:
                         if key in page
                     }
                 )
+            elif record["kind"] == "python":
+                journal = self.task_journal_path(record)
+                if journal is not None and journal.is_file():
+                    try:
+                        output, total = await asyncio.to_thread(
+                            read_page, journal, 0, self.response_limit
+                        )
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        record["warnings"] = [
+                            {"code": "journal_unavailable", "text": safe_error(exc)}
+                        ]
+                        record["output_truncated"] = True
+                    else:
+                        record.update(
+                            output=output,
+                            cursor=len(output),
+                            has_more=len(output) < total,
+                            output_truncated=bool(record.get("output_truncated")),
+                        )
             return record
+        if op == "history_task_read":
+            history_id = req.get("id")
+            record = self.history.get(history_id)
+            if record is None or record.get("kind") not in {"python", "execution"}:
+                raise ValueError("Unknown Python task history ID")
+            expected_history_id = (
+                self.task_history_id(record) if record.get("kind") == "python" else record.get("id")
+            )
+            if expected_history_id != history_id:
+                raise ValueError("History ID does not identify this task generation")
+            cursor = req.get("cursor", 0)
+            if type(cursor) is not int or cursor < 0:
+                raise ValueError("Invalid task output cursor")
+            budget = req.get("max_bytes", self.response_limit)
+            if type(budget) is not int or budget < 0 or budget > self.output_limit:
+                raise ValueError("Invalid task output budget")
+            journal = (
+                self.task_journal_path(record)
+                if record.get("kind") == "python"
+                else self.root / "runs" / f"{record['id']}.jsonl"
+            )
+            if journal is None:
+                return {
+                    "id": record.get("id"),
+                    "history_id": expected_history_id,
+                    "kind": record.get("kind"),
+                    "generation": record.get("generation"),
+                    "client_id": record.get("client_id", record.get("client")),
+                    "connection_id": record.get("connection_id"),
+                    "exec_id": record.get("exec_id"),
+                    "output": [],
+                    "cursor": cursor,
+                    "has_more": False,
+                    "truncated": True,
+                }
+            output, total = await asyncio.to_thread(read_page, journal, cursor, budget)
+            return {
+                "id": record.get("id"),
+                "history_id": expected_history_id,
+                "kind": record.get("kind"),
+                "generation": record.get("generation"),
+                "client_id": record.get("client_id", record.get("client")),
+                "connection_id": record.get("connection_id"),
+                "exec_id": record.get("exec_id"),
+                "output": output,
+                "cursor": cursor + len(output),
+                "has_more": cursor + len(output) < total,
+                "truncated": bool(record.get("output_truncated")),
+            }
         generation = req.pop("generation", None)
         if generation and generation != self.generation:
             raise RuntimeError("Expired kernel generation")
@@ -648,14 +761,31 @@ class Runtime:
             rec["error_truncated"] = req.get("error_truncated", False)
             self.finish(rec, req["state"], req.get("error"))
             return None
-        if op in {"message_send", "message_read", "message_ack"}:
+        if op in {"message_send", "message_reply", "message_read", "message_ack"}:
             if not (connection and connection["client_id"]) and not requested_client:
                 raise RuntimeError("Messages require a client identity")
             if self.stopping.is_set():
                 raise RuntimeError("Workspace manager is stopping")
             if op == "message_send":
-                message = self.messages.send(client, req["to"], req["text"])
+                message = self.messages.send(
+                    client,
+                    req["to"],
+                    req["text"],
+                    data=req.get("data"),
+                    reply_to=req.get("reply_to"),
+                )
                 for waiter in self.message_waiters.get(req["to"], ()):
+                    if not waiter.done():
+                        waiter.set_result(None)
+                return message
+            if op == "message_reply":
+                message = self.messages.reply(
+                    client,
+                    req["message_id"],
+                    req["text"],
+                    data=req.get("data"),
+                )
+                for waiter in self.message_waiters.get(message["to"], ()):
                     if not waiter.done():
                         waiter.set_result(None)
                 return message
@@ -667,12 +797,22 @@ class Runtime:
             deadline = asyncio.get_running_loop().time() + wait_ms / 1000
             while True:
                 page = self.messages.read(
-                    client, limit=req.get("limit", 20), after=req.get("after")
+                    client,
+                    limit=req.get("limit", 20),
+                    after=req.get("after"),
+                    sender=req.get("sender"),
+                    reply_to=req.get("reply_to"),
                 )
                 remaining = deadline - asyncio.get_running_loop().time()
                 if page["messages"] or remaining <= 0:
                     return page
-                await self.wait_activity(client, remaining, after=req.get("after"))
+                await self.wait_activity(
+                    client,
+                    remaining,
+                    after=req.get("after"),
+                    sender=req.get("sender"),
+                    reply_to=req.get("reply_to"),
+                )
         if op == "execute":
             if not self.workspace_available():
                 raise RuntimeError("The workspace moved; stop its manager and reconnect")
@@ -719,6 +859,67 @@ class Runtime:
                 req.get("wait_ms", 1000),
                 inbox_client=connection["client_id"] if connection else None,
             )
+        if op == "scan_start":
+            if self.stopping.is_set() or self.resetting or not self.healthy:
+                raise RuntimeError("Workspace is not accepting scans")
+            return await self.scans.start(
+                req["mode"],
+                targets=req["targets"],
+                ports=req.get("ports"),
+                concurrency=req.get("concurrency", 64),
+                rate=req.get("rate", 200),
+                timeout=req.get("timeout", 1.0),
+                args=req.get("args"),
+                client_id=client,
+                connection_id=connection_id,
+                exec_id=req.get("exec_id"),
+            )
+        if op == "scan_results":
+            return await self.scans.results(
+                req["id"],
+                cursor=req.get("cursor"),
+                max_entries=req.get("max_entries", 100),
+                max_bytes=req.get("max_bytes", 32768),
+            )
+        if op == "scan_summary":
+            return await self.scans.summary(req["id"], wait_ms=req.get("wait_ms", 0))
+        if op == "scan_cancel":
+            return await self.scans.cancel(req["id"])
+        if op == "browser_server":
+            if self.stopping.is_set() or self.resetting or not self.healthy:
+                raise RuntimeError("Workspace is not accepting browser requests")
+            async with self._resource_lock:
+                if self.browser is None:
+                    self.browser = BrowserService(
+                        self.workspace,
+                        self.py,
+                        kernel_pid=self.km.provisioner.pid,
+                        generation=self.generation,
+                        shells=self.shells,
+                    )
+                browser_service = self.browser
+
+            def track_install(ident, **fields):
+                self.track_shell(ident, client, connection_id, req.get("exec_id"), **fields)
+
+            return await browser_service.ensure(
+                req.get("browser", "chromium"),
+                launch_options=req.get("launch_options"),
+                track=track_install,
+            )
+        if op in {"search", "git"}:
+            if self.stopping.is_set():
+                raise RuntimeError("Workspace manager is stopping")
+            runner = ManagedCommands(self, client, connection_id, req.get("exec_id"))
+            args = req.get("args", {})
+            if not isinstance(args, dict):
+                raise TypeError("args must be an object")
+            if op == "search":
+                return await Search(self.workspace, runner).search(**args)
+            method = req.get("method")
+            if method not in {"status", "diff", "show"}:
+                raise ValueError("Unknown Git method")
+            return await getattr(Git(self.workspace, runner), method)(**args)
         if op == "shell_start":
             job = await self.shells.start(
                 req["command"],
@@ -746,6 +947,16 @@ class Runtime:
             return job
         if op == "shell_poll":
             return await self.shells.poll(req["id"], req.get("cursor", 0))
+        if op == "shell_read":
+            return await self.shells.read(
+                req["id"],
+                req.get("cursor", 0),
+                stream=req.get("stream"),
+                max_bytes=req.get("max_bytes", 32768),
+                wait_ms=req.get("wait_ms", 0),
+            )
+        if op == "shell_wait":
+            return await self.shells.wait(req["id"])
         if op == "shell_write":
             return await self.shells.write(
                 req["id"], req.get("text", ""), eof=req.get("eof", False)
@@ -809,10 +1020,28 @@ class Runtime:
             record = {**old, **event, "kind": "python"}
             self.task_records[event["id"]] = record
             delta = event.pop("output_delta", None)
+            output_stream = event.pop("output_stream", "stdout")
             record.pop("output_delta", None)
+            record.pop("output_stream", None)
             if delta is None and event.get("output") != old.get("output"):
                 delta = event.get("output")
             if delta:
+                journal = self.task_journal_path(record)
+                if journal is not None:
+                    try:
+                        append_events(
+                            journal,
+                            [
+                                {
+                                    "type": "stream",
+                                    "stream": output_stream,
+                                    "text": str(delta),
+                                    "generation": self.generation,
+                                }
+                            ],
+                        )
+                    except (OSError, RuntimeError) as exc:
+                        self.warn(record, "task_output_persist_failed", safe_error(exc))
                 self.history.append(
                     "python",
                     "output",
@@ -823,6 +1052,7 @@ class Runtime:
                         "exec_id": event.get("exec_id"),
                         "client_id": client,
                         "connection_id": connection_id,
+                        "stream": output_stream,
                         "text": delta,
                         "truncated": event.get("output_truncated", False),
                     },
@@ -893,6 +1123,7 @@ class Runtime:
             await self.mcp.close()
             self.mcp = MCPBridge(self.workspace)
             self.shells = self.new_shells()
+            self.scans = ScanService(self.workspace, self.shells, self.track_shell)
             self.queue = asyncio.Queue()
             self.generation = uuid.uuid4().hex
             await self.start_kernel()
@@ -908,8 +1139,47 @@ class Runtime:
         finally:
             self.resetting = False
 
+    async def cleanup_kernel_resources(self):
+        if not self.kc or not self.km or not self.replies or self.replies.done():
+            return
+        msg = self.kc.session.msg(
+            "execute_request",
+            {
+                "code": "",
+                "silent": True,
+                "store_history": False,
+                "user_expressions": {},
+                "allow_stdin": False,
+                "stop_on_error": False,
+            },
+            metadata={"mypr_control": "cleanup", "generation": self.generation},
+        )
+        ident = msg["header"]["msg_id"]
+        waiter = asyncio.get_running_loop().create_future()
+        self.control_waiters[ident] = waiter
+        try:
+            self.kc.shell_channel.send(msg)
+            async with asyncio.timeout(10):
+                result = await waiter
+            if result.get("status") != "ok":
+                raise RuntimeError(result.get("evalue", "Kernel resource cleanup failed"))
+        except Exception as exc:
+            if self.history:
+                self.history.append("runtime", "cleanup_warning", {"error": safe_error(exc)})
+        finally:
+            self.control_waiters.pop(ident, None)
+
     async def close_kernel(self):
         self.healthy = False
+        await self.cleanup_kernel_resources()
+        browser, self.browser = self.browser, None
+        if browser is not None:
+            try:
+                async with asyncio.timeout(8):
+                    await browser.close()
+            except Exception as exc:
+                if self.history:
+                    self.history.append("runtime", "cleanup_warning", {"error": safe_error(exc)})
         for task in [self.worker, self.iopub, self.replies, self.monitor]:
             if task:
                 task.cancel()
@@ -932,6 +1202,13 @@ class Runtime:
         if record.get("kind") == "python" and record.get("generation"):
             return f"python:{record['generation']}:{record['id']}"
         return None
+
+    def task_journal_path(self, record):
+        history_id = self.task_history_id(record)
+        if history_id is None:
+            return None
+        digest = hashlib.sha256(history_id.encode()).hexdigest()
+        return self.root / "runs" / f"task-{digest}.jsonl"
 
     def initialize_client(self, connection_id, requested_id):
         connection = self.clients.get(connection_id)
@@ -1020,6 +1297,8 @@ class Runtime:
         task.add_done_callback(self.shell_watchers.discard)
 
     async def close_shells(self):
+        if self.scans is not None:
+            await self.scans.close()
         await self.shells.close()
         await asyncio.gather(*list(self.shell_watchers), return_exceptions=True)
 
@@ -1086,9 +1365,20 @@ class Runtime:
             if req.get("op") == "attach":
                 await self.attach(reader, writer, req)
                 return
-            if req.get("op") in {"message_read", "execute", "poll"} or (
-                req.get("op") == "mcp" and req.get("method") not in MCP_MUTATIONS
-            ):
+            if req.get("op") in {
+                "message_read",
+                "execute",
+                "poll",
+                "search",
+                "git",
+                "shell_read",
+                "shell_wait",
+                "history_task_read",
+                "browser_server",
+                "scan_start",
+                "scan_results",
+                "scan_summary",
+            } or (req.get("op") == "mcp" and req.get("method") not in MCP_MUTATIONS):
                 operation = asyncio.create_task(self.dispatch(req))
                 disconnected = asyncio.create_task(reader.read(1))
                 try:

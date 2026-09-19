@@ -19,7 +19,7 @@ from typing import Any
 
 from .client_ids import ADJECTIVES, ANIMALS
 
-_KINDS = {"execution", "python", "shell", "package"}
+_KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
 _MAX_PAYLOAD_BYTES = 64 * 1024
 

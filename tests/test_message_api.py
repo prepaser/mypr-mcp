@@ -16,21 +16,48 @@ async def test_messages_forward_operations_and_arguments(monkeypatch, tmp_path):
             return {"id": 7, "to": fields["to"], "text": fields["text"]}
         if op == "message_read":
             return {"messages": [], "next_cursor": None, "has_more": False}
+        if op == "message_reply":
+            return {"id": 9, "reply_to": fields["message_id"], "text": fields["text"]}
         return 2
 
     monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
     ws = Workspace(tmp_path)
     with execution_context({"client_id": "calm-otter", "connection_id": "conn"}):
-        sent = await ws.messages.send("bright-fox", "hello")
-        read = await ws.messages.read(limit=5, after=7, wait_ms=250)
+        sent = await ws.messages.send("bright-fox", "hello", data={"kind": "review"}, reply_to=4)
+        reply = await ws.messages.reply(4, "done", data={"ok": True})
+        read = await ws.messages.read(
+            limit=5, after=7, wait_ms=250, sender="bright-fox", reply_to=4
+        )
         acknowledged = await ws.messages.ack([7, 8])
 
     assert sent == {"id": 7, "to": "bright-fox", "text": "hello"}
+    assert reply == {"id": 9, "reply_to": 4, "text": "done"}
     assert read == {"messages": [], "next_cursor": None, "has_more": False}
     assert acknowledged == 2
     assert calls == [
-        ("message_send", {"to": "bright-fox", "text": "hello"}),
-        ("message_read", {"limit": 5, "wait_ms": 250, "after": 7}),
+        (
+            "message_send",
+            {
+                "to": "bright-fox",
+                "text": "hello",
+                "data": {"kind": "review"},
+                "reply_to": 4,
+            },
+        ),
+        (
+            "message_reply",
+            {"message_id": 4, "text": "done", "data": {"ok": True}},
+        ),
+        (
+            "message_read",
+            {
+                "limit": 5,
+                "wait_ms": 250,
+                "after": 7,
+                "sender": "bright-fox",
+                "reply_to": 4,
+            },
+        ),
         ("message_ack", {"ids": [7, 8]}),
     ]
 

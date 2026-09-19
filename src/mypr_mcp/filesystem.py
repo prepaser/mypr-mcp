@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import difflib
 import hashlib
+import heapq
 import os
 import stat
 import tempfile
@@ -30,9 +31,12 @@ class Filesystem:
     continue from the same line.
     """
 
-    def __init__(self, workspace: str | os.PathLike[str], shell: Any = None) -> None:
+    def __init__(
+        self, workspace: str | os.PathLike[str], shell: Any = None, searcher: Any = None
+    ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self._shell = shell
+        self._searcher = searcher
 
     def _path(self, path: str | os.PathLike[str]) -> tuple[Path, str]:
         supplied = Path(path).expanduser()
@@ -187,13 +191,10 @@ class Filesystem:
         context: int = 0,
         max_matches: int = 100,
         max_bytes: int = 32 * 1024,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        if self._shell is None:
-            raise RuntimeError("ws.fs.search requires the workspace shell")
-        from .search import Search
-
-        return await Search(self.workspace, self._shell).search(
-            pattern,
+        args = dict(
+            pattern=pattern,
             paths=paths,
             glob=glob,
             fixed=fixed,
@@ -203,6 +204,57 @@ class Filesystem:
             context=context,
             max_matches=max_matches,
             max_bytes=max_bytes,
+            cursor=cursor,
+        )
+        if self._searcher is not None:
+            return await self._searcher(**args)
+        if self._shell is None:
+            raise RuntimeError("ws.fs.search requires the workspace shell")
+        from .search import Search
+
+        return await Search(self.workspace, self._shell).search(**args)
+
+    async def tree(
+        self,
+        path: str | os.PathLike[str] = ".",
+        *,
+        depth: int = 3,
+        max_entries: int = 200,
+        hidden: bool = False,
+    ) -> dict[str, Any]:
+        """Return a deterministic, bounded directory tree without following links."""
+        if not isinstance(depth, int) or isinstance(depth, bool) or depth < 0:
+            raise ValueError("depth must be a non-negative integer")
+        if not isinstance(max_entries, int) or isinstance(max_entries, bool) or max_entries < 1:
+            raise ValueError("max_entries must be a positive integer")
+        if type(hidden) is not bool:
+            raise TypeError("hidden must be a boolean")
+        candidate = _lexical_path(self.workspace, path)
+        return await _to_thread_uncancelled(
+            _tree,
+            candidate,
+            _display_path(candidate, self.workspace),
+            self.workspace,
+            depth,
+            max_entries,
+            hidden,
+        )
+
+    async def stat(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        follow_symlinks: bool = False,
+    ) -> dict[str, Any]:
+        """Return bounded metadata for a path, preserving terminal symlinks by default."""
+        if type(follow_symlinks) is not bool:
+            raise TypeError("follow_symlinks must be a boolean")
+        candidate = _lexical_path(self.workspace, path)
+        return await _to_thread_uncancelled(
+            _stat_path,
+            candidate,
+            _display_path(candidate, self.workspace),
+            follow_symlinks,
         )
 
 
@@ -212,6 +264,116 @@ def _below(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _lexical_path(root: Path, path: str | os.PathLike[str]) -> Path:
+    supplied = Path(path).expanduser()
+    candidate = supplied if supplied.is_absolute() else root / supplied
+    return Path(os.path.normpath(candidate))
+
+
+def _display_path(path: Path, root: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return str(path)
+    return str(relative) or "."
+
+
+def _metadata(path: Path, display: str, *, follow_symlinks: bool = False) -> dict[str, Any]:
+    info = path.stat() if follow_symlinks else path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(info.st_mode):
+        kind = "file"
+    else:
+        kind = "other"
+    result: dict[str, Any] = {
+        "path": display,
+        "kind": kind,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "mode": mode,
+    }
+    if kind == "symlink":
+        result["target"] = os.readlink(path)
+    return result
+
+
+class _ReverseName:
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, _ReverseName):
+            return NotImplemented
+        return self.value > other.value
+
+
+def _children(path: Path, limit: int, hidden: bool) -> tuple[list[os.DirEntry[str]], bool]:
+    heap: list[tuple[_ReverseName, str, os.DirEntry[str]]] = []
+    try:
+        entries = os.scandir(path)
+        with entries:
+            for entry in entries:
+                if not hidden and entry.name.startswith("."):
+                    continue
+                item = (_ReverseName(entry.name), entry.name, entry)
+                if len(heap) < limit:
+                    heapq.heappush(heap, item)
+                elif entry.name < heap[0][1]:
+                    heapq.heapreplace(heap, item)
+    except OSError:
+        raise
+    return [item[2] for item in sorted(heap, key=lambda item: item[1])], len(heap) == limit
+
+
+def _tree(
+    path: Path,
+    display: str,
+    root: Path,
+    depth: int,
+    max_entries: int,
+    hidden: bool,
+) -> dict[str, Any]:
+    count = 0
+    truncated = False
+
+    def visit(current: Path, current_display: str, remaining_depth: int) -> dict[str, Any]:
+        nonlocal count, truncated
+        node = _metadata(current, current_display)
+        if node["kind"] != "directory" or remaining_depth <= 0:
+            return node
+        if count >= max_entries:
+            truncated = True
+            return node
+        children, overflow = _children(current, max_entries - count + 1, hidden)
+        truncated |= overflow
+        result_children: list[dict[str, Any]] = []
+        for entry in children:
+            if count >= max_entries:
+                truncated = True
+                break
+            child = Path(entry.path)
+            child_display = _display_path(child, root)
+            count += 1
+            result_children.append(visit(child, child_display, remaining_depth - 1))
+        if result_children:
+            node["entries"] = result_children
+        return node
+
+    result = visit(path, display, depth)
+    result["truncated"] = truncated
+    return result
+
+
+def _stat_path(path: Path, display: str, follow_symlinks: bool) -> dict[str, Any]:
+    return _metadata(path, display, follow_symlinks=follow_symlinks)
 
 
 def _validate_line_range(
