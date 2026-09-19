@@ -200,6 +200,7 @@ class CellExecutor:
         if not exec_id:
             raise ValueError("mypr execute metadata requires exec_id")
         generation = str(metadata["generation"])
+        self.tasks._validate_new_id(exec_id, generated=True)
         count = self.shell.execution_count
         if not silent and store_history:
             self.shell.execution_count += 1
@@ -237,7 +238,7 @@ class CellExecutor:
             )
         holder["handle"] = handle
         handle._parent = parent
-        self.tasks._track(handle)
+        self.tasks._track(handle, generated=True)
         task.add_done_callback(lambda task: self._task_done(handle, task))
         return handle
 

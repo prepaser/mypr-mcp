@@ -264,6 +264,7 @@ class Shells:
         guard = Path(__file__).with_name("process_guard.py")
         return [
             sys.executable,
+            "-I",
             str(guard),
             "--parent-pid",
             str(os.getpid()),
@@ -638,6 +639,7 @@ class _MCPConnection:
                 raise ValueError("MCP server command must be a non-empty string")
             guard = Path(__file__).with_name("process_guard.py")
             args = [
+                "-I",
                 str(guard),
                 "--parent-pid",
                 str(os.getpid()),
@@ -957,8 +959,28 @@ def _config_cwd(cwd: Any, workspace: Path) -> str:
 
 def _page_servers(config: dict[str, dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
     names = sorted(config)
-    start = int(args.get("cursor", 0) or 0)
-    limit = max(1, min(int(args.get("limit", 50) or 50), 1000))
+    raw_cursor = args.get("cursor")
+    if raw_cursor is None:
+        start = 0
+    elif isinstance(raw_cursor, bool):
+        raise ValueError("cursor must be a non-negative integer")
+    elif isinstance(raw_cursor, int):
+        start = raw_cursor
+    elif isinstance(raw_cursor, str) and raw_cursor.isdecimal():
+        start = int(raw_cursor)
+    else:
+        raise ValueError("cursor must be a non-negative integer")
+    if start < 0:
+        raise ValueError("cursor must be a non-negative integer")
+    raw_limit = args.get("limit")
+    if raw_limit is None:
+        limit = 50
+    elif (
+        isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 1000
+    ):
+        raise ValueError("limit must be an integer between 1 and 1000")
+    else:
+        limit = raw_limit
     page = names[start : start + limit]
     end = start + len(page)
     return {

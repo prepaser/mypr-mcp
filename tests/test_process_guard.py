@@ -141,3 +141,32 @@ async def test_guard_preserves_signal_returncode(tmp_path):
         assert result["result"] == {"returncode": -signal.SIGTERM}
     finally:
         await shells.close()
+
+
+@pytest.mark.asyncio
+async def test_guard_isolated_from_python_environment(tmp_path):
+    shells = Shells(tmp_path)
+    try:
+        job = await shells.start(["/bin/echo", "ok"], env={"PYTHONHOME": "/nonexistent"})
+        for _ in range(300):
+            result = await shells.poll(job["id"])
+            if result["state"] != "running":
+                break
+            await asyncio.sleep(0.01)
+        assert result["state"] == "succeeded"
+        assert "ok" in "".join(event["text"] for event in result["output"])
+    finally:
+        await shells.close()
+
+
+@pytest.mark.asyncio
+async def test_guard_closes_parent_output_fds_while_descendant_runs(tmp_path):
+    shells = Shells(tmp_path)
+    try:
+        job = await shells.start("sleep 30 >/dev/null 2>&1 & exit 0")
+        record = shells._jobs[job["id"]]
+        await asyncio.wait_for(asyncio.gather(*record.readers), 5)
+        assert record.state == "running"
+        assert all(reader.done() for reader in record.readers)
+    finally:
+        await shells.close()

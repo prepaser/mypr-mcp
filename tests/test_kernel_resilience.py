@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -86,6 +87,62 @@ async def test_pruned_explicit_task_ids_cannot_be_reused(monkeypatch):
 
     with pytest.raises(ValueError, match="already exists"):
         manager.start(asyncio.sleep(0), task_id="stable")
+
+
+@pytest.mark.parametrize("ident", ["", 0, False])
+async def test_invalid_task_ids_close_rejected_coroutine(ident):
+    pending = asyncio.sleep(0)
+    with pytest.raises(ValueError, match="non-empty string"):
+        kernel_api.TaskManager().start(pending, task_id=ident)
+    assert pending.cr_frame is None
+
+
+@pytest.mark.asyncio
+async def test_generated_ids_do_not_create_an_unbounded_tombstone_ledger(monkeypatch):
+    async def fake_rpc(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
+    monkeypatch.setattr(kernel_api, "COMPLETED_TASKS", 0)
+    manager = kernel_api.TaskManager()
+    handles = [manager.start(asyncio.sleep(0)) for _ in range(1000)]
+    await asyncio.gather(*(handle._task for handle in handles))
+    await asyncio.gather(*list(manager._reporters))
+
+    assert manager._counter == 1000
+    assert not manager._explicit_ids
+    assert not hasattr(manager, "_used_ids")
+
+
+@pytest.mark.asyncio
+async def test_handle_registration_rejects_reserved_and_active_collisions(monkeypatch):
+    async def fake_rpc(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
+    manager = kernel_api.TaskManager()
+    for ident in ("a" * 32, "task-local-1", "remote-watch:job"):
+        with pytest.raises(ValueError, match="reserved generated namespace"):
+            manager.start(asyncio.sleep(0), task_id=ident)
+
+    custom = manager.start(asyncio.sleep(0), task_id="custom")
+    with pytest.raises(ValueError, match="already exists"):
+        manager._track(SimpleNamespace(id="custom"), generated=True)
+    await custom
+    await asyncio.gather(*list(manager._reporters))
+
+
+@pytest.mark.asyncio
+async def test_hidden_explicit_ids_remain_reserved(monkeypatch):
+    async def fake_rpc(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
+    manager = kernel_api.TaskManager()
+    hidden = manager.start(asyncio.sleep(0), task_id="hidden", visible=False)
+    await hidden
+    with pytest.raises(ValueError, match="already exists"):
+        manager.start(asyncio.sleep(0), task_id="hidden", visible=False)
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,29 @@ async def test_invalid_display_does_not_break_next_cell(workspace):
         assert (await rpc(socket_path(workspace), op="status"))["healthy"]
 
 
+async def test_custom_task_cannot_replace_cell_or_remote_handle(workspace):
+    async with mcp_session(workspace) as session:
+        cell = await execute(session, "42")
+        remote = await execute(session, "job = await ws.shell.start('printf done')\njob.id")
+        remote_id = result_text(remote).strip(" '\n")
+        for ident in (cell["exec_id"], remote_id):
+            rejected = await execute(
+                session,
+                f"import asyncio\nws.tasks.start(asyncio.sleep(0), task_id={ident!r})",
+            )
+            assert rejected["state"] == "failed"
+            assert "already exists" in rejected["error"]
+        assert (
+            result_text(
+                await execute(session, f"ws.tasks.get({cell['exec_id']!r}).result()")
+            ).strip()
+            == "42"
+        )
+        assert (
+            result_text(await execute(session, "await job\njob.output()")).strip(" '\n") == "done"
+        )
+
+
 def test_missing_image_preserves_result_and_inbox(tmp_path):
     result = tool_result(
         {

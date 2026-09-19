@@ -61,6 +61,14 @@ def _child_status(pid: int) -> tuple[bool, int]:
     return True, 1
 
 
+def _close_parent_fds() -> None:
+    for fd in (0, 1, 2):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _parent_dead(parent_pid: int, pidfd: int | None) -> bool:
     if pidfd is not None:
         readable, _, _ = select.select([pidfd], [], [], 0)
@@ -103,6 +111,8 @@ def main(argv: list[str]) -> int:
             except OSError as exc:
                 os.write(2, f"{exc}\n".encode("utf-8", "replace"))
                 os._exit(127)
+
+        _close_parent_fds()
 
         finished = False
         returncode = 1

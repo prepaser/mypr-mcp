@@ -239,6 +239,13 @@ import asyncio
 ws.local["job"] = ws.tasks.start(asyncio.sleep(2, result="done"))
 ```
 
+Cell, remote-job, and Python-task handles share one ID namespace. Custom task
+IDs cannot replace existing handles or use generated ID forms: 32 lowercase
+hexadecimal characters, `task-…-<number>`, or the `remote-watch:` prefix.
+Automatic task IDs use a monotonically increasing counter without retaining
+old IDs in memory. Custom IDs remain reserved until kernel reset, including
+IDs used with `visible=False`.
+
 Async tasks must yield to the event loop. Blocking or CPU-heavy work should run
 in a separate process, for example through `ws.shell.start(...)`.
 Use `ws.tasks.start()` for detached work that needs managed status and captured
@@ -334,6 +341,8 @@ Tool, resource, and prompt listing methods require a server name and accept
 when it is non-null. Server discovery uses `servers` and `next_cursor` instead;
 for additional pages use
 `await ws.mcp.request("list_servers", cursor=next_cursor, limit=50)`.
+Server-list cursors must be non-negative integers or decimal strings, and
+limits must be integers from 1 to 1000. Invalid values are rejected.
 
 Calls on the same external MCP connection may run concurrently, with each
 response kept with its requesting cell. Start a call with `ws.tasks.start(...)`
@@ -621,6 +630,10 @@ worker fails. Such a failure marks unfinished executions lost and rejects new
 executions until an explicit reset; Python code is never automatically replayed.
 
 Shell/package commands and local stdio MCP servers run through a supervisor.
+The supervisor's Python interpreter ignores Python-specific environment
+settings, while the command receives its configured environment unchanged.
+The supervisor closes its own standard streams after spawning the command,
+so it does not hold a terminated command's stdin/stdout pipes open.
 If the manager dies, their process groups receive SIGTERM, followed by SIGKILL
 after two seconds if needed. Same-group descendants remain supervised even
 after the original command exits. Processes that deliberately start a separate
@@ -672,6 +685,10 @@ Execution output and shell/package journals remain on disk under `.mypr/runs/`
 and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache
 eviction. Request deduplication uses SQLite and survives eviction and restart,
 including empty request IDs. Retention does not delete saved files or messages.
+Execution journals have rebuildable `.idx` byte-offset indexes. Historical
+polling seeks directly to the requested event cursor instead of loading the
+entire output file for each page. Older journals are indexed once on first
+read, off the manager's event loop; missing or stale indexes are rebuilt.
 
 Runtime files are created under `.mypr/`. The generated `.mypr/.gitignore`
 excludes the virtual environment, run records, artifacts, locks, logs, and

@@ -20,6 +20,7 @@ from jupyter_client.kernelspec import KernelSpec
 from . import __version__
 from .diagnostics import safe_error
 from .history import History
+from .journal import append_events, read_page
 from .messages import MessageStore
 from .services import MCPBridge, Shells
 from .transport import MAX_MESSAGE, socket_path, workspace_id
@@ -412,23 +413,23 @@ class Runtime:
                 self.save(rec)
             return
         step = min(1024, max(1, (self.response_limit - 256) // 12))
-        batch = []
-        with (self.root / "runs" / f"{rec['id']}.jsonl").open("a") as file:
-            for start in range(0, max(1, len(text)), step):
-                piece = dict(event, text=text[start : start + step])
-                if start:
-                    piece.pop("artifacts", None)
-                rec["events"].append(piece)
-                file.write(json.dumps(piece) + "\n")
-                batch.append(
-                    {
-                        "id": rec["id"],
-                        "exec_id": rec["id"],
-                        "client_id": rec.get("client_id"),
-                        "connection_id": rec.get("connection_id"),
-                        **piece,
-                    }
-                )
+        pieces, batch = [], []
+        for start in range(0, max(1, len(text)), step):
+            piece = dict(event, text=text[start : start + step])
+            if start:
+                piece.pop("artifacts", None)
+            pieces.append(piece)
+            batch.append(
+                {
+                    "id": rec["id"],
+                    "exec_id": rec["id"],
+                    "client_id": rec.get("client_id"),
+                    "connection_id": rec.get("connection_id"),
+                    **piece,
+                }
+            )
+        append_events(self.root / "runs" / f"{rec['id']}.jsonl", pieces)
+        rec["events"].extend(pieces)
         self.history.append_many("execution", "output", batch)
         rec["bytes"] += min(len(raw), room)
         self.save(rec)
@@ -459,36 +460,42 @@ class Runtime:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def poll(self, ident, cursor=0, wait_ms=1000, *, inbox_client=None):
-        if ident not in self.execs:
+        cold = ident not in self.execs
+        if cold:
             if len(ident) != 32 or any(c not in "0123456789abcdef" for c in ident):
                 raise ValueError("Invalid execution ID")
             path = self.root / "runs" / f"{ident}.json"
             if not path.exists():
                 raise ValueError("Unknown execution")
             rec = json.loads(path.read_text())
-            events = self.root / "runs" / f"{ident}.jsonl"
-            rec["events"] = (
-                [json.loads(s) for s in events.read_text().splitlines()] if events.exists() else []
-            )
         else:
             rec = self.execs[ident]
             if rec["state"] not in TERMINAL and wait_ms:
                 await self.wait_activity(
                     inbox_client, min(30000, max(0, wait_ms)) / 1000, rec["done"]
                 )
-        if cursor < 0 or cursor > len(rec["events"]):
+        if type(cursor) is not int or cursor < 0:
             raise ValueError("Invalid output cursor")
         error = rec.get("error")
         error_limit = min(1024, self.response_limit // 4)
         if error is not None:
             error = error.encode(errors="replace")[:error_limit].decode(errors="ignore")
-        output, size = [], len(json.dumps(error).encode())
-        for event in rec["events"][cursor:]:
-            n = len(json.dumps(event).encode())
-            if output and size + n > self.response_limit:
-                break
-            output.append(event)
-            size += n
+        size = len(json.dumps(error).encode())
+        if cold:
+            output, total = await asyncio.to_thread(
+                read_page, self.root / "runs" / f"{ident}.jsonl", cursor, self.response_limit, size
+            )
+        else:
+            total = len(rec["events"])
+            if cursor > total:
+                raise ValueError("Invalid output cursor")
+            output = []
+            for event in rec["events"][cursor:]:
+                n = len(json.dumps(event).encode())
+                if output and size + n > self.response_limit:
+                    break
+                output.append(event)
+                size += n
         return {
             "exec_id": ident,
             "client_id": rec.get("client_id", rec.get("client")),
@@ -498,7 +505,7 @@ class Runtime:
             "state": rec["state"],
             "output": output,
             "cursor": cursor + len(output),
-            "has_more": cursor + len(output) < len(rec["events"]),
+            "has_more": cursor + len(output) < total,
             "truncated": rec["truncated"],
             "error": error,
             **(

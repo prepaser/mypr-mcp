@@ -8,6 +8,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shlex
 import time
 from collections import deque
@@ -41,6 +42,15 @@ try:
     COMPLETED_TASKS = max(0, int(os.environ.get("MYPR_COMPLETED_TASKS", "128")))
 except ValueError:
     COMPLETED_TASKS = 128
+
+_HEX_ID = re.compile(r"^[0-9a-f]{32}$")
+_TASK_ID = re.compile(r"^task-.+-\d+$")
+
+
+def _reserved_generated_id(value: str) -> bool:
+    return bool(
+        _HEX_ID.fullmatch(value) or _TASK_ID.fullmatch(value) or value.startswith("remote-watch:")
+    )
 
 
 class NotReady(RuntimeError):
@@ -369,10 +379,27 @@ class TaskManager:
         self._reporters: set[asyncio.Task[None]] = set()
         self._completed: deque[tuple[str, TaskHandle]] = deque()
         self._completed_ids: set[str] = set()
-        self._used_ids: set[str] = set()
+        self._explicit_ids: set[str] = set()
 
-    def _track(self, handle: TaskHandle) -> None:
+    def _validate_new_id(self, ident: str, *, generated: bool) -> None:
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("Task ID must be a non-empty string")
+        current = self._handles.get(ident)
+        if current is not None:
+            raise ValueError(f"Task ID already exists: {ident}")
+        if ident in self._explicit_ids:
+            raise ValueError(f"Task ID already exists: {ident}")
+        if not generated and _reserved_generated_id(ident):
+            raise ValueError(f"Task ID uses a reserved generated namespace: {ident}")
+
+    def _track(self, handle: TaskHandle, *, generated: bool = False) -> None:
+        current = self._handles.get(handle.id)
+        if current is handle:
+            return
+        self._validate_new_id(handle.id, generated=generated)
         self._handles[handle.id] = handle
+        if not generated:
+            self._explicit_ids.add(handle.id)
 
     def _completed_handle(self, handle: TaskHandle) -> None:
         task = getattr(handle, "_task", None)
@@ -399,33 +426,45 @@ class TaskManager:
             raise TypeError("tasks.start expects an awaitable")
         generation = os.environ.get("MYPR_GENERATION", "local")
         if task_id is None:
-            while True:
-                self._counter += 1
-                ident = f"task-{generation}-{self._counter}"
-                if ident not in self._used_ids:
-                    break
+            self._counter += 1
+            ident = f"task-{generation}-{self._counter}"
+            generated = True
         else:
             ident = task_id
-        if ident in self._used_ids:
+            generated = False
+        try:
+            self._validate_new_id(ident, generated=generated)
+        except BaseException:
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
-            raise ValueError(f"Task ID already exists: {ident}")
-        self._used_ids.add(ident)
-        buffer = OutputBuffer()
-        run_state = {"started": False}
+            raise
+        try:
+            buffer = OutputBuffer()
+            run_state = {"started": False}
 
-        async def runner() -> Any:
-            run_state["started"] = True
-            token = _output_buffer.set(buffer)
+            async def runner() -> Any:
+                run_state["started"] = True
+                token = _output_buffer.set(buffer)
+                try:
+                    return await awaitable
+                finally:
+                    _output_buffer.reset(token)
+
+            runner_coro = runner()
             try:
-                return await awaitable
-            finally:
-                _output_buffer.reset(token)
-
-        task = asyncio.create_task(runner(), name=f"mypr:{ident}")
+                task = asyncio.create_task(runner_coro, name=f"mypr:{ident}", eager_start=False)
+            except BaseException:
+                runner_coro.close()
+                raise
+        except BaseException:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            if not generated:
+                self._explicit_ids.discard(ident)
+            raise
         handle = TaskHandle(ident, task, buffer, awaitable, run_state)
         if visible:
-            self._track(handle)
+            self._track(handle, generated=generated)
 
             async def report() -> None:
                 try:
@@ -436,6 +475,8 @@ class TaskManager:
             reporter = asyncio.create_task(report(), name=f"mypr:report:{ident}")
             self._reporters.add(reporter)
             reporter.add_done_callback(self._reporters.discard)
+        elif not generated:
+            self._explicit_ids.add(ident)
         return handle
 
     def list(self, client_id: str | None = None) -> list[dict[str, Any]]:
@@ -473,10 +514,9 @@ class RemoteTask(TaskHandle):
         self._cursor = 0
         self._cancel_requested = False
         self._lock = asyncio.Lock()
-        self._monitor = manager.start(
-            self._watch(), task_id=f"remote-watch:{task_id}", visible=False
-        )
-        manager._track(self)
+        manager._validate_new_id(task_id, generated=True)
+        self._monitor = manager.start(self._watch(), visible=False)
+        manager._track(self, generated=True)
 
     async def _watch(self) -> None:
         try:
