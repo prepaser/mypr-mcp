@@ -7,18 +7,20 @@ import contextvars
 import inspect
 import io
 import json
+import math
 import os
 import re
-import shlex
 import time
 from collections import deque
 from collections.abc import Awaitable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .diagnostics import safe_error, safe_error_details
+from .filesystem import Filesystem
+from .terminal import validate_size as _terminal_size
 
 _output_buffer: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
     "mypr_task_output", default=None
@@ -508,6 +510,7 @@ class RemoteTask(TaskHandle):
         self.id = task_id
         self._manager = manager
         self._buffer = OutputBuffer()
+        self._streams = {name: OutputBuffer() for name in ("stdout", "stderr")}
         self._created = time.time()
         self._finished_at: float | None = None
         self._client = _client_context.get()
@@ -517,6 +520,7 @@ class RemoteTask(TaskHandle):
         self._error: str | None = None
         self._warnings: list[dict[str, Any]] = []
         self._warnings_truncated = False
+        self._terminal: dict[str, Any] = {}
         self._cursor = 0
         self._cancel_requested = False
         self._lock = asyncio.Lock()
@@ -545,6 +549,9 @@ class RemoteTask(TaskHandle):
     def _merge(self, result: Any) -> None:
         if not isinstance(result, Mapping):
             return
+        self._terminal.update(
+            {key: result[key] for key in ("pty", "rows", "cols") if key in result}
+        )
         for warning in result.get("warnings", []):
             if warning not in self._warnings:
                 if len(self._warnings) < 4:
@@ -567,6 +574,7 @@ class RemoteTask(TaskHandle):
         output = result.get("output", "")
         if isinstance(output, str):
             self._buffer.write(output)
+            self._streams["stdout"].write(output)
             self._cursor = int(result.get("cursor", self._cursor + len(output)))
         elif isinstance(output, list):
             for event in output:
@@ -574,11 +582,14 @@ class RemoteTask(TaskHandle):
                     text = event.get("text", "")
                     if text:
                         self._buffer.write(str(text))
+                        stream = str(event.get("stream", "stdout"))
+                        self._streams.get(stream, self._streams["stdout"]).write(str(text))
             self._cursor = int(result.get("cursor", self._cursor + len(output)))
         elif isinstance(output, Mapping):
             text = output.get("text", output.get("output", ""))
             if text:
                 self._buffer.write(str(text))
+                self._streams["stdout"].write(str(text))
             self._cursor = int(result.get("cursor", output.get("cursor", self._cursor)))
         if "result" in result:
             self._result = result["result"]
@@ -593,6 +604,7 @@ class RemoteTask(TaskHandle):
             "status": self._state,
             "created_at": self._created,
             "error": self._error,
+            **self._terminal,
             **({"warnings": list(self._warnings)} if self._warnings else {}),
             **({"warnings_truncated": True} if self._warnings_truncated else {}),
             "client_id": self._client.id if self._client else None,
@@ -636,6 +648,42 @@ class RemoteTask(TaskHandle):
             self._merge(result)
         return True
 
+    async def write(self, text: str = "", *, eof: bool = False) -> dict[str, Any]:
+        if not isinstance(text, str) or type(eof) is not bool:
+            raise TypeError("text must be a string and eof must be a boolean")
+        return await _rpc("shell_write", id=self.id, text=text, eof=eof)
+
+    async def resize(self, rows: int, cols: int) -> dict[str, Any]:
+        _terminal_size(rows, cols)
+        async with self._lock:
+            result = await _rpc("shell_resize", id=self.id, rows=rows, cols=cols)
+            self._terminal.update(rows=result["rows"], cols=result["cols"])
+        return result
+
+
+class ShellError(RuntimeError):
+    def __init__(self, result: dict[str, Any]):
+        self.result = result
+        super().__init__(
+            f"Shell job {result['id']} {result['state']} (exit {result['returncode']})"
+        )
+
+
+async def _complete_cleanup(operation):
+    task = asyncio.create_task(operation)
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
 
 class Shell:
     def __init__(self, tasks: TaskManager) -> None:
@@ -647,14 +695,35 @@ class Shell:
         *,
         cwd: str | os.PathLike[str] | None = None,
         env: Mapping[str, str] | None = None,
+        input: str | None = None,
+        stdin: bool = False,
+        pty: bool = False,
+        rows: int = 24,
+        cols: int = 80,
     ) -> RemoteTask:
         if isinstance(command, list):
-            command = shlex.join(str(part) for part in command)
+            command = [str(part) for part in command]
+        elif not isinstance(command, str):
+            raise TypeError("command must be a string or an argv list")
+        if not command:
+            raise ValueError("command must not be empty")
+        if input is not None and not isinstance(input, str):
+            raise TypeError("input must be a string or None")
+        if type(stdin) is not bool:
+            raise TypeError("stdin must be a boolean")
+        if type(pty) is not bool:
+            raise TypeError("pty must be a boolean")
+        _terminal_size(rows, cols)
         result = await _rpc(
             "shell_start",
             command=command,
             cwd=str(cwd or os.getcwd()),
             env=dict(os.environ if env is None else env),
+            input=input,
+            stdin=stdin,
+            pty=pty,
+            rows=rows,
+            cols=cols,
         )
         if isinstance(result, Mapping):
             task_id = result.get("id", result.get("task_id"))
@@ -662,7 +731,72 @@ class Shell:
             task_id = result
         if not task_id:
             raise RPCError("shell_start returned no task id")
-        return RemoteTask(str(task_id), self._tasks)
+        handle = RemoteTask(str(task_id), self._tasks)
+        handle._terminal = {"pty": pty, **({"rows": rows, "cols": cols} if pty else {})}
+        return handle
+
+    async def run(
+        self,
+        command: str | list[str],
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+        env: Mapping[str, str] | None = None,
+        input: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109
+        check: bool = False,
+        max_bytes: int = 32768,
+        pty: bool = False,
+        rows: int = 24,
+        cols: int = 80,
+    ) -> dict[str, Any]:
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be a finite non-negative number or None")
+        launch = asyncio.create_task(
+            self.start(command, cwd=cwd, env=env, input=input, pty=pty, rows=rows, cols=cols)
+        )
+        try:
+            handle = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+
+            async def stop_launch():
+                handle = await launch
+                await handle.cancel()
+
+            with suppress(Exception):
+                await _complete_cleanup(stop_launch())
+            raise
+        timed_out = False
+        try:
+            async with asyncio.timeout(timeout):
+                await handle._monitor
+        except TimeoutError:
+            timed_out = True
+            await _complete_cleanup(handle.cancel())
+        except asyncio.CancelledError:
+            await _complete_cleanup(handle.cancel())
+            raise
+        result = handle.status()
+        result["state"] = result.pop("status")
+        result["returncode"] = (handle._result or {}).get("returncode")
+        result["timed_out"] = timed_out
+        result["truncated"] = handle._buffer.truncated
+        remaining = max_bytes
+        for name in ("stdout", "stderr"):
+            raw = handle._streams[name].get().encode("utf-8")
+            kept = raw[:remaining].decode("utf-8", "ignore")
+            result[name] = kept
+            remaining -= len(kept.encode("utf-8"))
+            result["truncated"] |= len(raw) > len(kept.encode("utf-8"))
+        if check and (timed_out or result["state"] != "succeeded"):
+            raise ShellError(result)
+        return result
 
 
 class MCP:
@@ -886,6 +1020,7 @@ class Workspace:
         self._locals: dict[str, dict[str, Any]] = {}
         self.tasks = TaskManager()
         self.shell = Shell(self.tasks)
+        self.fs = Filesystem(self.workspace, self.shell)
         self.mcp = MCP()
         self.messages = Messages()
         self.packages = Packages(self.tasks)
@@ -963,6 +1098,7 @@ def create_workspace(
     ws = Workspace(workspace, namespace)
     ws.tasks = _TASKS
     ws.shell = Shell(_TASKS)
+    ws.fs = Filesystem(ws.workspace, ws.shell)
     ws.packages = Packages(_TASKS)
     return ws
 
@@ -974,6 +1110,9 @@ __all__ = [
     "History",
     "NotReady",
     "RPCError",
+    "Filesystem",
+    "Shell",
+    "ShellError",
     "RemoteTask",
     "ResetRequested",
     "TaskHandle",

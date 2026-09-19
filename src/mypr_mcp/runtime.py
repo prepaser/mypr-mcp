@@ -724,13 +724,34 @@ class Runtime:
                 req["command"],
                 req.get("cwd", str(self.workspace)),
                 req.get("env", dict(os.environ)),
+                input=req.get("input"),
+                stdin=req.get("stdin", False),
+                pty=req.get("pty", False),
+                rows=req.get("rows", 24),
+                cols=req.get("cols", 80),
             )
             self.track_shell(
-                job["id"], client, connection_id, req.get("exec_id"), command=req["command"]
+                job["id"],
+                client,
+                connection_id,
+                req.get("exec_id"),
+                command=req["command"],
+                pty=req.get("pty", False),
+                **(
+                    {"rows": req.get("rows", 24), "cols": req.get("cols", 80)}
+                    if req.get("pty")
+                    else {}
+                ),
             )
             return job
         if op == "shell_poll":
             return await self.shells.poll(req["id"], req.get("cursor", 0))
+        if op == "shell_write":
+            return await self.shells.write(
+                req["id"], req.get("text", ""), eof=req.get("eof", False)
+            )
+        if op == "shell_resize":
+            return await self.shells.resize(req["id"], req["rows"], req["cols"])
         if op == "shell_cancel":
             return await self.shells.cancel(req["id"])
         if op == "mcp":
@@ -759,7 +780,9 @@ class Runtime:
             if not specs or any(not s or s.startswith("-") for s in specs):
                 raise ValueError("Expected package requirements, not command options")
             command = shlex.join(["uv", "pip", "install", "--python", str(self.py), *specs])
-            command += " && " + shlex.join(["uv", "pip", "freeze", "--python", str(self.py)])
+            command += " && " + shlex.join(
+                ["uv", "--color", "never", "pip", "freeze", "--python", str(self.py)]
+            )
             command += " > " + shlex.quote(str(self.root / "requirements.txt"))
             job = await self.shells.start(command, str(self.workspace), dict(os.environ))
             self.track_shell(
@@ -1035,6 +1058,7 @@ class Runtime:
             result=full.get("result"),
             output=text.encode()[:65536].decode(errors="ignore"),
             output_truncated=full.get("truncated") or len(text.encode()) > 65536,
+            **({key: full[key] for key in ("pty", "rows", "cols") if key in full}),
             **({"warnings": full["warnings"]} if full.get("warnings") else {}),
             **({"warnings_truncated": True} if full.get("warnings_truncated") else {}),
         )

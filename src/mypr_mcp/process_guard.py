@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import select
 import signal
 import sys
+import termios
 import time
 
 _GRACE_SECONDS = 2.0
@@ -50,6 +52,40 @@ def _signal_group(group_id: int, signum: signal.Signals) -> None:
         pass
 
 
+def _session_groups(session_id: int, own_pid: int) -> set[int]:
+    groups: set[int] = set()
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return groups
+    with entries:
+        for entry in entries:
+            if not entry.name.isdecimal() or int(entry.name) == own_pid:
+                continue
+            try:
+                with open(f"/proc/{entry.name}/stat", encoding="ascii", errors="replace") as file:
+                    text = file.read()
+                _, rest = text.rsplit(") ", 1)
+                fields = rest.split()
+                if fields[0] not in {"Z", "X"} and int(fields[3]) == session_id:
+                    groups.add(int(fields[2]))
+            except OSError, ValueError, IndexError:
+                continue
+    return groups
+
+
+def _session_has_live_members(session_id: int, own_pid: int) -> bool:
+    return bool(_session_groups(session_id, own_pid))
+
+
+def _signal_session(session_id: int, own_pid: int, signum: signal.Signals) -> None:
+    groups = sorted(
+        _session_groups(session_id, own_pid), key=lambda group_id: group_id == session_id
+    )
+    for group_id in groups:
+        _signal_group(group_id, signum)
+
+
 def _child_status(pid: int) -> tuple[bool, int]:
     result, status = os.waitpid(pid, os.WNOHANG)
     if result == 0:
@@ -84,19 +120,36 @@ def _open_pidfd(parent_pid: int) -> int | None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 4 or argv[0] != "--parent-pid" or argv[2] != "--":
+    if len(argv) < 4 or argv[0] != "--parent-pid":
         return 2
     try:
         parent_pid = int(argv[1])
     except ValueError:
         return 2
-    if parent_pid <= 1 or len(argv) == 3:
+    if parent_pid <= 1:
         return 2
-    command = argv[3:]
+    position = 2
+    pty = False
+    if position < len(argv) and argv[position] == "--pty":
+        pty = True
+        position += 1
+    if position >= len(argv) or argv[position] != "--" or position + 1 >= len(argv):
+        return 2
+    command = argv[position + 1 :]
     if os.getppid() != parent_pid or os.getpgrp() != os.getpid():
         return 1
     signal.signal(signal.SIGTERM, _mark_terminating)
-    signal.signal(signal.SIGINT, _mark_terminating)
+    if pty:
+        try:
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        except OSError:
+            return 1
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+        signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGINT, _mark_terminating)
     pidfd = _open_pidfd(parent_pid)
     try:
         if os.getppid() != parent_pid:
@@ -107,6 +160,11 @@ def main(argv: list[str]) -> int:
             return 127
         if child == 0:
             try:
+                if pty:
+                    signal.signal(signal.SIGINT, signal.SIG_DFL)
+                    signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+                    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+                    signal.signal(signal.SIGHUP, signal.SIG_DFL)
                 os.execvp(command[0], command)
             except OSError as exc:
                 os.write(2, f"{exc}\n".encode("utf-8", "replace"))
@@ -120,19 +178,37 @@ def main(argv: list[str]) -> int:
             if not finished:
                 finished, returncode = _child_status(child)
             if _terminating or _parent_dead(parent_pid, pidfd):
-                _signal_group(os.getpgrp(), signal.SIGTERM)
+                if pty:
+                    _signal_session(os.getsid(0), os.getpid(), signal.SIGTERM)
+                else:
+                    _signal_group(os.getpgrp(), signal.SIGTERM)
                 deadline = time.monotonic() + _GRACE_SECONDS
-                while time.monotonic() < deadline and _group_has_live_members(
-                    os.getpgrp(), os.getpid()
+                while time.monotonic() < deadline and (
+                    _session_has_live_members(os.getsid(0), os.getpid())
+                    if pty
+                    else _group_has_live_members(os.getpgrp(), os.getpid())
                 ):
                     time.sleep(_POLL_SECONDS)
-                if _group_has_live_members(os.getpgrp(), os.getpid()):
-                    _signal_group(os.getpgrp(), signal.SIGKILL)
+                live = (
+                    _session_has_live_members(os.getsid(0), os.getpid())
+                    if pty
+                    else _group_has_live_members(os.getpgrp(), os.getpid())
+                )
+                if live:
+                    if pty:
+                        _signal_session(os.getsid(0), os.getpid(), signal.SIGKILL)
+                    else:
+                        _signal_group(os.getpgrp(), signal.SIGKILL)
                     return 137
                 if not finished:
                     _, returncode = _child_status(child)
                 return returncode
-            if finished and not _group_has_live_members(os.getpgrp(), os.getpid()):
+            live = (
+                _session_has_live_members(os.getsid(0), os.getpid())
+                if pty
+                else _group_has_live_members(os.getpgrp(), os.getpid())
+            )
+            if finished and not live:
                 return returncode
             time.sleep(_POLL_SECONDS)
     finally:

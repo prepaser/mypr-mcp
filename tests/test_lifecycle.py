@@ -75,13 +75,17 @@ async def test_stop_protects_detached_python_tasks(workspace, force):
             await asyncio.sleep(0.01)
 
 
-async def test_packages_install_into_workspace_venv(workspace):
+async def test_packages_install_into_workspace_venv(workspace, monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("UV_COLOR", "always")
     async with mcp_session(workspace) as session:
         started = await execute(session, 'package = await ws.packages.add("pyyaml==6.0.3")')
         assert started["state"] == "succeeded"
         installed = await execute(session, "await package\npackage.status()")
         assert "succeeded" in result_text(installed)
-        assert "pyyaml==6.0.3" in (workspace / ".mypr/requirements.txt").read_text().lower()
+        requirements = (workspace / ".mypr/requirements.txt").read_text()
+        assert "pyyaml==6.0.3" in requirements.lower()
+        assert "\x1b" not in requirements
 
 
 async def test_shell_tracks_redirected_background_descendant(workspace):

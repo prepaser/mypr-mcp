@@ -37,6 +37,26 @@ State and identity
   handle in ws.local if you need it longer; use ws.history for evicted job records.
 - Keep large results in Python and return only the information needed for the next decision.
 
+Everyday workspace work
+- await ws.fs.read("src/app.py", start_line=1, end_line=80): bounded text and revision.
+  Long lines use next_cursor; continue with its line as start_line and byte as start_byte.
+- await ws.fs.search("pattern", paths="src", glob="*.py"): regex matches with locations.
+  Use fixed=True for literal text, or omit pattern to list files. Requires ripgrep (rg).
+- await ws.fs.write("notes.txt", "text"): create a file. Existing files require
+  expected_hash=page["revision"] or explicit overwrite=True.
+- await ws.fs.patch("src/app.py", [{"old": "before", "new": "after"}],
+  expected_hash=page["revision"]): exact edits with conflict detection and a diff.
+  Each old value must match once unless count is specified. dry_run=True previews edits.
+- await ws.fs.apply_patch(patch_text, dry_run=False): multi-file Add/Update/Delete/Move
+  using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked first;
+  expected_hashes maps paths to revisions (None means absent). No fuzzy matching.
+- await ws.fs.image("plot.png"): return a PNG/JPEG as inline image content (2 MiB default).
+- await ws.shell.run(["git", "status", "--short"]): wait and return bounded stdout,
+  stderr, returncode and job id. timeout cancels the process; check=True raises on failure.
+  Use input="text" for stdin. Full retained output is in ws.tasks.get(result["id"]).output().
+File paths are relative to ws.workspace; absolute paths are supported. Keep reusable
+results in ws.local and compose these helpers in Python for multi-step work.
+
 Execution and background work
 Cells run as independent asyncio tasks in the shared kernel, including cells from the
 same client. A pending await yields to other cells; synchronous code, synchronous
@@ -47,6 +67,13 @@ long the MCP call waits, not Python execution or task lifetime.
 Start long work without waiting for completion:
     ws.local["job"] = await ws.shell.start("command")
     ws.local["task"] = ws.tasks.start(coroutine)
+
+For interactive pipe input, use ws.shell.start(command, stdin=True), then
+await job.write("input\\n"). await job.write(eof=True) closes stdin.
+For a terminal, use ws.shell.start(command, pty=True, rows=24, cols=80).
+await job.resize(40, 120) changes its size; await job.write("\\x03") sends Ctrl-C.
+PTY stdout/stderr are combined, with terminal echo and ANSI output preserved.
+In PTY mode eof=True sends the terminal EOF character; cancel() terminates the job.
 
 In later cells, use ws.local["job"].status(), ws.local["job"].output(), or
 ws.local["job"].result(). result() raises NotReady until the job finishes.

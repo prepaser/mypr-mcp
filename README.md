@@ -190,6 +190,7 @@ skill reads, and task-handle inspection are synchronous.
 | --- | --- |
 | `ws.workspace`, `ws.root` | `Path` objects for the workspace and its `.mypr/` directory |
 | `ws.client`, `ws.local` | Current caller identity and its in-memory scratch dictionary |
+| `ws.fs` | Read, search, create, and patch files with bounded results |
 | `ws.shell`, `ws.tasks` | Start and inspect background work |
 | `ws.mcp` | Call and reconfigure external MCP servers |
 | `ws.messages` | Send and receive persistent client messages |
@@ -198,23 +199,145 @@ skill reads, and task-handle inspection are synchronous.
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
 
-Use ordinary Python for file and data work. `ws.workspace` stays anchored to
-the workspace even if code changes the kernel's current directory:
+Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths
+stay anchored to the workspace even if code changes the kernel's current directory:
 
 ```python
-(ws.workspace / "notes.txt").write_text("Hello from Python.\n", encoding="utf-8")
+await ws.fs.write("notes.txt", "Hello from Python.\n")
 ```
 
 All clients share imports, globals, and filesystem changes. Store caller-specific
 values in `ws.local`; they persist across cells from the same logical client.
 Kernel resets and crashes clear all in-memory local dictionaries.
 
+### Files and search
+
+```python
+ws.local["page"] = await ws.fs.read("src/app.py", start_line=20, end_line=80)
+await ws.fs.search("TODO|FIXME", paths="src", glob="*.py", context=2)
+await ws.fs.search(glob="*.py")
+await ws.fs.patch(
+    "src/app.py",
+    [{"old": "timeout = 10", "new": "timeout = 30"}],
+    expected_hash=ws.local["page"]["revision"],
+    dry_run=True,
+)
+```
+
+`read(path, *, start_line=1, end_line=None, start_byte=None, max_bytes=32768)`
+returns UTF-8 `text`, a SHA-256 `revision`, file `size`, line information, and
+`truncated`. Lines are one-based and `end_line` is inclusive. If the output limit
+cuts a line, continue using `next_cursor["line"]` as `start_line` and
+`next_cursor["byte"]` as `start_byte`. Compare revisions when reading multiple
+pages of a file that may change.
+
+`search(pattern=None, *, paths=None, glob=None, fixed=False, ignore_case=False,
+hidden=False, no_ignore=False, context=0, max_matches=100, max_bytes=32768)` uses
+`rg` from the workstation's PATH. Install ripgrep to enable it. With a pattern,
+it returns `matches` containing file paths, line numbers, byte-based columns,
+text, and match/context kind. Without a pattern, it returns `files`. `paths` and
+`glob` accept a string or a list. Ignore files and hidden-file rules apply by
+default. `truncated` reports incomplete results; `text_truncated` marks shortened
+match text. Search runs as a managed shell job and its captured scan output is
+bounded separately from the returned results. The returned `id` identifies its
+handle in `ws.tasks`.
+
+`write(path, text, *, expected_hash=None, overwrite=False, encoding="utf-8",
+create_parents=False)` creates a file. Replacing an existing file requires its
+current revision or explicit `overwrite=True`. `patch(path, edits, *,
+expected_hash=None, dry_run=False, encoding="utf-8", max_diff_bytes=32768)` applies
+an ordered list of exact `{"old": ..., "new": ...}` replacements. Each target
+must occur once by default; use `count=N` for the first N matches or
+`count="all"` for all matches. A missing or ambiguous target fails before writing.
+Results include old/new revisions and a bounded unified diff; `dry_run=True`
+leaves the file unchanged.
+
+Use `apply_patch(patch, *, expected_hashes=None, dry_run=False,
+max_diff_bytes=32768)` for a patch spanning multiple files:
+
+```python
+await ws.fs.apply_patch("""*** Begin Patch
+*** Add File: notes/new.txt
++Created from Python.
+*** Update File: notes/old.txt
+*** Move to: notes/renamed.txt
+@@
+-Before
++After
+*** Delete File: notes/obsolete.txt
+*** End Patch
+""", dry_run=True)
+```
+
+The format uses `*** Add File`, `*** Update File`, `*** Delete File`, optional
+`*** Move to`, and `@@` context hunks inside `*** Begin Patch` / `*** End Patch`.
+Matching is exact; ambiguous context is rejected. `expected_hashes` maps file
+paths to revisions, with `None` requiring that a path does not exist. All targets
+and hunks are validated before mutation, and affected paths share the same locks
+as `write()` and `patch()`. Files are staged before application; ordinary commit
+failures trigger rollback. This is not a filesystem-wide atomic transaction:
+external writers and process or machine crashes can interrupt recovery.
+Symlink paths, duplicate targets, and hard-link aliases within one patch are
+rejected. `*** End of File` anchors the final hunk to the end of the file.
+
+`await ws.fs.image("plot.png")` loads a PNG/JPEG for inline MCP image output.
+Return it as the cell's last expression or pass it to IPython's `display()`.
+`max_bytes` defaults to 2 MiB, matching the inline image limit; the source file
+is left unchanged.
+
+Writes use atomic replacement and preserve existing file permissions.
+Single-file `write()` and `patch()` follow symlinks while preserving the link
+itself. Edits through these helpers serialize
+per resolved path, including across clients. Revision checks reject stale content;
+they do not lock out edits by external programs. Absolute paths are accepted under
+the current user's permissions. Ordinary Python remains available for other file
+and data operations.
+
 ### Shell and async tasks
 
-`await ws.shell.start(command, *, cwd=None, env=None)` starts a command in its
+```python
+await ws.shell.run(["git", "status", "--short"])
+await ws.shell.run("make -j2", timeout=120, check=True)
+await ws.shell.run(["sort"], input="bravo\nalpha\n")
+```
+
+`run(command, *, cwd=None, env=None, input=None, timeout=None, check=False,
+max_bytes=32768, pty=False, rows=24, cols=80)` waits asynchronously for completion
+and returns `id`, `state`,
+`returncode`, separate `stdout`/`stderr`, `timed_out`, and `truncated`. The byte
+budget is shared between stdout and stderr, with stdout first. The full retained
+combined output remains in `ws.tasks.get(result["id"]).output()`. A nonzero exit
+is returned normally; `check=True` raises `ShellError` with the result in
+`exception.result`. A timeout cancels the process group and returns
+`timed_out=True`; cancelling the awaiting cell also cancels the command.
+
+`await ws.shell.start(command, *, cwd=None, env=None, input=None, stdin=False,
+pty=False, rows=24, cols=80)` starts a command in its
 own process group and returns a handle immediately. A string is interpreted by
-`/bin/sh`; a list quotes each argument literally. Standard input is closed, and
-stdout and stderr are captured together in the handle's output.
+`/bin/sh`; a list executes argv directly. Standard input is closed by default.
+`input` supplies UTF-8 text and then closes stdin; `stdin=True` keeps the pipe
+open for later `await job.write(text)` calls. Use `await job.write(eof=True)` to
+close it. stdout and stderr are captured together in the handle's output.
+
+Set `pty=True` for programs that need a terminal:
+
+```python
+ws.local["term"] = await ws.shell.start(
+    ["bash", "--noprofile", "--norc", "-i"], pty=True, rows=30, cols=100,
+)
+await ws.local["term"].write("pwd\n")
+await ws.local["term"].resize(40, 120)
+await ws.local["term"].write("\x03")  # Ctrl-C
+ws.local["term"].output()
+await ws.local["term"].cancel()
+```
+
+PTY mode provides a controlling terminal and combines stdout/stderr into stdout.
+Terminal echo, ANSI sequences, and CRLF line endings are preserved. `write()` is
+available without `stdin=True`. `write(eof=True)` sends the terminal's EOF control
+character instead of closing its master descriptor; programs in raw mode decide
+how to interpret it. Use `cancel()` to terminate the job. `resize(rows, cols)`
+updates the terminal size and notifies its foreground process group.
 
 The default `cwd` is the kernel's current directory. The default environment is
 the kernel's environment; an explicit `env` replaces it rather than merging it.

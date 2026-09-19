@@ -10,6 +10,7 @@ import asyncio
 import codecs
 import contextlib
 import copy
+import errno
 import json
 import os
 import signal
@@ -27,10 +28,18 @@ from mcp.types import PaginatedRequestParams
 
 from .config import MCPConfig, validate_name, validate_servers
 from .journal import decode_event
+from .terminal import close as close_terminal
+from .terminal import eof_byte
+from .terminal import resize as resize_terminal
 
 _MAX_SHELL_WARNINGS = 4
 _MAX_SHELL_WARNING_TEXT = 256
 _MAX_UNSAVED_COMPLETED = 1
+
+
+def _wake_future(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
 
 
 @dataclass
@@ -50,12 +59,67 @@ class _Job:
     warnings_truncated: bool = False
     journal_failed: bool = False
     metadata_failed: bool = False
+    stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     waiter: asyncio.Task[None] | None = None
     journal: Path | None = None
     metadata: Path | None = None
     finished_at: float | None = None
     memory_bytes: int = 0
+    pty_reader: _PTYReader | None = None
+    pty_master: int | None = None
+    pty: bool = False
+    session_id: int = 0
+    pty_write_waiter: asyncio.Future[None] | None = None
+    rows: int = 24
+    cols: int = 80
+
+
+class _PTYReader:
+    """A nonblocking PTY master reader integrated with the asyncio loop."""
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        os.set_blocking(fd, False)
+        self._closed = False
+        self._waiter: asyncio.Future[None] | None = None
+
+    async def read(self, size: int) -> bytes:
+        loop = asyncio.get_running_loop()
+        while not self._closed:
+            try:
+                return os.read(self.fd, size)
+            except BlockingIOError:
+                ready = loop.create_future()
+                self._waiter = ready
+                loop.add_reader(self.fd, self._wake, ready)
+                try:
+                    await ready
+                finally:
+                    if self._waiter is ready:
+                        loop.remove_reader(self.fd)
+                        self._waiter = None
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    return b""
+                raise
+        return b""
+
+    @staticmethod
+    def _wake(future: asyncio.Future[None]) -> None:
+        _wake_future(future)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            waiter = self._waiter
+            if waiter is not None:
+                with contextlib.suppress(RuntimeError):
+                    asyncio.get_running_loop().remove_reader(self.fd)
+                self._waiter = None
+                if not waiter.done():
+                    waiter.set_result(None)
+            close_terminal(self.fd)
 
 
 class Shells:
@@ -95,40 +159,52 @@ class Shells:
         command: str | list[str],
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        input: str | None = None,
+        stdin: bool = False,
+        pty: bool = False,
+        rows: int = 24,
+        cols: int = 80,
     ) -> dict[str, str]:
         if self._closed:
             raise RuntimeError("shell service is closed")
+        if input is not None and not isinstance(input, str):
+            raise TypeError("input must be a string or None")
+        if type(stdin) is not bool:
+            raise TypeError("stdin must be a boolean")
+        if type(pty) is not bool:
+            raise TypeError("pty must be a boolean")
+        if pty:
+            rows, cols = self._validate_pty_size(rows, cols)
         workdir = self._cwd(cwd)
         merged_env = (
             os.environ.copy()
             if env is None
             else {str(key): str(value) for key, value in env.items()}
         )
+        master_fd = slave_fd = None
         try:
-            command_args = self._guard_command(command)
-            if isinstance(command, str):
-                process = await asyncio.create_subprocess_exec(
-                    *command_args,
-                    cwd=workdir,
-                    env=merged_env,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                )
-            elif command:
-                process = await asyncio.create_subprocess_exec(
-                    *command_args,
-                    cwd=workdir,
-                    env=merged_env,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                )
-            else:
-                raise ValueError("command must not be empty")
+            if pty:
+                master_fd, slave_fd = os.openpty()
+                resize_terminal(slave_fd, rows, cols)
+            command_args = self._guard_command(command, pty=pty)
+            process = await asyncio.create_subprocess_exec(
+                *command_args,
+                cwd=workdir,
+                env=merged_env,
+                stdin=(
+                    slave_fd
+                    if pty
+                    else asyncio.subprocess.PIPE
+                    if input is not None or stdin
+                    else asyncio.subprocess.DEVNULL
+                ),
+                stdout=slave_fd if pty else asyncio.subprocess.PIPE,
+                stderr=slave_fd if pty else asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
         except (OSError, ValueError) as exc:
+            close_terminal(master_fd)
+            close_terminal(slave_fd)
             job_id = uuid.uuid4().hex
             job = self._new_job(job_id, _NoProcess(), 0, state="failed", error=str(exc))
             job.result = {"returncode": -1}
@@ -136,17 +212,117 @@ class Shells:
             self._jobs[job_id] = job
             self._prune_completed()
             return {"id": job_id}
+        finally:
+            close_terminal(slave_fd)
 
         job_id = uuid.uuid4().hex
         job = self._new_job(job_id, process, process.pid)
         self._jobs[job_id] = job
-        assert process.stdout is not None and process.stderr is not None
-        job.readers = [
-            asyncio.create_task(self._drain(job, process.stdout, "stdout")),
-            asyncio.create_task(self._drain(job, process.stderr, "stderr")),
-        ]
+        if pty:
+            assert master_fd is not None
+            job.pty = True
+            job.session_id = process.pid
+            job.rows = rows
+            job.cols = cols
+            job.pty_master = master_fd
+            job.pty_reader = _PTYReader(master_fd)
+            job.readers = [asyncio.create_task(self._drain(job, job.pty_reader, "stdout"))]
+        else:
+            assert process.stdout is not None and process.stderr is not None
+            job.readers = [
+                asyncio.create_task(self._drain(job, process.stdout, "stdout")),
+                asyncio.create_task(self._drain(job, process.stderr, "stderr")),
+            ]
+        if input is not None:
+            job.readers.append(asyncio.create_task(self._feed(job, input, eof=not stdin)))
         job.waiter = asyncio.create_task(self._wait(job))
         return {"id": job_id}
+
+    async def write(self, job_id: str, text: str = "", *, eof: bool = False) -> dict:
+        if not isinstance(text, str) or type(eof) is not bool:
+            raise TypeError("text must be a string and eof must be a boolean")
+        job = self._jobs.get(job_id)
+        if job is None or job.state not in {"running", "cancelling"}:
+            raise ValueError("shell job is not running")
+        if job.pty:
+            fd = job.pty_master
+            if fd is None:
+                raise ValueError("shell terminal is closed")
+            payload = text.encode("utf-8")
+            if eof:
+                marker = eof_byte(fd)
+                payload += marker * 2
+            async with job.stdin_lock:
+                try:
+                    for start in range(0, len(payload), 16384):
+                        await self._write_pty(job, fd, payload[start : start + 16384])
+                except OSError as exc:
+                    if exc.errno in {errno.EIO, errno.EBADF}:
+                        raise ValueError("shell terminal is closed") from exc
+                    raise
+            return {"id": job_id, "bytes": len(text.encode("utf-8")), "closed": False, "eof": eof}
+        stream = job.process.stdin
+        if stream is None:
+            raise ValueError("shell job was not started with stdin=True")
+        async with job.stdin_lock:
+            if stream.is_closing():
+                raise ValueError("shell stdin is closed")
+            try:
+                for start in range(0, len(text), 16384):
+                    stream.write(text[start : start + 16384].encode("utf-8"))
+                    await stream.drain()
+            finally:
+                if eof:
+                    stream.close()
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                        await stream.wait_closed()
+        return {"id": job_id, "bytes": len(text.encode("utf-8")), "closed": eof}
+
+    async def _write_pty(self, job: _Job, fd: int, payload: bytes) -> None:
+        loop = asyncio.get_running_loop()
+        offset = 0
+        while offset < len(payload):
+            if job.pty_master != fd:
+                raise BrokenPipeError("shell terminal is closed")
+            try:
+                count = os.write(fd, payload[offset:])
+            except BlockingIOError:
+                ready = loop.create_future()
+                job.pty_write_waiter = ready
+                loop.add_writer(fd, _wake_future, ready)
+                try:
+                    await ready
+                finally:
+                    if job.pty_write_waiter is ready:
+                        loop.remove_writer(fd)
+                        job.pty_write_waiter = None
+                continue
+            if count <= 0:
+                raise BrokenPipeError("shell terminal is closed")
+            offset += count
+
+    async def resize(self, job_id: str, rows: int, cols: int) -> dict[str, int | str]:
+        rows, cols = self._validate_pty_size(rows, cols)
+        job = self._jobs.get(job_id)
+        if job is None or not job.pty or job.pty_master is None:
+            raise ValueError("shell job was not started with pty=True")
+        if job.state not in {"running", "cancelling"}:
+            raise ValueError("shell job is not running")
+        try:
+            resize_terminal(job.pty_master, rows, cols)
+        except OSError as exc:
+            raise ValueError(f"unable to resize shell terminal: {exc}") from exc
+        job.rows = rows
+        job.cols = cols
+        return {"id": job_id, "rows": rows, "cols": cols}
+
+    async def _feed(self, job: _Job, text: str, *, eof: bool) -> None:
+        try:
+            await self.write(job.id, text, eof=eof)
+        except BrokenPipeError, ConnectionResetError:
+            pass
+        except Exception as exc:
+            self._add_warning(job, "input_write_failed", exc)
 
     async def poll(self, job_id: str, cursor: int = 0) -> dict[str, Any]:
         job = self._jobs.get(job_id)
@@ -210,6 +386,9 @@ class Shells:
             "truncated": bool(metadata.get("truncated", False)),
             "warnings": warnings[:_MAX_SHELL_WARNINGS],
             "warnings_truncated": warnings_truncated,
+            "pty": bool(metadata.get("pty", False)),
+            "rows": metadata.get("rows", 24),
+            "cols": metadata.get("cols", 80),
         }
 
     @staticmethod
@@ -224,6 +403,9 @@ class Shells:
             "truncated": job.truncated,
             "warnings": list(job.warnings),
             "warnings_truncated": job.warnings_truncated,
+            "pty": job.pty,
+            "rows": job.rows,
+            "cols": job.cols,
         }
 
     async def cancel(self, job_id: str) -> dict[str, Any]:
@@ -233,7 +415,7 @@ class Shells:
         if job.state not in {"running", "cancelling"}:
             return {"id": job.id, "state": job.state, "result": job.result, "error": job.error}
         job.state = "cancelling"
-        self._signal_group(job, signal.SIGTERM)
+        self._signal_job(job, signal.SIGTERM)
         killer = asyncio.create_task(self._kill_group_later(job))
         try:
             await asyncio.wait_for(asyncio.shield(job.waiter), timeout=2.0)
@@ -241,15 +423,15 @@ class Shells:
             if job.waiter is not None:
                 await asyncio.shield(job.waiter)
         finally:
-            if not killer.done() and not self._group_has_live_members(job.group_id):
+            if not killer.done() and not self._job_has_live_members(job):
                 killer.cancel()
             await asyncio.gather(killer, return_exceptions=True)
         return await self.poll(job.id, len(job.output))
 
     async def _kill_group_later(self, job: _Job) -> None:
         await asyncio.sleep(2)
-        if self._group_has_live_members(job.group_id):
-            self._signal_group(job, signal.SIGKILL)
+        if self._job_has_live_members(job):
+            self._signal_job(job, signal.SIGKILL)
 
     async def close(self) -> None:
         if self._closed:
@@ -261,12 +443,25 @@ class Shells:
         await asyncio.gather(
             *(task for job in self._jobs.values() for task in job.readers), return_exceptions=True
         )
+        for job in self._jobs.values():
+            self._close_pty(job)
 
     def _cwd(self, cwd: str | None) -> str:
         if cwd is None:
             return str(self.workspace)
         path = Path(cwd)
         return str(path if path.is_absolute() else self.workspace / path)
+
+    @staticmethod
+    def _validate_pty_size(rows: int, cols: int) -> tuple[int, int]:
+        if (
+            type(rows) is not int
+            or type(cols) is not int
+            or not 1 <= rows <= 65535
+            or not 1 <= cols <= 65535
+        ):
+            raise ValueError("rows and cols must be integers between 1 and 65535")
+        return rows, cols
 
     def _new_job(
         self,
@@ -288,7 +483,7 @@ class Shells:
             metadata=self.jobs_root / f"{job_id}.json",
         )
 
-    def _guard_command(self, command: str | list[str]) -> list[str]:
+    def _guard_command(self, command: str | list[str], *, pty: bool = False) -> list[str]:
         if isinstance(command, str):
             original = ["/bin/sh", "-c", command]
         elif command:
@@ -296,15 +491,16 @@ class Shells:
         else:
             raise ValueError("command must not be empty")
         guard = Path(__file__).with_name("process_guard.py")
-        return [
+        args = [
             sys.executable,
             "-I",
             str(guard),
             "--parent-pid",
             str(os.getpid()),
-            "--",
-            *original,
         ]
+        if pty:
+            args.append("--pty")
+        return [*args, "--", *original]
 
     @staticmethod
     def _validate_cursor(cursor: int, size: int) -> int:
@@ -348,6 +544,9 @@ class Shells:
             "warnings": job.warnings,
             "warnings_truncated": job.warnings_truncated,
             "output_count": len(job.output),
+            "pty": job.pty,
+            "rows": job.rows,
+            "cols": job.cols,
         }
         temporary = job.metadata.with_suffix(".tmp")
         temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -403,7 +602,7 @@ class Shells:
             job.metadata_failed = True
             self._add_warning(job, "metadata_persist_failed", exc)
 
-    async def _drain(self, job: _Job, stream: asyncio.StreamReader, name: str) -> None:
+    async def _drain(self, job: _Job, stream: Any, name: str) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         while True:
             try:
@@ -444,13 +643,14 @@ class Shells:
             job.finished_at = time.time()
             self._persist_metadata(job)
             self._prune_completed()
+            self._close_pty(job)
             return
         reader_results = await asyncio.gather(*job.readers, return_exceptions=True)
         for result in reader_results:
             if isinstance(result, Exception):
                 self._add_warning(job, "output_reader_failed", result)
         tick = asyncio.Event()
-        while self._group_has_live_members(job.group_id):
+        while self._job_has_live_members(job):
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(tick.wait(), 0.05)
         job.result = {"returncode": returncode}
@@ -461,6 +661,23 @@ class Shells:
         job.finished_at = time.time()
         self._persist_metadata(job)
         self._prune_completed()
+        self._close_pty(job)
+
+    @staticmethod
+    def _close_pty(job: _Job) -> None:
+        if job.pty_write_waiter is not None:
+            if job.pty_master is not None:
+                with contextlib.suppress(OSError):
+                    asyncio.get_running_loop().remove_writer(job.pty_master)
+            if not job.pty_write_waiter.done():
+                job.pty_write_waiter.set_result(None)
+            job.pty_write_waiter = None
+        if job.pty_reader is not None:
+            job.pty_reader.close()
+            job.pty_reader = None
+        elif job.pty_master is not None:
+            close_terminal(job.pty_master)
+        job.pty_master = None
 
     @staticmethod
     def _signal_group(job: _Job, sig: signal.Signals) -> None:
@@ -472,6 +689,52 @@ class Shells:
             pass
         except PermissionError as exc:
             job.error = str(exc)
+
+    @classmethod
+    def _signal_job(cls, job: _Job, sig: signal.Signals) -> None:
+        if job.pty and job.session_id:
+            cls._signal_session(job.session_id, sig)
+        else:
+            cls._signal_group(job, sig)
+
+    @staticmethod
+    def _session_groups(session_id: int) -> set[int]:
+        groups: set[int] = set()
+        if not session_id:
+            return groups
+        try:
+            entries = Path("/proc").iterdir()
+        except OSError:
+            return groups
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="ascii")
+                _, rest = stat.rsplit(") ", 1)
+                fields = rest.split()
+                if int(fields[3]) == session_id and fields[0] not in {"Z", "X"}:
+                    groups.add(int(fields[2]))
+            except OSError, ValueError, IndexError:
+                continue
+        return groups
+
+    @classmethod
+    def _signal_session(cls, session_id: int, sig: signal.Signals) -> None:
+        groups = sorted(
+            cls._session_groups(session_id), key=lambda group_id: group_id == session_id
+        )
+        for group_id in groups:
+            try:
+                os.killpg(group_id, sig)
+            except ProcessLookupError, PermissionError:
+                pass
+
+    @classmethod
+    def _job_has_live_members(cls, job: _Job) -> bool:
+        if job.pty and job.session_id:
+            return bool(cls._session_groups(job.session_id))
+        return cls._group_has_live_members(job.group_id)
 
     @staticmethod
     def _group_exists(group_id: int) -> bool:
