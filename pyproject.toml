@@ -1,6 +1,6 @@
 [project]
 name = "mypr-mcp"
-version = "0.7.0"
+version = "0.8.0"
 description = "A persistent, workspace-shared Python environment for MCP agents"
 requires-python = ">=3.14"
 dependencies = ["mcp>=2.2,<3", "ipykernel>=7.3,<8", "jupyter-client>=8.10,<9", "pyyaml>=6,<7", "tomlkit>=0.15,<1"]
