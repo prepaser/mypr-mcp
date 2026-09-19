@@ -121,7 +121,12 @@ async def test_handle_registration_rejects_reserved_and_active_collisions(monkey
 
     monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
     manager = kernel_api.TaskManager()
-    for ident in ("a" * 32, "task-local-1", "remote-watch:job"):
+    for ident in (
+        "a" * 32,
+        "task-local-1",
+        "python:" + "b" * 32 + ":task",
+        "remote-watch:job",
+    ):
         with pytest.raises(ValueError, match="reserved generated namespace"):
             manager.start(asyncio.sleep(0), task_id=ident)
 

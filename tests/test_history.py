@@ -90,6 +90,73 @@ def test_record_merge_summary_and_get(tmp_path: Path):
         history.close()
 
 
+def test_record_can_keep_same_public_id_across_generations(tmp_path: Path):
+    history = History(tmp_path)
+    try:
+        history.record("python", {"id": "legacy", "generation": "zero", "state": "succeeded"})
+        history.record(
+            "python",
+            {"id": "repeatable", "generation": "one", "state": "succeeded"},
+            event="succeeded",
+            entity_id="python:one:repeatable",
+        )
+        history.record(
+            "python",
+            {"id": "repeatable", "generation": "two", "state": "running"},
+            event="running",
+            entity_id="python:two:repeatable",
+        )
+        history.record(
+            "python",
+            {"id": "legacy", "generation": "three", "state": "running"},
+            entity_id="python:three:legacy",
+        )
+
+        assert history.get("repeatable")["generation"] == "two"
+        assert history.get("python:one:repeatable")["generation"] == "one"
+        assert history.get("legacy")["generation"] == "three"
+        assert history.get("python:zero:legacy") == {
+            "id": "legacy",
+            "generation": "zero",
+            "state": "succeeded",
+            "kind": "python",
+            "history_id": "python:zero:legacy",
+        }
+        assert {
+            item["history_id"] for item in history.list()["items"] if item["id"] == "legacy"
+        } == {"python:zero:legacy", "python:three:legacy"}
+        assert len(history.list()["items"]) == 4
+        assert [event["data"] for event in history.logs()["events"]] == [
+            {"history_id": "python:one:repeatable", "generation": "one"},
+            {"history_id": "python:two:repeatable", "generation": "two"},
+        ]
+    finally:
+        history.close()
+
+
+def test_recover_updates_generation_qualified_python_record(tmp_path: Path):
+    history = History(tmp_path)
+    try:
+        history.record(
+            "python",
+            {"id": "repeatable", "generation": "one", "state": "running"},
+            entity_id="python:one:repeatable",
+        )
+
+        assert history.recover() == 1
+        assert history.get("python:one:repeatable")["state"] == "lost"
+        assert history.get("repeatable")["state"] == "lost"
+        assert history.recover() == 0
+        with history._lock:
+            count = history._db.execute(
+                "SELECT COUNT(*) FROM entities WHERE json_extract(data, '$.id') = ?",
+                ("repeatable",),
+            ).fetchone()[0]
+        assert count == 1
+    finally:
+        history.close()
+
+
 def test_logs_cursor_filter_and_recovery(tmp_path: Path):
     history = History(tmp_path)
     try:

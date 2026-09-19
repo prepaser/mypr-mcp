@@ -98,6 +98,25 @@ def append_events(path: Path, events: list[dict]) -> None:
         index.write(_HEADER.pack(_MAGIC, *_identity(path.stat())))
 
 
+def decode_event(line: bytes, line_number: int) -> dict:
+    try:
+        event = json.loads(line)
+        if isinstance(event, dict):
+            return event
+    except ValueError, UnicodeError:
+        pass
+    truncated = not line.endswith(b"\n")
+    return {
+        "type": "warning",
+        "code": "journal_truncated" if truncated else "journal_corrupt",
+        "text": (
+            f"Output journal line {line_number} is "
+            f"{'incomplete' if truncated else 'corrupt'}; its output could not be recovered."
+        ),
+        "line": line_number,
+    }
+
+
 def read_page(path: Path, cursor: int, budget: int, initial_size: int = 0):
     if type(cursor) is not int or cursor < 0:
         raise ValueError("Invalid output cursor")
@@ -115,8 +134,8 @@ def read_page(path: Path, cursor: int, budget: int, initial_size: int = 0):
     output, size = [], initial_size
     with path.open("rb") as source:
         source.seek(offset)
-        for _ in range(cursor, count):
-            event = json.loads(source.readline())
+        for position in range(cursor, count):
+            event = decode_event(source.readline(), position + 1)
             length = len(json.dumps(event).encode())
             if output and size + length > budget:
                 break

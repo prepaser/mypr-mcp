@@ -3,6 +3,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import pytest
 from conftest import execute, mcp_session, result_text
 
 import mypr_mcp.cli as cli
@@ -46,6 +47,48 @@ async def test_custom_task_cannot_replace_cell_or_remote_handle(workspace):
         assert (
             result_text(await execute(session, "await job\njob.output()")).strip(" '\n") == "done"
         )
+
+
+async def test_reset_reusing_python_task_id_keeps_active_work_guard(workspace):
+    async with mcp_session(workspace) as session:
+        first = await execute(
+            session,
+            "import asyncio\n"
+            "ws.local['task'] = ws.tasks.start(asyncio.sleep(0), task_id='repeatable')\n"
+            "await ws.local['task']\n"
+            "ws.local['task'].id",
+        )
+        assert result_text(first).strip(" '\n") == "repeatable"
+
+        reset = await execute(session, "await ws.reset(force=True)")
+        assert reset["state"] == "succeeded"
+
+        submitted = await execute(
+            session,
+            "import asyncio\n"
+            "ws.local['gate'] = asyncio.Event()\n"
+            "ws.local['task'] = ws.tasks.start("
+            "ws.local['gate'].wait(), task_id='repeatable')\n"
+            "ws.local['task'].id",
+        )
+        assert submitted["state"] == "succeeded"
+
+        path = socket_path(workspace)
+        for _ in range(100):
+            history = await rpc(path, op="history_get", id="repeatable")
+            if history.get("state") in {"queued", "running"}:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError(f"reused task was not recorded: {history}")
+        records = await rpc(path, op="history_list", limit=100)
+        reused = [item for item in records["items"] if item["id"] == "repeatable"]
+        assert len(reused) == 2
+        assert len({item["history_id"] for item in reused}) == 2
+
+        status = await rpc(path, op="status")
+        with pytest.raises(RuntimeError, match="active work"):
+            await rpc(path, op="stop", manager_pid=status["pid"])
 
 
 def test_missing_image_preserves_result_and_inbox(tmp_path):

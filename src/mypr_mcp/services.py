@@ -26,6 +26,11 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
 from .config import MCPConfig, validate_name, validate_servers
+from .journal import decode_event
+
+_MAX_SHELL_WARNINGS = 4
+_MAX_SHELL_WARNING_TEXT = 256
+_MAX_UNSAVED_COMPLETED = 1
 
 
 @dataclass
@@ -41,6 +46,10 @@ class _Job:
     truncated: bool = False
     error: str | None = None
     result: dict[str, int] | None = None
+    warnings: list[dict[str, str]] = field(default_factory=list)
+    warnings_truncated: bool = False
+    journal_failed: bool = False
+    metadata_failed: bool = False
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     waiter: asyncio.Task[None] | None = None
     journal: Path | None = None
@@ -123,7 +132,7 @@ class Shells:
             job_id = uuid.uuid4().hex
             job = self._new_job(job_id, _NoProcess(), 0, state="failed", error=str(exc))
             job.result = {"returncode": -1}
-            self._write_metadata(job)
+            self._persist_metadata(job)
             self._jobs[job_id] = job
             self._prune_completed()
             return {"id": job_id}
@@ -165,19 +174,42 @@ class Shells:
                 "cursor": cursor,
                 "result": None,
                 "error": "unknown job",
+                "warnings": [],
             }
         if not isinstance(metadata, dict):
             raise RuntimeError("invalid persisted shell metadata")
         output = self._read_journal(journal_path)
-        cursor = self._validate_cursor(cursor, len(output))
+        output_count = metadata.get("output_count", len(output))
+        if type(output_count) is not int or output_count < len(output):
+            output_count = len(output)
+        self._validate_cursor(cursor, output_count)
+        warnings = metadata.get("warnings", [])
+        if not isinstance(warnings, list):
+            warnings = []
+        warnings = [warning for warning in warnings if isinstance(warning, dict)]
+        warnings_truncated = bool(metadata.get("warnings_truncated", False))
+        for event in output:
+            if event.get("type") == "warning":
+                warning = {
+                    "code": event.get("code", "journal_warning"),
+                    "text": event.get("text", "Output journal warning"),
+                }
+                if warning not in warnings:
+                    if len(warnings) < _MAX_SHELL_WARNINGS:
+                        warnings.append(warning)
+                    else:
+                        warnings_truncated = True
+        warnings_truncated |= len(warnings) > _MAX_SHELL_WARNINGS
         return {
             "id": job_id,
             "state": metadata.get("state", "unknown"),
             "output": output[cursor:],
-            "cursor": len(output),
+            "cursor": output_count,
             "result": metadata.get("result"),
             "error": metadata.get("error"),
             "truncated": bool(metadata.get("truncated", False)),
+            "warnings": warnings[:_MAX_SHELL_WARNINGS],
+            "warnings_truncated": warnings_truncated,
         }
 
     @staticmethod
@@ -190,6 +222,8 @@ class Shells:
             "result": job.result,
             "error": job.error,
             "truncated": job.truncated,
+            "warnings": list(job.warnings),
+            "warnings_truncated": job.warnings_truncated,
         }
 
     async def cancel(self, job_id: str) -> dict[str, Any]:
@@ -283,18 +317,15 @@ class Shells:
     @staticmethod
     def _read_journal(path: Path) -> list[dict[str, str]]:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            file = path.open("rb")
         except FileNotFoundError:
             return []
         output = []
-        for line in lines:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("invalid persisted shell journal") from exc
-            if not isinstance(event, dict):
-                raise RuntimeError("invalid persisted shell journal")
-            output.append(event)
+        with file:
+            line_number = 0
+            while line := file.readline():
+                line_number += 1
+                output.append(decode_event(line, line_number))
         return output
 
     @staticmethod
@@ -314,6 +345,9 @@ class Shells:
             "result": job.result,
             "error": job.error,
             "truncated": job.truncated,
+            "warnings": job.warnings,
+            "warnings_truncated": job.warnings_truncated,
+            "output_count": len(job.output),
         }
         temporary = job.metadata.with_suffix(".tmp")
         temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -324,18 +358,58 @@ class Shells:
             job for job in self._jobs.values() if job.state not in {"running", "cancelling"}
         ]
         completed.sort(key=lambda job: job.finished_at or 0)
+        unsaved = [job for job in completed if job.metadata_failed]
+        while len(unsaved) > _MAX_UNSAVED_COMPLETED:
+            job = unsaved.pop(0)
+            self._jobs.pop(job.id, None)
+            completed.remove(job)
         memory = sum(job.memory_bytes for job in completed)
         while len(completed) > self.completed_records or memory > self.cache_bytes:
-            job = completed.pop(0)
+            candidates = [job for job in completed if not job.metadata_failed]
+            if not candidates:
+                break
+            job = candidates[0]
+            completed.remove(job)
             memory -= job.memory_bytes
             self._jobs.pop(job.id, None)
+
+    @staticmethod
+    def _warning_text(error: BaseException) -> str:
+        text = str(error).strip() or error.__class__.__name__
+        return text[:_MAX_SHELL_WARNING_TEXT]
+
+    @staticmethod
+    def _add_warning(job: _Job, code: str, error: BaseException | str) -> None:
+        if len(job.warnings) >= _MAX_SHELL_WARNINGS:
+            job.warnings_truncated = True
+            return
+        text = error if isinstance(error, str) else Shells._warning_text(error)
+        job.warnings.append({"code": code, "text": text[:_MAX_SHELL_WARNING_TEXT]})
+
+    @classmethod
+    def _persist_output(cls, job: _Job, event: dict[str, str]) -> None:
+        if job.journal is None or job.journal_failed:
+            return
+        try:
+            cls._write_output(job, event)
+        except Exception as exc:
+            job.journal_failed = True
+            cls._add_warning(job, "output_persist_failed", exc)
+
+    def _persist_metadata(self, job: _Job) -> None:
+        try:
+            self._write_metadata(job)
+        except Exception as exc:
+            job.metadata_failed = True
+            self._add_warning(job, "metadata_persist_failed", exc)
 
     async def _drain(self, job: _Job, stream: asyncio.StreamReader, name: str) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         while True:
             try:
                 chunk = await stream.read(64 * 1024)
-            except ConnectionError, OSError:
+            except Exception as exc:
+                self._add_warning(job, "output_read_failed", exc)
                 return
             if not chunk:
                 break
@@ -350,7 +424,7 @@ class Shells:
                     event = {"stream": name, "text": text}
                     job.output.append(event)
                     job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
-                    self._write_output(job, event)
+                    self._persist_output(job, event)
             if len(keep) < len(chunk):
                 job.truncated = True
         text = decoder.decode(b"", final=True)
@@ -358,7 +432,7 @@ class Shells:
             event = {"stream": name, "text": text}
             job.output.append(event)
             job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
-            self._write_output(job, event)
+            self._persist_output(job, event)
 
     async def _wait(self, job: _Job) -> None:
         try:
@@ -368,10 +442,13 @@ class Shells:
             job.error = str(exc)
             job.result = {"returncode": -1}
             job.finished_at = time.time()
-            self._write_metadata(job)
+            self._persist_metadata(job)
             self._prune_completed()
             return
-        await asyncio.gather(*job.readers, return_exceptions=True)
+        reader_results = await asyncio.gather(*job.readers, return_exceptions=True)
+        for result in reader_results:
+            if isinstance(result, Exception):
+                self._add_warning(job, "output_reader_failed", result)
         tick = asyncio.Event()
         while self._group_has_live_members(job.group_id):
             with contextlib.suppress(TimeoutError):
@@ -382,7 +459,7 @@ class Shells:
         else:
             job.state = "succeeded" if returncode == 0 else "failed"
         job.finished_at = time.time()
-        self._write_metadata(job)
+        self._persist_metadata(job)
         self._prune_completed()
 
     @staticmethod

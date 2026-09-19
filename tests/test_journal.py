@@ -111,3 +111,42 @@ def test_empty_journal(tmp_path):
     assert read_page(path, 0, 1024) == ([], 0)
     path.touch()
     assert read_page(path, 0, 1024) == ([], 0)
+
+
+@pytest.mark.parametrize("tail", [b'{"text":"cut', b'{"text":"\xf0\x9f'])
+def test_incomplete_tail_preserves_prefix_and_cursor(tmp_path, tail):
+    path = tmp_path / "events.jsonl"
+    original = b'{"text":"saved"}\n' + tail
+    path.write_bytes(original)
+    page, total = read_page(path, 0, 4096)
+    assert page[0] == {"text": "saved"}
+    assert page[1]["code"] == "journal_truncated"
+    assert page[1]["line"] == 2
+    assert total == 2
+    assert read_page(path, 1, 4096) == (page[1:], 2)
+    assert read_page(path, 2, 4096) == ([], 2)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("damaged", [b"broken\n", b"[]\n", b"\xff\n"])
+def test_corrupt_record_preserves_later_output_and_pagination(tmp_path, damaged):
+    path = tmp_path / "events.jsonl"
+    original = b'{"text":"before"}\n' + damaged + b'{"text":"after"}\n'
+    path.write_bytes(original)
+    events, cursor = [], 0
+    while cursor < 3:
+        page, total = read_page(path, cursor, 1)
+        assert total == 3
+        assert len(page) == 1
+        events.extend(page)
+        cursor += len(page)
+    assert events[0] == {"text": "before"}
+    assert events[1]["code"] == "journal_corrupt"
+    assert events[2] == {"text": "after"}
+    assert path.read_bytes() == original
+
+
+def test_complete_json_without_newline_is_readable(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b'{"text":"complete"}')
+    assert read_page(path, 0, 1024) == ([{"text": "complete"}], 1)

@@ -45,11 +45,15 @@ except ValueError:
 
 _HEX_ID = re.compile(r"^[0-9a-f]{32}$")
 _TASK_ID = re.compile(r"^task-.+-\d+$")
+_HISTORY_ID = re.compile(r"^python:[0-9a-f]{32}:.+$")
 
 
 def _reserved_generated_id(value: str) -> bool:
     return bool(
-        _HEX_ID.fullmatch(value) or _TASK_ID.fullmatch(value) or value.startswith("remote-watch:")
+        _HEX_ID.fullmatch(value)
+        or _TASK_ID.fullmatch(value)
+        or _HISTORY_ID.fullmatch(value)
+        or value.startswith("remote-watch:")
     )
 
 
@@ -511,6 +515,8 @@ class RemoteTask(TaskHandle):
         self._state = "queued"
         self._result: Any = None
         self._error: str | None = None
+        self._warnings: list[dict[str, Any]] = []
+        self._warnings_truncated = False
         self._cursor = 0
         self._cancel_requested = False
         self._lock = asyncio.Lock()
@@ -539,6 +545,14 @@ class RemoteTask(TaskHandle):
     def _merge(self, result: Any) -> None:
         if not isinstance(result, Mapping):
             return
+        for warning in result.get("warnings", []):
+            if warning not in self._warnings:
+                if len(self._warnings) < 4:
+                    self._warnings.append(warning)
+                else:
+                    self._warnings_truncated = True
+        self._warnings_truncated |= bool(result.get("warnings_truncated"))
+        self._buffer.truncated |= bool(result.get("truncated"))
         state = str(result.get("status", result.get("state", self._state)))
         if self._cancel_requested and self._state in {"cancelled", "failed", "lost"}:
             state = self._state
@@ -579,6 +593,8 @@ class RemoteTask(TaskHandle):
             "status": self._state,
             "created_at": self._created,
             "error": self._error,
+            **({"warnings": list(self._warnings)} if self._warnings else {}),
+            **({"warnings_truncated": True} if self._warnings_truncated else {}),
             "client_id": self._client.id if self._client else None,
             "connection_id": self._client.connection_id if self._client else None,
             "exec_id": self._exec_id,
@@ -586,6 +602,15 @@ class RemoteTask(TaskHandle):
         if self._finished_at is not None:
             status["finished_at"] = self._finished_at
         return status
+
+    def output(self, cursor: int | None = None) -> str | dict[str, Any]:
+        result = super().output(cursor)
+        if isinstance(result, dict):
+            if self._warnings:
+                result["warnings"] = list(self._warnings)
+            if self._warnings_truncated:
+                result["warnings_truncated"] = True
+        return result
 
     async def _wait(self) -> Any:
         await self._monitor

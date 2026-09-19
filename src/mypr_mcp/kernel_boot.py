@@ -3,18 +3,32 @@
 from __future__ import annotations
 
 import ctypes
+import importlib
 import os
 import signal
 import sys
 from pathlib import Path
 
+
+def _load_installed_package() -> None:
+    """Load mypr_mcp without putting its distribution dependencies first."""
+
+    source = Path(__file__).resolve().parents[1]
+    source_text = str(source)
+    if "mypr_mcp" in sys.modules:
+        return
+    sys.path.insert(0, source_text)
+    try:
+        importlib.import_module("mypr_mcp")
+    finally:
+        sys.path.remove(source_text)
+
+
 if __package__:
     from .cells import CellExecutor, install_context_displayhook
     from .kernel_api import MultiplexStream, create_workspace, execution_context
 else:
-    _source = Path(__file__).resolve().parents[1]
-    if str(_source) not in sys.path:
-        sys.path.insert(0, str(_source))
+    _load_installed_package()
     from mypr_mcp.cells import CellExecutor, install_context_displayhook
     from mypr_mcp.kernel_api import MultiplexStream, create_workspace, execution_context
 

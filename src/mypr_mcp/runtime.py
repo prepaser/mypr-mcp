@@ -87,7 +87,7 @@ class Runtime:
         )
 
     def retain_completed(self, kind, rec):
-        key = (kind, rec["id"])
+        key = (kind, rec.get("generation"), rec["id"])
         size = len(json.dumps(self.public_record(rec), ensure_ascii=True).encode())
         size += len(json.dumps(rec.get("events", []), ensure_ascii=True).encode())
         self.completed_bytes -= self.completed.pop(key, 0)
@@ -97,10 +97,12 @@ class Runtime:
             len(self.completed) > self.completed_records
             or self.completed_bytes > self.cache_bytes - self.cache_bytes // 2
         ):
-            (old_kind, ident), size = self.completed.popitem(last=False)
+            (old_kind, generation, ident), size = self.completed.popitem(last=False)
             self.completed_bytes -= size
             records = self.execs if old_kind == "execution" else self.task_records
-            records.pop(ident, None)
+            current = records.get(ident)
+            if current is not None and current.get("generation") == generation:
+                records.pop(ident, None)
 
     def critical_done(self, task):
         if self.stopping.is_set() or self.resetting or not self.healthy:
@@ -496,6 +498,13 @@ class Runtime:
                     break
                 output.append(event)
                 size += n
+        warnings = list(rec.get("warnings", []))
+        warnings.extend(
+            {"code": event["code"], "text": event["text"]}
+            for event in output
+            if event.get("type") == "warning"
+            and event.get("code") in {"journal_truncated", "journal_corrupt"}
+        )
         return {
             "exec_id": ident,
             "client_id": rec.get("client_id", rec.get("client")),
@@ -513,8 +522,12 @@ class Runtime:
                 if rec.get("error_truncated") or error != rec.get("error")
                 else {}
             ),
-            **({"warnings": rec["warnings"]} if rec.get("warnings") else {}),
-            **({"warnings_truncated": True} if rec.get("warnings_truncated") else {}),
+            **({"warnings": warnings[:4]} if warnings else {}),
+            **(
+                {"warnings_truncated": True}
+                if rec.get("warnings_truncated") or len(warnings) > 4
+                else {}
+            ),
         }
 
     async def dispatch(self, req):
@@ -606,7 +619,18 @@ class Runtime:
             if record["kind"] == "execution":
                 page = await self.poll(record["id"], wait_ms=0)
                 record.update(
-                    {key: page[key] for key in ("output", "cursor", "has_more", "truncated")}
+                    {
+                        key: page[key]
+                        for key in (
+                            "output",
+                            "cursor",
+                            "has_more",
+                            "truncated",
+                            "warnings",
+                            "warnings_truncated",
+                        )
+                        if key in page
+                    }
                 )
             return record
         generation = req.pop("generation", None)
@@ -752,12 +776,17 @@ class Runtime:
                 exec_id=req.get("exec_id"),
                 generation=self.generation,
             )
-            old = self.task_records.get(event["id"]) or self.history.get(event["id"]) or {}
+            old = self.task_records.get(event["id"])
+            if old is None:
+                old = self.history.get(event["id"]) or {}
+            if old.get("generation") != self.generation:
+                old = {}
             if old.get("state") in TERMINAL:
                 return None
-            self.task_records[event["id"]] = {**old, **event, "kind": "python"}
+            record = {**old, **event, "kind": "python"}
+            self.task_records[event["id"]] = record
             delta = event.pop("output_delta", None)
-            self.task_records[event["id"]].pop("output_delta", None)
+            record.pop("output_delta", None)
             if delta is None and event.get("output") != old.get("output"):
                 delta = event.get("output")
             if delta:
@@ -766,6 +795,8 @@ class Runtime:
                     "output",
                     {
                         "id": event["id"],
+                        "history_id": self.task_history_id(record),
+                        "generation": self.generation,
                         "exec_id": event.get("exec_id"),
                         "client_id": client,
                         "connection_id": connection_id,
@@ -775,11 +806,12 @@ class Runtime:
                 )
             self.history.record(
                 "python",
-                self.task_records[event["id"]],
+                record,
                 event=event["state"] if old.get("state") != event["state"] else None,
+                entity_id=self.task_history_id(record),
             )
             if event["state"] in TERMINAL:
-                self.retain_completed("python", self.task_records[event["id"]])
+                self.retain_completed("python", record)
             return None
         if op == "reset":
             from_kernel = req.get("from_kernel", False)
@@ -871,6 +903,12 @@ class Runtime:
     @staticmethod
     def public_record(rec):
         return {k: v for k, v in rec.items() if k not in {"done", "idle", "events"}}
+
+    @staticmethod
+    def task_history_id(record):
+        if record.get("kind") == "python" and record.get("generation"):
+            return f"python:{record['generation']}:{record['id']}"
+        return None
 
     def initialize_client(self, connection_id, requested_id):
         connection = self.clients.get(connection_id)
@@ -997,6 +1035,8 @@ class Runtime:
             result=full.get("result"),
             output=text.encode()[:65536].decode(errors="ignore"),
             output_truncated=full.get("truncated") or len(text.encode()) > 65536,
+            **({"warnings": full["warnings"]} if full.get("warnings") else {}),
+            **({"warnings_truncated": True} if full.get("warnings_truncated") else {}),
         )
         self.history.record(
             record["kind"], record, event=full["state"] if previous != full["state"] else None
@@ -1008,7 +1048,12 @@ class Runtime:
         for record in list(self.task_records.values()):
             if record["kind"] == "python" and record["state"] not in TERMINAL:
                 record.update(state=state, error=error, finished=time.time())
-                self.history.record("python", record, event=state)
+                self.history.record(
+                    "python",
+                    record,
+                    event=state,
+                    entity_id=self.task_history_id(record),
+                )
                 self.retain_completed("python", record)
 
     async def connection(self, reader, writer):

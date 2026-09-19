@@ -24,6 +24,19 @@ _ACTIVE_STATES = {"queued", "running", "cancelling"}
 _MAX_PAYLOAD_BYTES = 64 * 1024
 
 
+def _python_history_id(record: Mapping[str, Any]) -> str | None:
+    if record.get("kind") == "python" and record.get("generation") and record.get("id"):
+        return str(record.get("history_id") or f"python:{record['generation']}:{record['id']}")
+    return record.get("history_id")
+
+
+def _python_history_key(value: str) -> tuple[str, str] | None:
+    parts = value.split(":", 2)
+    if len(parts) == 3 and parts[0] == "python" and all(parts[1:]):
+        return parts[1], parts[2]
+    return None
+
+
 class History:
     """Store workspace entities and an append-only event log in SQLite."""
 
@@ -62,6 +75,9 @@ class History:
                 );
                 CREATE INDEX IF NOT EXISTS entities_kind_idx
                     ON entities(kind, entity_seq DESC);
+                CREATE INDEX IF NOT EXISTS entities_public_id_idx ON entities(
+                    json_extract(data, '$.id'), entity_seq DESC
+                );
                 CREATE INDEX IF NOT EXISTS execution_request_idx ON entities(
                     COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client')),
                     json_extract(data, '$.request_id'), entity_seq
@@ -130,7 +146,14 @@ class History:
         if value is not None:
             self._db.execute("INSERT OR IGNORE INTO client_ids(id) VALUES (?)", (str(value),))
 
-    def record(self, kind: str, record: dict[str, Any], event: str | None = None) -> dict[str, Any]:
+    def record(
+        self,
+        kind: str,
+        record: dict[str, Any],
+        event: str | None = None,
+        *,
+        entity_id: str | None = None,
+    ) -> dict[str, Any]:
         """Merge an entity update and optionally append its lifecycle event."""
         self._ensure_open()
         self._validate_kind(kind)
@@ -142,12 +165,17 @@ class History:
         supplied_kind = record.get("kind")
         if supplied_kind is not None and supplied_kind != kind:
             raise ValueError(f"record kind {supplied_kind!r} does not match {kind!r}")
+        storage_id = ident if entity_id is None else entity_id
+        if not isinstance(storage_id, str) or not storage_id:
+            raise ValueError("entity_id must be a non-empty string")
+        if storage_id != ident:
+            record = {**record, "history_id": storage_id}
         now = time.time()
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 row = self._db.execute(
-                    "SELECT entity_seq, kind, data FROM entities WHERE id = ?", (ident,)
+                    "SELECT entity_seq, kind, data FROM entities WHERE id = ?", (storage_id,)
                 ).fetchone()
                 if row is None:
                     merged = dict(record)
@@ -156,24 +184,30 @@ class History:
                     self._db.execute(
                         "INSERT INTO entities(id, kind, created, updated, data) "
                         "VALUES (?, ?, ?, ?, ?)",
-                        (ident, kind, now, now, _dump(merged)),
+                        (storage_id, kind, now, now, _dump(merged)),
                     )
                 else:
                     if row["kind"] != kind:
-                        raise ValueError(f"entity {ident!r} already has kind {row['kind']!r}")
+                        raise ValueError(f"entity {storage_id!r} already has kind {row['kind']!r}")
                     previous = _load(row["data"])
                     merged = {**previous, **record}
                     merged["id"] = ident
                     merged.setdefault("kind", kind)
                     self._db.execute(
                         "UPDATE entities SET updated = ?, data = ? WHERE id = ?",
-                        (now, _dump(merged), ident),
+                        (now, _dump(merged), storage_id),
                     )
                 self._remember_client(merged.get("client_id"))
                 self._remember_client(merged.get("client"))
                 result = dict(merged)
                 if event is not None:
-                    self._insert_event(event, kind, result, now=now)
+                    history_id = _python_history_id(result)
+                    data = (
+                        {"history_id": history_id, "generation": result.get("generation")}
+                        if history_id is not None
+                        else None
+                    )
+                    self._insert_event(event, kind, result, now=now, data=data)
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
@@ -257,6 +291,9 @@ class History:
             item.pop("code", None)
             item.pop("output", None)
             item.pop("events", None)
+            history_id = _python_history_id(item)
+            if history_id is not None:
+                item["history_id"] = history_id
             items.append(item)
         next_cursor = int(visible[-1]["entity_seq"]) if has_more and visible else None
         return {"items": items, "next_cursor": next_cursor}
@@ -267,8 +304,39 @@ class History:
         if not isinstance(ident, str) or not ident:
             raise ValueError("id must be a non-empty string")
         with self._lock:
+            python_key = _python_history_key(ident)
+            if python_key is not None:
+                generation, task_id = python_key
+                row = self._db.execute(
+                    "SELECT data FROM entities "
+                    "WHERE kind = 'python' "
+                    "AND json_extract(data, '$.id') = ? "
+                    "AND json_extract(data, '$.generation') = ? "
+                    "ORDER BY entity_seq DESC LIMIT 1",
+                    (task_id, generation),
+                ).fetchone()
+                if row is not None:
+                    result = _load(row["data"])
+                    result["history_id"] = _python_history_id(result) or ident
+                    return result
             row = self._db.execute("SELECT data FROM entities WHERE id = ?", (ident,)).fetchone()
-        return _load(row["data"]) if row else None
+            if row is not None:
+                exact = _load(row["data"])
+                if exact.get("history_id") == ident:
+                    return exact
+            row = self._db.execute(
+                "SELECT data FROM entities "
+                "WHERE json_extract(data, '$.id') = ? "
+                "ORDER BY entity_seq DESC LIMIT 1",
+                (ident,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = _load(row["data"])
+        history_id = _python_history_id(result)
+        if history_id is not None:
+            result["history_id"] = history_id
+        return result
 
     def logs(
         self,
@@ -350,7 +418,7 @@ class History:
                     record.pop("error", None)
                 else:
                     record["error"] = error
-                self.record(row["kind"], record, event=state)
+                self.record(row["kind"], record, event=state, entity_id=row["id"])
                 count += 1
         return count
 

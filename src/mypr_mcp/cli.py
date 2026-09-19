@@ -89,6 +89,7 @@ Discover and reuse capabilities
 - ws.local["install"] = await ws.packages.add("package"): start a workspace venv install.
 - await ws.history.list(client_id=ws.client.id): find your executions and jobs.
   await ws.history.get(record_id) reads details; await ws.history.logs() reads events.
+  Python task records expose history_id to distinguish reused IDs across resets.
 
 Lifecycle
 Code runs with the current OS user's permissions. Exceptions do not undo earlier changes.
@@ -97,6 +98,8 @@ or managed jobs are active unless force=True, which cancels them first. Completi
 through execute/poll. Saved files, packages, and history remain.
 Kernel or manager crashes lose in-memory state; history persists and code is not replayed.
 Malformed or missing display artifacts produce warnings without changing Python success.
+Shell storage warnings appear in job.status() and job.output(cursor=0). Damaged saved
+output is replaced by warning events; readable output and event cursors are preserved.
 error is a bounded summary; error_truncated indicates shortening. Read paged output
 for traceback details. Essential runtime worker failure is reported as unhealthy/lost;
 use explicit CLI reset to recover. CLI stop waits for manager exit before success.

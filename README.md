@@ -282,6 +282,10 @@ the cell's actual last-expression value. `await` on a cell handle waits for
 that cell only; a cell cannot await its own handle.
 
 Task IDs are shared across the kernel; omit `task_id` to generate one.
+An explicit ID can be reused after reset. Each kernel generation keeps a separate
+history record: `await ws.history.get(task_id)` returns the latest record, while
+`await ws.history.get(record["history_id"])` retrieves a specific generation.
+The `python:<generation>:...` history-ID namespace is reserved.
 `ws.tasks.list()` includes completed visible tasks, while `ws.tasks.active()`
 returns active handles. `visible=False` omits an async task from discovery,
 history reporting, and the reset guard; keep the default for managed work.
@@ -657,6 +661,13 @@ Malformed display items and unavailable image files produce bounded `warnings`
 without changing successful Python execution to failure. Valid text, execution
 state, cursors, and inbox data remain available. Excess warnings are indicated
 by `warnings_truncated`.
+Shell and package jobs report output persistence failures through `warnings` in
+`job.status()` and `job.output(cursor=0)`. Their exit status still describes the
+command itself, and output continues to be drained after a storage failure.
+Historical polling preserves readable journal entries and replaces damaged lines
+with warning events, keeping event cursors stable. `journal_truncated` identifies
+an incomplete final line; `journal_corrupt` identifies other invalid records.
+The original journal is left unchanged.
 The `error` field is a bounded summary (at most 1 KiB, smaller for small response
 budgets); `error_truncated` marks shortened summaries. Detailed traceback output
 is paged subject to the normal output limit.
@@ -681,6 +692,10 @@ references, not arbitrary objects retained by Python code.
 Manager record and shell-output caches each retain at most `completed_records`
 completed entries and share the serialized-byte budget equally. Counts must be
 positive and `cache_bytes` must be at least 1024. Active work is never evicted.
+If shell metadata cannot be saved, the most recent affected completed job is
+retained outside these cache limits so its result and warning remain inspectable.
+This fallback lasts only while the manager is alive and retains at most one job's
+output, subject to the normal per-job output limit.
 Execution output and shell/package journals remain on disk under `.mypr/runs/`
 and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache
 eviction. Request deduplication uses SQLite and survives eviction and restart,
@@ -706,6 +721,9 @@ For development, run `uv sync` in the checkout, then launch its
 
 To publish a release, update the package version, remove previous distributions,
 and rebuild:
+
+Set the version in `pyproject.toml`. Runtime version reporting reads the installed
+distribution metadata; source-only development kernels read `pyproject.toml`.
 
 ```sh
 rm -f dist/mypr_mcp-*.whl dist/mypr_mcp-*.tar.gz
