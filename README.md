@@ -9,6 +9,8 @@ The runtime is intended for Linux, Python 3.14, and [uv](https://docs.astral.sh/
 Commands run with the current OS user's permissions; mypr-mcp does not provide
 a sandbox.
 
+Licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
+
 ## Run
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
