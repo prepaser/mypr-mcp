@@ -8,7 +8,7 @@ from packaging.version import InvalidVersion, Version
 from . import __version__
 
 PROTOCOL_VERSION = 1
-CAPABILITIES = [
+LEGACY_CAPABILITIES = (
     "execute",
     "poll",
     "messages",
@@ -20,8 +20,8 @@ CAPABILITIES = [
     "skills",
     "modules",
     "locks",
-    "restart",
-]
+)
+CAPABILITIES = [*LEGACY_CAPABILITIES, "restart", "system"]
 LEGACY_INSTRUCTIONS = """This workspace uses the legacy 0.9.0 runtime.
 Use execute for Python and poll for submitted executions. Store client-local values in
 ws.local. ws.status(), ws.reset(), ws.fs, ws.git, ws.http, ws.browser, ws.net, ws.tasks,
@@ -48,7 +48,7 @@ def check_compatibility(state):
         return {
             **state,
             "protocol_version": 0,
-            "capabilities": [name for name in CAPABILITIES if name != "restart"],
+            "capabilities": list(LEGACY_CAPABILITIES),
             "instructions": LEGACY_INSTRUCTIONS,
             "legacy": True,
         }

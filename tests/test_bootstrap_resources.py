@@ -23,6 +23,7 @@ async def test_bootstrap_checks_packages_without_version_bump(tmp_path, monkeypa
     await bootstrap.ensure_runtime(python, command)
     assert len(commands) == 1
     assert "playwright==1.0" in commands[0]
+    assert "psutil==1.0" in commands[0]
     await bootstrap.ensure_runtime(python, command)
     assert len(commands) == 1
     installed.pop("httpx2")

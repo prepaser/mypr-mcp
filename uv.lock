@@ -538,7 +538,7 @@ wheels = [
 
 [[package]]
 name = "mypr-mcp"
-version = "0.9.0"
+version = "0.9.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx2", extra = ["http2", "socks"] },
@@ -547,6 +547,7 @@ dependencies = [
     { name = "mcp" },
     { name = "packaging" },
     { name = "playwright" },
+    { name = "psutil" },
     { name = "pyyaml" },
     { name = "tomlkit" },
 ]
@@ -566,6 +567,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.2,<3" },
     { name = "packaging", specifier = ">=26,<27" },
     { name = "playwright", specifier = ">=1.58,<2" },
+    { name = "psutil", specifier = ">=7.2,<8" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "tomlkit", specifier = ">=0.15,<1" },
 ]

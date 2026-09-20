@@ -26,6 +26,15 @@ State and identity
 - Keep large results in Python and return only the information needed for the next decision.
 
 Everyday workspace work
+- await ws.system.info(): visible workstation specifications and CPU/memory limits.
+  await ws.system.usage(interval=0.5): independently sampled CPU, RAM, swap, disk I/O,
+  network and GPU usage. await ws.system.disks() or disks(path) checks free disk space.
+  await ws.system.processes(sort="cpu", limit=20) identifies busy processes; cmdline=True
+  includes bounded arguments. await ws.system.gpus(processes=True) adds GPU process data.
+  Missing metrics are None, not zero. Check sources, warnings and truncated. Memory is
+  bytes; throughput is bytes/second; process CPU uses one core as 100% and may exceed it.
+  Limits reflect the kernel's visible namespace, affinity and cgroup v2; they do not
+  reserve resources. GPU tooling is optional and never installed automatically.
 - await ws.fs.read("src/app.py", start_line=1, end_line=80): bounded text and revision.
   Long lines use next_cursor; continue with its line as start_line and byte as start_byte.
 - await ws.fs.search("pattern", paths="src", glob="*.py"): regex matches with locations.

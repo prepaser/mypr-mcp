@@ -199,6 +199,7 @@ skill reads, and task-handle inspection are synchronous.
 | `ws.http` | Use named, persistent HTTPX2 clients and bounded requests |
 | `ws.browser` | Use native Playwright browser contexts and pages |
 | `ws.net` | Resolve hosts, inspect TCP/TLS endpoints, and run scans |
+| `ws.system` | Inspect workstation hardware, limits, and current resource usage |
 | `ws.locks` | Coordinate shared work with task-scoped logical locks |
 | `ws.packages` | Install kernel packages |
 | `ws.history` | Query saved execution and task records |
@@ -923,6 +924,60 @@ need a kernel reset before an upgrade is visible.
 names and types, task summaries, and discovered skills. `await ws.status()`
 returns manager health, generation, connections, active execution IDs, and
 queued executions.
+
+### Workstation resources
+
+`ws.system` collects a bounded snapshot of the workstation visible to the
+kernel. Collection runs in short-lived guarded helper processes, so vendor
+utilities or a slow filesystem do not block other Python cells. The result of
+each method is a JSON-compatible envelope with `collected_at`,
+`duration_seconds`, `scope`, `sources`, `warnings`, and `truncated` fields.
+
+```python
+info = await ws.system.info()
+usage = await ws.system.usage(interval=0.5)
+processes = await ws.system.processes(
+    sort="rss", limit=10, interval=0.5, cmdline=True
+)
+gpus = await ws.system.gpus(processes=True)
+workspace_disk = await ws.system.disks(path=".")
+```
+
+The `info` envelope contains `os`, `python`, `cpu`, `memory`, `storage`, and
+`limits`. `usage` contains interval-based `cpu`, `memory`, `swap`, per-interface
+`network`, per-device `disk_io`, `disks`, and `gpus` data. `processes` returns a
+bounded `processes` list with PID, creation time, status, CPU percentage, RSS,
+and I/O counters; `sort` accepts `cpu`, `rss`, `read`, or `write`, and `limit`
+is capped at 200. The `pids` and `user` filters narrow that list, while
+`cmdline` is false by default. `gpus` reports available vendor metrics and
+optional GPU processes. `disks(path=...)` reports filesystem capacity for the
+workspace-relative path (or an absolute path).
+
+All sizes are bytes and all rates are bytes per second. Whole-machine CPU usage
+is reported from 0 to 100%; process CPU usage uses one logical CPU as 100%, so
+a multi-threaded process can exceed 100%. Unsupported or inaccessible values
+are `None`, with the reason recorded in `warnings` or `sources`, rather than
+being reported as zero. A missing driver, inaccessible process, or unavailable
+vendor utility does not discard other sections. NVIDIA metrics use
+`nvidia-smi`; AMD uses `amd-smi`; Intel uses `xpu-smi` and, where available,
+`intel_gpu_top`, with Linux DRM/sysfs fallback. The API does not install
+operating-system tools automatically. Vendor utilization uses the driver's
+measurement window; DRM client counters use the requested interval. DRM engine
+activity and client memory are separate from whole-device utilization and VRAM.
+Shared DRM descriptors are counted once, with their owning PIDs listed. Vendor
+process PIDs can refer to a different PID namespace from the Python kernel.
+
+The snapshot uses the kernel's PID namespace and filesystem view. `limits` separately reports CPU affinity and cgroup v2 quota or memory
+headroom when discoverable; these are execution limits and available headroom,
+not a reservation of those resources. Responses are limited to 32 KiB; `truncated` and `omitted` identify details
+removed to fit that budget. A timeout
+stops the guarded helper, and cleanup can make the completed call slightly
+longer than the requested deadline.
+
+The default measurement interval is 0.5 seconds and must be between 0.1 and
+10 seconds. The default timeout is 5 seconds and must exceed the interval.
+Repeated snapshots are best scheduled as ordinary async cells or background
+tasks; the API does not create a resident monitor or retain historical samples.
 
 ## Reset and lifecycle
 

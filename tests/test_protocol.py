@@ -17,6 +17,7 @@ def test_legacy_profile_does_not_advertise_restart():
     legacy = check_compatibility({"version": "0.9.0"})
     assert legacy["legacy"]
     assert "restart" not in legacy["capabilities"]
+    assert "system" not in legacy["capabilities"]
     assert "unavailable" in legacy["instructions"]
 
 

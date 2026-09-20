@@ -27,6 +27,7 @@ from .locks import WorkspaceLocks
 from .modules import ModuleManager
 from .network_tools import NetworkTools
 from .skill_tools import SkillsWriting
+from .system_tools import SystemTools
 from .terminal import validate_size as _terminal_size
 from .workspace_tools import Git
 
@@ -1586,6 +1587,7 @@ class Workspace:
         self.history = History()
         self.http = HTTPTools(self.workspace, lambda: self.client)
         self.net = NetworkTools(self.workspace, self.tasks, _rpc)
+        self.system = SystemTools(self.workspace)
         self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
         self._closing = False
 
