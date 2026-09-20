@@ -1,6 +1,6 @@
 [project]
 name = "mypr-mcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "A persistent, workspace-shared Python environment for MCP agents"
 readme = "README.md"
 license = "AGPL-3.0-only"
