@@ -178,38 +178,26 @@ class Filesystem:
         finally:
             lock.release()
 
-    async def search(
-        self,
-        pattern: str | None = None,
-        *,
-        paths: str | list[str] | None = None,
-        glob: str | list[str] | None = None,
-        fixed: bool = False,
-        ignore_case: bool = False,
-        hidden: bool = False,
-        no_ignore: bool = False,
-        context: int = 0,
-        max_matches: int = 100,
-        max_bytes: int = 32 * 1024,
-        cursor: str | None = None,
-    ) -> dict[str, Any]:
-        args = dict(
-            pattern=pattern,
-            paths=paths,
-            glob=glob,
-            fixed=fixed,
-            ignore_case=ignore_case,
-            hidden=hidden,
-            no_ignore=no_ignore,
-            context=context,
-            max_matches=max_matches,
-            max_bytes=max_bytes,
-            cursor=cursor,
-        )
+    async def search(self, pattern=None, **options):
+        return await self._search_query("rg", pattern, options)
+
+    async def search_docs(self, pattern=None, **options):
+        return await self._search_query("rga", pattern, options)
+
+    async def search_ast(self, pattern=None, **options):
+        return await self._search_query("ast", pattern, options)
+
+    async def search_backends(self):
+        return await self._search_query("info", None, {})
+
+    async def _search_query(self, backend, pattern, options):
+        if "backend" in options:
+            raise ValueError("select a search method instead of overriding backend")
+        args = dict(pattern=pattern, backend=backend, **options)
         if self._searcher is not None:
             return await self._searcher(**args)
         if self._shell is None:
-            raise RuntimeError("ws.fs.search requires the workspace shell")
+            raise RuntimeError("workspace search requires the workspace shell")
         from .search import Search
 
         return await Search(self.workspace, self._shell).search(**args)

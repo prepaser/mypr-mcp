@@ -104,7 +104,9 @@ async def execute(
     if request_id is not None:
         arguments["request_id"] = request_id
     payload = decode_result(await session.call_tool("execute", arguments))
-    if payload["state"] not in {"succeeded", "failed", "cancelled", "lost"}:
+    if payload["state"] not in {"succeeded", "failed", "cancelled", "lost"} or payload.get(
+        "has_more"
+    ):
         payload = await poll_until_done(session, payload["exec_id"], initial=payload)
     return payload
 
@@ -126,7 +128,9 @@ async def poll_until_done(
         )
         events.extend(payload.get("output", []))
         cursor = payload["cursor"]
-        if payload["state"] in {"succeeded", "failed", "cancelled", "lost"}:
+        if payload["state"] in {"succeeded", "failed", "cancelled", "lost"} and not payload.get(
+            "has_more"
+        ):
             payload["output"] = events
             payload["cursor"] = len(events)
             return payload

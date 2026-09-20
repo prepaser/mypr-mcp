@@ -21,7 +21,7 @@ LEGACY_CAPABILITIES = (
     "modules",
     "locks",
 )
-CAPABILITIES = [*LEGACY_CAPABILITIES, "restart", "system"]
+CAPABILITIES = [*LEGACY_CAPABILITIES, "restart", "system", "search_v2", "search_docs", "search_ast"]
 LEGACY_INSTRUCTIONS = """This workspace uses the legacy 0.9.0 runtime.
 Use execute for Python and poll for submitted executions. Store client-local values in
 ws.local. ws.status(), ws.reset(), ws.fs, ws.git, ws.http, ws.browser, ws.net, ws.tasks,

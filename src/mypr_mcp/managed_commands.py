@@ -160,6 +160,180 @@ class ManagedCommands:
             raise RuntimeError(f"Command failed: {result['error'] or result['returncode']}")
         return result
 
+    async def stream(
+        self,
+        command,
+        *,
+        cwd=None,
+        env=None,
+        input=None,
+        timeout=30,  # noqa: ASYNC109
+        max_bytes=16 * 1024 * 1024,
+        on_stdout,
+    ) -> dict[str, Any]:
+        """Run a command while forwarding bounded stdout chunks to a callback.
+
+        Unlike :meth:`run`, stdout is not accumulated in the returned result.
+        The callback may return a string to stop the command early.
+        """
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+        if timeout is not None and (
+            type(timeout) not in (int, float)
+            or isinstance(timeout, bool)
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be a finite non-negative number or None")
+        if not callable(on_stdout):
+            raise TypeError("on_stdout must be callable")
+
+        shells = self.runtime.shells
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        launch = asyncio.create_task(
+            shells.start(command, cwd or str(self.runtime.workspace), env, input=input)
+        )
+        ident: str | None = None
+        stderr = bytearray()
+        stderr_limit = 64 * 1024
+        consumed = 0
+        cursor = None
+        page: dict[str, Any] = {}
+        warnings: list[Any] = []
+        warnings_truncated = False
+        truncated = False
+        timed_out = False
+        stop_reason: str | None = None
+
+        def add_warning(warning: Any) -> None:
+            nonlocal warnings_truncated
+            if warning in warnings:
+                return
+            if len(warnings) < _MAX_WARNINGS:
+                warnings.append(warning)
+            else:
+                warnings_truncated = True
+
+        async def consume(value: Any, *, forward: bool, preserve_reason: bool = False) -> None:
+            nonlocal cursor, consumed, truncated, warnings_truncated, stop_reason
+            if not isinstance(value, dict):
+                raise RuntimeError("shell read returned an invalid result")
+            events = value.get("events", value.get("output", []))
+            if isinstance(events, str):
+                events = [{"stream": "stdout", "text": events}]
+            elif isinstance(events, dict):
+                events = [events]
+            if not isinstance(events, list):
+                raise RuntimeError("shell read returned invalid output events")
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                raw = str(event.get("text", "")).encode("utf-8", "replace")
+                if not raw:
+                    continue
+                stream = "stderr" if event.get("stream") == "stderr" else "stdout"
+                available = max(0, max_bytes - consumed)
+                kept = raw[:available]
+                consumed += len(raw)
+                if len(kept) < len(raw):
+                    truncated = True
+
+                if stream == "stderr":
+                    diagnostic = kept[: max(0, stderr_limit - len(stderr))]
+                    stderr.extend(diagnostic)
+                    if len(diagnostic) < len(kept):
+                        truncated = True
+                elif forward and kept:
+                    text = kept.decode("utf-8", "ignore")
+                    if text:
+                        reason = await on_stdout(text)
+                        if reason is not None and not preserve_reason:
+                            if not isinstance(reason, str):
+                                raise TypeError("on_stdout must return a string or None")
+                            stop_reason = reason
+                            break
+
+                if len(kept) < len(raw) or consumed >= max_bytes:
+                    if stop_reason is None and not preserve_reason:
+                        stop_reason = "scan_bytes"
+                    break
+            truncated |= bool(value.get("truncated"))
+            page_warnings = value.get("warnings", [])
+            if not isinstance(page_warnings, list):
+                page_warnings = [
+                    {"code": "invalid_warnings", "text": "Shell returned invalid warnings"}
+                ]
+            for warning in page_warnings:
+                add_warning(warning)
+            warnings_truncated |= bool(value.get("warnings_truncated"))
+            if "cursor" in value:
+                cursor = value["cursor"]
+
+        async def drain() -> None:
+            nonlocal page
+            for _ in range(1024):
+                old_cursor = cursor
+                page = await shells.read(ident, cursor=cursor, max_bytes=_PAGE_BYTES, wait_ms=0)
+                await consume(page, forward=timed_out, preserve_reason=True)
+                if not page.get("has_more") or page.get("cursor") == old_cursor:
+                    return
+            add_warning({"code": "output_drain_limit", "text": "Output drain limit reached"})
+
+        try:
+            async with asyncio.timeout_at(deadline):
+                job = await asyncio.shield(launch)
+                ident = await self._track_or_cancel(shells, job, command)
+                while True:
+                    page = await shells.read(
+                        ident, cursor=cursor, max_bytes=_PAGE_BYTES, wait_ms=1000
+                    )
+                    await consume(page, forward=True)
+                    if stop_reason is not None:
+                        break
+                    if page.get("state") not in _ACTIVE and not page.get("has_more"):
+                        break
+            if stop_reason is not None:
+                await self._cancel(shells, ident)
+                await drain()
+        except TimeoutError:
+            timed_out = True
+            stop_reason = "timeout"
+            if ident is None:
+                job = await _uncancelled(launch, propagate=False)
+                ident = await self._track_or_cancel(shells, job, command)
+            await self._cancel(shells, ident)
+            with suppress(Exception):
+                await drain()
+        except asyncio.CancelledError:
+            if ident is None:
+                job = await _uncancelled(launch, propagate=False)
+                ident = await self._track_or_cancel(shells, job, command)
+            with suppress(Exception):
+                await self._cancel(shells, ident)
+            raise
+        except BaseException:
+            with suppress(Exception):
+                if ident is not None:
+                    await self._cancel(shells, ident)
+            raise
+
+        result = {
+            "id": ident,
+            "state": page.get("state", "unknown"),
+            "returncode": (page.get("result") or {}).get("returncode"),
+            "stdout": "",
+            "stderr": bytes(stderr).decode("utf-8", "ignore"),
+            "error": page.get("error"),
+            "truncated": truncated,
+            "warnings": warnings,
+            "timed_out": timed_out,
+        }
+        if stop_reason is not None:
+            result["stop_reason"] = stop_reason
+        if warnings_truncated:
+            result["warnings_truncated"] = True
+        return result
+
     async def _track_or_cancel(self, shells, job: Any, command: Any) -> str:
         if not isinstance(job, dict) or not job.get("id"):
             raise RuntimeError("shell start returned no job ID")

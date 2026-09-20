@@ -85,7 +85,7 @@ class SnapshotStore:
         fd, temporary = tempfile.mkstemp(prefix=f".{ident}.", suffix=".tmp", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, separators=(",", ":"))
+                json.dump(payload, file, ensure_ascii=True, separators=(",", ":"))
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, target)

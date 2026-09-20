@@ -90,6 +90,7 @@ class Runtime:
         self.browser = None
         self.scans = None
         self._resource_lock = asyncio.Lock()
+        self.search_slots = asyncio.Semaphore(2)
         self.background = set()
 
     def new_shells(self):

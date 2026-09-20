@@ -39,7 +39,19 @@ Everyday workspace work
   Long lines use next_cursor; continue with its line as start_line and byte as start_byte.
 - await ws.fs.search("pattern", paths="src", glob="*.py"): regex matches with locations.
   Use fixed=True for literal text, or omit pattern to list files. Requires ripgrep (rg).
-  Follow next_cursor with ws.fs.search(cursor=...) while has_more; pages use a saved snapshot.
+  mode="files", "counts", or "exists" avoids unneeded match text. Patterns can be a list.
+  word=True, multiline=True, and before/after select matching and context behavior.
+  Follow next_cursor with the same search method(cursor=...) while has_more; pages use a
+  saved snapshot. page_cursor rereads the current page with a larger output budget.
+  timeout=30, scan_bytes, and scan_limit bound the search itself; max_matches/max_bytes
+  bound each page. Check complete, stop_reason and scan_truncated before assuming no hits
+  or complete counts. An incomplete existence search returns exists=None unless a hit is known.
+- await ws.fs.search_docs("pattern", paths="docs"): rga document/archive search.
+  Locations refer to extracted text, not editable source positions. Converters are optional.
+- await ws.fs.search_ast("print($$$ARGS)", lang="python", paths="src"): read-only AST search.
+  Pass rule={...}, constraints={...}, utils={...} for structural rules. Results include
+  ranges and captures; details_truncated marks omitted details. This does not rewrite files.
+  await ws.fs.search_backends() reports installed engines and conversion dependencies.
 - await ws.fs.tree("src") and await ws.fs.stat("src/app.py"): bounded tree and metadata.
 - await ws.git.status(), await ws.git.diff(), await ws.git.show("HEAD", path="README.md"):
   read-only Git views. Continue with cursor=next_cursor while has_more.

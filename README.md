@@ -240,22 +240,72 @@ cuts a line, continue using `next_cursor["line"]` as `start_line` and
 pages of a file that may change.
 
 `search(pattern=None, *, paths=None, glob=None, fixed=False, ignore_case=False,
-hidden=False, no_ignore=False, context=0, max_matches=100, max_bytes=32768, cursor=None)` uses
-`rg` from the workstation's PATH. Install ripgrep to enable it. With a pattern,
-it returns `matches` containing file paths, line numbers, byte-based columns,
-text, and match/context kind. Without a pattern, it returns `files`. `paths` and
-`glob` accept a string or a list. Ignore files and hidden-file rules apply by
-default. `truncated` reports incomplete results; `text_truncated` marks shortened
-match text. Search runs as a managed shell job and its captured scan output is
-bounded separately from the returned results. The returned `id` identifies its
-job; use `await ws.tasks.attach(result["id"])` to inspect it.
-The first request completes the query and saves a bounded snapshot. Continue with
-`await ws.fs.search(cursor=page["next_cursor"])` while `has_more` is true.
-`max_matches` and `max_bytes` apply to each page. Continuations read the saved
-snapshot without rerunning the search, even after a reset or restart. The scan
-is limited to 16 MiB; `scan_truncated` reports an incomplete retained query.
-`truncated` also covers remaining pages and shortened match text. A budget too
-small for a path and its metadata raises an error; increase `max_bytes`.
+hidden=False, no_ignore=False, context=0, word=False, line=False,
+multiline=False, dotall=False, before=None, after=None, regex_engine="default",
+mode=None, timeout=30, scan_bytes=16*1024*1024, scan_limit=None,
+max_matches=100, max_bytes=32768, cursor=None)` uses `rg` from the workstation's
+`PATH`. Install ripgrep to enable it; mypr-mcp does not install command-line
+tools. A string or list of patterns is accepted and is treated as an OR query.
+`paths` and `glob` also accept a string or a list. Ignore files and hidden-file
+rules apply by default.
+
+When `mode` is omitted, a pattern selects `matches` and a pattern-less query
+selects `files`. Explicit `mode` controls the result collection: `matches`
+returns matching lines and all match spans, `files` returns matching paths, `counts` returns
+`{"path": ..., "count": ...}` rows, and `exists` returns a boolean. If an
+incomplete scan found no match, `exists` is `None`. `matches` includes one-based
+lines and byte-based columns, zero-based UTF-8 byte offsets, and
+an exclusive end offset when available. `context` may add surrounding rows;
+their `kind` is `context`. `pcre2` can be selected with `regex_engine` when the
+installed `rg` supports it. Invalid patterns and unsupported engines fail
+before a scan starts.
+
+Search runs as a managed job. `timeout` includes process startup and output
+collection; `scan_bytes` and `scan_limit` bound the retained scan. The response
+has `backend`, `complete`, `stop_reason`, `scan_truncated`, `has_more`, and
+`next_cursor` fields. A timeout or scan limit preserves the partial result with
+`complete=false`; it is not a complete count. Cancellation propagates to the
+caller after the managed process is cleaned up. `max_matches` and `max_bytes`
+bound one returned page. The first request saves a bounded snapshot, so
+`await ws.fs.search(cursor=page["next_cursor"])` continues without rerunning
+the command, even after a reset or restart. `page_cursor` rereads the same
+page with a different `max_bytes` budget. A budget too small for one path and
+its metadata raises an error; increase `max_bytes`.
+
+Use `search_docs(pattern, *, paths=None, glob=None, mode="matches", adapters=None,
+accurate=False, cache=True, archive_depth=5, timeout=30, scan_bytes=16*1024*1024,
+scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` for PDF, Office,
+ebook, archive, and other formats supported by `rga` (ripgrep-all). It exposes
+the same result modes and completion fields as `search`, with `backend="rga"`.
+`adapters` selects the rga adapter list, `accurate=True` enables MIME detection,
+`cache=False` uses a per-query temporary extraction cache that is removed after
+the search, and `archive_depth` limits nested archive traversal. Missing
+adapters or converters produce a partial result and warning while matches from
+other files remain available. Document locations are
+coordinates in extracted text; they are not byte offsets or editable line
+positions in the original PDF or Office document. Archive member names may be
+present in the displayed path or text according to the rga adapter.
+
+Use `search_ast(pattern=None, *, lang, rule=None, constraints=None, utils=None,
+paths=None, glob=None, mode="matches", timeout=30, scan_bytes=16*1024*1024,
+scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` for read-only
+structural searches through ast-grep. Provide either a pattern or a rule, not
+both. Patterns use ast-grep metavariables such as `$NAME` and `$$$ARGS`; rules
+may combine `kind`, `pattern`, `has`, `inside`, `follows`, `precedes`,
+`constraints`, and `utils`. Results include the source path, language, matched
+text, an exclusive source range, and metavariable ranges when available.
+`counts` counts matched AST nodes. Large matches may omit optional submatch or
+capture details and set `details_truncated=true`; the result retains the
+minimal path, line, and column metadata, but its source range may also be
+omitted. `page_cursor` can reread the same page with a larger byte budget. This
+API never rewrites files, runs project fixes, or installs language parsers.
+`backend="ast"` identifies the result.
+
+`await ws.fs.search_backends()` reports whether `rg`, `rga`, and ast-grep are
+available, their versions, and the document converters visible on `PATH`.
+Search tools use the current workspace permissions and Linux process namespace;
+they do not provide a sandbox. Search cache and snapshots are tool data and are
+excluded from ordinary workspace searches unless selected explicitly through `paths`.
 
 `await ws.fs.tree(path=".", depth=3, max_entries=200, hidden=False)` returns
 a deterministic directory view with `entries` and `truncated`. Symlinks are

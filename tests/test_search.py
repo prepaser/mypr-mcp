@@ -11,7 +11,7 @@ from mypr_mcp.search import Search
 
 
 class ShellRunner:
-    async def run(self, command, *, cwd, check, max_bytes):
+    async def run(self, command, *, cwd, check, max_bytes, timeout=None):  # noqa: ASYNC109
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd,

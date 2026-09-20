@@ -18,6 +18,7 @@ def test_legacy_profile_does_not_advertise_restart():
     assert legacy["legacy"]
     assert "restart" not in legacy["capabilities"]
     assert "system" not in legacy["capabilities"]
+    assert not {"search_v2", "search_docs", "search_ast"} & set(legacy["capabilities"])
     assert "unavailable" in legacy["instructions"]
 
 
