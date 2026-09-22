@@ -6,11 +6,38 @@ from pathlib import Path
 
 from conftest import decode_result, execute, mcp_session, result_text, stop_manager
 
+from mypr_mcp.instructions import INSTRUCTIONS
+
 
 async def test_init_execute_and_poll_tools_and_expression_result(workspace: Path):
-    async with mcp_session(workspace) as session:
-        tools = await session.list_tools()
-        assert {tool.name for tool in tools.tools} == {"init", "execute", "poll"}
+    async with mcp_session(workspace, initialize_client=False) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        assert set(tools) == {"init", "execute", "poll"}
+        for tool in tools.values():
+            assert tool.description
+            assert all(prop.get("description") for prop in tool.input_schema["properties"].values())
+        assert tools["execute"].input_schema["required"] == ["code"]
+        assert tools["poll"].input_schema["required"] == ["exec_id"]
+        assert tools["execute"].input_schema["properties"]["wait_ms"]["default"] == 1000
+        assert tools["poll"].input_schema["properties"]["cursor"]["default"] is None
+
+        initialized = decode_result(await session.call_tool("init", {}))
+        assert "help" in initialized["runtime"]["capabilities"]
+        assert initialized["runtime"]["instructions"] == INSTRUCTIONS
+        help_result = await execute(
+            session,
+            'print(ws.help())\nprint(ws.help("fs"))',
+        )
+        assert help_result["state"] == "succeeded"
+        assert "ws.fs.read" in result_text(help_result)
+        assert "lifecycle" in result_text(help_result)
+        for code, error in [
+            ('ws.help("unknown-topic")', "ValueError"),
+            ('ws.help(["fs"])', "TypeError"),
+        ]:
+            failed = await execute(session, code)
+            assert failed["state"] == "failed"
+            assert error in failed["error"]
 
         payload = await execute(session, "answer = 41\nanswer + 1")
         assert payload["state"] == "succeeded"

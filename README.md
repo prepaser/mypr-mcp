@@ -184,9 +184,17 @@ cells or background jobs.
 
 ## Python workspace API
 
-The kernel injects `ws`, a `Workspace` instance, into every Python cell.
-Methods shown with `await` are asynchronous; property access, inspection,
-skill reads, and task-handle inspection are synchronous.
+The kernel injects `ws`, a `Workspace` instance, into every Python cell. Methods shown with `await` are asynchronous; property access, help, inspection, skill reads, and task-handle inspection are synchronous.
+
+`init` returns the running manager's core instructions and capabilities. When `help` is available, query detailed guidance from that kernel as needed:
+
+```python
+print(ws.help())          # Topic index
+print(ws.help("fs"))      # File reads and revision-checked edits
+print(ws.help("search"))  # Text, document, and AST search
+```
+
+`ws.help(topic=None)` returns a string without I/O. Topics cover workspace APIs and execution lifecycle; unknown topics raise `ValueError` with the available names. Follow the running manager's instructions when it differs from the installed MCP client.
 
 | Entry point | Purpose |
 | --- | --- |
@@ -205,6 +213,7 @@ skill reads, and task-handle inspection are synchronous.
 | `ws.locks` | Coordinate shared work with task-scoped logical locks |
 | `ws.packages` | Install kernel packages |
 | `ws.history` | Query saved execution and task records |
+| `ws.help()`, `ws.help("topic")` | Read the topic index or API guidance from the running kernel |
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
 | `await ws.restart()` | Replace the manager and kernel with this installation; see [Reset and lifecycle](#reset-and-lifecycle) |

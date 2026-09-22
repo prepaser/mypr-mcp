@@ -10,11 +10,12 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent
+from pydantic import Field
 
 from . import __version__
 from .bridge import ConnectionBridge
@@ -201,8 +202,20 @@ async def serve(workspace):
             raise ToolError(str(exc)) from exc
 
     @mcp.tool()
-    async def init(client_id: str | None = None) -> dict[str, Any]:
-        """Bind this connection to a new or existing client ID before executing Python."""
+    async def init(
+        client_id: Annotated[
+            str | None,
+            Field(
+                description="Omit for a new readable ID; supply an ID to create or resume it. "
+                "An ID cannot be shared by live connections or switched on this connection."
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Start workspace work here: bind a client ID before execute.
+
+        Returns the running manager's API instructions, capabilities, and versions.
+        Repeated calls retain the current ID. Follow this runtime's guidance.
+        """
         nonlocal bound_client
         result = await request("init", client_id=client_id)
         bound_client = result["client_id"]
@@ -211,9 +224,36 @@ async def serve(workspace):
 
     @mcp.tool()
     async def execute(
-        code: str, wait_ms: int = 1000, request_id: str | None = None
+        code: Annotated[
+            str,
+            Field(
+                description="Python cell with top-level await support. Use ws helpers for "
+                "workspace work and ws.local for client-local values; print concise results."
+            ),
+        ],
+        wait_ms: Annotated[
+            int,
+            Field(
+                description="Milliseconds to wait for cell output, not an execution timeout. "
+                "Messages may end the wait early; inspect state and has_more."
+            ),
+        ] = 1000,
+        request_id: Annotated[
+            str | None,
+            Field(
+                description="Optional deduplication key for this logical client. Same ID and "
+                "identical code return the existing execution; different code is rejected. "
+                "Omit for a new execution. Reuse does not rebuild state after restart."
+            ),
+        ] = None,
     ) -> CallToolResult:
-        """Execute an async-capable Python cell after init has bound a client ID."""
+        """Read/edit files, search, run commands, and compose helpers in persistent Python.
+
+        Call init first and follow its API instructions. Returns exec_id, state, output,
+        cursor, and has_more. Use poll for pending cells or remaining output; do not
+        resubmit code just because the tool wait ended. Confirm uncertain side effects
+        before repeating a state-changing operation.
+        """
         if bound_client is None:
             raise ToolError("Call init before execute")
         if request_id is None:
@@ -228,8 +268,31 @@ async def serve(workspace):
         return tool_result(result)
 
     @mcp.tool()
-    async def poll(exec_id: str, cursor: int | None = None, wait_ms: int = 1000) -> CallToolResult:
-        """Read a submitted cell's state and output; use Python handles for background jobs."""
+    async def poll(
+        exec_id: Annotated[
+            str, Field(description="The submitted cell's exec_id returned by execute.")
+        ],
+        cursor: Annotated[
+            int | None,
+            Field(
+                description="Use the cursor returned by the previous execute/poll to continue "
+                "reading cell output. Omit to read from the beginning."
+            ),
+        ] = None,
+        wait_ms: Annotated[
+            int,
+            Field(
+                description="Milliseconds to wait for new cell output, not an execution timeout. "
+                "Messages may end the wait early."
+            ),
+        ] = 1000,
+    ) -> CallToolResult:
+        """Continue a submitted cell without executing it again; available before init.
+
+        Poll queued/running cells and keep reading while has_more, even after a terminal
+        state. Use the returned cursor each time. Once terminal with no more output,
+        evaluate the result/error. Python handles manage jobs started by a cell.
+        """
         result = await request(
             "poll",
             exec_id=exec_id,

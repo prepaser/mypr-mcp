@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .api_help import workspace_help
 from .browser_tools import BrowserTools
 from .diagnostics import safe_error, safe_error_details
 from .filesystem import Filesystem
@@ -1686,6 +1687,10 @@ class Workspace:
             generation=os.environ.get("MYPR_GENERATION"),
         )
         raise ResetRequested(result)
+
+    def help(self, topic: str | None = None) -> str:
+        """Return the topic index or API guidance for this running kernel."""
+        return workspace_help(topic)
 
     def inspect(self) -> dict[str, Any]:
         namespace = self._namespace.items() if self._namespace is not None else ()

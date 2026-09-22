@@ -4,12 +4,19 @@ from mypr_mcp.protocol import check_compatibility, descriptor, runtime_info
 
 
 def test_compatible_protocol_ignores_release_number():
-    state = {**descriptor(), "version": "0.1.0", "generation": "existing"}
+    state = {
+        **descriptor(),
+        "version": "0.1.0",
+        "generation": "existing",
+        "capabilities": ["execute", "poll"],
+        "instructions": "Guidance from the running manager",
+    }
     assert check_compatibility(state) is state
     info = runtime_info(state, "0.9.0", include_instructions=True)
     assert info["update_pending"]
     assert info["generation"] == "existing"
     assert info["instructions"] == state["instructions"]
+    assert info["capabilities"] == ["execute", "poll"]
     assert not runtime_info(state, "0.1.0")["update_pending"]
 
 
@@ -18,6 +25,7 @@ def test_legacy_profile_does_not_advertise_restart():
     assert legacy["legacy"]
     assert "restart" not in legacy["capabilities"]
     assert "system" not in legacy["capabilities"]
+    assert "help" not in legacy["capabilities"]
     assert not {"search_v2", "search_docs", "search_ast"} & set(legacy["capabilities"])
     assert "unavailable" in legacy["instructions"]
 
