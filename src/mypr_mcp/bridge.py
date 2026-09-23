@@ -29,6 +29,7 @@ class ConnectionBridge:
         self._stopped = False
         self._state = None
         self._reported_generation = None
+        self._last_timing = None
 
     @property
     def generation(self):
@@ -76,6 +77,33 @@ class ConnectionBridge:
             await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
     async def request(self, op: str, **fields: Any):
+        started = time.perf_counter()
+        timing = {"bridge_ready": 0.0, "manager_rpc": 0.0}
+        if self._last_timing is not None:
+            fields["_bridge_sample"], self._last_timing = self._last_timing, None
+        try:
+            result = await self._request(op, fields, timing)
+        finally:
+            timing["bridge_total"] = (time.perf_counter() - started) * 1000
+            timing = {key: round(value, 3) for key, value in timing.items()}
+            self._last_timing = dict(timing)
+        return {**result, "_timing_ms": {**result.get("_timing_ms", {}), **timing}}
+
+    async def _request(self, op, fields, timing):
+        async def ready():
+            started = time.perf_counter()
+            try:
+                await self.wait_ready()
+            finally:
+                timing["bridge_ready"] += (time.perf_counter() - started) * 1000
+
+        async def call_manager(connection_id):
+            started = time.perf_counter()
+            try:
+                return await rpc(self.path, op=op, connection_id=connection_id, **fields)
+            finally:
+                timing["manager_rpc"] += (time.perf_counter() - started) * 1000
+
         if op == "poll" and (
             not self._ready.is_set()
             or self._error is not None
@@ -90,10 +118,10 @@ class ConnectionBridge:
             ticket = active_ticket(self.workspace)
             if ticket is not None:
                 raise RuntimeError(f"Workspace is restarting: {ticket['id']}")
-        await self.wait_ready()
+        await ready()
         connection_id = self.connection_id
         try:
-            result = await rpc(self.path, op=op, connection_id=connection_id, **fields)
+            result = await call_manager(connection_id)
         except ConnectionError, OSError, RuntimeError:
             ticket = self._ticket()
             origin = (ticket or {}).get("origin") or {}
@@ -115,8 +143,8 @@ class ConnectionBridge:
                 if result is not None:
                     return self._decorate(result)
                 if ticket["state"] == "succeeded":
-                    await self.wait_ready()
-                    result = await rpc(self.path, op=op, connection_id=self.connection_id, **fields)
+                    await ready()
+                    result = await call_manager(self.connection_id)
                     return self._decorate(result)
             raise
         if op == "init":

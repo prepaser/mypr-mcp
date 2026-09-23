@@ -5,6 +5,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -34,10 +35,50 @@ from .restart_records import poll_restart
 from .scan_service import ScanService
 from .search import Search
 from .services import MCPBridge, Shells
+from .timings import Timings
 from .transport import MAX_MESSAGE, socket_path, workspace_id
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
 MCP_MUTATIONS = {"configure", "remove", "restart", "reload"}
+TIMING_OPS = {
+    "init",
+    "status",
+    "performance",
+    "history_list",
+    "logs",
+    "history_get",
+    "history_task_read",
+    "cell_terminal",
+    "message_send",
+    "message_reply",
+    "message_read",
+    "message_ack",
+    "execute",
+    "poll",
+    "scan_start",
+    "scan_results",
+    "scan_summary",
+    "scan_cancel",
+    "browser_server",
+    "search",
+    "git",
+    "shell_start",
+    "shell_poll",
+    "shell_read",
+    "shell_wait",
+    "shell_write",
+    "shell_resize",
+    "shell_cancel",
+    "mcp",
+    "packages_add",
+    "task_event",
+    "task_terminal",
+    "restart",
+    "restart_prepare",
+    "reset",
+    "stop",
+}
+BRIDGE_TIMINGS = {"bridge_ready", "manager_rpc", "bridge_total"}
 
 
 def _write_json(path, data):
@@ -106,6 +147,14 @@ class Runtime:
         self.workspace_id = workspace_id(self.workspace)
         self.socket = socket_path(self.workspace)
         self.generation = uuid.uuid4().hex
+        self.timings = Timings(
+            labels={
+                *(f"dispatch.{op}" for op in TIMING_OPS),
+                *(f"bridge.{name}" for name in BRIDGE_TIMINGS),
+                "kernel.queue",
+                "kernel.roundtrip",
+            }
+        )
         self.execs = {}
         self.completed = OrderedDict()
         self.completed_bytes = 0
@@ -309,6 +358,7 @@ class Runtime:
                 if rec["state"] in TERMINAL:
                     continue
                 rec.update(state="lost", error=message, finished=time.time())
+                self.observe_kernel_roundtrip(rec)
                 self.active.pop(rec["id"], None)
                 self.by_msg.pop(rec.get("msg_id"), None)
                 rec["done"].set()
@@ -444,13 +494,24 @@ class Runtime:
                 finished=time.time(),
             )
             candidate = {**self.public_record(rec), **fields}
-            await self.persist_execution(candidate, event=state)
+            try:
+                await self.persist_execution(candidate, event=state)
+            finally:
+                if state in TERMINAL:
+                    self.observe_kernel_roundtrip(rec)
             rec.update(fields)
             self.active.pop(rec["id"], None)
             self.by_msg.pop(rec.get("msg_id"), None)
             rec["done"].set()
             await self.notify_execution_change(rec)
             self.retain_completed("execution", rec)
+
+    def observe_kernel_roundtrip(self, rec):
+        sent_at = rec.get("_kernel_sent_at")
+        if sent_at is None or rec.get("_kernel_roundtrip_recorded"):
+            return
+        rec["_kernel_roundtrip_recorded"] = True
+        self.timings.observe("kernel.roundtrip", time.perf_counter() - sent_at)
 
     async def update_execution(self, rec, fields, event=None):
         task = asyncio.create_task(self._update_execution(rec, fields, event))
@@ -514,7 +575,12 @@ class Runtime:
                 submitted = asyncio.get_running_loop().create_future()
                 self.submit_waiters[rec["msg_id"]] = submitted
                 try:
+                    sent_at = time.perf_counter()
                     self.kc.shell_channel.send(msg)
+                    rec["_kernel_sent_at"] = sent_at
+                    self.timings.observe(
+                        "kernel.queue", sent_at - rec.get("_admitted_at", sent_at)
+                    )
                     await submitted
                 finally:
                     self.submit_waiters.pop(rec["msg_id"], None)
@@ -899,6 +965,7 @@ class Runtime:
                 _revision=0,
             )
             await self.persist_execution(rec, event="queued")
+            rec["_admitted_at"] = time.perf_counter()
             self.execs[ident] = rec
             if not self.healthy:
                 await self.finish(rec, "lost", self.health_error or "Kernel unavailable")
@@ -908,20 +975,72 @@ class Runtime:
 
     async def dispatch(self, req):
         op = req.get("op")
+        bridge_sample = req.pop("_bridge_sample", None)
+        if isinstance(bridge_sample, dict):
+            for name, milliseconds in bridge_sample.items():
+                if name not in BRIDGE_TIMINGS or isinstance(milliseconds, bool):
+                    continue
+                try:
+                    milliseconds = float(milliseconds)
+                except (OverflowError, TypeError, ValueError):
+                    continue
+                if math.isfinite(milliseconds) and milliseconds >= 0:
+                    self.timings.observe(f"bridge.{name}", milliseconds / 1000)
         connection_id = req.get("connection_id")
-        result = await self._dispatch(req)
-        connection = self.clients.get(connection_id)
-        if (
-            op in {"init", "execute", "poll"}
-            and connection
-            and connection["client_id"] is not None
-            and self.messages is not None
-        ):
+        started = time.perf_counter()
+        try:
+            result = await self._dispatch(req)
+            connection = self.clients.get(connection_id)
+            if (
+                op in {"init", "execute", "poll"}
+                and connection
+                and connection["client_id"] is not None
+                and self.messages is not None
+            ):
+                result = {
+                    **result,
+                    "inbox": await self.io(self.messages.inbox, connection["client_id"]),
+                }
+        finally:
+            elapsed = time.perf_counter() - started
+            label = op if op in TIMING_OPS else "other"
+            self.timings.observe(f"dispatch.{label}", elapsed)
+        if op in {"init", "execute", "poll"} and isinstance(result, dict):
             result = {
                 **result,
-                "inbox": await self.io(self.messages.inbox, connection["client_id"]),
+                "_timing_ms": {"manager_dispatch": round(elapsed * 1000, 3)},
             }
         return result
+
+    def performance_snapshot(self):
+        samples = self.timings.snapshot()
+        manager = {
+            name.removeprefix("dispatch."): value
+            for name, value in samples.items()
+            if name.startswith("dispatch.")
+        }
+        bridge = {
+            name.removeprefix("bridge."): value
+            for name, value in samples.items()
+            if name.startswith("bridge.")
+        }
+        storage = (
+            self.persistence.performance_snapshot()
+            if self.persistence is not None
+            else {"queue_depth": 0, "queue_capacity": 128, "queue_wait": None, "work": None}
+        )
+        return {
+            "manager_dispatch": manager,
+            "bridge": bridge,
+            "storage": storage,
+            "kernel": {
+                "queue_ms": samples.get("kernel.queue"),
+                "roundtrip_ms": samples.get("kernel.roundtrip"),
+                "roundtrip_semantics": (
+                    "manager-observed send-to-finish, including event and persistence delay"
+                ),
+            },
+        }
 
     async def _dispatch(self, req):
         op = req.pop("op")
@@ -953,7 +1072,48 @@ class Runtime:
                 raise ValueError("Connection belongs to another client")
             connection["last_activity"] = time.time()
         client = (connection["client_id"] if connection else requested_client) or "anonymous"
+        if op == "performance":
+            return self.performance_snapshot()
         if op == "status":
+            detail = req.get("detail", True)
+            if type(detail) is not bool:
+                raise ValueError("detail must be a boolean")
+            if not detail:
+                target = connection.get("target") if connection else None
+                target_version = target.get("version") if target else None
+                info = (
+                    runtime_info(descriptor(), target_version)
+                    if target_version
+                    else runtime_info(descriptor())
+                )
+                result = {
+                    "version": info["manager_version"],
+                    "manager_version": info["manager_version"],
+                    "bridge_version": info["bridge_version"],
+                    "protocol_version": info["protocol_version"],
+                    "update_pending": info["update_pending"],
+                    "workspace_id": self.workspace_id,
+                    "generation": self.generation,
+                    "healthy": self.healthy,
+                    "restarting": self.restarting,
+                    "resetting": self.resetting,
+                    "workspace_available": self.workspace_available(),
+                    "connection_count": len(self.clients),
+                    "client_count": len(
+                        {
+                            item["client_id"]
+                            for item in self.clients.values()
+                            if item["client_id"]
+                        }
+                    ),
+                    "active_count": len(self.active),
+                    "queued_count": sum(
+                        record["state"] == "queued" for record in self.execs.values()
+                    ),
+                }
+                if self.health_error:
+                    result["health_error"] = self.health_error
+                return result
             connections = []
             for info in self.clients.values():
                 owned = [

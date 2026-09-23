@@ -13,6 +13,7 @@ async def test_mcp_handshake_survives_workspace_startup_failure(tmp_path):
 import asyncio
 from pathlib import Path
 from mypr_mcp import cli
+Path('import-ready').touch()
 async def unavailable(workspace):
     raise RuntimeError('Incompatible workspace protocol; run mypr-mcp restart')
 cli.ensure = unavailable
@@ -25,8 +26,11 @@ asyncio.run(cli.serve(Path.cwd()))
         env=dict(os.environ),
     )
     async with stdio_client(params) as (reader, writer):
+        async with asyncio.timeout(45):
+            while not (tmp_path / "import-ready").exists():  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
         async with ClientSession(reader, writer) as session:
-            initialized = await asyncio.wait_for(session.initialize(), 5)
+            initialized = await asyncio.wait_for(session.initialize(), 30)
             assert initialized.instructions == COMMON_INSTRUCTIONS
             tools = await session.list_tools()
             assert {tool.name for tool in tools.tools} == {"init", "execute", "poll"}

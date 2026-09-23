@@ -1642,8 +1642,13 @@ class Workspace:
         key = client.id if client is not None else "__anonymous__"
         return self._locals.setdefault(key, {})
 
-    async def status(self) -> Any:
-        return await _rpc("status")
+    async def status(self, *, detail: bool = False) -> Any:
+        if type(detail) is not bool:
+            raise TypeError("detail must be a boolean")
+        return await _rpc("status", detail=detail)
+
+    async def performance(self) -> Any:
+        return await _rpc("performance")
 
     async def reset(self, force: bool = False) -> Any:
         if _output_buffer.get() is not None:

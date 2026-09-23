@@ -160,7 +160,7 @@ async def test_uninitialized_connection_does_not_count_as_client(workspace: Path
         with sqlite3.connect(history_path) as database:
             before = database.execute("SELECT COUNT(*) FROM client_ids").fetchone()[0]
         async with mcp_session(workspace) as initialized:
-            state = json_output(await execute(initialized, "await ws.status()"))
+            state = json_output(await execute(initialized, "await ws.status(detail=True)"))
             assert state["connection_count"] == 2
             assert state["client_count"] == 1
             assert any(item.get("client_id") is None for item in state["connections"])

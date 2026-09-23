@@ -76,7 +76,7 @@ Missing metrics are None, not zero. Check sources, warnings, and truncated field
     ),
     "messages": (
         "Coordinate clients with inbox messages and workspace status.",
-        """await ws.status() reports connected clients, active execution IDs, and the execution queue. ws.client.id is your logical identity; ws.client.connection_id identifies this connection.
+        """await ws.status() returns compact runtime health, version, workspace, generation, and connection, active, and queued counts. Pass detail=True for the full connection list, active execution IDs, queue, and manager instructions. ws.client.id is your logical identity; ws.client.connection_id identifies this connection.
 
 await ws.messages.send(client_id, text) sends to a registered workspace client, even if it is disconnected. Structured JSON can be attached with data={...}. await ws.messages.read(limit=20, after=None, wait_ms=0) reads unacknowledged messages. Follow next_cursor when has_more is true; wait_ms can wait up to 30000 ms. Use sender=... and reply_to=... to wait for replies to a particular message. await ws.messages.reply(message_id, text, data=None) answers a message addressed to you, including after acknowledgment. await ws.messages.ack([message_id]) acknowledges messages after handling them.
 
@@ -136,11 +136,15 @@ await ws.modules.check(name, test_code="...") validates code in a separate Pytho
         "Find execution records and inspect event logs.",
         """await ws.history.list(client_id=ws.client.id) finds your executions and jobs. await ws.history.get(record_id) reads a record; await ws.history.logs() reads events. Python task records expose history_id to distinguish reused IDs across resets.""",
     ),
+    "performance": (
+        "Inspect recent manager, storage, kernel, and bridge timings.",
+        """await ws.performance() returns rolling timing summaries for manager, storage, kernel, and bridge work. Each label keeps its latest 256 samples and a total_count observed since manager start, with p50, p95, and max in milliseconds. Bridge timing for the most recent completed request appears on the next call; concurrent or disconnected calls may not all be reported. Execution results include timing_ms in MCP _meta (result.meta in the Python SDK), outside printed content and structuredContent; request errors may lack timings. Manager and RPC times include requested notification waits and are not overhead-only measurements. Nested spans overlap, so do not sum them to infer unmeasured overhead; kernel round-trip includes IPC and output persistence, not only Python execution. Time outside the MCP server, including host scheduling, external transport, and model execution, is not measured. Samples remain in memory until manager restart.""",
+    ),
     "lifecycle": (
         "Understand client identity, persistence, reset, restart, and recovery.",
         """The Python kernel is shared by every client connected to this workspace. Variables, imports, functions, and active tasks survive calls and client disconnects. Ordinary globals are shared between clients; background tasks retain their creator's client context. Store per-client working values in ws.local, a dict scoped to your logical client ID. Reconnecting with the same ID restores that local state while the same kernel remains alive.
 
-ws.inspect() reports variable types, tasks, and skills without dumping their values. await ws.status() reports runtime health, connected clients, active executions, and the execution queue.
+ws.inspect() reports variable types, tasks, and skills without dumping their values. await ws.status() returns compact health and counts; pass detail=True for connection records, active execution IDs, queued IDs, and manager instructions. await ws.performance() reports rolling manager, storage, kernel, and bridge timing summaries.
 
 init() creates a new adjective-animal client ID; init(client_id="...") creates or resumes that logical session. The ID is bound to the MCP connection and is not passed to execute. Repeated init returns the current ID. Switching IDs or using one ID on multiple live connections is rejected. Poll is available before init.
 

@@ -107,26 +107,35 @@ json.load(sys.stdin)
 if os.fork() == 0:
     os.setsid()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    open('descendant.pid','w').write(str(os.getpid()))
+    with open('descendant.pid.tmp', 'w') as file:
+        file.write(str(os.getpid()))
+        file.flush()
+    os.replace('descendant.pid.tmp', 'descendant.pid')
     time.sleep(30)
 else:
     time.sleep(30)
 """,
     )
     task = asyncio.create_task(tools.disks(timeout=1))
-    async with asyncio.timeout(3):
-        while not await asyncio.to_thread((tmp_path / "descendant.pid").exists):  # noqa: ASYNC110
-            await asyncio.sleep(0.01)
-    pid = int((tmp_path / "descendant.pid").read_text())
-    if cancel:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    else:
-        result = await task
-        assert result["sources"]["disks"]["status"] == "timeout"
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    pid_file = tmp_path / "descendant.pid"
+    try:
+        async with asyncio.timeout(3):
+            while not await asyncio.to_thread(pid_file.exists):  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
+        pid = int(pid_file.read_text())
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await task
+            assert result["sources"]["disks"]["status"] == "timeout"
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_output_flood_is_stopped(tmp_path, monkeypatch):

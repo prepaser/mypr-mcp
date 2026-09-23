@@ -215,6 +215,7 @@ print(ws.help("search"))  # Text, document, and AST search
 | `ws.locks` | Coordinate shared work with task-scoped logical locks |
 | `ws.packages` | Install kernel packages |
 | `ws.history` | Query saved execution and task records |
+| `await ws.performance()` | Read recent timing summaries |
 | `ws.help()`, `ws.help("topic")` | Read the topic index or API guidance from the running kernel |
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
@@ -793,19 +794,14 @@ accidental name reuse only when code follows the `ws.local` convention;
 ordinary globals remain shared. Reconnecting with the same ID resumes the same
 local dictionary while the kernel remains alive.
 
-Use `await ws.status()` for the current manager, kernel, active executions,
-queue, and connected-client information. `active` is an array of execution IDs;
-each connection also reports its active execution IDs. `connection_count`
-includes connections waiting to call `init`; `client_count` includes only
-initialized logical clients. Use `await ws.history.list(...)` and
-`await ws.history.get(exec_id)` to inspect execution records from Python. History
-records include the logical client and connection IDs, timestamps, state, and
-output metadata. A task inherits its creator's identity even while another
-client executes. IDs are organizational labels, not access-control boundaries.
+Use `await ws.status()` for compact manager and kernel health, version, workspace identity, generation, and connection, active, and queued counts. `connection_count` includes connections waiting to call `init`; `client_count` includes only initialized logical clients. Pass `detail=True` to include connection records, active and queued execution IDs, and manager instructions. Use `await ws.history.list(...)` and `await ws.history.get(exec_id)` to inspect execution records from Python. History records include the logical client and connection IDs, timestamps, state, and output metadata. A task inherits its creator's identity even while another client executes. IDs are organizational labels, not access-control boundaries.
 
 ```python
 state = await ws.status()
 state["connection_count"], state["client_count"]
+state["active_count"], state["queued_count"]
+details = await ws.status(detail=True)
+details["connections"]
 await ws.history.list(client_id=ws.client.id, limit=20)
 await ws.history.get(exec_id)  # Also accepts a background task ID.
 await ws.history.logs(client_id=ws.client.id, limit=20)
@@ -831,6 +827,10 @@ ws.local["logs"]["events"]
 Without a cursor, `logs()` returns recent events; `cursor=0` starts at the
 beginning. Log cursors, history-list cursors, task-output cursors, and MCP
 `poll` cursors belong to different APIs and must not be interchanged.
+
+`await ws.performance()` returns rolling timing summaries for manager, storage, kernel, and bridge work. Each label keeps its latest 256 samples and a `total_count` observed since manager start, with `p50`, `p95`, and `max` in milliseconds. Bridge timing for the most recent completed request appears on the next call; concurrent or disconnected calls may not all be reported. Execution results include `timing_ms` in MCP `_meta` (the Python SDK exposes `result.meta`), outside printed content and `structuredContent`. Request errors raised before a result is produced may lack these timings. Manager and RPC times include requested notification waits and are not overhead-only measurements. Nested spans overlap, so do not sum them to infer unmeasured overhead; kernel round-trip includes IPC and output persistence, not only Python execution. Time outside the MCP server, including host scheduling, external transport, and model execution, is not measured. Samples remain in memory until manager restart.
+
+See [the performance benchmark](benchmarks/README.md) for reproducible request latency, output size, and before/after comparisons.
 
 `connections` contains connection and activity timestamps, active execution
 IDs, and owned task IDs. Open IPC connections determine liveness, so a
@@ -983,10 +983,7 @@ The installation uses `uv pip` and writes the resulting freeze to
 `.mypr/requirements.txt`. Packages already imported by the current kernel may
 need a kernel reset before an upgrade is visible.
 
-`ws.inspect()` returns the workspace path, kernel generation, visible variable
-names and types, task summaries, and discovered skills. `await ws.status()`
-returns manager health, generation, connections, active execution IDs, and
-queued executions.
+`ws.inspect()` returns the workspace path, kernel generation, visible variable names and types, task summaries, and discovered skills. `await ws.status()` returns compact manager health and counts; pass `detail=True` for connection records, active and queued execution IDs, and manager instructions.
 
 ### Workstation resources
 

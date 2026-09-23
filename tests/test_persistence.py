@@ -37,6 +37,11 @@ async def test_cancelled_submit_waits_for_accepted_io_and_fifo_order():
         with pytest.raises(asyncio.CancelledError):
             await first
         await asyncio.gather(second, third)
+        metrics = worker.performance_snapshot()
+        assert metrics["queue_wait"]["total_count"] == 3
+        assert metrics["work"]["total_count"] == 3
+        assert metrics["queue_depth"] == 0
+        assert metrics["queue_capacity"] == 1
     finally:
         release.set()
         await worker.close()

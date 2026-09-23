@@ -139,7 +139,7 @@ async def test_cell_cannot_await_itself(workspace: Path):
     async with mcp_session(workspace) as session:
         pending = await submit(
             session,
-            "active = (await ws.status())['active']\n"
+            "active = (await ws.status(detail=True))['active']\n"
             "exec_id = active[-1] if isinstance(active, list) else active\n"
             "await ws.tasks.get(exec_id)",
         )

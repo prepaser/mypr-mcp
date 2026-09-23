@@ -10,6 +10,8 @@ from pathlib import Path
 
 from conftest import execute, mcp_session, result_text
 
+from mypr_mcp.transport import attachment, rpc, socket_path
+
 
 def json_output(payload: dict) -> object:
     """Decode the repr of a JSON string returned by IPython."""
@@ -17,8 +19,8 @@ def json_output(payload: dict) -> object:
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def status(session) -> dict:
-    payload = await execute(session, "await ws.status()")
+async def status(session, *, detail=False) -> dict:
+    payload = await execute(session, f"await ws.status(detail={detail!r})")
     value = json_output(payload)
     assert isinstance(value, dict)
     return value
@@ -125,7 +127,21 @@ async def test_status_tracks_connections_unique_clients_and_abrupt_disconnect(wo
         first_id = result_text(await execute(first, "ws.client.id")).strip(" '\n")
         async with mcp_session(workspace) as second:
             second_id = result_text(await execute(second, "ws.client.id")).strip(" '\n")
-            state = await status(second)
+            compact = await status(second)
+            assert compact["connection_count"] == 2
+            assert compact["client_count"] == 2
+            assert isinstance(compact["active_count"], int)
+            assert isinstance(compact["queued_count"], int)
+            assert "manager_version" in compact and "bridge_version" in compact
+            assert {
+                "instructions",
+                "connections",
+                "active",
+                "queued",
+                "workspace",
+            }.isdisjoint(compact)
+
+            state = await status(second, detail=True)
             assert state["connection_count"] == 2
             assert state["client_count"] == 2
             assert {item["client_id"] for item in state["connections"]} == {
@@ -139,10 +155,9 @@ async def test_status_tracks_connections_unique_clients_and_abrupt_disconnect(wo
                 assert all(isinstance(exec_id, str) for exec_id in item["active"])
                 assert isinstance(item["task_ids"], list)
 
-        state = await status(first)
+        state = await status(first, detail=True)
         assert state["connection_count"] == 1
         assert state["client_count"] == 1
-
         existing_processes = _find_client_processes(workspace)
         async with mcp_session(workspace) as abrupt:
             await execute(abrupt, "1 + 1")
@@ -152,12 +167,28 @@ async def test_status_tracks_connections_unique_clients_and_abrupt_disconnect(wo
             os.kill(pid, signal.SIGKILL)
 
         for _ in range(40):
-            state = await status(first)
+            state = await status(first, detail=True)
             if state["connection_count"] == 1:
                 break
             await asyncio.sleep(0.1)
         assert state["connection_count"] == 1
         assert state["client_count"] == 1
+
+
+async def test_status_preserves_full_protocol_default_without_install_descriptor(workspace: Path):
+    async with mcp_session(workspace):
+        path = socket_path(workspace)
+        async with attachment(path, "legacy-status"):
+            compact = await rpc(
+                path, op="status", detail=False, connection_id="legacy-status"
+            )
+            assert compact["bridge_version"] == compact["manager_version"]
+            assert "instructions" not in compact
+            assert "connections" not in compact
+
+            full = await rpc(path, op="status", connection_id="legacy-status")
+            assert "instructions" in full
+            assert isinstance(full["connections"], list)
 
 
 async def test_request_ids_are_scoped_to_logical_client(workspace: Path):

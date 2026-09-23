@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
+
+from .timings import Timings
 
 
 class PersistenceUnavailable(RuntimeError):
@@ -18,6 +20,15 @@ class _Call:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
     result: asyncio.Future[Any]
+    queued_at: float
+
+
+@dataclass(slots=True)
+class _Outcome:
+    queue_wait: float
+    work: float
+    value: Any = None
+    error: BaseException | None = None
 
 
 async def await_completion(task: asyncio.Future[Any]) -> Any:
@@ -43,6 +54,7 @@ class PersistenceWorker:
         self._closed = False
         self._failure = None
         self._on_failure = on_failure
+        self.timings = Timings(labels={"queue_wait", "work"})
         self._gate = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
         self._task = asyncio.create_task(self._run(), name="mypr:persistence")
@@ -70,11 +82,12 @@ class PersistenceWorker:
             self._queue.task_done()
 
     async def call(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        queued_at = time.perf_counter()
         async with self._gate:
             if not self.available:
                 raise self._failure or PersistenceUnavailable("Persistence worker is unavailable")
             result = self._loop.create_future()
-            await self._queue.put(_Call(function, args, kwargs, result))
+            await self._queue.put(_Call(function, args, kwargs, result, queued_at))
             if not self.available:
                 self._fail_pending(
                     self._failure or PersistenceUnavailable("Persistence worker is unavailable")
@@ -103,9 +116,10 @@ class PersistenceWorker:
                 try:
                     work = self._loop.run_in_executor(
                         self._executor,
-                        partial(current.function, *current.args, **current.kwargs),
+                        self._invoke,
+                        current,
                     )
-                    value = await asyncio.shield(work)
+                    outcome = await asyncio.shield(work)
                 except asyncio.CancelledError as exc:
                     while not work.done():
                         try:
@@ -118,15 +132,17 @@ class PersistenceWorker:
                         self._fail(current, exc)
                     else:
                         try:
-                            current.result.set_result(work.result())
+                            outcome = work.result()
+                            self._observe(outcome)
+                            self._resolve(current, outcome)
                         except BaseException as work_error:
                             self._fail(current, work_error)
                     raise
                 except BaseException as exc:
                     self._fail(current, exc)
                 else:
-                    if not current.result.done():
-                        current.result.set_result(value)
+                    self._observe(outcome)
+                    self._resolve(current, outcome)
                 finally:
                     self._queue.task_done()
                     current = None
@@ -157,6 +173,38 @@ class PersistenceWorker:
                     self._fail(pending, exc)
                 self._queue.task_done()
             raise
+
+    @staticmethod
+    def _invoke(call: _Call) -> _Outcome:
+        started = time.perf_counter()
+        queue_wait = max(0.0, started - call.queued_at)
+        try:
+            value = call.function(*call.args, **call.kwargs)
+        except BaseException as exc:
+            return _Outcome(queue_wait, time.perf_counter() - started, error=exc)
+        return _Outcome(queue_wait, time.perf_counter() - started, value=value)
+
+    def _observe(self, outcome: _Outcome) -> None:
+        self.timings.observe("queue_wait", outcome.queue_wait)
+        self.timings.observe("work", outcome.work)
+
+    @staticmethod
+    def _resolve(call: _Call, outcome: _Outcome) -> None:
+        if call.result.done():
+            return
+        if outcome.error is not None:
+            call.result.set_exception(outcome.error)
+        else:
+            call.result.set_result(outcome.value)
+
+    def performance_snapshot(self) -> dict[str, Any]:
+        timings = self.timings.snapshot()
+        return {
+            "queue_depth": self._queue.qsize(),
+            "queue_capacity": self._queue.maxsize,
+            "queue_wait": timings.get("queue_wait"),
+            "work": timings.get("work"),
+        }
 
     @staticmethod
     def _fail(call: _Call, error: BaseException) -> None:

@@ -284,7 +284,9 @@ def _render_result(
 
 
 async def tool_result(result: dict[str, Any]) -> CallToolResult:
+    started = time.perf_counter()
     result = dict(result)
+    timing = dict(result.pop("_timing_ms", {}))
     warnings = list(result.get("warnings", []))
     images = []
     artifact_issues = []
@@ -322,10 +324,12 @@ async def tool_result(result: dict[str, Any]) -> CallToolResult:
     if warnings:
         result["warnings"] = warnings
     text = _render_result(result, artifact_issues)
+    timing["render"] = round((time.perf_counter() - started) * 1000, 3)
     return CallToolResult(
         content=[TextContent(text=text), *images],
         structuredContent=result,
         isError=result.get("state") in {"failed", "lost"},
+        _meta={"timing_ms": timing},
     )
 
 
@@ -416,8 +420,9 @@ async def serve(workspace):
         wait_ms: Annotated[
             int,
             Field(
-                description="Milliseconds to wait for cell output, not an execution timeout. "
-                "Messages may end the wait early; inspect state and has_more."
+                description="Milliseconds to wait for completion or inbox activity, not an "
+                "execution timeout or total request deadline. Output alone does not end this "
+                "wait; inspect state and has_more."
             ),
         ] = 1000,
         request_id: Annotated[
@@ -464,8 +469,9 @@ async def serve(workspace):
         wait_ms: Annotated[
             int,
             Field(
-                description="Milliseconds to wait for new cell output, not an execution timeout. "
-                "Messages may end the wait early."
+                description="Milliseconds to wait for new output, completion, or inbox activity. "
+                "Available output returns immediately. This is not an execution timeout or "
+                "total request deadline."
             ),
         ] = 1000,
     ) -> CallToolResult:
