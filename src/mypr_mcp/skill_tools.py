@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from .persistence import await_completion
+from .revisions import RevisionStore
 
 
 class SkillsWriting:
@@ -43,58 +47,182 @@ class SkillsWriting:
     ) -> dict[str, Any]:
         if not isinstance(text, str):
             raise TypeError("text must be a string")
+        if self._fs is None:
+            raise RuntimeError("skill writes require a workspace filesystem")
         path = self._skill_path(name)
         validation = await self.validate(name, text)
         if not validation["valid"]:
             details = "; ".join(validation["errors"])
             raise ValueError(f"Invalid skill: {details}")
         relative = self._relative(path)
-        old: str | None
-        old_revision: str | None
-        try:
-            if self._fs is not None:
+        revisions = self._revision_store()
+        task = asyncio.create_task(
+            self._write_transaction(
+                name,
+                relative,
+                text,
+                expected_hash,
+                dry_run,
+                max_diff_bytes,
+                validation,
+                revisions,
+            )
+        )
+        return await await_completion(task)
+
+    async def _write_transaction(
+        self,
+        name: str,
+        relative: str,
+        text: str,
+        expected_hash: str | None,
+        dry_run: bool,
+        max_diff_bytes: int,
+        validation: dict[str, Any],
+        revisions: RevisionStore,
+    ) -> dict[str, Any]:
+        async with revisions.transaction(relative):
+            try:
                 old_result = await self._fs.read(relative, max_bytes=16 * 1024 * 1024)
                 if old_result.get("truncated"):
                     raise ValueError("existing skill exceeds max_bytes; refusing partial CAS")
                 old = old_result["text"]
                 old_revision = old_result["revision"]
-            else:
-                old = path.read_text(encoding="utf-8")
-                old_revision = _sha256(old)
-        except FileNotFoundError:
-            old = None
-            old_revision = None
-        if dry_run:
+            except FileNotFoundError:
+                old = None
+                old_revision = None
             _check_hash(old, expected_hash, old_revision)
-            diff, diff_truncated = _diff(relative, old or "", text, max_diff_bytes)
+            if dry_run:
+                diff, diff_truncated = _diff(relative, old or "", text, max_diff_bytes)
+                return {
+                    "name": name,
+                    "path": relative,
+                    "changed": old != text,
+                    "dry_run": True,
+                    "old_revision": old_revision,
+                    "revision": _sha256(text),
+                    "diff": diff,
+                    "diff_truncated": diff_truncated,
+                    "warnings": validation["warnings"],
+                }
+            await revisions.ensure_capacity(relative, (old, text))
+            await revisions.prepare(relative, (old, text))
+            result = await self._fs.write(
+                relative,
+                text,
+                expected_hash=expected_hash,
+                create_parents=True,
+            )
+            await revisions.record(relative, (old, text))
             return {
                 "name": name,
                 "path": relative,
                 "changed": old != text,
-                "dry_run": True,
+                "dry_run": False,
                 "old_revision": old_revision,
-                "revision": _sha256(text),
-                "diff": diff,
-                "diff_truncated": diff_truncated,
                 "warnings": validation["warnings"],
+                **result,
             }
+
+    async def history(
+        self, name: str, *, limit: int = 20, cursor: int | None = None
+    ) -> dict[str, Any]:
+        relative = self._relative(self._skill_path(name))
+        revisions = self._revision_store()
+        async with revisions.transaction(relative):
+            return {"name": name, **await revisions.history(relative, limit=limit, cursor=cursor)}
+
+    async def read_revision(
+        self,
+        name: str,
+        revision: str,
+        *,
+        start_byte: int = 0,
+        max_bytes: int = 32_768,
+    ) -> dict[str, Any]:
+        relative = self._relative(self._skill_path(name))
+        revisions = self._revision_store()
+        async with revisions.transaction(relative):
+            return {
+                "name": name,
+                **await revisions.read_revision(
+                    relative, revision, start_byte=start_byte, max_bytes=max_bytes
+                ),
+            }
+
+    async def restore(
+        self, name: str, revision: str, *, expected_hash: str | None = None
+    ) -> dict[str, Any]:
         if self._fs is None:
             raise RuntimeError("skill writes require a workspace filesystem")
-        result = await self._fs.write(
-            relative,
-            text,
-            expected_hash=expected_hash,
-            create_parents=True,
+        path = self._skill_path(name)
+        relative = self._relative(path)
+        revisions = self._revision_store()
+        task = asyncio.create_task(
+            self._restore_transaction(name, relative, revision, expected_hash, revisions)
         )
-        return {
-            "name": name,
-            "path": relative,
-            "changed": old != text,
-            "dry_run": False,
-            "old_revision": old_revision,
-            "warnings": validation["warnings"],
-            **result,
-        }
+        return await await_completion(task)
+
+    async def _restore_transaction(
+        self,
+        name: str,
+        relative: str,
+        revision: str,
+        expected_hash: str | None,
+        revisions: RevisionStore,
+    ) -> dict[str, Any]:
+        async with revisions.transaction(relative):
+            text = await revisions.restore_content(relative, revision)
+            validation = await self.validate(name, text)
+            if not validation["valid"]:
+                details = "; ".join(validation["errors"])
+                raise ValueError(f"Invalid skill revision: {details}")
+            try:
+                current = await self._fs.read(relative, max_bytes=64 * 1024 * 1024)
+                if current.get("truncated"):
+                    raise ValueError("existing skill exceeds max_bytes; refusing partial CAS")
+                old = current["text"]
+                old_revision = current["revision"]
+            except FileNotFoundError:
+                old = None
+                old_revision = None
+            if old is not None and expected_hash is None:
+                raise FileExistsError("Skill already exists; provide expected_hash to restore")
+            if expected_hash is not None and old_revision != expected_hash:
+                raise ValueError(f"Revision mismatch: expected {expected_hash}, got {old_revision}")
+            if old == text:
+                return {
+                    "name": name,
+                    "path": relative,
+                    "changed": False,
+                    "revision": revision,
+                    "old_revision": old_revision,
+                    "activated": False,
+                    "warnings": validation["warnings"],
+                }
+            await revisions.ensure_capacity(relative, (old, text))
+            await revisions.prepare(relative, (old, text))
+            result = await self._fs.write(
+                relative,
+                text,
+                expected_hash=expected_hash,
+                create_parents=True,
+            )
+            await revisions.record(relative, (old, text))
+            return {
+                "name": name,
+                "path": relative,
+                "changed": True,
+                "old_revision": old_revision,
+                "activated": False,
+                "warnings": validation["warnings"],
+                **result,
+            }
+
+    def _revision_store(self) -> RevisionStore:
+        if self._fs is None:
+            raise RuntimeError("skill revision history requires a workspace filesystem")
+        return RevisionStore(self._fs.workspace, self._fs, "skills")
 
     def _skill_path(self, name: str) -> Path:
         _validate_skill_name(name)

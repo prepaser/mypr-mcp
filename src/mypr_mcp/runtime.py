@@ -300,6 +300,7 @@ class Runtime:
             "*.lock",
             "browser/",
             "scans/",
+            "revisions/",
         ]
         missing = [entry for entry in required if entry not in entries]
         if missing:
@@ -1407,7 +1408,8 @@ class Runtime:
             job = await self.shells.start(
                 req["command"],
                 req.get("cwd", str(self.workspace)),
-                req.get("env", dict(os.environ)),
+                req.get("env"),
+                inherit_env=req.get("inherit_env", req.get("env") is None),
                 input=req.get("input"),
                 stdin=req.get("stdin", False),
                 pty=req.get("pty", False),

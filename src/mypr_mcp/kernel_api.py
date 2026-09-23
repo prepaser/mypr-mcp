@@ -21,10 +21,12 @@ from typing import Any
 
 from .api_help import workspace_help
 from .browser_tools import BrowserTools
+from .code_tools import CodeTools
 from .diagnostics import safe_error, safe_error_details
 from .filesystem import Filesystem
 from .http_tools import HTTPTools
 from .locks import WorkspaceLocks
+from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
 from .skill_tools import SkillsWriting
@@ -1216,12 +1218,37 @@ class Shell:
     def __init__(self, tasks: TaskManager) -> None:
         self._tasks = tasks
 
+    @staticmethod
+    def _environment(
+        env: Mapping[str, str | None] | None, inherit_env: bool
+    ) -> dict[str, str]:
+        if type(inherit_env) is not bool:
+            raise TypeError("inherit_env must be a boolean")
+        if env is not None and not isinstance(env, Mapping):
+            raise TypeError("env must be a mapping or None")
+        result = os.environ.copy() if inherit_env else {}
+        for key, value in (env or {}).items():
+            if not isinstance(key, str):
+                raise TypeError("environment variable names must be strings")
+            if not key or "=" in key or "\0" in key:
+                raise ValueError(f"invalid environment variable name: {key!r}")
+            if value is None:
+                result.pop(key, None)
+                continue
+            if not isinstance(value, str):
+                raise TypeError("environment variable values must be strings or None")
+            if "\0" in value:
+                raise ValueError(f"environment variable {key!r} contains a null byte")
+            result[key] = value
+        return result
+
     async def start(
         self,
         command: str | list[str],
         *,
         cwd: str | os.PathLike[str] | None = None,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
+        inherit_env: bool = True,
         input: str | None = None,
         stdin: bool = False,
         pty: bool = False,
@@ -1241,11 +1268,13 @@ class Shell:
         if type(pty) is not bool:
             raise TypeError("pty must be a boolean")
         _terminal_size(rows, cols)
+        child_env = self._environment(env, inherit_env)
         result = await _rpc(
             "shell_start",
             command=command,
             cwd=str(cwd or os.getcwd()),
-            env=dict(os.environ if env is None else env),
+            env=child_env,
+            inherit_env=False,
             input=input,
             stdin=stdin,
             pty=pty,
@@ -1267,7 +1296,8 @@ class Shell:
         command: str | list[str],
         *,
         cwd: str | os.PathLike[str] | None = None,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
+        inherit_env: bool = True,
         input: str | None = None,
         timeout: float | None = None,  # noqa: ASYNC109
         check: bool = False,
@@ -1286,7 +1316,16 @@ class Shell:
         ):
             raise ValueError("timeout must be a finite non-negative number or None")
         launch = asyncio.create_task(
-            self.start(command, cwd=cwd, env=env, input=input, pty=pty, rows=rows, cols=cols)
+            self.start(
+                command,
+                cwd=cwd,
+                env=env,
+                inherit_env=inherit_env,
+                input=input,
+                pty=pty,
+                rows=rows,
+                cols=cols,
+            )
         )
         try:
             handle = await asyncio.shield(launch)
@@ -1578,6 +1617,7 @@ class Workspace:
         self.tasks = TaskManager()
         self.shell = Shell(self.tasks)
         self.fs = Filesystem(self.workspace, self.shell, self._search)
+        self.docs = Documents(self.fs)
         self.mcp = MCP()
         self.messages = Messages()
         self.packages = Packages(self.tasks)
@@ -1590,6 +1630,7 @@ class Workspace:
         self.net = NetworkTools(self.workspace, self.tasks, _rpc)
         self.system = SystemTools(self.workspace)
         self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
+        self.code = CodeTools(self.workspace)
         self._closing = False
 
     async def _close_resources(self):
@@ -1610,7 +1651,7 @@ class Workspace:
         ]
         if pending:
             await asyncio.wait(pending, timeout=2)
-        resources = [getattr(self, name, None) for name in ("browser", "http")]
+        resources = [getattr(self, name, None) for name in ("browser", "http", "code")]
         results = await asyncio.gather(
             *(resource.aclose() for resource in resources if resource is not None),
             return_exceptions=True,
@@ -1694,8 +1735,8 @@ class Workspace:
         raise ResetRequested(result)
 
     def help(self, topic: str | None = None) -> str:
-        """Return the topic index or API guidance for this running kernel."""
-        return workspace_help(topic)
+        """Return topic guidance or a method's live signature and documentation."""
+        return workspace_help(topic, workspace=self)
 
     def inspect(self) -> dict[str, Any]:
         namespace = self._namespace.items() if self._namespace is not None else ()
@@ -1733,6 +1774,7 @@ def create_workspace(
     ws.tasks = _TASKS
     ws.shell = Shell(_TASKS)
     ws.fs = Filesystem(ws.workspace, ws.shell, ws._search)
+    ws.docs = Documents(ws.fs)
     ws.skills = Skills(ws.workspace, ws.fs)
     ws.modules = ModuleManager(ws.workspace, ws.fs, ws.shell)
     ws.packages = Packages(_TASKS)

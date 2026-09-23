@@ -194,15 +194,18 @@ The kernel injects `ws`, a `Workspace` instance, into every Python cell. Methods
 print(ws.help())          # Topic index
 print(ws.help("fs"))      # File reads and revision-checked edits
 print(ws.help("search"))  # Text, document, and AST search
+print(ws.help("shell.run"))  # Live method signature, defaults, and return guidance
 ```
 
-`ws.help(topic=None)` returns a string without I/O. Topics cover workspace APIs and execution lifecycle; unknown topics raise `ValueError` with the available names. Follow the running manager's instructions when it differs from the installed MCP client.
+`ws.help(topic=None)` returns a string without I/O. Topics cover workspace APIs and execution lifecycle; each API topic lists its public methods. Pass a method path such as `"shell.run"` or `"ws.mcp.read_resource"` to inspect the running implementation's signature, defaults, return annotation, and documentation. Private attributes and arbitrary attribute traversal are rejected. Follow the running manager's instructions when it differs from the installed MCP client.
 
 | Entry point | Purpose |
 | --- | --- |
 | `ws.workspace`, `ws.root` | `Path` objects for the workspace and its `.mypr/` directory |
 | `ws.client`, `ws.local` | Current caller identity and its in-memory scratch dictionary |
 | `ws.fs` | Read, search, create, and patch files with bounded results |
+| `ws.code` | Query optional language servers for definitions, references, hover, and diagnostics |
+| `ws.docs` | Inspect PDFs, extract page text, and render page images |
 | `ws.shell`, `ws.tasks` | Start and inspect background work |
 | `ws.mcp` | Call and reconfigure external MCP servers |
 | `ws.messages` | Send and receive persistent client messages |
@@ -220,6 +223,10 @@ print(ws.help("search"))  # Text, document, and AST search
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
 | `await ws.restart()` | Replace the manager and kernel with this installation; see [Reset and lifecycle](#reset-and-lifecycle) |
+
+For language-server setup and coordinate semantics, see [code navigation](docs/code.md).
+
+See [images and PDF pages](docs/media.md) for image resizing/cropping, PDF text extraction, page rendering, limits, and optional workspace packages. These operations preserve the source files.
 
 Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths
 stay anchored to the workspace even if code changes the kernel's current directory:
@@ -524,23 +531,9 @@ await ws.shell.run("make -j2", timeout=120, check=True)
 await ws.shell.run(["sort"], input="bravo\nalpha\n")
 ```
 
-`run(command, *, cwd=None, env=None, input=None, timeout=None, check=False,
-max_bytes=32768, pty=False, rows=24, cols=80)` waits asynchronously for completion
-and returns `id`, `state`,
-`returncode`, separate `stdout`/`stderr`, `timed_out`, and `truncated`. The byte
-budget is shared between stdout and stderr, with stdout first. The full retained
-combined output remains in `ws.tasks.get(result["id"]).output()`. A nonzero exit
-is returned normally; `check=True` raises `ShellError` with the result in
-`exception.result`. A timeout cancels the process group and returns
-`timed_out=True`; cancelling the awaiting cell also cancels the command.
+`run(command, *, cwd=None, env=None, inherit_env=True, input=None, timeout=None, check=False, max_bytes=32768, pty=False, rows=24, cols=80)` waits asynchronously for completion and returns `id`, `state`, `returncode`, separate `stdout`/`stderr`, `timed_out`, and `truncated`. The byte budget is shared between stdout and stderr, with stdout first. The full retained combined output remains in `ws.tasks.get(result["id"]).output()`. A nonzero exit is returned normally; `check=True` raises `ShellError` with the result in `exception.result`. A timeout cancels the process group and returns `timed_out=True`; cancelling the awaiting cell also cancels the command.
 
-`await ws.shell.start(command, *, cwd=None, env=None, input=None, stdin=False,
-pty=False, rows=24, cols=80)` starts a command in its
-own process group and returns a handle immediately. A string is interpreted by
-`/bin/sh`; a list executes argv directly. Standard input is closed by default.
-`input` supplies UTF-8 text and then closes stdin; `stdin=True` keeps the pipe
-open for later `await job.write(text)` calls. Use `await job.write(eof=True)` to
-close it. stdout and stderr are captured together in the handle's output.
+`await ws.shell.start(command, *, cwd=None, env=None, inherit_env=True, input=None, stdin=False, pty=False, rows=24, cols=80)` starts a command in its own process group and returns a handle immediately. A string is interpreted by `/bin/sh`; a list executes argv directly. Standard input is closed by default. `input` supplies UTF-8 text and then closes stdin; `stdin=True` keeps the pipe open for later `await job.write(text)` calls. Use `await job.write(eof=True)` to close it. stdout and stderr are captured together in the handle's output.
 
 Set `pty=True` for programs that need a terminal:
 
@@ -562,17 +555,13 @@ character instead of closing its master descriptor; programs in raw mode decide
 how to interpret it. Use `cancel()` to terminate the job. `resize(rows, cols)`
 updates the terminal size and notifies its foreground process group.
 
-The default `cwd` is the kernel's current directory. The default environment is
-the kernel's environment; an explicit `env` replaces it rather than merging it.
-To override one variable while retaining the others:
+The default `cwd` is the kernel's current directory. `env` overlays the kernel's environment; a `None` value removes that variable. Set `inherit_env=False` to start with an empty environment and use only the supplied values. This applies to both `run` and `start`, including PTY jobs. Existing callers that relied on replacement must pass `inherit_env=False` explicitly.
 
 ```python
-import os
-
 ws.local["job"] = await ws.shell.start(
     ["python", "--version"],
     cwd=ws.workspace,
-    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    env={"PYTHONUNBUFFERED": "1", "VARIABLE_TO_REMOVE": None},
 )
 ```
 
@@ -964,6 +953,8 @@ fresh module and bind it only after successful execution; failed reloads leave
 the old module binding intact. References already held elsewhere keep pointing
 to the previous module after a successful reload. Imports can have external side
 effects; a failed reload does not undo those side effects.
+
+Module and skill writes retain content revisions. Use `await ws.modules.history(name)` or `await ws.skills.history(name)` to list revisions, `read_revision(name, revision)` to read one, and `restore(name, revision, expected_hash=current_revision)` to restore a file. Restoring a module does not reload it; existing Python references continue to point to the loaded code. See [revision history](docs/revisions.md) for paging, consistency, and recovery behavior.
 
 ### Packages and inspection
 

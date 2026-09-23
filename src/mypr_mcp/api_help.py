@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 _TOPICS = {
     "fs": (
         "Read, inspect, and edit workspace files.",
@@ -19,7 +21,15 @@ await ws.fs.write(path, text) creates a file; use create_parents=True if parent 
 
 await ws.fs.apply_patch(patch_text, dry_run=False) applies multi-file Add, Update, Delete, and Move operations using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked before changes are applied. expected_hashes maps paths to revisions; use None for a path that must not exist. There is no fuzzy matching.
 
-await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Inline images also share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
+await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Pass resize=(width, height) to fit an image into a box, or crop=(left, top, right, bottom) in source pixel coordinates. Transformations require Pillow in the workspace Python environment, run in a bounded subprocess, and never overwrite the original. await ws.fs.image_info(path) reports source dimensions and revision. Inline images share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
+    ),
+    "docs": (
+        "Inspect, extract text from, and render PDF pages.",
+        """PDF helpers require PyMuPDF in the workspace Python environment. Install it explicitly: job = await ws.packages.add("pymupdf"); await job. Image transformations also need "pillow". Installing packages only in the MCP client's environment does not install them in the workspace kernel.
+
+await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR.
+
+await ws.docs.render_page(path, page=1, dpi=120) returns an inline page image. clip=(left, top, right, bottom) selects a region in PDF points. Source path, page, revision, geometry, and rendering details accompany the result. Workers bound input size, output size, pixel count, and execution time. Read ws.help("docs.render_page") for the current method signature.""",
     ),
     "search": (
         "Search code, documents, and syntax trees.",
@@ -33,6 +43,14 @@ Search work and each returned page are bounded. timeout, scan_bytes, and scan_li
 await ws.fs.search_docs(pattern, paths=...) uses rga to search documents and archives. Returned locations refer to extracted text, not editable source positions; document converters are optional.
 
 await ws.fs.search_ast(pattern, lang="python", paths=...) performs read-only structural matching. Pass rule, constraints, or utils for AST rules. Results include source ranges and captures; details_truncated indicates omitted details. await ws.fs.search_backends() reports available search engines and document conversion dependencies.""",
+    ),
+    "code": (
+        "Use optional language servers for definitions, references, hover, and diagnostics.",
+        """await ws.code.configure("clangd", ["clangd", "-j=2"], ["c", "cpp"]) starts an explicitly selected stdio language server. Install the server separately; mypr does not download one. Servers are shared within this workspace and close during reset.
+
+await ws.code.definition("clangd", "src/main.c", line=10, character=5), references(...), and hover(...) query saved source. Public line and character values are one-based Unicode code-point positions; mypr converts the server's negotiated position encoding. Source changes are synchronized before queries. Inspect result truncation and coordinate metadata; diagnostics report the synchronized document version.
+
+await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostics for the synchronized document; pending or stale results must not be treated as a clean bill of health. ws.code.status() lists configured servers. await ws.code.close("clangd") stops one. This API does not apply edits or rename symbols. Use ws.help("code.configure") and the query method names for current signatures and result details.""",
     ),
     "git": (
         "Inspect repository status, diffs, and file history.",
@@ -50,6 +68,8 @@ Responses are bounded. When has_more is true, continue with cursor=next_cursor."
     print(ws.local["result"]["stdout"])
 
 timeout cancels the process. check=True raises when it exits unsuccessfully. Use input="text" to provide stdin. Full retained output is available from ws.tasks.get(ws.local["result"]["id"]).output().
+
+env overlays the calling kernel's environment by default. Use env={"NO_COLOR": "1", "VARIABLE_TO_REMOVE": None} to set or remove variables without losing PATH. inherit_env=False starts with an empty environment and applies only env. Both run and start use these rules.
 
 For long-running work, start a job and keep its handle in client-local state:
     ws.local["job"] = await ws.shell.start("command")
@@ -96,6 +116,8 @@ Locks release on context exit, task completion or cancellation, and reset; they 
 
 Use await ws.mcp.get_config("server") to read saved configuration before changing selected fields with await ws.mcp.configure("server", config). After editing server code, await ws.mcp.restart("server") restarts that server; await ws.mcp.reload() applies config.toml edits. await ws.mcp.remove("server") disconnects and removes it.
 
+await ws.mcp.list_resources("server") and await ws.mcp.read_resource("server", uri) expose resources. await ws.mcp.list_prompts("server") lists prompts; await ws.mcp.get_prompt("server", name, arguments={...}) returns a prompt's messages. Read the relevant server descriptions before supplying arguments. ws.help("mcp.call_tool") and other method names show live signatures.
+
 These operations preserve Python state. A busy connection requires force=True to interrupt its calls.""",
     ),
     "http": (
@@ -120,13 +142,17 @@ Scan handles provide synchronous status(), output(), and result(). Await read(),
     ),
     "skills": (
         "Discover, read, validate, and edit workspace skills.",
-        """ws.skills.list() discovers available skills; ws.skills.read("name") reads their instructions. Read a skill before using it. await ws.skills.validate(name, text) checks content. await ws.skills.write(name, text, expected_hash=revision) saves it with revision checks.""",
+        """ws.skills.list() discovers available skills; ws.skills.read("name") reads their instructions. Read a skill before using it. await ws.skills.validate(name, text) checks content. await ws.skills.write(name, text, expected_hash=revision) saves it with revision checks.
+
+await ws.skills.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.skills.read_revision(name, revision, start_byte=0, max_bytes=32768) reads a revision. await ws.skills.restore(name, revision, expected_hash=current_revision) validates and restores the file. History is stored under .mypr/revisions and survives reset. Edits made outside these helpers are not continuously tracked.""",
     ),
     "modules": (
         "Manage reusable Python modules in the workspace library.",
         """ws.modules.list() and await ws.modules.read(name) inspect modules under ws.root / "lib/ws_lib". await ws.modules.write(name, source, expected_hash=...) writes a module; existing files require expected_hash.
 
-await ws.modules.check(name, test_code="...") validates code in a separate Python process. Saving does not activate code; use ws.modules.load(name) or ws.modules.reload(name). Reload replaces the module object, while references already held elsewhere remain unchanged.""",
+await ws.modules.check(name, test_code="...") validates code in a separate Python process. Saving does not activate code; use ws.modules.load(name) or ws.modules.reload(name). Reload replaces the module object, while references already held elsewhere remain unchanged.
+
+await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.modules.read_revision(name, revision, start_byte=0, max_bytes=32768) reads saved source. await ws.modules.restore(name, revision, expected_hash=current_revision) restores source after validation and revision checks. Restore does not activate the file or change existing Python references. Direct edits are captured only when a later helper write observes them.""",
     ),
     "packages": (
         "Install packages into the workspace Python environment.",
@@ -162,20 +188,88 @@ _TOPIC_NAMES = tuple(_TOPICS)
 _INDEX = (
     "mypr workspace API topics\n\n"
     + "\n".join(f"{name}: {description}" for name, (description, _) in _TOPICS.items())
-    + '\n\nRead one topic with ws.help("topic").'
+    + '\n\nRead a topic with ws.help("topic") or inspect a method with ws.help("shell.run").'
 )
 
 
-def workspace_help(topic: str | None = None) -> str:
+_METHOD_NOTES = {
+    "shell.run": "Returns a dict with id, state, returncode, stdout, stderr, timed_out, and truncated. timeout cancels the process; check=True raises on unsuccessful exit. Retained output is accessible through ws.tasks.get(id).",
+    "shell.start": "Returns a job handle. Await it to wait for completion; status/output/result are synchronous and read/write/expect/cancel are async. env overlays inherited variables by default; None removes a variable. inherit_env=False replaces the environment.",
+    "fs.read": "Returns text, revision (SHA-256), and range/paging metadata. Follow next_cursor for bounded or long-line reads. Keep revision for expected_hash when editing.",
+    "fs.write": "Returns path and revision metadata. Existing files require expected_hash or overwrite=True. A mismatched revision rejects the write.",
+    "fs.patch": "Returns revision and bounded diff metadata. Each old string must match exactly; dry_run previews without writing.",
+    "fs.apply_patch": "Returns per-file changes and a bounded diff. expected_hashes validates target revisions; dry_run previews without writing.",
+    "fs.search": "Returns a bounded result page. Follow next_cursor while has_more; inspect complete and stop_reason before treating absence or counts as definitive.",
+    "fs.search_docs": "Returns document search matches in extracted text, not editable file coordinates. Follow next_cursor and inspect complete/stop_reason.",
+    "fs.search_ast": "Returns structural matches with source ranges and captures. Follow next_cursor; inspect details_truncated and complete.",
+    "mcp.call_tool": "Returns the external server's MCP result; inspect isError and structuredContent/content. Arguments follow that tool's inputSchema from list_tools.",
+    "mcp.read_resource": "Returns the external server's resource contents. URIs come from list_resources or the server's resource templates.",
+    "mcp.get_prompt": "Returns the external server's prompt messages. Inspect list_prompts for supported arguments.",
+    "status": "Returns compact runtime health, versions, generation, and counts. detail=True includes connection records, active/queued execution IDs, and manager instructions.",
+    "performance": "Returns manager_dispatch, bridge, storage, and kernel timing summaries. See ws.help('performance') for sample limits and measurement semantics.",
+    "modules.load": "Returns a Python module object. Loading activates saved code; writing or restoring a module does not activate it.",
+    "modules.reload": "Returns a new Python module object. Existing references held elsewhere are not automatically updated.",
+}
+_WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "reset", "restart"}
+
+
+def _method(workspace, path):
+    parts = path.removeprefix("ws.").split(".")
+    if len(parts) == 1 and parts[0] in _WORKSPACE_METHODS:
+        owner, name = workspace, parts[0]
+    elif len(parts) == 2 and parts[0] in _TOPICS:
+        owner, name = vars(workspace).get(parts[0]), parts[1]
+    else:
+        raise ValueError(f"unknown API method {path!r}")
+    if owner is None or not name or name.startswith("_"):
+        raise ValueError(f"unknown API method {path!r}")
+    member = inspect.getattr_static(owner, name, None)
+    if isinstance(member, (staticmethod, classmethod)):
+        member = member.__get__(owner, type(owner))
+    elif inspect.isfunction(member):
+        if name not in vars(owner):
+            member = member.__get__(owner, type(owner))
+    elif not inspect.ismethod(member):
+        raise ValueError(f"unknown API method {path!r}")
+    return member, ".".join(parts)
+
+
+def method_help(workspace, path):
+    member, name = _method(workspace, path)
+    prefix = "async " if inspect.iscoroutinefunction(member) else ""
+    lines = [f"{prefix}ws.{name}{inspect.signature(member, eval_str=False)}"]
+    if doc := inspect.getdoc(member):
+        lines.extend(("", doc))
+    if note := _METHOD_NOTES.get(name):
+        lines.extend(("", note))
+    if "." in name:
+        lines.extend(("", f'Related guidance: ws.help("{name.split(".")[0]}")'))
+    return "\n".join(lines)
+
+
+def workspace_help(topic: str | None = None, *, workspace=None) -> str:
     if topic is None:
         return _INDEX
     if not isinstance(topic, str):
         raise TypeError("topic must be a string or None")
+    if workspace is not None and ("." in topic or topic in _WORKSPACE_METHODS - {"performance"}):
+        return method_help(workspace, topic)
     try:
-        return _TOPICS[topic][1]
+        text = _TOPICS[topic][1]
     except KeyError:
         available = ", ".join(_TOPIC_NAMES)
         raise ValueError(f"unknown help topic {topic!r}; available topics: {available}") from None
+    if workspace is not None and (owner := vars(workspace).get(topic)) is not None:
+        methods = [
+            name
+            for name, member in inspect.getmembers_static(owner)
+            if not name.startswith("_")
+            and (inspect.isroutine(member) or isinstance(member, (staticmethod, classmethod)))
+        ]
+        if methods:
+            text += "\n\nMethods: " + ", ".join(f"{topic}.{name}" for name in methods)
+            text += f'\nInspect one with ws.help("{topic}.{methods[0]}").'
+    return text
 
 
 __all__ = ["workspace_help"]

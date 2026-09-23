@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import difflib
 import hashlib
@@ -14,6 +15,9 @@ import tokenize
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+from .persistence import await_completion
+from .revisions import RevisionStore
 
 
 class ModuleManager:
@@ -29,6 +33,7 @@ class ModuleManager:
         self.root = self.workspace / ".mypr" / "lib" / "ws_lib"
         self.fs = fs
         self.shell = shell
+        self.revisions = RevisionStore(self.workspace, fs, "modules")
 
     def list(self) -> list[dict[str, Any]]:
         if not self.root.is_dir():
@@ -129,43 +134,151 @@ class ModuleManager:
         path = self._module_path(name)
         _compile(source, path)
         relative = self._relative(path)
-        try:
-            old_result = await self.fs.read(relative, max_bytes=16 * 1024 * 1024)
-            if old_result.get("truncated"):
-                raise ValueError("existing module exceeds max_bytes; refusing partial CAS")
-            old = old_result["text"]
-            old_revision = old_result["revision"]
-        except FileNotFoundError:
-            old = None
-            old_revision = None
-        if dry_run:
+        task = asyncio.create_task(
+            self._write_transaction(
+                name, relative, source, expected_hash, dry_run, max_diff_bytes
+            )
+        )
+        return await await_completion(task)
+
+    async def _write_transaction(
+        self,
+        name: str,
+        relative: str,
+        source: str,
+        expected_hash: str | None,
+        dry_run: bool,
+        max_diff_bytes: int,
+    ) -> dict[str, Any]:
+        async with self.revisions.transaction(relative):
+            try:
+                old_result = await self.fs.read(relative, max_bytes=16 * 1024 * 1024)
+                if old_result.get("truncated"):
+                    raise ValueError("existing module exceeds max_bytes; refusing partial CAS")
+                old = old_result["text"]
+                old_revision = old_result["revision"]
+            except FileNotFoundError:
+                old = None
+                old_revision = None
             _check_hash(old, expected_hash, old_revision)
-            diff, diff_truncated = _diff(relative, old or "", source, max_diff_bytes)
+            if dry_run:
+                diff, diff_truncated = _diff(relative, old or "", source, max_diff_bytes)
+                return {
+                    "name": name,
+                    "path": relative,
+                    "changed": old != source,
+                    "dry_run": True,
+                    "old_revision": old_revision,
+                    "revision": _sha256(source.encode()),
+                    "diff": diff,
+                    "diff_truncated": diff_truncated,
+                }
+            await self.revisions.ensure_capacity(relative, (old, source))
+            await self.revisions.prepare(relative, (old, source))
+            result = await self.fs.write(
+                relative,
+                source,
+                expected_hash=expected_hash,
+                overwrite=False,
+                create_parents=True,
+            )
+            await self.revisions.record(relative, (old, source))
             return {
                 "name": name,
                 "path": relative,
                 "changed": old != source,
-                "dry_run": True,
+                "dry_run": False,
                 "old_revision": old_revision,
-                "revision": _sha256(source.encode()),
-                "diff": diff,
-                "diff_truncated": diff_truncated,
+                **result,
             }
-        result = await self.fs.write(
-            relative,
-            source,
-            expected_hash=expected_hash,
-            overwrite=False,
-            create_parents=True,
+
+    async def history(
+        self, name: str, *, limit: int = 20, cursor: int | None = None
+    ) -> dict[str, Any]:
+        path = self._module_path(name)
+        relative = self._relative(path)
+        async with self.revisions.transaction(relative):
+            page = await self.revisions.history(relative, limit=limit, cursor=cursor)
+            return {"name": name, **page}
+
+    async def read_revision(
+        self,
+        name: str,
+        revision: str,
+        *,
+        start_byte: int = 0,
+        max_bytes: int = 32_768,
+    ) -> dict[str, Any]:
+        path = self._module_path(name)
+        relative = self._relative(path)
+        async with self.revisions.transaction(relative):
+            return {
+                "name": name,
+                **await self.revisions.read_revision(
+                    relative, revision, start_byte=start_byte, max_bytes=max_bytes
+                ),
+            }
+
+    async def restore(
+        self, name: str, revision: str, *, expected_hash: str | None = None
+    ) -> dict[str, Any]:
+        path = self._module_path(name)
+        relative = self._relative(path)
+        task = asyncio.create_task(
+            self._restore_transaction(name, path, relative, revision, expected_hash)
         )
-        return {
-            "name": name,
-            "path": relative,
-            "changed": old != source,
-            "dry_run": False,
-            "old_revision": old_revision,
-            **result,
-        }
+        return await await_completion(task)
+
+    async def _restore_transaction(
+        self,
+        name: str,
+        path: Path,
+        relative: str,
+        revision: str,
+        expected_hash: str | None,
+    ) -> dict[str, Any]:
+        async with self.revisions.transaction(relative):
+            source = await self.revisions.restore_content(relative, revision)
+            _compile(source, path)
+            try:
+                current = await self.fs.read(relative, max_bytes=64 * 1024 * 1024)
+                if current.get("truncated"):
+                    raise ValueError("existing module exceeds max_bytes; refusing partial CAS")
+                old = current["text"]
+                old_revision = current["revision"]
+            except FileNotFoundError:
+                old = None
+                old_revision = None
+            if old is not None and expected_hash is None:
+                raise FileExistsError("Module already exists; provide expected_hash to restore")
+            if expected_hash is not None and old_revision != expected_hash:
+                raise ValueError(f"Revision mismatch: expected {expected_hash}, got {old_revision}")
+            if old == source:
+                return {
+                    "name": name,
+                    "path": relative,
+                    "changed": False,
+                    "revision": revision,
+                    "old_revision": old_revision,
+                    "activated": False,
+                }
+            await self.revisions.ensure_capacity(relative, (old, source))
+            await self.revisions.prepare(relative, (old, source))
+            result = await self.fs.write(
+                relative,
+                source,
+                expected_hash=expected_hash,
+                create_parents=True,
+            )
+            await self.revisions.record(relative, (old, source))
+            return {
+                "name": name,
+                "path": relative,
+                "changed": True,
+                "old_revision": old_revision,
+                "activated": False,
+                **result,
+            }
 
     def load(self, name: str) -> ModuleType:
         return self._activate(name)

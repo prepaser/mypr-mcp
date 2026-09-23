@@ -130,15 +130,63 @@ class Filesystem:
             max_diff_bytes=max_diff_bytes,
         )
 
-    async def image(self, path: str | os.PathLike[str], *, max_bytes: int = 2 * 1024 * 1024):
-        """Load a PNG or JPEG for inline display in an execute result."""
+    async def image(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        max_bytes: int = 2 * 1024 * 1024,
+        resize: tuple[int, int] | None = None,
+        crop: tuple[int, int, int, int] | None = None,
+        max_input_bytes: int = 64 * 1024 * 1024,
+    ):
+        """Load a PNG or JPEG for inline display. ``resize`` fits within a (width, height)
+        box; ``crop`` uses (left, top, right, bottom) pixel coordinates. Modified images
+        include source path, dimensions, crop, and SHA-256 in display metadata.
+        """
         if type(max_bytes) is not int or max_bytes < 1:
             raise ValueError("max_bytes must be a positive integer")
+        if (
+            not isinstance(max_input_bytes, int)
+            or isinstance(max_input_bytes, bool)
+            or not 1 <= max_input_bytes <= 64 * 1024 * 1024
+        ):
+            raise ValueError("max_input_bytes must be between 1 and 67108864")
         resolved, display = self._path(path)
+        if resize is not None or crop is not None:
+            from .media_tools import display_image, transform_image
+
+            data, metadata = await transform_image(
+                resolved,
+                display,
+                max_output_bytes=max_bytes,
+                max_input_bytes=max_input_bytes,
+                resize=resize,
+                crop=crop,
+            )
+            return display_image(
+                data=data,
+                image_format=metadata["format"],
+                metadata=metadata,
+                alt=f"{display} ({metadata['width']}×{metadata['height']})",
+            )
         data, image_format = await _to_thread_uncancelled(_read_image, resolved, display, max_bytes)
         from IPython.display import Image
 
         return Image(data=data, format=image_format, embed=True)
+
+    async def image_info(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        max_input_bytes: int = 64 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Inspect a PNG or JPEG. Returns source path, SHA-256, byte size, format, mode,
+        and pixel dimensions without decoding the full image in the kernel process.
+        """
+        from .media_tools import inspect_image
+
+        resolved, display = self._path(path)
+        return await inspect_image(resolved, display, max_input_bytes=max_input_bytes)
 
     async def patch(
         self,

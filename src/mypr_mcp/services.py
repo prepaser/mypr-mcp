@@ -18,6 +18,7 @@ import signal
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -160,12 +161,14 @@ class Shells:
         self,
         command: str | list[str],
         cwd: str | None = None,
-        env: dict[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
         input: str | None = None,
         stdin: bool = False,
         pty: bool = False,
         rows: int = 24,
         cols: int = 80,
+        *,
+        inherit_env: bool = True,
     ) -> dict[str, str]:
         if self._closed:
             raise RuntimeError("shell service is closed")
@@ -178,11 +181,24 @@ class Shells:
         if pty:
             rows, cols = self._validate_pty_size(rows, cols)
         workdir = self._cwd(cwd)
-        merged_env = (
-            os.environ.copy()
-            if env is None
-            else {str(key): str(value) for key, value in env.items()}
-        )
+        if type(inherit_env) is not bool:
+            raise TypeError("inherit_env must be a boolean")
+        if env is not None and not isinstance(env, Mapping):
+            raise TypeError("env must be a mapping or None")
+        child_env = os.environ.copy() if inherit_env else {}
+        for key, value in (env or {}).items():
+            if not isinstance(key, str):
+                raise TypeError("environment variable names must be strings")
+            if not key or "=" in key or "\0" in key:
+                raise ValueError(f"invalid environment variable name: {key!r}")
+            if value is None:
+                child_env.pop(key, None)
+                continue
+            if not isinstance(value, str):
+                raise TypeError("environment variable values must be strings or None")
+            if "\0" in value:
+                raise ValueError(f"environment variable {key!r} contains a null byte")
+            child_env[key] = value
         master_fd = slave_fd = None
         try:
             if pty:
@@ -192,7 +208,7 @@ class Shells:
             process = await asyncio.create_subprocess_exec(
                 *command_args,
                 cwd=workdir,
-                env=merged_env,
+                env=child_env,
                 stdin=(
                     slave_fd
                     if pty

@@ -1,0 +1,11 @@
+# Workspace revisions
+
+Workspace modules and skills keep a content-addressed history under `.mypr/revisions/`. A successful `ws.modules.write()` or `ws.skills.write()` records the previous file on the first tracked change and then records each new content hash. Repeating a write with the same content does not add another history entry. Dry runs and failed compare-and-swap writes do not change history.
+
+Use `await ws.modules.history("name")` or `await ws.skills.history("name")` to list the newest revisions first. The default page contains 20 entries; `limit` accepts 1–100. When `has_more` is true, pass `next_cursor` as `cursor` to fetch older entries. Each entry contains a stable sequence number, SHA-256 revision, byte size, and recording time.
+
+`await ws.modules.read_revision("name", revision)` and `await ws.skills.read_revision("name", revision)` return a bounded UTF-8 page. The default page is 32 KiB; `max_bytes` accepts up to 1 MiB. Pass the returned `next_cursor` as `start_byte` to continue. A page may exceed `max_bytes` by up to three bytes when needed to include one complete Unicode character. Revision objects are checked against their SHA-256 name before they are returned.
+
+Restore with `await ws.modules.restore("name", revision, expected_hash=current_hash)` or `await ws.skills.restore("name", revision, expected_hash=current_hash)`. Supplying the current file hash is required when the file exists. A missing file can be restored with `expected_hash=None`. Restore validates Python syntax or skill metadata, writes atomically, and records the transition. It does not load, reload, or otherwise activate a module; existing Python references remain unchanged until an explicit `load()` or `reload()`.
+
+Revision objects are plain UTF-8 source files named by their SHA-256 hash. Per-resource JSON indexes contain only hashes, sizes, sequence numbers, and timestamps. The history is local to the workspace and does not snapshot unrelated files. Edits made through `ws.fs`, an editor, or another process are not recorded automatically; the next successful tracked write captures the then-current file as its previous revision. The metadata index is capped at 16 MiB per resource and individual stored revisions at 64 MiB.

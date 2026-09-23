@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 
 import mypr_mcp.kernel_api as api
+from mypr_mcp.runtime import Runtime
 from mypr_mcp.services import Shells
 
 
@@ -118,6 +119,49 @@ async def test_run_keeps_current_env_by_default(shell):
     assert result["stdout"].strip() == os.environ["PATH"]
 
 
+async def test_run_env_overlays_and_removes_inherited_values(shell, monkeypatch):
+    commands, _ = shell
+    monkeypatch.setenv("MYPR_ENV_TEST", "inherited")
+    result = await commands.run(
+        [
+            sys.executable,
+            "-c",
+            'import os; print(os.getenv("MYPR_ENV_TEST")); print(os.getenv("PATH", "missing"))',
+        ],
+        env={"MYPR_ENV_TEST": "overridden", "PATH": None},
+    )
+    assert result["stdout"] == "overridden\nmissing\n"
+
+
+async def test_run_can_replace_the_inherited_environment(shell):
+    commands, _ = shell
+    result = await commands.run(
+        [
+            sys.executable,
+            "-c",
+            'import os; print(os.getenv("VALUE")); print(os.getenv("PATH", "missing"))',
+        ],
+        env={"VALUE": "only"},
+        inherit_env=False,
+    )
+    assert result["stdout"] == "only\nmissing\n"
+
+
+async def test_start_applies_environment_to_pty(shell):
+    commands, _ = shell
+    handle = await commands.start(
+        [
+            sys.executable,
+            "-c",
+            'import os; print(os.getenv("PATH", "missing"))',
+        ],
+        env={"PATH": None},
+        pty=True,
+    )
+    await handle
+    assert handle.output() == "missing\r\n"
+
+
 async def test_cancel_during_launch_still_cleans_up_process(shell, monkeypatch):
     commands, service = shell
     launched = asyncio.Event()
@@ -179,3 +223,82 @@ async def test_run_rejects_invalid_limits_before_start(shell, kwargs):
     with pytest.raises(ValueError):
         await commands.run("true", **kwargs)
     assert not service._jobs
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"env": []}, TypeError),
+        ({"env": {1: "value"}}, TypeError),
+        ({"env": {"BAD=NAME": "value"}}, ValueError),
+        ({"env": {"VALUE": 1}}, TypeError),
+        ({"env": {"VALUE": "bad\0value"}}, ValueError),
+        ({"inherit_env": 1}, TypeError),
+    ],
+)
+async def test_run_rejects_invalid_environment_before_start(shell, kwargs, error):
+    commands, service = shell
+    with pytest.raises(error):
+        await commands.run("true", **kwargs)
+    assert not service._jobs
+
+
+@pytest.mark.asyncio
+async def test_shell_service_env_overlays_and_removes_parent_values(monkeypatch, tmp_path):
+    service = Shells(tmp_path)
+    monkeypatch.setenv("MYPR_ENV_TEST", "inherited")
+    try:
+        started = await service.start(
+            [
+                sys.executable,
+                "-c",
+                'import os; print(os.getenv("MYPR_ENV_TEST")); print(os.getenv("PATH", "missing"))',
+            ],
+            env={"MYPR_ENV_TEST": "overridden", "PATH": None},
+        )
+        async with asyncio.timeout(5):
+            while True:
+                result = await service.poll(started["id"])
+                if result["state"] in {"succeeded", "failed", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+        assert result["state"] == "succeeded"
+        assert "".join(event["text"] for event in result["output"]) == "overridden\nmissing\n"
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize(
+    ("rpc_fields", "expected_inherit"),
+    [
+        ({"env": {"ONLY": "value"}}, False),
+        ({"env": None}, True),
+        ({"env": {"PATH": None}, "inherit_env": False}, False),
+    ],
+)
+async def test_shell_start_rpc_preserves_environment_mode(rpc_fields, expected_inherit):
+    class ShellService:
+        async def start(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            return {"id": "shell-id"}
+
+    class Manager:
+        restarting = False
+        stopping = asyncio.Event()
+        clients = {}
+        workspace = "/workspace"
+
+        def __init__(self):
+            self.shells = ShellService()
+            self.tracked = []
+
+        def track_shell(self, *args, **kwargs):
+            self.tracked.append((args, kwargs))
+
+    manager = Manager()
+    await Runtime._dispatch(
+        manager,
+        {"op": "shell_start", "command": "true", **rpc_fields},
+    )
+    assert manager.shells.kwargs["inherit_env"] is expected_inherit

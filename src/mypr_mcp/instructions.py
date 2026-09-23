@@ -9,7 +9,7 @@ INSTRUCTIONS = """Use execute for workspace work through Python and poll for sub
 
 Getting started
 - init() assigns an adjective-animal client ID; init(client_id="...") creates or resumes a logical client. This connection keeps that ID, so execute does not need it. Repeated init returns the same ID; switching IDs or sharing one across live connections is rejected. Poll is available before init.
-- For API details, run print(ws.help()) for the topic index, then print(ws.help("fs")) or another topic. Help comes from this running kernel; use its API and reported capabilities.
+- For API details, run print(ws.help()) for topics, print(ws.help("fs")) for guidance, or print(ws.help("shell.run")) for a method's live signature and defaults. Help comes from this running kernel; use its API and reported capabilities.
 - Files and search: ws.fs; commands and background work: ws.shell/ws.tasks; Git: ws.git. Help also covers system, messages, locks, mcp, http, browser, net, skills, modules, packages, history, and lifecycle.
 
 Read and search before editing:
