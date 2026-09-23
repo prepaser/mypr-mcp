@@ -150,3 +150,17 @@ def test_complete_json_without_newline_is_readable(tmp_path):
     path = tmp_path / "events.jsonl"
     path.write_bytes(b'{"text":"complete"}')
     assert read_page(path, 0, 1024) == ([{"text": "complete"}], 1)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_unicode_pages_use_utf8_budget_for_new_and_legacy_journals(tmp_path, legacy):
+    path = tmp_path / "unicode.jsonl"
+    events = [{"type": "stream", "stream": "stdout", "text": "가" * 1024 + '\n"\\'}] * 4
+    if legacy:
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    else:
+        append_events(path, events)
+    page, total = read_page(path, 0, 16384, 4)
+    assert page == events
+    assert total == 4
+    assert read_page(path, len(page), 16384) == ([], 4)

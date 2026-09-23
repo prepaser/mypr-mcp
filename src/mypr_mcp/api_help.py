@@ -19,7 +19,7 @@ await ws.fs.write(path, text) creates a file; use create_parents=True if parent 
 
 await ws.fs.apply_patch(patch_text, dry_run=False) applies multi-file Add, Update, Delete, and Move operations using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked before changes are applied. expected_hashes maps paths to revisions; use None for a path that must not exist. There is no fuzzy matching.
 
-await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default size limit is 2 MiB.""",
+await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Inline images also share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
     ),
     "search": (
         "Search code, documents, and syntax trees.",
@@ -60,7 +60,7 @@ Use tasks help for handle status, output paging, expect, result, and cancellatio
     ),
     "tasks": (
         "Track Python cells and detached background jobs.",
-        """Cells run as independent asyncio tasks in one shared kernel, including cells from the same client. An await yields to other cells; synchronous code, synchronous IPython magics, and CPU-heavy work block the event loop. Cells can finish out of order, so wait for dependencies before submitting dependent code. MCP wait_ms limits how long a call waits, not task lifetime.
+        """Cells run as independent asyncio tasks in one shared kernel, including cells from the same client. An await yields to other cells; synchronous code, synchronous IPython magics, and CPU-heavy work block the event loop. Cells can finish out of order, so wait for dependencies before submitting dependent code. MCP wait_ms limits notification waiting, not total request latency or task lifetime. Poll returns available output immediately and wakes for new output or completion.
 
 ws.tasks.start(coroutine) starts detached async work and returns a handle. Store handles in ws.local. Raw asyncio.create_task() output after its parent cell finishes is not retained. Every cell is also a task handle: ws.tasks.get(exec_id) exposes its status (kind="cell") and actual last-expression result. A cell cannot await its own handle; use MCP poll for cell output.
 

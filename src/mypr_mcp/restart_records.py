@@ -82,7 +82,10 @@ def poll_restart(workspace, exec_id, cursor=0):
             events, count = read_page(path.with_suffix(".jsonl"), cursor, 32768)
             if cursor + len(events) == total and record.get("restart_result"):
                 final = {"type": "result", "text": record["restart_result"]}
-                if not events or len(json.dumps([*events, final]).encode()) <= 32768:
+                if (
+                    not events
+                    or len(json.dumps([*events, final], ensure_ascii=False).encode()) <= 32768
+                ):
                     events.append(final)
         count = total + bool(record.get("restart_result"))
     return {

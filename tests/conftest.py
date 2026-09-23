@@ -85,9 +85,21 @@ async def stop_manager(workspace: Path) -> None:
 
 
 def decode_result(result) -> dict:
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict):
+        return structured
     blocks = [block.text for block in result.content if hasattr(block, "text")]
     assert blocks, result
-    return json.loads(blocks[0])
+    try:
+        value = json.loads(blocks[0])
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            "MCP result has neither structured content nor legacy JSON text"
+        ) from exc
+    assert isinstance(value, dict), result
+    return value
 
 
 def result_text(payload: dict) -> str:

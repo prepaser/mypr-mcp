@@ -131,16 +131,18 @@ Three tools are exposed to the agent:
   execution is allowed before `init`, since the execution ID identifies the
   target.
 
-The `init`, `execute`, and `poll` responses include a small preview of the
-current client's unacknowledged inbox. Previews contain up to five messages and
-fit within a 4 KiB JSON budget; reading a preview does not acknowledge its messages.
-Use `ws.messages.read()` to page through full messages. Before `init`, `poll`
-omits the inbox.
+Tool responses provide readable text in `content` and the complete machine-readable payload in `structuredContent`. The text includes the current output page in full, with execution state, cursor, errors, warnings, and inbox previews. Adjacent fragments of the same stream are combined for display; the structured events and their cursors are unchanged. Initialization and runtime changes also include the running manager's API instructions.
+
+Clients must parse `structuredContent` (the Python MCP SDK exposes `result.structured_content`), rather than treating text blocks as JSON. For older servers, a client may fall back to parsing their JSON text when structured content is absent. The new text format intentionally no longer mirrors the complete JSON payload.
+
+`execute` waits for completion, inbox activity, or its wait deadline so short cells normally need only one call. `poll` returns immediately when the requested output is available or the execution is terminal; otherwise it waits for output, completion, inbox activity, or its wait deadline. `wait_ms` bounds this notification wait, not total request latency or Python execution time. Continue polling running cells, and read remaining pages while `has_more` is true even after execution finishes.
+
+The `init`, `execute`, and `poll` responses include a small preview of the current client's unacknowledged inbox. Previews contain up to five messages and fit within a 4 KiB JSON budget; reading a preview does not acknowledge its messages. Use `ws.messages.read()` to page through full messages. Before `init`, `poll` omits the inbox.
 
 Call `init()` before the first `execute`:
 
 ```text
-init()                         -> {"client_id": "calm-otter"}
+init()                       -> binds calm-otter and returns runtime guidance
 execute(code="...", ...)      -> uses calm-otter automatically
 poll(exec_id="...", ...)      -> reads the execution
 ```
@@ -1149,10 +1151,9 @@ in-memory variables and local state must be recreated after a crash.
 
 ## Output limits
 
-Execution output is retained up to 16 MiB per run by default. Text events are paged with a default 32 KiB budget, and `poll` uses cursors
-to retrieve later events. PNG/JPEG displays up to 2 MiB are also returned as
-MCP images. Excess output is consumed and marked as truncated. Non-text display
-data is stored under `.mypr/artifacts/`.
+Execution output is retained up to 16 MiB per run by default. Text events are paged with a default 32 KiB UTF-8 JSON budget, and `poll` uses cursors to retrieve later events. This is an output-page budget, not a limit on the entire MCP response: metadata, the readable text representation, inbox previews, and inline images add to it. Excess retained output is consumed and marked as truncated. Non-text display data is stored under `.mypr/artifacts/`.
+
+Inline PNG/JPEG images share a 2 MiB source-byte budget per response; base64 encoding increases their wire size. Images that exceed this budget are omitted from inline content, with their artifact paths and reasons retained in the response. Their files remain available for later inspection. Image reads are bounded even if a file grows after its metadata is checked.
 Malformed display items and unavailable image files produce bounded `warnings`
 without changing successful Python execution to failure. Valid text, execution
 state, cursors, and inbox data remain available. Excess warnings are indicated
@@ -1198,6 +1199,9 @@ eviction. Request deduplication uses SQLite and survives eviction and restart,
 including empty request IDs. Query snapshots remain under `.mypr/searches/` and
 `.mypr/git/`. Cache retention does not delete these snapshots, journals, saved
 files, or messages.
+
+Execution admission, output publication, and terminal responses wait for their required records to be stored. Manager history and message I/O runs off the event loop in order; reset, restart, and shutdown settle pending records before closing storage. A storage failure is reported rather than returning an unrecorded execution success.
+
 Execution journals have rebuildable `.idx` byte-offset indexes. Historical
 polling seeks directly to the requested event cursor instead of loading the
 entire output file for each page. Older journals are indexed once on first

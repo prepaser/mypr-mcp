@@ -91,8 +91,8 @@ async def test_reset_reusing_python_task_id_keeps_active_work_guard(workspace):
             await rpc(path, op="stop", manager_pid=status["pid"])
 
 
-def test_missing_image_preserves_result_and_inbox(tmp_path):
-    result = tool_result(
+async def test_missing_image_preserves_result_and_inbox(tmp_path):
+    result = await tool_result(
         {
             "state": "succeeded",
             "cursor": 1,
@@ -109,6 +109,9 @@ def test_missing_image_preserves_result_and_inbox(tmp_path):
     assert result.structured_content["cursor"] == 1
     assert result.structured_content["inbox"]["unacked"] == 1
     assert result.structured_content["warnings"][0]["code"] == "artifact_unavailable"
+    text = next(block.text for block in result.content if hasattr(block, "text"))
+    assert str(tmp_path / "missing") in text
+    assert "No such file" in text
 
 
 async def test_small_cache_preserves_poll_and_request_identity(workspace):
@@ -239,9 +242,11 @@ async def test_failed_worker_marks_runtime_and_pending_cell_lost(workspace):
         await asyncio.gather(task, return_exceptions=True)
         assert not runtime.healthy
         assert "reader failed" in runtime.health_error
+        await asyncio.wait_for(rec["done"].wait(), 5)
         assert rec["state"] == "lost"
         assert rec["done"].is_set()
     finally:
+        await runtime.drain_background()
         runtime.history.close()
 
 
@@ -275,17 +280,30 @@ async def test_large_output_yields_before_terminal_status(workspace):
             {"msg_type": kind, "content": content, "parent_header": {"msg_id": "source"}}
         )
     runtime.kc = SimpleNamespace(get_iopub_msg=messages.get)
+    first_page = asyncio.Event()
+    continue_output = asyncio.Event()
+    append = runtime.append
+
+    async def append_page(record, event):
+        await append(record, event)
+        if not first_page.is_set():
+            first_page.set()
+            await continue_output.wait()
+
+    runtime.append = append_page
     reader = asyncio.create_task(runtime.read_output())
     try:
-        await asyncio.sleep(0)
+        await asyncio.wait_for(first_page.wait(), 5)
         await runtime.dispatch({"op": "status"})
         assert 0 < rec["bytes"] < len(text)
-        await asyncio.wait_for(rec["done"].wait(), 5)
+        continue_output.set()
+        await asyncio.wait_for(rec["done"].wait(), 20)
         assert rec["bytes"] == len(text)
         assert "".join(item["text"] for item in rec["events"]) == text
         events = runtime.history.logs(limit=1)["events"]
         assert events[0]["event"] == "succeeded"
     finally:
+        continue_output.set()
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
         runtime.history.close()

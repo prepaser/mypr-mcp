@@ -91,7 +91,7 @@ def append_events(path: Path, events: list[dict]) -> None:
     with path.open("ab") as journal, path.with_suffix(".idx").open("r+b") as index:
         index.seek(0, os.SEEK_END)
         for event in events:
-            journal.write((json.dumps(event) + "\n").encode())
+            journal.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
             index.write(_OFFSET.pack(journal.tell()))
         journal.flush()
         index.seek(0)
@@ -136,7 +136,7 @@ def read_page(path: Path, cursor: int, budget: int, initial_size: int = 0):
         source.seek(offset)
         for position in range(cursor, count):
             event = decode_event(source.readline(), position + 1)
-            length = len(json.dumps(event).encode())
+            length = len(json.dumps(event, ensure_ascii=False).encode())
             if output and size + length > budget:
                 break
             output.append(event)

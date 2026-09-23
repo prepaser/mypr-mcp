@@ -2,7 +2,7 @@ import ast
 import asyncio
 
 import pytest
-from conftest import decode_result, execute, mcp_session, result_text, stop_manager
+from conftest import decode_result, execute, mcp_session, poll_until_done, result_text, stop_manager
 
 from mypr_mcp.transport import rpc, socket_path
 
@@ -85,9 +85,7 @@ async def test_messages_wake_tool_wait_without_cancelling_cell(workspace, tool):
             await execute(
                 receiver, f"await ws.messages.ack([{sent['id']}])\nws.local['gate'].set()"
             )
-            completed = decode_result(
-                await receiver.call_tool("poll", {"exec_id": woken["exec_id"], "wait_ms": 5000})
-            )
+            completed = await poll_until_done(receiver, woken["exec_id"])
             assert completed["state"] == "succeeded"
             assert result_text(completed).strip() == "42"
         finally:

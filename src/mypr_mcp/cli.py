@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -121,37 +122,218 @@ async def _stop_spawned(proc):
         await asyncio.to_thread(proc.wait)
 
 
-def tool_result(result):
+_IMAGE_RESPONSE_LIMIT = 2 * 1024 * 1024
+
+
+def _read_image(path: Path, limit: int) -> bytes:
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("artifact is not a regular file")
+        chunks = []
+        size = 0
+        while size <= limit:
+            chunk = os.read(fd, limit + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _encode_image(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _render_runtime(runtime: dict[str, Any]) -> list[str]:
+    lines = ["runtime:"]
+    for key in ("manager_version", "bridge_version", "protocol_version", "generation"):
+        if runtime.get(key) is not None:
+            lines.append(f"{key}={runtime[key]}")
+    if "update_pending" in runtime:
+        lines.append(f"update_pending={str(runtime['update_pending']).lower()}")
+    if runtime.get("capabilities"):
+        lines.append("capabilities=" + ", ".join(runtime["capabilities"]))
+    if runtime.get("instructions"):
+        lines.extend(("instructions:", runtime["instructions"]))
+    return lines
+
+
+def _render_output_event(event: dict[str, Any]) -> list[str]:
+    kind = event.get("type")
+    text = event.get("text", "")
+    if kind == "stream":
+        lines = [f"[{event.get('stream', 'stream')}]"]
+    elif kind == "result":
+        lines = ["[result]"]
+    elif kind == "error":
+        lines = ["[error]"]
+    elif kind == "warning":
+        code = event.get("code")
+        lines = [f"[warning{': ' + str(code) if code else ''}]"]
+    else:
+        lines = [json.dumps(event, ensure_ascii=False, separators=(",", ":"))]
+        return lines
+    if isinstance(text, str) and text:
+        lines.append(text)
+    for artifact in event.get("artifacts", []):
+        path = artifact.get("path", "<unknown path>")
+        mime = artifact.get("mime", "unknown type")
+        lines.append(f"[artifact] {path} ({mime})")
+    return lines
+
+
+def _render_output_events(events: list[dict[str, Any]]) -> list[str]:
+    lines = []
+    stream = None
+    chunks = []
+
+    def flush_stream():
+        nonlocal stream, chunks
+        if stream is not None:
+            lines.append(f"[{stream}]")
+            text = "".join(chunks)
+            if text:
+                lines.append(text)
+        stream = None
+        chunks = []
+
+    for event in events:
+        if event.get("type") == "stream" and not event.get("artifacts"):
+            current = event.get("stream", "stream")
+            if stream is not None and stream != current:
+                flush_stream()
+            stream = current
+            text = event.get("text", "")
+            if isinstance(text, str):
+                chunks.append(text)
+            continue
+        flush_stream()
+        lines.extend(_render_output_event(event))
+    flush_stream()
+    return lines
+
+
+def _render_inbox(inbox: dict[str, Any]) -> list[str]:
+    lines = [
+        f"inbox unacked={inbox.get('unacked', 0)} "
+        f"has_more={str(bool(inbox.get('has_more', False))).lower()}"
+    ]
+    for message in inbox.get("messages", []):
+        metadata = [f"id={message.get('id')}", f"from={message.get('from', '?')}"]
+        if message.get("reply_to") is not None:
+            metadata.append(f"reply_to={message['reply_to']}")
+        if message.get("truncated"):
+            metadata.append("truncated=true")
+        lines.append(f"[{', '.join(metadata)}] {message.get('text', '')}")
+    return lines
+
+
+def _render_result(
+    result: dict[str, Any], artifact_issues: list[tuple[str, str, str]] | None = None
+) -> str:
+    lines = []
+    if "exec_id" not in result and result.get("client_id") is not None:
+        lines.append(f"client_id={result['client_id']}")
+    for key in (
+        "exec_id",
+        "state",
+        "cursor",
+        "has_more",
+        "truncated",
+    ):
+        if key in result:
+            value = result[key]
+            if isinstance(value, bool):
+                value = str(value).lower()
+            lines.append(f"{key}={value}")
+    if result.get("error"):
+        lines.append("error: " + str(result["error"]))
+    if result.get("error_truncated"):
+        lines.append("error_truncated=true")
+    if "runtime" in result and result["runtime"].get("instructions"):
+        lines.extend(_render_runtime(result["runtime"]))
+    output = result.get("output", [])
+    lines.extend(_render_output_events(output))
+    output_warnings = {
+        (event.get("code"), event.get("text"))
+        for event in output
+        if event.get("type") == "warning"
+    }
+    artifact_warning_texts = set()
+    for code, path, reason in artifact_issues or []:
+        artifact_warning_texts.add(f"{path}: {reason}")
+        label = "unavailable" if code == "artifact_unavailable" else "omitted"
+        lines.append(f"inline image {label}: {path}: {reason}")
+    for warning in result.get("warnings", []):
+        code = warning.get("code")
+        if (code, warning.get("text")) in output_warnings:
+            continue
+        if warning.get("text") in artifact_warning_texts:
+            continue
+        lines.append(f"warning{': ' + str(code) if code else ''}: {warning.get('text', '')}")
+    if result.get("warnings_truncated"):
+        lines.append("warnings_truncated=true")
+    if isinstance(result.get("inbox"), dict):
+        lines.extend(_render_inbox(result["inbox"]))
+    return "\n".join(lines)
+
+
+async def tool_result(result: dict[str, Any]) -> CallToolResult:
     result = dict(result)
     warnings = list(result.get("warnings", []))
     images = []
+    artifact_issues = []
+    image_bytes = 0
     for event in result.get("output", []):
         for artifact in event.get("artifacts", []):
-            path = Path(artifact["path"])
-            try:
-                if (
-                    artifact["mime"] not in {"image/png", "image/jpeg"}
-                    or path.stat().st_size > 2 * 1024 * 1024
-                ):
-                    continue
-                images.append(
-                    ImageContent(
-                        data=base64.b64encode(path.read_bytes()).decode(), mimeType=artifact["mime"]
-                    )
-                )
-            except OSError as exc:
-                if len(warnings) < 4:
-                    warnings.append(
-                        {"code": "artifact_unavailable", "text": safe_error(exc, limit=256)}
-                    )
+            artifact_path = artifact.get("path")
+            mime = artifact.get("mime")
+            if not isinstance(artifact_path, str):
+                continue
+            if mime not in {"image/png", "image/jpeg"}:
+                continue
+            path = Path(artifact_path)
+            remaining = _IMAGE_RESPONSE_LIMIT - image_bytes
+            if remaining <= 0:
+                reason = "per-response inline image limit (2 MiB) reached"
+                warning_code = "artifact_omitted"
+            else:
+                try:
+                    raw = await asyncio.to_thread(_read_image, path, remaining)
+                except OSError as exc:
+                    reason = safe_error(exc, limit=256)
+                    warning_code = "artifact_unavailable"
                 else:
-                    result["warnings_truncated"] = True
+                    if len(raw) > remaining:
+                        reason = "per-response inline image limit (2 MiB) exceeded"
+                        warning_code = "artifact_omitted"
+                    else:
+                        encoded = await asyncio.to_thread(_encode_image, raw)
+                        images.append(ImageContent(data=encoded, mimeType=mime))
+                        image_bytes += len(raw)
+                        continue
+            artifact_issues.append((warning_code, str(path), reason))
+            _append_artifact_warning(warnings, result, warning_code, path, reason)
     if warnings:
         result["warnings"] = warnings
-    content = [TextContent(text=json.dumps(result, ensure_ascii=False)), *images]
+    text = _render_result(result, artifact_issues)
     return CallToolResult(
-        content=content, structuredContent=result, isError=result.get("state") in {"failed", "lost"}
+        content=[TextContent(text=text), *images],
+        structuredContent=result,
+        isError=result.get("state") in {"failed", "lost"},
     )
+
+
+def _append_artifact_warning(warnings, result, code, path, reason):
+    if len(warnings) < 4:
+        warnings.append({"code": code, "text": f"{path}: {reason}"})
+    else:
+        result["warnings_truncated"] = True
 
 
 async def stop_runtime(path, force=False, *, workspace=None, restart_id=None):
@@ -210,7 +392,7 @@ async def serve(workspace):
                 "An ID cannot be shared by live connections or switched on this connection."
             ),
         ] = None,
-    ) -> dict[str, Any]:
+    ) -> CallToolResult:
         """Start workspace work here: bind a client ID before execute.
 
         Returns the running manager's API instructions, capabilities, and versions.
@@ -220,7 +402,7 @@ async def serve(workspace):
         result = await request("init", client_id=client_id)
         bound_client = result["client_id"]
         await bridge.bind_client(bound_client)
-        return result
+        return await tool_result(result)
 
     @mcp.tool()
     async def execute(
@@ -265,7 +447,7 @@ async def serve(workspace):
             request_id=request_id,
             client_id=bound_client,
         )
-        return tool_result(result)
+        return await tool_result(result)
 
     @mcp.tool()
     async def poll(
@@ -299,7 +481,7 @@ async def serve(workspace):
             cursor=cursor,
             wait_ms=wait_ms,
         )
-        return tool_result(result)
+        return await tool_result(result)
 
     await bridge.start()
     mcp_task = asyncio.create_task(mcp.run_stdio_async())
