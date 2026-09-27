@@ -1,0 +1,33 @@
+# Browser observation
+
+`ws.browser` exposes native async Playwright objects. Observation and accessibility snapshots add bounded inspection without replacing Playwright's page, locator, or event APIs.
+
+## Page events
+
+```python
+observation = await ws.browser.observe(page)
+page.on("console", lambda message: print(message.text))
+page_result = await observation.read()
+details = await observation.request("r3", body=True)
+observation.close()
+```
+
+`read(cursor=None, limit=100, max_bytes=32768)` returns this page's console messages, page errors, requests, responses, and failed requests, plus `next_cursor`, `has_more`, `dropped`, and `closed`. The cursor is a monotonically increasing client cursor, so a page observer may see gaps caused by events from other observed pages. Each client has one shared ring capped at 1,000 events and 4 MiB, can retain details for at most 256 requests, and can observe at most 64 pages. Old events and request details are evicted when the limits are reached; `dropped` reports that the requested cursor predates retained history.
+
+Request events carry an ID. `request(id, body=False, include_sensitive_headers=False)` returns request and response metadata while redacting authorization, cookie, token, secret, session, and API-key headers by default. User information and sensitive query parameters in URLs are also redacted. Response bodies are opt-in and capped at 256 KiB. Playwright buffers a response body before returning it; to avoid an unknown-size allocation, mypr only reads a body when `Content-Length` is present, no larger than the cap, and `Content-Encoding` is absent or `identity`, then checks the actual size again. Missing, invalid, oversized, or compressed lengths produce `body_error` instead. The precheck relies on the server's declared length; if a server understates it, Playwright may allocate more than the cap before mypr can reject the returned body. Request and response bodies are never collected automatically.
+
+Observers attach only to pages whose context belongs to the current client, or to an explicitly shared context or connection. Calling `observation.close()` removes listeners but retains bounded event history and request detail references until eviction or reset. Closing a page or its context removes that page's listeners. Reset removes all observers and their in-memory event history.
+
+## Accessibility snapshots
+
+```python
+first = await ws.browser.snapshot(page, selector="main", depth=5)
+matches = await ws.browser.find(first["snapshot_id"], "Continue")
+next_page = await ws.browser.snapshot(page, cursor=first["next_cursor"])
+later = await ws.browser.snapshot(page)
+changes = await ws.browser.diff(first["snapshot_id"], later["snapshot_id"])
+```
+
+`snapshot(page, selector=None, cursor=None, depth=None, mode=None, boxes=None, limit=32768)` captures the native Playwright ARIA snapshot once and returns URL, title, capture time, snapshot ID, and a UTF-8 bounded text page. If the metadata and a minimal text page cannot fit within `limit`, it raises `ValueError`; increase the limit and retry. A returned cursor pages the same immutable capture; it does not query a changed DOM again. Explicit `depth`, `mode`, or `boxes` options are accepted only when supported by the installed Playwright version. Captures are kept in memory per client, up to 32 snapshots and 16 MiB; FIFO eviction makes older IDs expire.
+
+`find(snapshot_id, text, regex=False, cursor=None, limit=100)` returns matching lines and 1-based line and column positions. Searches run in a short-lived, parent-supervised worker with a two-second deadline and a 768 MiB address-space cap so a pathological expression cannot stall the shared Python kernel. `diff(before_id, after_id, cursor=None, limit=32768)` returns a unified text diff in bounded pages and uses the same worker limits; diffs above 50,000 lines are rejected. Search cursors are tied to their snapshot and query; diff cursors are tied to both snapshot IDs. Expired or mismatched cursors raise an error.

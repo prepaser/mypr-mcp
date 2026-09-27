@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import socket
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ _NETWORK_FS = {
     "fuse.sshfs",
 }
 _MAX_TEXT = 4096
+_MAX_DIAGNOSTIC_RECORDS = 1000
 
 
 def _psutil():
@@ -479,6 +481,214 @@ def _processes(request: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _socket_parts(address: Any) -> tuple[str | None, int | None]:
+    if isinstance(address, tuple):
+        host = _text(address[0], 256) if address else None
+        port = address[1] if len(address) > 1 and isinstance(address[1], int) else None
+        return host, port
+    return _text(address, 256) if address else None, None
+
+
+def _socket_row(connection: Any) -> dict[str, Any]:
+    try:
+        family = socket.AddressFamily(connection.family).name.lower()
+    except ValueError, TypeError:
+        family = str(connection.family)
+    if family == "af_unix":
+        protocol = "unix"
+    else:
+        try:
+            protocol = {
+                socket.SOCK_STREAM: "tcp",
+                socket.SOCK_DGRAM: "udp",
+            }.get(connection.type, "other")
+        except AttributeError, TypeError:
+            protocol = "other"
+    local_address, local_port = _socket_parts(connection.laddr)
+    remote_address, remote_port = _socket_parts(connection.raddr)
+    return {
+        "protocol": protocol,
+        "family": family,
+        "local_address": local_address,
+        "local_port": local_port,
+        "remote_address": remote_address,
+        "remote_port": remote_port,
+        "state": _text(connection.status, 64) or "NONE",
+        "pid": connection.pid,
+    }
+
+
+def _connection_snapshot(psutil, *, process=None) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    if process is not None:
+        try:
+            return [_socket_row(item) for item in process.net_connections(kind="all")], warnings
+        except Exception as exc:
+            return [], [f"sockets unavailable for pid {process.pid}: {_text(exc, 256)}"]
+    for kind in ("inet", "unix"):
+        try:
+            rows.extend(_socket_row(item) for item in psutil.net_connections(kind=kind))
+        except (AttributeError, NotImplementedError) as exc:
+            warnings.append(f"{kind} sockets unavailable: {_text(exc, 256)}")
+        except Exception as exc:
+            warnings.append(f"{kind} sockets unavailable: {_text(exc, 256)}")
+    return rows, warnings
+
+
+def _sockets(request: dict[str, Any]) -> dict[str, Any]:
+    result = _base()
+    psutil = _psutil()
+    rows, warnings = _connection_snapshot(psutil)
+    protocol = request.get("protocol")
+    local_address = request.get("local_address")
+    local_port = request.get("local_port")
+    remote_address = request.get("remote_address")
+    remote_port = request.get("remote_port")
+    state = request.get("state")
+    pid = request.get("pid")
+    if state is not None:
+        state = str(state).upper()
+    rows = [
+        row
+        for row in rows
+        if (protocol is None or row["protocol"] == protocol)
+        and (local_address is None or row["local_address"] == local_address)
+        and (local_port is None or row["local_port"] == local_port)
+        and (remote_address is None or row["remote_address"] == remote_address)
+        and (remote_port is None or row["remote_port"] == remote_port)
+        and (state is None or row["state"].upper() == state)
+        and (pid is None or row["pid"] == pid)
+    ]
+    rows.sort(
+        key=lambda row: (
+            row["protocol"],
+            row["local_address"] or "",
+            row["local_port"] or 0,
+            row["remote_address"] or "",
+            row["remote_port"] or 0,
+            row["pid"] or 0,
+        )
+    )
+    total = len(rows)
+    if total > _MAX_DIAGNOSTIC_RECORDS:
+        warnings.append(f"socket list limited to {_MAX_DIAGNOSTIC_RECORDS} records")
+    result.update(
+        {
+            "sockets": rows[:_MAX_DIAGNOSTIC_RECORDS],
+            "total": total,
+            "truncated": total > _MAX_DIAGNOSTIC_RECORDS,
+            "warnings": warnings,
+        }
+    )
+    return result
+
+
+def _process_detail(request: dict[str, Any]) -> dict[str, Any]:
+    result = _base()
+    psutil = _psutil()
+    pid = int(request["pid"])
+    warnings: list[str] = []
+    try:
+        process = psutil.Process(pid)
+        identity = float(process.create_time())
+    except psutil.NoSuchProcess:
+        result.update(
+            {"process": None, "status": "gone", "warnings": [f"pid {pid} no longer exists"]}
+        )
+        return result
+    except Exception as exc:
+        result.update(
+            {
+                "process": None,
+                "status": "unavailable",
+                "warnings": [f"pid {pid} unavailable: {_text(exc, 256)}"],
+            }
+        )
+        return result
+
+    def read(label: str, operation, default=None):
+        try:
+            return operation()
+        except Exception as exc:
+            warnings.append(f"{label} unavailable: {_text(exc, 192)}")
+            return default
+
+    record: dict[str, Any] = {
+        "pid": pid,
+        "create_time": identity,
+        "name": _text(read("name", process.name)),
+        "username": _text(read("username", process.username)),
+        "status": _text(read("status", process.status)),
+        "executable": _text(read("executable", process.exe), 1024),
+        "cwd": _text(read("working directory", process.cwd), 1024),
+    }
+    parent = read("parent", process.parent)
+    if parent is not None:
+        record["parent"] = read(
+            "parent details",
+            lambda: {
+                "pid": parent.pid,
+                "create_time": parent.create_time(),
+                "name": _text(parent.name()),
+            },
+        )
+    else:
+        record["parent"] = None
+
+    if request.get("children"):
+        children = read("children", process.children, []) or []
+        child_rows = []
+        for child in children[:128]:
+            child_info = read(
+                f"child pid {child.pid}",
+                lambda child=child: {
+                    "pid": child.pid,
+                    "create_time": child.create_time(),
+                    "name": _text(child.name()),
+                },
+            )
+            if child_info is not None:
+                child_rows.append(child_info)
+        record["children"] = child_rows
+        if len(children) > 128:
+            warnings.append("child list limited to 128 processes")
+
+    if request.get("open_files"):
+        files = read("open files", process.open_files, []) or []
+        record["open_files"] = [
+            {"path": _text(item.path, 1024), "fd": getattr(item, "fd", None)}
+            for item in files[:128]
+        ]
+        if len(files) > 128:
+            warnings.append("open file list limited to 128 files")
+
+    if request.get("sockets"):
+        connections, socket_warnings = _connection_snapshot(psutil, process=process)
+        record["sockets"] = connections[:128]
+        warnings.extend(socket_warnings)
+        if len(connections) > 128:
+            warnings.append("process socket list limited to 128 sockets")
+
+    try:
+        current_identity = float(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess:
+        current_identity = None
+    except Exception as exc:
+        current_identity = identity
+        warnings.append(f"process identity recheck unavailable: {_text(exc, 192)}")
+    if current_identity is None:
+        result.update({"process": None, "status": "gone"})
+        warnings.append(f"pid {pid} exited during inspection")
+    elif current_identity != identity:
+        result.update({"process": None, "status": "reused"})
+        warnings.append(f"pid {pid} changed identity during inspection")
+    else:
+        result.update({"process": record, "status": "partial" if warnings else "ok"})
+    result["warnings"] = warnings
+    return result
+
+
 def _mounts(psutil, path: str | None, workspace: str | None) -> tuple[list[Any], list[str]]:
     warnings: list[str] = []
     if path is not None:
@@ -549,6 +759,8 @@ def collect(section: str, request: dict[str, Any] | None = None) -> dict[str, An
         "info": _info,
         "base_usage": _base_usage,
         "processes": _processes,
+        "process_detail": _process_detail,
+        "sockets": _sockets,
         "disks": _disks,
     }
     try:

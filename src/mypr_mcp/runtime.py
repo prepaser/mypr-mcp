@@ -303,6 +303,9 @@ class Runtime:
             "browser/",
             "scans/",
             "revisions/",
+            "document-results/",
+            "git-history/",
+            "rewrites/",
         ]
         missing = [entry for entry in required if entry not in entries]
         if missing:
@@ -1453,7 +1456,7 @@ class Runtime:
             if op == "search":
                 return await Search(self.workspace, runner).search(**args)
             method = req.get("method")
-            if method not in {"status", "diff", "show"}:
+            if method not in {"status", "diff", "show", "log", "blame"}:
                 raise ValueError("Unknown Git method")
             return await getattr(Git(self.workspace, runner), method)(**args)
         if op == "shell_start":

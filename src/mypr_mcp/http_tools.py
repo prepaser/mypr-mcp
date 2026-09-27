@@ -64,6 +64,72 @@ class HTTPTools:
         self._options: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._closed = False
         self._shutdown_task: asyncio.Task[None] | None = None
+        self._html = None
+
+    async def extract_html(
+        self,
+        html: str | None = None,
+        *,
+        url: str | None = None,
+        selector: str | None = None,
+        max_bytes: int = 32 * 1024,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Extract a bounded, paged main-text and link view from HTML."""
+        if self._closed:
+            raise RuntimeError("HTTP service is closed")
+        from .html_tools import HTMLExtractor
+
+        if self._html is None:
+            self._html = HTMLExtractor(self)
+        return await self._html.extract_html(
+            html, url=url, selector=selector, max_bytes=max_bytes, cursor=cursor
+        )
+
+    async def read_html(
+        self,
+        url: str | None = None,
+        *,
+        name: str = "default",
+        shared: bool = False,
+        max_input_bytes: int = DEFAULT_MAX_BYTES,
+        max_bytes: int = 32 * 1024,
+        cursor: str | None = None,
+        selector: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Fetch HTML with a named client, then extract a bounded paged view."""
+        from .html_tools import MAX_INPUT_BYTES, _validate_output_limit
+
+        _validate_output_limit(max_bytes)
+        if cursor is not None:
+            if url is not None or selector is not None or kwargs:
+                raise ValueError(
+                    "url, selector, and request options cannot be combined with cursor"
+                )
+            return await self.extract_html(None, max_bytes=max_bytes, cursor=cursor)
+        if not isinstance(url, str) or not url:
+            raise ValueError("url must be a non-empty string")
+        if (
+            not isinstance(max_input_bytes, int)
+            or isinstance(max_input_bytes, bool)
+            or not 1 <= max_input_bytes <= MAX_INPUT_BYTES
+        ):
+            raise ValueError(f"max_input_bytes must be between 1 and {MAX_INPUT_BYTES}")
+        response = await self.get(
+            url,
+            name=name,
+            shared=shared,
+            max_bytes=max_input_bytes,
+            **kwargs,
+        )
+        response.raise_for_status()
+        return await self.extract_html(
+            response.text,
+            url=str(response.url),
+            selector=selector,
+            max_bytes=max_bytes,
+        )
 
     def _key(self, name: str, shared: bool) -> tuple[str, str, str]:
         if not isinstance(name, str) or not name:
@@ -256,6 +322,8 @@ class HTTPTools:
             await _wait_uncancelled(self._shutdown_task)
             return
         self._closed = True
+        if self._html is not None:
+            self._html.clear()
         clients = tuple(self._clients.values())
         self._clients.clear()
         self._options.clear()

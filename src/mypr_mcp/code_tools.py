@@ -23,6 +23,12 @@ MAX_RESULTS = 500
 MAX_DIAGNOSTICS = 256
 MAX_HOVER_CHARS = 64 * 1024
 MAX_STDERR_BYTES = 16 * 1024
+MAX_SYMBOL_DEPTH = 32
+MAX_SYMBOL_TEXT = 1024
+MAX_HIERARCHY_ITEMS = 64
+DEFAULT_RESULT_BYTES = 32 * 1024
+CALL_CANCEL_GRACE = 0.1
+COORDINATE_SYSTEM = "one_based_unicode_code_points"
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _LANGUAGE_IDS = {
     ".c": "c",
@@ -106,6 +112,21 @@ def _range(value: Any, text: str, encoding: str) -> dict[str, Any] | None:
             "character": _user_character(source, pos.get("character"), encoding),
         }
     return result
+
+
+def _coordinate_range(value: Any, text: str | None, encoding: str) -> tuple[Any, str]:
+    if value is None:
+        return None, "not_provided"
+    if text is None:
+        return None, "source_unavailable"
+    converted = _range(value, text, encoding)
+    return converted, "converted" if converted is not None else "invalid"
+
+
+def _result_limit(value: Any) -> int:
+    if type(value) is not int or not 512 <= value <= MAX_RESULT_BYTES:
+        raise ValueError(f"max_bytes must be an integer between 512 and {MAX_RESULT_BYTES}")
+    return value
 
 
 def _uri_path(uri: Any) -> Path | None:
@@ -511,6 +532,7 @@ class _LanguageServer:
         params: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,  # noqa: ASYNC109
+        cancel_timeout: float | None = 1,
     ) -> Any:  # noqa: ASYNC109
         if self._failure:
             raise CodeError(self._failure)
@@ -525,12 +547,14 @@ class _LanguageServer:
                 )
                 return await future
         except TimeoutError as exc:
-            with suppress(CodeError, TimeoutError):
-                await self._notify("$/cancelRequest", {"id": ident}, timeout=1)
+            if cancel_timeout is not None:
+                with suppress(CodeError, TimeoutError):
+                    await self._notify("$/cancelRequest", {"id": ident}, timeout=cancel_timeout)
             raise CodeError(f"LSP request {method} timed out") from exc
         except asyncio.CancelledError:
-            with suppress(CodeError, TimeoutError):
-                await self._notify("$/cancelRequest", {"id": ident}, timeout=1)
+            if cancel_timeout is not None:
+                with suppress(CodeError, TimeoutError):
+                    await self._notify("$/cancelRequest", {"id": ident}, timeout=cancel_timeout)
             raise
         finally:
             if self._pending.get(ident) is future:
@@ -650,6 +674,413 @@ class _LanguageServer:
             "path": str(path),
             "range": _range(raw_range, text, self.position_encoding) if text is not None else None,
         }
+
+    def _workspace_uri_path(self, uri: Any) -> Path | None:
+        path = _uri_path(uri)
+        if path is None:
+            return None
+        try:
+            path.resolve().relative_to(self.root)
+        except OSError, ValueError:
+            return None
+        return path
+
+    async def _text_for_uri(self, uri: str, cache: dict[str, str]) -> str | None:
+        document = self.documents.get(uri)
+        if document is not None:
+            return document.text
+        if uri in cache:
+            return cache[uri]
+        path = self._workspace_uri_path(uri)
+        if path is None or len(cache) >= 16:
+            return None
+        try:
+            text = await asyncio.to_thread(self._read_file, path)
+        except OSError, ValueError:
+            return None
+        cache[uri] = text
+        return text
+
+    def _document_provenance(self, uri: str, text: str | None) -> dict[str, Any]:
+        document = self.documents.get(uri)
+        return {
+            "document_version": document.version if document is not None else None,
+            "coordinate_source": (
+                "open_document"
+                if document is not None
+                else "disk"
+                if text is not None
+                else "unavailable"
+            ),
+        }
+
+    async def _symbol_location(
+        self, uri: Any, raw_range: Any, cache: dict[str, str]
+    ) -> dict[str, Any] | None:
+        path = self._workspace_uri_path(uri)
+        if path is None:
+            return None
+        text = await self._text_for_uri(str(uri), cache)
+        converted, status = _coordinate_range(raw_range, text, self.position_encoding)
+        return {
+            "path": str(path),
+            "range": converted,
+            "range_status": status,
+            **self._document_provenance(str(uri), text),
+        }
+
+    async def _clean_symbol(
+        self,
+        value: Any,
+        text: str,
+        document_uri: str,
+        cache: dict[str, str],
+        budget: list[int],
+        omitted: list[bool],
+        depth: int = 0,
+    ) -> dict[str, Any] | None:
+        if not isinstance(value, dict) or not isinstance(value.get("name"), str):
+            omitted[0] = True
+            return None
+        kind = value.get("kind")
+        if (
+            type(kind) is not int
+            or not 1 <= kind <= 26
+            or budget[0] <= 0
+            or depth >= MAX_SYMBOL_DEPTH
+        ):
+            omitted[0] = True
+            return None
+        budget[0] -= 1
+        raw_range = value.get("range")
+        selection_range = value.get("selectionRange")
+        location = value.get("location")
+        if isinstance(location, dict):
+            if raw_range is None:
+                raw_range = location.get("range")
+            uri = location.get("uri")
+        else:
+            uri = None
+        symbol_uri = str(uri) if isinstance(uri, str) else document_uri
+        symbol_text = await self._text_for_uri(symbol_uri, cache)
+        converted_range, range_status = _coordinate_range(
+            raw_range, symbol_text, self.position_encoding
+        )
+        converted_selection, selection_status = _coordinate_range(
+            selection_range if selection_range is not None else raw_range,
+            symbol_text,
+            self.position_encoding,
+        )
+        result: dict[str, Any] = {
+            "name": value["name"][:MAX_SYMBOL_TEXT],
+            "kind": kind,
+            "range": converted_range,
+            "range_status": range_status,
+            "selection_range": converted_selection,
+            "selection_range_status": selection_status,
+            **self._document_provenance(symbol_uri, symbol_text),
+        }
+        if isinstance(value.get("detail"), str):
+            result["detail"] = value["detail"][:MAX_SYMBOL_TEXT]
+        if isinstance(value.get("containerName"), str):
+            result["container"] = value["containerName"][:MAX_SYMBOL_TEXT]
+        if isinstance(uri, str):
+            item_location = await self._symbol_location(uri, raw_range, cache)
+            if item_location is not None:
+                result["location"] = item_location
+        children = value.get("children")
+        if children is not None:
+            if not isinstance(children, list):
+                omitted[0] = True
+                result["children"] = []
+            else:
+                clean_children = []
+                for child in children:
+                    clean = await self._clean_symbol(
+                        child, text, document_uri, cache, budget, omitted, depth + 1
+                    )
+                    if clean is not None:
+                        clean_children.append(clean)
+                result["children"] = clean_children
+        return result
+
+    async def document_symbols(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        language: str | None = None,
+        max_bytes: int = DEFAULT_RESULT_BYTES,
+    ) -> dict[str, Any]:
+        """Return a bounded symbol tree for a workspace document."""
+        max_bytes = _result_limit(max_bytes)
+        self._require("documentSymbolProvider")
+        async with self._operation_lock:
+            doc, _ = await self._document(path, language)
+            raw = await self._request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": doc.uri}}
+            )
+            if raw is None:
+                raw = []
+            if not isinstance(raw, list):
+                raise CodeError("language server returned malformed document symbols")
+            cache: dict[str, str] = {doc.uri: doc.text}
+            budget = [MAX_RESULTS]
+            omitted = [False]
+            result = {
+                "path": str(doc.path),
+                "document_version": doc.version,
+                "coordinate_system": COORDINATE_SYSTEM,
+                "symbols": [],
+                "truncated": False,
+            }
+            truncated = len(raw) > MAX_RESULTS
+            for item in raw[:MAX_RESULTS]:
+                clean = await self._clean_symbol(
+                    item, doc.text, doc.uri, cache, budget, omitted
+                )
+                if clean is None:
+                    truncated = True
+                    continue
+                result["symbols"].append(clean)
+                if _json_size(result) > max_bytes:
+                    result["symbols"].pop()
+                    truncated = True
+                    break
+            if omitted[0]:
+                truncated = True
+            result["truncated"] = truncated
+            return result
+
+    async def workspace_symbols(
+        self, query: str = "", *, max_bytes: int = DEFAULT_RESULT_BYTES
+    ) -> dict[str, Any]:
+        """Search workspace symbols and return bounded file locations."""
+        max_bytes = _result_limit(max_bytes)
+        if not isinstance(query, str) or len(query) > 4096 or "\x00" in query:
+            raise ValueError("query must be a string of at most 4096 characters")
+        self._require("workspaceSymbolProvider")
+        async with self._operation_lock:
+            raw = await self._request("workspace/symbol", {"query": query})
+            if raw is None:
+                raw = []
+            if not isinstance(raw, list):
+                raise CodeError("language server returned malformed workspace symbols")
+            cache: dict[str, str] = {}
+            result = {
+                "query": query,
+                "coordinate_system": COORDINATE_SYSTEM,
+                "symbols": [],
+                "truncated": False,
+            }
+            truncated = len(raw) > MAX_RESULTS
+            for item in raw[:MAX_RESULTS]:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    truncated = True
+                    continue
+                kind = item.get("kind")
+                location = item.get("location")
+                if type(kind) is not int or not 1 <= kind <= 26 or not isinstance(location, dict):
+                    truncated = True
+                    continue
+                clean_location = await self._symbol_location(
+                    location.get("uri"), location.get("range"), cache
+                )
+                if clean_location is None:
+                    truncated = True
+                    continue
+                symbol = {"name": item["name"][:MAX_SYMBOL_TEXT], "kind": kind, **clean_location}
+                if isinstance(item.get("containerName"), str):
+                    symbol["container"] = item["containerName"][:MAX_SYMBOL_TEXT]
+                result["symbols"].append(symbol)
+                if _json_size(result) > max_bytes:
+                    result["symbols"].pop()
+                    truncated = True
+                    break
+            result["truncated"] = truncated
+            return result
+
+    async def _clean_call_item(self, value: Any, cache: dict[str, str]) -> dict[str, Any] | None:
+        if not isinstance(value, dict) or not isinstance(value.get("name"), str):
+            return None
+        kind = value.get("kind")
+        uri = value.get("uri")
+        path = self._workspace_uri_path(uri)
+        if type(kind) is not int or not 1 <= kind <= 26 or path is None:
+            return None
+        text = await self._text_for_uri(str(uri), cache)
+        converted_range, range_status = _coordinate_range(
+            value.get("range"), text, self.position_encoding
+        )
+        converted_selection, selection_status = _coordinate_range(
+            value.get("selectionRange"), text, self.position_encoding
+        )
+        result: dict[str, Any] = {
+            "name": value["name"][:MAX_SYMBOL_TEXT],
+            "kind": kind,
+            "path": str(path),
+            "range": converted_range,
+            "range_status": range_status,
+            "selection_range": converted_selection,
+            "selection_range_status": selection_status,
+            **self._document_provenance(str(uri), text),
+        }
+        if isinstance(value.get("detail"), str):
+            result["detail"] = value["detail"][:MAX_SYMBOL_TEXT]
+        return result
+
+    async def calls(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+        *,
+        direction: str,
+        language: str | None = None,
+        max_bytes: int = DEFAULT_RESULT_BYTES,
+    ) -> dict[str, Any]:
+        """Return one-hop incoming or outgoing calls for symbols at a position."""
+        if direction not in ("incoming", "outgoing"):
+            raise ValueError("direction must be 'incoming' or 'outgoing'")
+        max_bytes = _result_limit(max_bytes)
+        self._require("callHierarchyProvider")
+        async with self._operation_lock:
+            doc, _ = await self._document(path, language)
+            pos = _position(doc.text, line, character, self.position_encoding)
+            deadline = asyncio.get_running_loop().time() + self.timeout
+            try:
+                prepared = await self._request(
+                    "textDocument/prepareCallHierarchy",
+                    {"textDocument": {"uri": doc.uri}, "position": pos},
+                    timeout=self.timeout,
+                    cancel_timeout=CALL_CANCEL_GRACE,
+                )
+            except CodeError as exc:
+                if (
+                    str(exc) == "LSP request textDocument/prepareCallHierarchy timed out"
+                    and asyncio.get_running_loop().time() >= deadline
+                ):
+                    return {
+                        "direction": direction,
+                        "path": str(doc.path),
+                        "document_version": doc.version,
+                        "coordinate_system": COORDINATE_SYSTEM,
+                        "groups": [],
+                        "ambiguous": False,
+                        "truncated": True,
+                    }
+                raise
+            if prepared is None:
+                prepared = []
+            if not isinstance(prepared, list):
+                raise CodeError("language server returned malformed call hierarchy items")
+            candidates = []
+            seen = set()
+            valid_count = 0
+            for item in prepared[:MAX_HIERARCHY_ITEMS]:
+                clean = await self._clean_call_item(item, {doc.uri: doc.text})
+                if clean is None:
+                    continue
+                valid_count += 1
+                identity = (
+                    clean["path"],
+                    json.dumps(clean["selection_range"], sort_keys=True),
+                    clean["name"],
+                    clean["kind"],
+                )
+                if identity not in seen:
+                    candidates.append((identity, item, clean))
+                    seen.add(identity)
+            truncated = len(prepared) > MAX_HIERARCHY_ITEMS or valid_count != len(prepared)
+            result = {
+                "direction": direction,
+                "path": str(doc.path),
+                "document_version": doc.version,
+                "coordinate_system": COORDINATE_SYSTEM,
+                "groups": [],
+                "ambiguous": len(candidates) > 1,
+                "truncated": truncated,
+            }
+            method = (
+                "callHierarchy/incomingCalls"
+                if direction == "incoming"
+                else "callHierarchy/outgoingCalls"
+            )
+            call_budget = MAX_RESULTS
+            for _, item, clean_item in candidates:
+                if call_budget <= 0:
+                    truncated = True
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    truncated = True
+                    break
+                try:
+                    raw_calls = await self._request(
+                        method,
+                        {"item": item},
+                        timeout=remaining,
+                        cancel_timeout=CALL_CANCEL_GRACE,
+                    )
+                except CodeError as exc:
+                    if (
+                        str(exc) == f"LSP request {method} timed out"
+                        and asyncio.get_running_loop().time() >= deadline
+                    ):
+                        truncated = True
+                        break
+                    raise
+                if raw_calls is None:
+                    raw_calls = []
+                if not isinstance(raw_calls, list):
+                    raise CodeError("language server returned malformed call hierarchy results")
+                calls = []
+                cache = {doc.uri: doc.text}
+                available = call_budget
+                for call in raw_calls[:available]:
+                    call_budget -= 1
+                    if not isinstance(call, dict):
+                        truncated = True
+                        continue
+                    target = call.get("from" if direction == "incoming" else "to")
+                    clean_target = await self._clean_call_item(target, cache)
+                    ranges = call.get("fromRanges")
+                    if clean_target is None or not isinstance(ranges, list):
+                        truncated = True
+                        continue
+                    range_uri = (
+                        target.get("uri")
+                        if direction == "incoming"
+                        else item.get("uri")
+                        if isinstance(item, dict)
+                        else None
+                    )
+                    range_text = (
+                        await self._text_for_uri(range_uri, cache)
+                        if isinstance(range_uri, str)
+                        else None
+                    )
+                    clean_ranges = []
+                    if len(ranges) > MAX_RESULTS:
+                        truncated = True
+                    for raw_range in ranges[:MAX_RESULTS]:
+                        converted, range_status = _coordinate_range(
+                            raw_range, range_text, self.position_encoding
+                        )
+                        clean_ranges.append({"range": converted, "coordinate_status": range_status})
+                    calls.append({"item": clean_target, "ranges": clean_ranges})
+                    if _json_size(result) + _json_size(calls) > max_bytes:
+                        calls.pop()
+                        truncated = True
+                        break
+                if len(raw_calls) > available:
+                    truncated = True
+                result["groups"].append({"item": clean_item, "calls": calls})
+                if _json_size(result) > max_bytes:
+                    result["groups"].pop()
+                    truncated = True
+                    break
+            result["truncated"] = truncated
+            return result
 
     async def _locations(self, value: Any) -> tuple[list[dict[str, Any]], bool]:
         if value is None:
@@ -914,6 +1345,9 @@ class _LanguageServer:
                     "definitionProvider",
                     "referencesProvider",
                     "hoverProvider",
+                    "documentSymbolProvider",
+                    "workspaceSymbolProvider",
+                    "callHierarchyProvider",
                     "diagnosticProvider",
                 )
                 if _supports(self.capabilities.get(feature))
@@ -1123,6 +1557,46 @@ class CodeTools:
     ) -> dict[str, Any] | None:
         """Return hover documentation at one-based source coordinates."""
         return await self._server(name).hover(path, line, character, language=language)
+
+    async def document_symbols(
+        self,
+        name: str,
+        path: str | os.PathLike[str],
+        *,
+        language: str | None = None,
+        max_bytes: int = DEFAULT_RESULT_BYTES,
+    ) -> dict[str, Any]:
+        """Return the symbol tree for a workspace document."""
+        return await self._server(name).document_symbols(
+            path, language=language, max_bytes=max_bytes
+        )
+
+    async def workspace_symbols(
+        self, name: str, query: str = "", *, max_bytes: int = DEFAULT_RESULT_BYTES
+    ) -> dict[str, Any]:
+        """Search workspace symbols."""
+        return await self._server(name).workspace_symbols(query, max_bytes=max_bytes)
+
+    async def calls(
+        self,
+        name: str,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+        *,
+        direction: str,
+        language: str | None = None,
+        max_bytes: int = DEFAULT_RESULT_BYTES,
+    ) -> dict[str, Any]:
+        """Return one-hop incoming or outgoing calls for symbols at a position."""
+        return await self._server(name).calls(
+            path,
+            line,
+            character,
+            direction=direction,
+            language=language,
+            max_bytes=max_bytes,
+        )
 
     async def diagnostics(
         self,

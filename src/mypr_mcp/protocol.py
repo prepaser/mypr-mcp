@@ -35,6 +35,16 @@ CAPABILITIES = [
     "media",
     "code",
     "revisions",
+    "mcp_resource_templates",
+    "local_diagnostics",
+    "browser_observation",
+    "browser_snapshots",
+    "code_structure",
+    "ast_rewrite",
+    "html_extract",
+    "git_history",
+    "document_extract",
+    "ocr",
 ]
 LEGACY_INSTRUCTIONS = """This workspace uses the legacy 0.9.0 runtime.
 Use execute for Python and poll for submitted executions. Store client-local values in

@@ -67,6 +67,45 @@ class NetworkTools:
         self.workspace = Path(workspace).resolve()
         self.tasks = tasks
         self.rpc = rpc
+        from .system_tools import SystemTools
+
+        self._system = SystemTools(self.workspace)
+
+    async def sockets(
+        self,
+        *,
+        protocol: str | None = None,
+        local_address: str | None = None,
+        local_port: int | None = None,
+        remote_address: str | None = None,
+        remote_port: int | None = None,
+        state: str | None = None,
+        pid: int | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+        timeout: float = 5.0,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """List local sockets with snapshot paging.
+
+        Filters are exact matches. `protocol` accepts tcp, udp, or unix;
+        address and port filters apply to the local or remote endpoint, while
+        `state` and `pid` filter connection state and owner. The first page
+        defaults to 20 records (limit 1-50). Pass only `cursor` to continue
+        the same snapshot; snapshots expire after 60 seconds. Each page is
+        capped at 32 KiB. `timeout` defaults to 5 seconds.
+        """
+        return await self._system.sockets(
+            protocol=protocol,
+            local_address=local_address,
+            local_port=local_port,
+            remote_address=remote_address,
+            remote_port=remote_port,
+            state=state,
+            pid=pid,
+            cursor=cursor,
+            limit=limit,
+            timeout=timeout,
+        )
 
     async def resolve(
         self,

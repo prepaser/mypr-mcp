@@ -130,6 +130,33 @@ class Filesystem:
             max_diff_bytes=max_diff_bytes,
         )
 
+    async def rewrite_ast(
+        self,
+        pattern: str | None = None,
+        *,
+        rule: Mapping[str, Any] | None = None,
+        replacement: str,
+        lang: str,
+        paths: str | list[str] | None = None,
+        glob: str | list[str] | None = None,
+    ) -> dict[str, Any]:
+        from .ast_rewrite import rewrite_ast
+
+        return await rewrite_ast(
+            self,
+            pattern=pattern,
+            rule=rule,
+            replacement=replacement,
+            lang=lang,
+            paths=paths,
+            glob=glob,
+        )
+
+    async def apply_rewrite(self, plan_id: str) -> dict[str, Any]:
+        from .ast_rewrite import apply_rewrite
+
+        return await apply_rewrite(self, plan_id)
+
     async def image(
         self,
         path: str | os.PathLike[str],

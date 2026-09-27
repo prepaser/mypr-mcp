@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .document_tools import DocumentExtractor
+
 _WORKER = Path(__file__).with_name("media_worker.py")
 _WORKERS = asyncio.Semaphore(2)
 _MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -32,9 +34,7 @@ def _kill_worker(process: asyncio.subprocess.Process) -> None:
             pass
 
 
-async def _cleanup_worker(
-    process: asyncio.subprocess.Process, communication: asyncio.Task
-) -> None:
+async def _cleanup_worker(process: asyncio.subprocess.Process, communication: asyncio.Task) -> None:
     if process.stdin is not None and not process.stdin.is_closing():
         process.stdin.close()
     _kill_worker(process)
@@ -46,9 +46,7 @@ async def _cleanup_worker(
         await asyncio.gather(communication, return_exceptions=True)
     else:
         transport = getattr(process, "_transport", None)
-        stdout_transport = (
-            transport.get_pipe_transport(1) if transport is not None else None
-        )
+        stdout_transport = transport.get_pipe_transport(1) if transport is not None else None
         if stdout_transport is not None:
             stdout_transport.close()
         communication.cancel()
@@ -79,9 +77,7 @@ async def _cleanup_worker_uncancellable(
 
 async def inspect_image(path: Path, display: str, *, max_input_bytes: int) -> dict[str, Any]:
     _validate_limit("max_input_bytes", max_input_bytes, _MAX_INPUT_BYTES)
-    return await _call(
-        "image_info", path, display, {"max_input_bytes": max_input_bytes}
-    )
+    return await _call("image_info", path, display, {"max_input_bytes": max_input_bytes})
 
 
 async def transform_image(
@@ -168,6 +164,53 @@ class Documents:
 
     def __init__(self, filesystem: Any) -> None:
         self._filesystem = filesystem
+        self._extractor = DocumentExtractor(filesystem)
+
+    async def ocr(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        language: str = "eng",
+        start_page: int = 1,
+        max_pages: int = 5,
+        dpi: int = 200,
+        cursor: str | None = None,
+        max_bytes: int = 32_768,
+        max_input_bytes: int = _MAX_INPUT_BYTES,
+    ) -> dict[str, Any]:
+        """OCR a PDF, PNG, or JPEG and return paged text with word coordinates."""
+        return await self._extractor.ocr(
+            path,
+            language=language,
+            start_page=start_page,
+            max_pages=max_pages,
+            dpi=dpi,
+            cursor=cursor,
+            max_bytes=max_bytes,
+            max_input_bytes=max_input_bytes,
+        )
+
+    async def extract(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        cursor: str | None = None,
+        max_bytes: int = 32_768,
+        max_input_bytes: int = _MAX_INPUT_BYTES,
+        cached_values: bool = False,
+    ) -> dict[str, Any]:
+        """Extract structured text from DOCX, PPTX, or XLSX."""
+        return await self._extractor.extract(
+            path,
+            cursor=cursor,
+            max_bytes=max_bytes,
+            max_input_bytes=max_input_bytes,
+            cached_values=cached_values,
+        )
+
+    async def backends(self) -> dict[str, Any]:
+        """Report OCR and Office extraction dependencies and Tesseract languages."""
+        return await self._extractor.backends()
 
     async def info(
         self,
@@ -349,9 +392,7 @@ async def _call(
 
         communication = asyncio.create_task(communicate_bounded())
         try:
-            stdout, exceeded = await asyncio.wait_for(
-                asyncio.shield(communication), _TIMEOUT
-            )
+            stdout, exceeded = await asyncio.wait_for(asyncio.shield(communication), _TIMEOUT)
         except TimeoutError:
             await _cleanup_worker_uncancellable(process, communication)
             raise MediaToolError("Media operation exceeded its 15-second time limit") from None
@@ -434,9 +475,7 @@ def _validate_clip(
     if not isinstance(clip, (tuple, list)) or len(clip) != 4:
         raise ValueError("clip must contain four coordinates in PDF points")
     if any(
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
+        not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
         for value in clip
     ):
         raise ValueError("clip coordinates must be finite numbers")

@@ -21,13 +21,15 @@ await ws.fs.write(path, text) creates a file; use create_parents=True if parent 
 
 await ws.fs.apply_patch(patch_text, dry_run=False) applies multi-file Add, Update, Delete, and Move operations using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked before changes are applied. expected_hashes maps paths to revisions; use None for a path that must not exist. There is no fuzzy matching.
 
+await ws.fs.rewrite_ast(...) previews structural replacements without changing files. Keep the returned plan_id and inspect the diff before await ws.fs.apply_rewrite(plan_id). Applying a plan checks every original file hash first; incomplete scans cannot be applied.
+
 await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Pass resize=(width, height) to fit an image into a box, or crop=(left, top, right, bottom) in source pixel coordinates after EXIF orientation is applied. Transformations require Pillow in the workspace Python environment, run in a bounded subprocess, and never overwrite the original. await ws.fs.image_info(path) reports oriented source dimensions and revision. Inline images share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
     ),
     "docs": (
         "Inspect, extract text from, and render PDF pages.",
         """PDF helpers require PyMuPDF in the workspace Python environment. Install it explicitly: job = await ws.packages.add("pymupdf"); await job. Image transformations also need "pillow". Installing packages only in the MCP client's environment does not install them in the workspace kernel.
 
-await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR.
+await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR. Use await ws.docs.ocr(path, ...) explicitly for scanned PDF pages or PNG/JPEG images. await ws.docs.extract(path, ...) reads DOCX paragraphs/tables, PPTX slides, or XLSX cells. await ws.docs.backends() checks optional packages and OCR language data. These operations run outside the kernel, preserve source files, and return bounded pages tied to the source revision.
 
 await ws.docs.render_page(path, page=1, dpi=120) returns an inline page image. clip=(left, top, right, bottom) selects a region in PDF points. Source path, page, revision, geometry, and rendering details accompany the result. Workers bound input size, output size, pixel count, and execution time. Read ws.help("docs.render_page") for the current method signature.""",
     ),
@@ -50,7 +52,7 @@ await ws.fs.search_ast(pattern, lang="python", paths=...) performs read-only str
 
 await ws.code.definition("clangd", "src/main.c", line=10, character=5), references(...), and hover(...) query saved source. Public line and character values are one-based Unicode code-point positions; mypr converts the server's negotiated position encoding. Source changes are synchronized before queries. Inspect result truncation and coordinate metadata; diagnostics report the synchronized document version.
 
-await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostics for the synchronized document; pending or stale results must not be treated as a clean bill of health. ws.code.status() lists configured servers. await ws.code.close("clangd") stops one. This API does not apply edits or rename symbols. Use ws.help("code.configure") and the query method names for current signatures and result details.""",
+await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostics for the synchronized document; pending or stale results must not be treated as a clean bill of health. ws.code.status() lists configured servers. await ws.code.close("clangd") stops one. await ws.code.document_symbols(server, path) returns the document outline. workspace_symbols(server, query) searches project symbols; calls(server, path, line=..., character=..., direction="incoming") returns one level of callers, or use direction="outgoing" for callees. Server capability checks distinguish unsupported features from empty results. Structure queries default to max_bytes=32768; inspect truncated before treating a result as complete. Call hierarchy uses one overall server timeout. This API does not apply edits or rename symbols. Use ws.help("code.configure") and the query method names for current signatures and result details.""",
     ),
     "git": (
         "Inspect repository status, diffs, and file history.",
@@ -59,7 +61,7 @@ await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostic
     await ws.git.diff()
     await ws.git.show("HEAD", path="README.md")
 
-Responses are bounded. When has_more is true, continue with cursor=next_cursor.""",
+await ws.git.log(...) returns structured commit history and await ws.git.blame(path, ...) returns line attribution. Both default to HEAD and pin the resolved commit for subsequent pages. Responses are bounded. When has_more is true, continue with cursor=next_cursor.""",
     ),
     "shell": (
         "Run commands and manage interactive or long-lived processes.",
@@ -92,6 +94,8 @@ Use ws.tasks.list() and ws.tasks.get(task_id) to find handles. Completed handles
         "Inspect workstation specifications, limits, and resource usage.",
         """await ws.system.info() reports visible workstation specifications and CPU/memory limits. await ws.system.usage(interval=0.5) samples CPU, RAM, swap, disk I/O, network, and GPU usage. await ws.system.disks() reports free space; pass a path to inspect a specific location. await ws.system.processes(sort="cpu", limit=20) lists busy processes; cmdline=True includes bounded arguments. await ws.system.gpus(processes=True) includes GPU process data.
 
+await ws.system.process(pid, children=True, open_files=True, sockets=True) inspects one process and its optional relationships. Process identity includes its creation time; disappearance or permission failures are reported explicitly.
+
 Missing metrics are None, not zero. Check sources, warnings, and truncated fields. Memory is measured in bytes; throughput is bytes per second. Process CPU uses one core as 100% and can exceed 100%. Limits reflect the kernel's visible namespace, affinity, and cgroup v2; they do not reserve resources. GPU tooling is optional and is never installed automatically.""",
     ),
     "messages": (
@@ -116,13 +120,15 @@ Locks release on context exit, task completion or cancellation, and reset; they 
 
 Use await ws.mcp.get_config("server") to read saved configuration before changing selected fields with await ws.mcp.configure("server", config). After editing server code, await ws.mcp.restart("server") restarts that server; await ws.mcp.reload() applies config.toml edits. await ws.mcp.remove("server") disconnects and removes it.
 
-await ws.mcp.list_resources("server") and await ws.mcp.read_resource("server", uri) expose resources. await ws.mcp.list_prompts("server") lists prompts; await ws.mcp.get_prompt("server", name, arguments={...}) returns a prompt's messages. Read the relevant server descriptions before supplying arguments. ws.help("mcp.call_tool") and other method names show live signatures.
+await ws.mcp.list_resources("server") and await ws.mcp.read_resource("server", uri) expose resources. await ws.mcp.list_resource_templates("server", cursor=None) discovers parameterized URIs and preserves the server's nextCursor; pass it back as cursor. await ws.mcp.list_prompts("server") lists prompts; await ws.mcp.get_prompt("server", name, arguments={...}) returns a prompt's messages. Read the relevant server descriptions before supplying arguments. ws.help("mcp.call_tool") and other method names show live signatures.
 
 These operations preserve Python state. A busy connection requires force=True to interrupt its calls. Initial connection and protocol initialization have a 30-second deadline, including lazy first use; startup failure reaches queued calls, and a later call can retry after cleanup. This is not a timeout on initialized tool calls.""",
     ),
     "http": (
         "Make bounded asynchronous HTTP requests and downloads.",
         """ws.http provides named persistent HTTPX2 (httpx2.AsyncClient) clients. Use await ws.http.get/post/... for bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and await ws.http.download(url, path) for atomic workspace downloads.
+
+await ws.http.extract_html(html, url=..., selector=...) extracts readable content from existing HTML. await ws.http.read_html(url, ...) fetches through a named HTTP client before extraction. Both return bounded text and link results with source metadata. Parsing requires optional workspace packages trafilatura and cssselect; it does not execute JavaScript. Pass browser page.content() to extract a rendered document.
 
 Default limits are 16 MiB for requests and 256 MiB for downloads. ws.http.client(name, ...) returns the native client; close it before changing its options.""",
     ),
@@ -132,11 +138,15 @@ Default limits are 16 MiB for requests and 256 MiB for downloads. ws.http.client
 
 The first managed use installs a missing browser engine automatically. Await ws.browser.save_state(...) and ws.browser.load_state(...) for explicit authentication-state persistence, and await ws.browser.screenshot(page, path) to save an artifact and return inline image output.
 
+await ws.browser.observe(page) starts a client-owned bounded event collector; use await observation.read(...) and await observation.request(...) on the returned handle; observation.close() is synchronous. Response bodies are opt-in and sensitive headers are masked by default. await ws.browser.snapshot(page, ...) captures a bounded accessibility snapshot. Follow its cursor to read the same capture; await ws.browser.find(snapshot_id, text, ...) searches a saved capture and await ws.browser.diff(before_id, after_id, ...) compares two captures. These helpers reuse native Playwright and do not replace locators.
+
 Managed resources close on reset. External browser processes and pre-existing tabs survive.""",
     ),
     "net": (
         "Run bounded DNS, TCP, TLS, and port-scan diagnostics.",
         """await ws.net.resolve(...), await ws.net.connect(...), and await ws.net.tls(...) provide bounded DNS, TCP, and verified TLS diagnostics. await ws.net.scan(targets, ports=...) starts a TCP scan; await ws.net.nmap(targets, args=[...]) starts Nmap.
+
+await ws.net.sockets(...) inspects local TCP, UDP, and Unix sockets with address, port, state, and PID filters. This is local listener/connection inspection, separate from remote scanning.
 
 Scan handles provide synchronous status(), output(), and result(). Await read(), expect(), cancel(), summary(), and paged results(); awaiting the handle waits for completion. Use await ws.tasks.attach(scan_id) after reconnecting. TCP and Nmap result files are bounded and survive reset; active scans require force=True to reset. Nmap output options are managed by mypr and cannot be passed in args.""",
     ),
@@ -203,7 +213,7 @@ _METHOD_NOTES = {
     "fs.search_docs": "Returns document search matches in extracted text, not editable file coordinates. Follow next_cursor and inspect complete/stop_reason.",
     "fs.search_ast": "Returns structural matches with source ranges and captures. Follow next_cursor; inspect details_truncated and complete.",
     "mcp.call_tool": "Returns the external server's MCP result; inspect isError and structuredContent/content. Arguments follow that tool's inputSchema from list_tools.",
-    "mcp.read_resource": "Returns the external server's resource contents. URIs come from list_resources or the server's resource templates.",
+    "mcp.read_resource": "Returns the external server's resource contents. URIs come from list_resources or list_resource_templates.",
     "mcp.get_prompt": "Returns the external server's prompt messages. Inspect list_prompts for supported arguments.",
     "status": "Returns compact runtime health, versions, generation, and counts. detail=True includes connection records, active/queued execution IDs, and manager instructions.",
     "performance": "Returns manager_dispatch, bridge, storage, and kernel timing summaries. See ws.help('performance') for sample limits and measurement semantics.",

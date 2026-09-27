@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .browser_observation import BrowserObservation, BrowserObservations
+from .browser_snapshots import BrowserSnapshots
+
 _SHARED = object()
 
 
@@ -91,6 +94,8 @@ class BrowserTools:
         self._context_lock = asyncio.Lock()
         self._connections: dict[tuple[object, str], _Connection] = {}
         self._contexts: dict[tuple[object, str], _Context] = {}
+        self._observations = BrowserObservations(self._owner)
+        self._snapshots = BrowserSnapshots()
         self._closed = False
         self._cleanup_task: asyncio.Task[None] | None = None
 
@@ -288,7 +293,7 @@ class BrowserTools:
                 endpoint=endpoint,
                 signature=signature,
             )
-            self._connections[key] = record
+            self._track_connection(record)
             return record
 
     @staticmethod
@@ -433,6 +438,7 @@ class BrowserTools:
     def _context_closed(self, key: tuple[object, str], context: Any) -> None:
         item = self._contexts.get(key)
         if item is not None and item.context is context:
+            self._observations.close_context(context)
             try:
                 self._finalize_context_artifacts(item)
             except Exception:
@@ -509,7 +515,21 @@ class BrowserTools:
         self._connections.pop(record.key, None)
         for key, item in list(self._contexts.items()):
             if item.connection_key == record.key:
+                self._observations.close_context(item.context)
                 self._contexts.pop(key, None)
+
+    def _track_connection(self, record: _Connection) -> None:
+        self._connections[record.key] = record
+        on = getattr(record.browser, "on", None)
+        if callable(on):
+            try:
+                on("disconnected", lambda *_args: self._connection_disconnected(record))
+            except Exception:
+                pass
+
+    def _connection_disconnected(self, record: _Connection) -> None:
+        if self._connections.get(record.key) is record:
+            self._forget_connection(record)
 
     async def connect(
         self,
@@ -571,7 +591,7 @@ class BrowserTools:
                 if isinstance(exc, ValueError):
                     raise
                 raise BrowserError(f"unable to connect to browser: {exc}") from exc
-            self._connections[key] = _Connection(
+            record = _Connection(
                 key=key,
                 name=name,
                 owner=_SHARED if shared else owner,
@@ -582,6 +602,7 @@ class BrowserTools:
                 endpoint=endpoint,
                 signature=signature,
             )
+            self._track_connection(record)
             if cancelled or self._closed:
                 with suppress(Exception):
                     await _shielded(native.close())
@@ -622,6 +643,84 @@ class BrowserTools:
                 }
             )
         return sorted(result, key=lambda value: (value["type"], value["name"], str(value["owner"])))
+
+    def _accessible_page(self, page: Any) -> tuple[str, Any]:
+        owner = self._owner()
+        if page is None:
+            raise TypeError("page must be a native Playwright Page")
+        if getattr(page, "is_closed", lambda: False)():
+            raise BrowserError("page is closed")
+        try:
+            context = page.context
+        except Exception as exc:
+            raise BrowserError("page is not a native Playwright Page") from exc
+        for item in self._contexts.values():
+            if item.context is context and (item.owner == owner or item.shared):
+                return owner, context
+        for record in self._connections.values():
+            if record.owner not in {owner, _SHARED}:
+                continue
+            try:
+                contexts = record.browser.contexts
+            except Exception:
+                continue
+            if any(candidate is context for candidate in contexts):
+                return owner, context
+        raise BrowserError("page context is not owned by this client or explicitly shared")
+
+    async def observe(self, page: Any) -> BrowserObservation:
+        """Observe events from a page in a context visible to this client."""
+
+        owner, context = self._accessible_page(page)
+        return await self._observations.observe(owner, page, context)
+
+    async def snapshot(
+        self,
+        page: Any,
+        *,
+        selector: str | None = None,
+        cursor: str | None = None,
+        depth: int | None = None,
+        mode: str | None = None,
+        boxes: bool | None = None,
+        limit: int = 32 * 1024,
+    ) -> dict[str, Any]:
+        owner = self._owner() if cursor is not None else self._accessible_page(page)[0]
+        return await self._snapshots.snapshot(
+            owner,
+            page,
+            selector=selector,
+            cursor=cursor,
+            depth=depth,
+            mode=mode,
+            boxes=boxes,
+            limit=limit,
+        )
+
+    async def find(
+        self,
+        snapshot_id: str,
+        text: str,
+        *,
+        regex: bool = False,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return await self._snapshots.find(
+            self._owner(), snapshot_id, text, regex=regex, cursor=cursor, limit=limit
+        )
+
+    async def diff(
+        self,
+        before_id: str,
+        after_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 32 * 1024,
+    ) -> dict[str, Any]:
+        return await self._snapshots.diff(
+            self._owner(), before_id, after_id, cursor=cursor, limit=limit
+        )
 
     async def close(
         self,
@@ -667,6 +766,7 @@ class BrowserTools:
                         errors.append(RuntimeError(f"context {item.name!r} close failed: {exc}"))
                     else:
                         cancelled |= operation_cancelled
+                        self._observations.close_context(item.context)
                         try:
                             self._finalize_context_artifacts(item)
                         except BaseException as exc:
@@ -834,6 +934,8 @@ class BrowserTools:
     async def _cleanup(self) -> None:
         errors: list[BaseException] = []
         cancelled = False
+        self._observations.close_all()
+        self._snapshots.clear()
         driver_task = self._driver_task
         if driver_task is not None and not driver_task.done():
             try:

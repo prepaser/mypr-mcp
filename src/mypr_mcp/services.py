@@ -1486,6 +1486,8 @@ async def _session_dispatch(
         result = await session.list_tools(params=params)
     elif method == "list_resources":
         result = await session.list_resources(params=params)
+    elif method == "list_resource_templates":
+        result = await session.list_resource_templates(params=params)
     elif method == "list_prompts":
         result = await session.list_prompts(params=params)
     elif method == "call_tool":

@@ -29,3 +29,18 @@ def test_method_help_uses_live_signature_and_exposes_undocumented_methods(tmp_pa
 def test_method_help_rejects_attributes_and_arbitrary_traversal(tmp_path, path):
     with pytest.raises(ValueError, match="unknown API method"):
         Workspace(tmp_path).help(path)
+
+
+def test_new_tool_signatures_are_discoverable_without_optional_dependencies(tmp_path):
+    ws = Workspace(tmp_path)
+    paths = (
+        "mcp.list_resource_templates", "net.sockets", "system.process",
+        "browser.observe", "browser.snapshot", "browser.find", "browser.diff",
+        "code.document_symbols", "code.workspace_symbols", "code.calls",
+        "fs.rewrite_ast", "fs.apply_rewrite", "http.extract_html", "http.read_html",
+        "git.log", "git.blame", "docs.ocr", "docs.extract", "docs.backends",
+    )
+    for path in paths:
+        owner, method = path.split(".")
+        member = getattr(getattr(ws, owner), method)
+        assert f"ws.{path}{inspect.signature(member)}" in ws.help(path)

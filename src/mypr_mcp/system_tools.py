@@ -12,6 +12,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .diagnostic_snapshots import DiagnosticSnapshots
+
 _MAX_OUTPUT = 32768
 _PROBE_OUTPUT = 1024 * 1024
 _GPUS = ("gpu:nvidia", "gpu:amd", "gpu:intel")
@@ -29,14 +31,17 @@ def _size(value):
     return len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode())
 
 
-def _bounded(result):
-    if _size(result) <= _MAX_OUTPUT:
+def _bounded(result, limit=_MAX_OUTPUT):
+    if _size(result) <= limit:
         return result
     result["truncated"] = True
     result["warnings"].append(
-        {"code": "output_limit", "message": "Some details were omitted to fit 32 KiB"}
+        {
+            "code": "output_limit",
+            "message": f"Some details were omitted to fit {limit // 1024} KiB",
+        }
     )
-    while _size(result) > _MAX_OUTPUT:
+    while _size(result) > limit:
         candidates = []
 
         def visit(value, path, candidates=candidates):
@@ -86,6 +91,7 @@ class SystemTools:
         self.workspace = Path(workspace).resolve()
         self.reference_pid = os.getpid()
         self._slots = asyncio.Semaphore(4)
+        self._socket_snapshots = DiagnosticSnapshots()
 
     @staticmethod
     def _validate(interval, timeout):
@@ -146,6 +152,89 @@ class SystemTools:
             cmdline=cmdline,
         )
 
+    async def process(
+        self,
+        pid,
+        *,
+        children=False,
+        open_files=False,
+        sockets=False,
+        timeout=5,  # noqa: ASYNC109
+    ):
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("pid must be a positive integer")
+        for name, value in (
+            ("children", children),
+            ("open_files", open_files),
+            ("sockets", sockets),
+        ):
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+        self._validate(None, timeout)
+        return await self._collect(
+            ["process_detail"],
+            timeout=timeout,
+            pid=pid,
+            children=children,
+            open_files=open_files,
+            sockets=sockets,
+        )
+
+    async def sockets(
+        self,
+        *,
+        protocol=None,
+        local_address=None,
+        local_port=None,
+        remote_address=None,
+        remote_port=None,
+        state=None,
+        pid=None,
+        cursor=None,
+        limit=20,
+        timeout=5,  # noqa: ASYNC109
+    ):
+        if protocol is not None and (
+            not isinstance(protocol, str) or protocol not in {"tcp", "udp", "unix"}
+        ):
+            raise ValueError("protocol must be tcp, udp, unix, or None")
+        for name, value in (("local_port", local_port), ("remote_port", remote_port)):
+            if value is not None and (type(value) is not int or not 0 <= value <= 65535):
+                raise ValueError(f"{name} must be an integer between 0 and 65535")
+        if pid is not None and (type(pid) is not int or pid <= 0):
+            raise ValueError("pid must be a positive integer")
+        for name, value in (("local_address", local_address), ("remote_address", remote_address)):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be a string")
+        if state is not None and not isinstance(state, str):
+            raise TypeError("state must be a string")
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+        self._validate(None, timeout)
+        if cursor is not None:
+            if not isinstance(cursor, str) or not cursor:
+                raise ValueError("cursor must be a non-empty string")
+            return self._socket_snapshots.page(cursor=cursor, limit=limit)
+        result = await self._collect(
+            ["sockets"],
+            timeout=timeout,
+            output_limit=_PROBE_OUTPUT,
+            protocol=protocol,
+            local_address=local_address,
+            local_port=local_port,
+            remote_address=remote_address,
+            remote_port=remote_port,
+            state=state,
+            pid=pid,
+        )
+        return self._socket_snapshots.page(
+            result.get("sockets", []),
+            limit=limit,
+            total=result.get("total", 0),
+            truncated=result.get("truncated", False),
+            warnings=result.get("warnings", []),
+        )
+
     async def gpus(self, interval=0.5, *, processes=False, timeout=5):  # noqa: ASYNC109
         self._validate(interval, timeout)
         if type(processes) is not bool:
@@ -162,7 +251,14 @@ class SystemTools:
             path = str(path.absolute())
         return await self._collect(["disks"], timeout=timeout, path=path)
 
-    async def _collect(self, sections, *, timeout, **options):  # noqa: ASYNC109
+    async def _collect(  # noqa: ASYNC109
+        self,
+        sections,
+        *,
+        timeout,  # noqa: ASYNC109
+        output_limit=_MAX_OUTPUT,
+        **options,  # noqa: ASYNC109
+    ):  # noqa: ASYNC109
         _, timeout = self._validate(None, timeout)
         started = time.monotonic()
         deadline = started + timeout
@@ -246,7 +342,7 @@ class SystemTools:
                 {"code": "warnings_truncated", "message": "Additional diagnostics omitted"}
             ]
         result["duration_seconds"] = round(time.monotonic() - started, 6)
-        return _bounded(result)
+        return _bounded(result, output_limit)
 
     @staticmethod
     async def _join(jobs):

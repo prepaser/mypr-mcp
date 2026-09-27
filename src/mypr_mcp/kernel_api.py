@@ -1418,6 +1418,10 @@ class MCP:
             kwargs["server"] = server
         return await self.request("list_resources", **kwargs)
 
+    async def list_resource_templates(self, server: str, *, cursor: str | None = None) -> Any:
+        """List parameterized resource URIs, preserving the server's nextCursor."""
+        return await self.request("list_resource_templates", server=server, cursor=cursor)
+
     async def list_prompts(self, server: str | None = None, **kwargs: Any) -> Any:
         if server:
             kwargs["server"] = server

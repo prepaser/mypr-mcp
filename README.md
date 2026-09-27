@@ -203,18 +203,18 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | --- | --- |
 | `ws.workspace`, `ws.root` | `Path` objects for the workspace and its `.mypr/` directory |
 | `ws.client`, `ws.local` | Current caller identity and its in-memory scratch dictionary |
-| `ws.fs` | Read, search, create, and patch files with bounded results |
-| `ws.code` | Query optional language servers for definitions, references, hover, and diagnostics |
-| `ws.docs` | Inspect PDFs, extract page text, and render page images |
+| `ws.fs` | Read, search, patch files, and preview/apply structural rewrites |
+| `ws.code` | Query language servers for navigation, symbols, calls, and diagnostics |
+| `ws.docs` | Read PDFs and Office documents, render pages, and explicitly run OCR |
 | `ws.shell`, `ws.tasks` | Start and inspect background work |
 | `ws.mcp` | Call and reconfigure external MCP servers |
 | `ws.messages` | Send and receive persistent client messages |
 | `ws.skills`, `ws.modules` | Validate, save, and reuse workspace capabilities |
-| `ws.git` | Read structured Git status, diffs, and committed files |
-| `ws.http` | Use named, persistent HTTPX2 clients and bounded requests |
-| `ws.browser` | Use native Playwright browser contexts and pages |
-| `ws.net` | Resolve hosts, inspect TCP/TLS endpoints, and run scans |
-| `ws.system` | Inspect workstation hardware, limits, and current resource usage |
+| `ws.git` | Read structured Git status, diffs, history, blame, and committed files |
+| `ws.http` | Use persistent HTTPX2 clients and extract readable HTML content |
+| `ws.browser` | Use native Playwright, bounded event observation, and saved snapshots |
+| `ws.net` | Inspect local sockets, resolve hosts, query TCP/TLS endpoints, and run scans |
+| `ws.system` | Inspect hardware, limits, resource usage, and process relationships |
 | `ws.locks` | Coordinate shared work with task-scoped logical locks |
 | `ws.packages` | Install kernel packages |
 | `ws.history` | Query saved execution and task records |
@@ -226,7 +226,7 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 
 For language-server setup and coordinate semantics, see [code navigation](docs/code.md).
 
-See [images and PDF pages](docs/media.md) for image resizing/cropping, PDF text extraction, page rendering, limits, and optional workspace packages. These operations preserve the source files.
+See [media and document extraction](docs/media.md) for images, PDF pages, OCR, Office formats, and optional workspace packages. These operations preserve the source files. Further guides cover [structural rewrites](docs/rewrites.md), [browser observation](docs/browser.md), [HTML extraction](docs/http.md), [Git history](docs/git.md), and [local diagnostics](docs/diagnostics.md). [External tool recipes](docs/tool-recipes.md) show how to use installed benchmarking, tracing, and code-analysis tools through existing shell jobs.
 
 Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths
 stay anchored to the workspace even if code changes the kernel's current directory:
@@ -391,6 +391,8 @@ and data operations.
 await ws.git.status()
 await ws.git.diff(staged=True, paths=["src"])
 await ws.git.show("HEAD", path="README.md")
+await ws.git.log(path="src")
+await ws.git.blame("README.md", start_line=1, end_line=20)
 ```
 
 `status(*, cursor=None, max_entries=200, max_bytes=32768)` returns branch and
@@ -682,6 +684,7 @@ await ws.mcp.list_servers()
 await ws.mcp.list_tools("reports")
 await ws.mcp.call_tool("reports", "fetch", {"id": "42"})
 await ws.mcp.list_resources("reports")
+await ws.mcp.list_resource_templates("reports")
 await ws.mcp.read_resource("reports", "reports://latest")
 await ws.mcp.list_prompts("reports")
 await ws.mcp.get_prompt("reports", "summary", {"id": "42"})

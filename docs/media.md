@@ -45,3 +45,28 @@ while result["next_cursor"]:
 ```
 
 `ws.docs.render_page(path, page, dpi=120, clip=None, max_bytes=2MiB)` returns an inline PNG. Its image metadata and readable text label carry the source path and revision, page number, page bounds, clip, actual DPI, and pixel dimensions. A page that would exceed the pixel or byte budget is rendered at a lower resolution; invalid page ranges, encrypted PDFs, unsupported image formats, and files over the input limit fail with a bounded error.
+
+## OCR and Office files
+
+`ws.docs.ocr(path, language="eng", start_page=1, max_pages=5, dpi=200, cursor=None, max_bytes=32768)` runs OCR for PDF, PNG, and JPEG files. Install Tesseract and the required language data on the workstation, and install the Python backends in the workspace kernel before use:
+
+```python
+job = await ws.packages.add("pillow", "pymupdf")
+await job
+await ws.docs.backends()
+result = await ws.docs.ocr("scans/report.pdf", language="eng", max_pages=5)
+```
+
+`backends()` reports Python package availability, the Tesseract executable and version, and installed language codes. PDF OCR also requires PyMuPDF; PNG and JPEG OCR require Pillow. The default page budget is five pages at 200 DPI, and pages above 16 million pixels are rendered at a lower effective DPI. Image EXIF orientation is normalized before OCR; `start_page` must be 1 for images. Each word item contains its text, Tesseract confidence, and `[left, top, width, height]` bounding box; `coordinate_space` identifies the coordinate system and `pages` reports each rendered size and effective DPI. Follow `next_cursor` to read the immutable result in bounded pages. If a PDF has additional pages, `next_page` identifies the next page to pass as `start_page`. `complete` and `truncation_reason` distinguish a full result from page, item, or output limits. `next_page` is set only when the selected page range finished; a worker item/output limit within a page cannot resume that page.
+
+`ws.docs.extract(path, cursor=None, max_bytes=32768, cached_values=False)` extracts `.docx`, `.pptx`, and `.xlsx` files. Install only the parser packages needed by the document type:
+
+```python
+job = await ws.packages.add("python-docx", "python-pptx", "openpyxl")
+await job
+result = await ws.docs.extract("reports/summary.docx")
+```
+
+Results contain ordered blocks with paragraph, slide, table-cell, or worksheet cell locations and source SHA-256 revision. Long text is split into ordered `part` chunks with character offsets; concatenate the chunks sharing a location to reconstruct the original cell or text block. Nested DOCX tables and PowerPoint groups are traversed up to eight levels; deeper content is reported as incomplete with a warning. XLSX extraction uses read-only mode and returns formulas by default. Set `cached_values=True` to read cached cell values; formulas are never evaluated, and cells without cached values may be omitted. Repeat `cached_values=True` when continuing a cached-value query. Continue with `next_cursor`; pages remain tied to their original immutable result even if the source file changes. Results are stored under `.mypr/document-results/`, with at most 16 snapshots and 32 MiB total; older results expire as new results are added.
+
+OCR and Office parsing run in guarded workers with a 60-second operation limit, two-worker concurrency, 64 MiB input limit, bounded result storage, and an Office ZIP expansion cap. Encrypted files, macro-enabled Office formats, legacy binary Office formats, and unsupported extensions are rejected. Optional dependencies are never installed automatically.

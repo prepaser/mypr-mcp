@@ -29,7 +29,8 @@ def main():
             from mypr_mcp.system_base import collect
 
             result = collect(section, request)
-        print(json.dumps({"ok": True, "data": _bounded(result)}, allow_nan=False))
+        output_limit = 768 * 1024 if section in {"sockets", "process_detail"} else 32768
+        print(json.dumps({"ok": True, "data": _bounded(result, output_limit)}, allow_nan=False))
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:512]}"}))
         return 1

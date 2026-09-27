@@ -40,3 +40,55 @@ class Git:
                 "max_bytes": max_bytes,
             },
         )
+
+    async def log(
+        self,
+        ref="HEAD",
+        *,
+        path=None,
+        author=None,
+        since=None,
+        until=None,
+        cursor=None,
+        max_entries=50,
+        max_bytes=32768,
+    ):
+        return await self._rpc(
+            "git",
+            method="log",
+            args={
+                "ref": ref,
+                "path": path,
+                "author": author,
+                "since": since,
+                "until": until,
+                "cursor": cursor,
+                "max_entries": max_entries,
+                "max_bytes": max_bytes,
+            },
+        )
+
+    async def blame(
+        self,
+        path=None,
+        ref="HEAD",
+        *,
+        start_line=None,
+        end_line=None,
+        cursor=None,
+        max_entries=100,
+        max_bytes=32768,
+    ):
+        return await self._rpc(
+            "git",
+            method="blame",
+            args={
+                "path": path,
+                "ref": ref,
+                "start_line": start_line,
+                "end_line": end_line,
+                "cursor": cursor,
+                "max_entries": max_entries,
+                "max_bytes": max_bytes,
+            },
+        )
