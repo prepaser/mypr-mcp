@@ -736,6 +736,8 @@ establishes a fresh initialized connection. It does not reread the config file.
 This lets an agent write or improve a local MCP server, reconnect it, and use
 its updated tools in the same Python session.
 
+Initial connection and protocol initialization have a 30-second deadline, including lazy first use. A timeout fails queued calls instead of leaving that server blocked indefinitely; a later request can retry once cleanup finishes. This startup deadline does not limit the duration of an initialized server's tool calls.
+
 Changes affecting active or queued calls are rejected by default. Use
 `force=True` on these management methods to close the affected connections and
 fail their pending calls. Other servers remain usable. Closing a connection does
@@ -903,13 +905,7 @@ ws.skills.list()
 ws.skills.read("review")
 ```
 
-`list()` returns metadata from YAML front matter plus each file's `path`,
-defaulting `name` to the directory name. Invalid YAML is reported on that
-item through an `error` field while the other skills remain available. Skills
-whose files resolve outside `.mypr/skills` through a symlink are skipped;
-links that stay inside the skills root are supported. `read(name)` returns the
-full Markdown.
-Both read from disk, so edits are visible on the next call without a reload.
+`list()` discovers nested names such as `group/review` and returns YAML metadata plus each file's `path`. The returned `name` is always its relative directory path and can be passed directly to `read()`. A different front-matter name is preserved as `declared_name`. Invalid YAML is reported on that item through an `error` field while other skills remain available. Files resolving outside `.mypr/skills` are skipped. Internal links to skill files or leaf skill directories work; directory symlinks are not recursively expanded. `read(name)` returns the full Markdown. Both read from disk, so edits are visible on the next call without a reload.
 
 Validate and edit a skill through the revision-aware helpers:
 
@@ -1214,10 +1210,10 @@ For development, run `uv sync` in the checkout, then launch its
 To publish a release, update the package version, remove previous distributions,
 and rebuild:
 
-Set the version in `pyproject.toml`. Runtime version reporting reads the installed
-distribution metadata; source-only development kernels read `pyproject.toml`.
+Set the version in `pyproject.toml` and refresh `uv.lock`. Runtime version reporting reads the installed distribution metadata; source-only development kernels read `pyproject.toml`.
 
 ```sh
+uv lock
 rm -f dist/mypr_mcp-*.whl dist/mypr_mcp-*.tar.gz
 uv build --no-sources
 uv publish

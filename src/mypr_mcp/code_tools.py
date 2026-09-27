@@ -818,14 +818,31 @@ class _LanguageServer:
                     snapshot = cached
                 elif wait_ms:
                     event = self._diag_events.setdefault(doc.uri, asyncio.Event())
-                    event.clear()
-                    if self._diag_generation.get(doc.uri, 0) > generation:
-                        event.set()
-                    try:
-                        async with asyncio.timeout(wait_ms / 1000):
-                            await event.wait()
-                    except TimeoutError:
-                        pass
+                    deadline = asyncio.get_running_loop().time() + wait_ms / 1000
+                    observed_generation = generation
+                    while True:
+                        snapshot = self.diagnostics_cache.get(doc.uri)
+                        if (
+                            snapshot is not None
+                            and type(snapshot.get("version")) is int
+                            and snapshot.get("version") == doc.version
+                        ):
+                            break
+                        current_generation = self._diag_generation.get(doc.uri, 0)
+                        if current_generation != observed_generation:
+                            observed_generation = current_generation
+                            continue
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        event.clear()
+                        if self._diag_generation.get(doc.uri, 0) != observed_generation:
+                            continue
+                        try:
+                            async with asyncio.timeout(remaining):
+                                await event.wait()
+                        except TimeoutError:
+                            break
                     snapshot = self.diagnostics_cache.get(doc.uri)
                 else:
                     snapshot = cached

@@ -1554,9 +1554,10 @@ class Skills(SkillsWriting):
         if not self.root.is_dir():
             return []
         found = []
-        for path in sorted(self.root.glob("*/SKILL.md")):
+        for path in sorted(self.root.rglob("*/SKILL.md")):
+            name = path.parent.relative_to(self.root).as_posix()
             try:
-                resolved = self._path(path.parent.name)
+                resolved = self._path(name)
             except OSError, ValueError:
                 continue
             try:
@@ -1564,7 +1565,9 @@ class Skills(SkillsWriting):
             except (OSError, UnicodeError) as exc:
                 detail = str(exc).strip() or exc.__class__.__name__
                 item = {"error": f"Unable to read skill: {detail}"}
-            item.setdefault("name", path.parent.name)
+            if "name" in item and item["name"] != name:
+                item["declared_name"] = item["name"]
+            item["name"] = name
             item["path"] = str(path)
             found.append(item)
         return found

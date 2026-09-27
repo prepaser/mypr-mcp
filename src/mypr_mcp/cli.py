@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -24,6 +25,8 @@ from .diagnostics import safe_error
 from .instructions import COMMON_INSTRUCTIONS
 from .instructions import INSTRUCTIONS as INSTRUCTIONS
 from .transport import find_runtime, manager_running, rpc, socket_path
+
+STARTUP_TIMEOUT = 180
 
 
 async def ensure(workspace, *, locked=False):
@@ -75,7 +78,7 @@ async def ensure(workspace, *, locked=False):
                 raise
         finally:
             log.close()
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise RuntimeError(f"Workspace manager failed; inspect {root / 'manager.log'}")
@@ -88,7 +91,7 @@ async def ensure(workspace, *, locked=False):
             await asyncio.sleep(0.1)
         raise TimeoutError(f"Workspace startup timed out; inspect {root / 'manager.log'}")
     except BaseException:
-        if proc is not None and proc.poll() is None:
+        if proc is not None:
             cleanup = asyncio.create_task(_stop_spawned(proc))
             while not cleanup.done():
                 try:
@@ -113,12 +116,12 @@ async def _finish_owned(task):
 
 async def _stop_spawned(proc):
     with contextlib.suppress(ProcessLookupError):
-        proc.terminate()
+        os.killpg(proc.pid, signal.SIGTERM)
     try:
         await asyncio.to_thread(proc.wait, timeout=10)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
         await asyncio.to_thread(proc.wait)
 
 

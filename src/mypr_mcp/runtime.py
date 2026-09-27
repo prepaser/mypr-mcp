@@ -16,6 +16,7 @@ import tomllib
 import uuid
 from collections import OrderedDict
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from jupyter_client import AsyncKernelManager
 from jupyter_client.kernelspec import KernelSpec
@@ -79,6 +80,7 @@ TIMING_OPS = {
     "stop",
 }
 BRIDGE_TIMINGS = {"bridge_ready", "manager_rpc", "bridge_total"}
+COMMAND_TIMEOUT = 180
 
 
 def _write_json(path, data):
@@ -168,7 +170,7 @@ class Runtime:
         self._admission_lock = asyncio.Lock()
         self._initialize_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
-        self._task_locks = {}
+        self._task_locks = WeakValueDictionary()
         self._persistence_failure_task = None
         self.message_waiters = {}
         self.task_records = {}
@@ -365,7 +367,7 @@ class Runtime:
                 rec["done"].set()
                 await self.notify_execution_change(rec)
         for ident in list(self.task_records):
-            lock = self._task_locks.setdefault(ident, asyncio.Lock())
+            lock = self.task_lock(ident)
             async with lock:
                 record = self.task_records.get(ident)
                 if record is None or record.get("kind") != "python":
@@ -395,10 +397,60 @@ class Runtime:
     def execution_lock(self, rec):
         return rec.setdefault("_persist_lock", asyncio.Lock())
 
+    def task_lock(self, ident):
+        return self._task_locks.setdefault(ident, asyncio.Lock())
+
     async def command(self, *args):
-        proc = await asyncio.create_subprocess_exec(*args, stdout=sys.stderr, stderr=sys.stderr)
-        if await proc.wait():
+        guard = Path(__file__).with_name("process_guard.py")
+        launch = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                str(guard),
+                "--parent-pid",
+                str(os.getpid()),
+                "--tree",
+                "--",
+                *args,
+                stdout=sys.stderr,
+                stderr=sys.stderr,
+                start_new_session=True,
+            )
+        )
+        proc = None
+        try:
+            async with asyncio.timeout(COMMAND_TIMEOUT):
+                proc = await asyncio.shield(launch)
+                returncode = await proc.wait()
+        except BaseException:
+            if proc is None:
+                proc = await self._finish_command_launch(launch)
+            if proc.returncode is None:
+                cleanup = asyncio.create_task(self._stop_command(proc))
+                await self._finish_command_launch(cleanup)
+            raise
+        if returncode:
             raise RuntimeError(f"Command failed: {args[0]}")
+
+    @staticmethod
+    async def _finish_command_launch(task):
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result()
+
+    @staticmethod
+    async def _stop_command(proc):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            async with asyncio.timeout(10):
+                await proc.wait()
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            await proc.wait()
 
     def check_persistence(self):
         if self.persistence is not None and not self.persistence.available:
@@ -1509,7 +1561,7 @@ class Runtime:
                 exec_id=req.get("exec_id"),
                 generation=self.generation,
             )
-            task = asyncio.create_task(self.record_task_event(event, client, connection_id, op))
+            task = asyncio.create_task(self.admit_task_event(event, client, connection_id, op))
             return await await_completion(task)
         if op == "restart":
             from .restart import request_restart
@@ -1561,7 +1613,6 @@ class Runtime:
                 raise RuntimeError("Workspace restart/reset already in progress")
             origin = ticket.get("origin") or {}
             current = self.execs.get(origin.get("exec_id"))
-            self._check_restart_busy(current, ticket.get("force", False))
             await self._reserve_restart(ident, current, ticket.get("force", False))
             return {"prepared": True, "restart_id": ident}
         if op == "reset":
@@ -1629,7 +1680,7 @@ class Runtime:
         raise ValueError(f"Unknown operation: {op}")
 
     async def record_task_event(self, event, client, connection_id, op):
-        lock = self._task_locks.setdefault(event["id"], asyncio.Lock())
+        lock = self.task_lock(event["id"])
         async with lock:
             old = self.task_records.get(event["id"])
             if old is None:
@@ -1684,6 +1735,15 @@ class Runtime:
                 self.retain_completed("python", record)
             return None
 
+    async def admit_task_event(self, event, client, connection_id, op):
+        async with self._admission_lock:
+            if (
+                event.get("state") not in TERMINAL
+                and (self.stopping.is_set() or self.resetting or self.restarting)
+            ):
+                raise RuntimeError("Workspace is not accepting new Python tasks")
+            await self.record_task_event(event, client, connection_id, op)
+
     async def send_message(self, client, to, text, *, data=None, reply_to=None):
         message = await self.io(
             self.messages.send,
@@ -1715,12 +1775,9 @@ class Runtime:
     def _check_restart_busy(self, current, force):
         if not force and (
             any(rec is not current and rec["state"] not in TERMINAL for rec in self.execs.values())
-            or (
-                current is None
-                and any(
-                    rec["kind"] == "python" and rec["state"] not in TERMINAL
-                    for rec in self.task_records.values()
-                )
+            or any(
+                rec["kind"] == "python" and rec["state"] not in TERMINAL
+                for rec in self.task_records.values()
             )
             or self.shells.active
         ):
@@ -2111,7 +2168,7 @@ class Runtime:
 
     async def _lose_python_tasks(self, error, state):
         for ident in list(self.task_records):
-            lock = self._task_locks.setdefault(ident, asyncio.Lock())
+            lock = self.task_lock(ident)
             async with lock:
                 record = self.task_records.get(ident)
                 if (

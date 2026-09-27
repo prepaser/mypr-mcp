@@ -997,6 +997,8 @@ class _Request:
 
 
 class _MCPConnection:
+    initialization_timeout = 30.0
+
     def __init__(self, config: dict[str, Any], workspace: Path):
         self.config = copy.deepcopy(config)
         self.workspace = workspace
@@ -1028,16 +1030,26 @@ class _MCPConnection:
         if not self._closed:
             self._admissions_blocked = False
 
+    def _start_owner(self) -> None:
+        if self.task is None or self.task.done():
+            self._ready.clear()
+            self._ready_error = None
+            self._initialized = False
+            self.task = asyncio.create_task(self._owner())
+
     def admit(self, method: str, args: dict[str, Any]) -> asyncio.Future[Any]:
         if self._closed:
             raise RuntimeError("MCP connection is closed")
         if self._admissions_blocked:
             raise RuntimeError("MCP connection is being reconfigured")
+        if self.task is not None and not self.task.done() and self._ready_error is not None:
+            raise RuntimeError(
+                f"MCP connection initialization failed: {self._ready_error}"
+            ) from self._ready_error
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending[future] = None
-        if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self._owner())
+        self._start_owner()
         self.queue.put_nowait(_Request(method, args, future))
         return future
 
@@ -1047,8 +1059,7 @@ class _MCPConnection:
     async def ensure_ready(self, timeout_seconds: float = 30.0) -> None:
         if self._closed:
             raise RuntimeError("MCP connection is closed")
-        if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self._owner())
+        self._start_owner()
         try:
             await asyncio.wait_for(self._ready.wait(), timeout_seconds)
         except TimeoutError as exc:
@@ -1082,14 +1093,20 @@ class _MCPConnection:
         self.task = None
 
     async def _owner(self) -> None:
-        self._ready.clear()
-        self._ready_error = None
-        self._initialized = False
+        startup_error = None
         try:
             async with contextlib.AsyncExitStack() as stack:
                 self._initializing = True
                 try:
-                    session = await self._open(stack)
+                    try:
+                        async with asyncio.timeout(self.initialization_timeout):
+                            session = await self._open(stack)
+                    except TimeoutError as exc:
+                        startup_error = TimeoutError("MCP connection initialization timed out")
+                        self._ready_error = startup_error
+                        self._ready.set()
+                        self._drain_queue(startup_error)
+                        raise startup_error from exc
                 finally:
                     self._initializing = False
                 self._initialized = True
@@ -1127,6 +1144,8 @@ class _MCPConnection:
             self._initialized = False
             if self._closed:
                 error = RuntimeError("MCP connection closed by reconfiguration")
+            elif startup_error is not None:
+                error = startup_error
             elif isinstance(exc, Exception):
                 error = exc
             else:

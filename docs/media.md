@@ -18,7 +18,7 @@ await ws.fs.image("screenshots/page.png", crop=(80, 40, 1480, 980), resize=(1000
 await ws.fs.image_info("screenshots/page.png")
 ```
 
-`image_info()` returns `path`, `revision` (SHA-256), `size_bytes`, `format`, `mode`, `width`, and `height`. Transformed inline images include the same source revision plus original and output dimensions and the applied crop/resize in their display metadata and readable text label.
+`image_info()` returns `path`, `revision` (SHA-256), `size_bytes`, `format`, `mode`, `width`, and `height`. JPEG EXIF orientation is applied before reporting dimensions or transforming an image. Crop coordinates and the `original_width`/`original_height` fields in transformed-image metadata use this displayed orientation, so they match what `image_info()` reports. Transformed inline images include the same source revision plus original and output dimensions and the applied crop/resize in their display metadata and readable text label.
 
 ## PDFs
 

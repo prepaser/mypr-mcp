@@ -60,6 +60,38 @@ async def test_image_info_and_transform_are_bounded_and_keep_source(tmp_path):
         await fs.image("missing.png", resize=(4, 4))
 
 
+async def test_jpeg_exif_orientation_defines_info_and_crop_coordinates(tmp_path):
+    pillow_image = pytest.importorskip("PIL.Image")
+    image_path = tmp_path / "oriented.jpg"
+    source = pillow_image.new("RGB", (120, 80))
+    for box, color in (
+        ((0, 0, 60, 40), "red"),
+        ((60, 0, 120, 40), "green"),
+        ((0, 40, 60, 80), "blue"),
+        ((60, 40, 120, 80), "yellow"),
+    ):
+        source.paste(color, box)
+    exif = pillow_image.Exif()
+    exif[274] = 6
+    source.save(image_path, quality=100, subsampling=0, exif=exif)
+
+    fs = Filesystem(tmp_path)
+    info = await fs.image_info(image_path.name)
+    transformed = await fs.image(image_path.name, crop=(0, 0, 40, 40))
+    rendered = pillow_image.open(io.BytesIO(transformed.data))
+
+    assert (info["width"], info["height"]) == (80, 120)
+    assert rendered.size == (40, 40)
+    red, green, blue = rendered.getpixel((20, 20))
+    assert blue > 180 and red < 80 and green < 80
+    bundle, metadata = transformed._repr_mimebundle_()
+    image_metadata = metadata["image/jpeg"]["mypr"]
+    assert image_metadata["original_width"] == info["width"]
+    assert image_metadata["original_height"] == info["height"]
+    assert image_metadata["crop"] == [0, 0, 40, 40]
+    assert "crop [0, 0, 40, 40]px" in bundle["text/plain"]
+
+
 async def test_pdf_read_cursor_reconstructs_pages_without_mixing_revisions(tmp_path):
     pymupdf = pytest.importorskip("pymupdf")
     pdf_path = tmp_path / "report.pdf"
@@ -137,9 +169,12 @@ async def test_media_worker_output_is_capped_and_process_reaped(tmp_path, monkey
         "while True: os.write(1, block)\n"
     )
     monkeypatch.setattr(media_tools, "_WORKER", worker)
+    monkeypatch.setattr(media_tools, "_MAX_WORKER_OUTPUT", 4096)
 
     with pytest.raises(media_tools.MediaToolError, match="response exceeded its size limit"):
-        await media_tools._call("test", tmp_path / "unused", "unused", {})
+        await asyncio.wait_for(
+            media_tools._call("test", tmp_path / "unused", "unused", {}), timeout=2
+        )
     _assert_process_reaped(int(pid_path.read_text()))
 
 
@@ -160,6 +195,17 @@ async def test_cancelled_media_worker_is_reaped(tmp_path, monkeypatch):
         media_tools._call("test", tmp_path / "unused", "unused", {})
     )
     pid = await _worker_pid(pid_path)
+    kill_called = asyncio.Event()
+    process_type = asyncio.subprocess.Process
+    original_kill = process_type.kill
+
+    def kill(process):
+        kill_called.set()
+        return original_kill(process)
+
+    monkeypatch.setattr(process_type, "kill", kill)
+    task.cancel()
+    await kill_called.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

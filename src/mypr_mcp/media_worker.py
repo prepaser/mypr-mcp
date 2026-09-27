@@ -132,78 +132,96 @@ def _image_info(request: dict) -> dict:
     data, revision = _read(
         request["path"], request["display"], request["max_input_bytes"]
     )
-    with _image_open(data) as image:
-        return {
-            "path": request["display"],
-            "revision": revision,
-            "size_bytes": len(data),
-            "format": image.format,
-            "mode": image.mode,
-            "width": image.width,
-            "height": image.height,
-        }
+    with _image_open(data) as source:
+        from PIL import ImageOps
+
+        image = ImageOps.exif_transpose(source)
+        try:
+            return {
+                "path": request["display"],
+                "revision": revision,
+                "size_bytes": len(data),
+                "format": source.format,
+                "mode": image.mode,
+                "width": image.width,
+                "height": image.height,
+            }
+        finally:
+            if image is not source:
+                image.close()
 
 
 def _image_transform(request: dict) -> dict:
-    from PIL import Image
-
     data, revision = _read(
         request["path"], request["display"], request["max_input_bytes"]
     )
     limit = request["max_output_bytes"]
     if not isinstance(limit, int) or not 1 <= limit <= _MAX_OUTPUT_BYTES:
         raise _Failure("ValueError", "max_bytes exceeds the inline image limit")
-    with _image_open(data) as original:
-        width, height = original.size
-        source_mode = original.mode
-        crop = request.get("crop")
-        if crop is not None:
-            if (
-                not isinstance(crop, list)
-                or len(crop) != 4
-                or any(not isinstance(value, int) or isinstance(value, bool) for value in crop)
-            ):
-                raise _Failure("ValueError", "crop must contain four pixel coordinates")
-            left, top, right, bottom = crop
-            if left < 0 or top < 0 or right <= left or bottom <= top:
-                raise _Failure("ValueError", "crop must be a non-empty pixel rectangle")
-            if right > width or bottom > height:
-                raise _Failure("ValueError", f"crop must fit within {width}x{height} pixels")
-        resize = request.get("resize")
-        if resize is not None and (
-            not isinstance(resize, list)
-            or len(resize) != 2
-            or any(not isinstance(value, int) or isinstance(value, bool) for value in resize)
-            or any(value < 1 or value > 8192 for value in resize)
-            or resize[0] * resize[1] > 16_000_000
-        ):
-            raise _Failure("ValueError", "resize exceeds the supported dimensions")
-        image = original.crop(crop) if crop is not None else original.copy()
+    with _image_open(data) as source:
+        from PIL import Image, ImageOps
+
+        original = ImageOps.exif_transpose(source)
         try:
-            if resize is not None:
-                image.thumbnail(tuple(resize), Image.Resampling.LANCZOS)
-            result = _encode_image(image, original.format, limit, resize is not None)
-            return {
-                "data": base64.b64encode(result).decode("ascii"),
-                "path": request["display"],
-                "revision": revision,
-                "size_bytes": len(data),
-                "format": original.format,
-                "mode": (
-                    "RGB"
-                    if original.format == "JPEG" and image.mode not in {"RGB", "L"}
-                    else image.mode
-                ),
-                "source_mode": source_mode,
-                "original_width": width,
-                "original_height": height,
-                "width": image.width,
-                "height": image.height,
-                "crop": crop,
-                "resize": resize,
-            }
+            image_format = source.format
+            width, height = original.size
+            source_mode = original.mode
+            crop = request.get("crop")
+            if crop is not None:
+                if (
+                    not isinstance(crop, list)
+                    or len(crop) != 4
+                    or any(not isinstance(value, int) or isinstance(value, bool) for value in crop)
+                ):
+                    raise _Failure("ValueError", "crop must contain four pixel coordinates")
+                left, top, right, bottom = crop
+                if left < 0 or top < 0 or right <= left or bottom <= top:
+                    raise _Failure("ValueError", "crop must be a non-empty pixel rectangle")
+                if right > width or bottom > height:
+                    raise _Failure(
+                        "ValueError", f"crop must fit within {width}x{height} pixels"
+                    )
+            resize = request.get("resize")
+            if resize is not None and (
+                not isinstance(resize, list)
+                or len(resize) != 2
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in resize
+                )
+                or any(value < 1 or value > 8192 for value in resize)
+                or resize[0] * resize[1] > 16_000_000
+            ):
+                raise _Failure("ValueError", "resize exceeds the supported dimensions")
+            image = original.crop(crop) if crop is not None else original.copy()
+            try:
+                if resize is not None:
+                    image.thumbnail(tuple(resize), Image.Resampling.LANCZOS)
+                result = _encode_image(image, image_format, limit, resize is not None)
+                return {
+                    "data": base64.b64encode(result).decode("ascii"),
+                    "path": request["display"],
+                    "revision": revision,
+                    "size_bytes": len(data),
+                    "format": image_format,
+                    "mode": (
+                        "RGB"
+                        if image_format == "JPEG" and image.mode not in {"RGB", "L"}
+                        else image.mode
+                    ),
+                    "source_mode": source_mode,
+                    "original_width": width,
+                    "original_height": height,
+                    "width": image.width,
+                    "height": image.height,
+                    "crop": crop,
+                    "resize": resize,
+                }
+            finally:
+                image.close()
         finally:
-            image.close()
+            if original is not source:
+                original.close()
 
 
 def _encode_image(image, image_format: str, limit: int, can_shrink: bool) -> bytes:

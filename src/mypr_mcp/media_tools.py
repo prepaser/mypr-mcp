@@ -17,10 +17,64 @@ _MAX_INPUT_BYTES = 64 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _MAX_WORKER_OUTPUT = 8 * 1024 * 1024
 _TIMEOUT = 15
+_CLEANUP_TIMEOUT = 2
 
 
 class MediaToolError(RuntimeError):
     """A bounded media operation failed in its worker process."""
+
+
+def _kill_worker(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
+async def _cleanup_worker(
+    process: asyncio.subprocess.Process, communication: asyncio.Task
+) -> None:
+    if process.stdin is not None and not process.stdin.is_closing():
+        process.stdin.close()
+    _kill_worker(process)
+    try:
+        await asyncio.wait_for(asyncio.shield(process.wait()), _CLEANUP_TIMEOUT)
+    except TimeoutError:
+        pass
+    if communication.done():
+        await asyncio.gather(communication, return_exceptions=True)
+    else:
+        transport = getattr(process, "_transport", None)
+        stdout_transport = (
+            transport.get_pipe_transport(1) if transport is not None else None
+        )
+        if stdout_transport is not None:
+            stdout_transport.close()
+        communication.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(communication, return_exceptions=True), _CLEANUP_TIMEOUT
+            )
+        except TimeoutError:
+            pass
+    if process.returncode is None:
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), _CLEANUP_TIMEOUT)
+        except TimeoutError:
+            pass
+
+
+async def _cleanup_worker_uncancellable(
+    process: asyncio.subprocess.Process, communication: asyncio.Task
+) -> None:
+    cleanup = asyncio.create_task(_cleanup_worker(process, communication))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    await cleanup
 
 
 async def inspect_image(path: Path, display: str, *, max_input_bytes: int) -> dict[str, Any]:
@@ -260,30 +314,33 @@ async def _call(
             env=env,
         )
 
-        async def communicate_bounded() -> bytes:
-            async def read_stdout() -> bytes:
+        async def communicate_bounded() -> tuple[bytes, bool]:
+            async def read_stdout() -> tuple[bytes, bool]:
                 chunks = []
                 size = 0
-                while size <= _MAX_WORKER_OUTPUT:
-                    chunk = await process.stdout.read(
-                        min(64 * 1024, _MAX_WORKER_OUTPUT - size + 1)
-                    )
-                    if not chunk:
-                        break
+                exceeded = False
+                while chunk := await process.stdout.read(64 * 1024):
+                    if exceeded:
+                        continue
+                    remaining = _MAX_WORKER_OUTPUT - size
+                    if len(chunk) > remaining:
+                        if remaining > 0:
+                            chunks.append(chunk[:remaining])
+                        exceeded = True
+                        _kill_worker(process)
+                        continue
                     chunks.append(chunk)
                     size += len(chunk)
-                if size > _MAX_WORKER_OUTPUT and process.returncode is None:
-                    process.kill()
-                return b"".join(chunks)
+                return b"".join(chunks), exceeded
 
             reader = asyncio.create_task(read_stdout())
             try:
                 process.stdin.write(request)
                 await process.stdin.drain()
                 process.stdin.close()
-                stdout = await reader
+                stdout, exceeded = await reader
                 await process.wait()
-                return stdout
+                return stdout, exceeded
             except BaseException:
                 if not reader.done():
                     reader.cancel()
@@ -292,20 +349,16 @@ async def _call(
 
         communication = asyncio.create_task(communicate_bounded())
         try:
-            stdout = await asyncio.wait_for(asyncio.shield(communication), _TIMEOUT)
+            stdout, exceeded = await asyncio.wait_for(
+                asyncio.shield(communication), _TIMEOUT
+            )
         except TimeoutError:
-            if process.returncode is None:
-                process.kill()
-            await asyncio.gather(communication, return_exceptions=True)
-            await process.wait()
+            await _cleanup_worker_uncancellable(process, communication)
             raise MediaToolError("Media operation exceeded its 15-second time limit") from None
         except BaseException:
-            if process.returncode is None:
-                process.kill()
-            await asyncio.gather(communication, return_exceptions=True)
-            await process.wait()
+            await _cleanup_worker_uncancellable(process, communication)
             raise
-    if len(stdout) > _MAX_WORKER_OUTPUT:
+    if exceeded:
         raise MediaToolError("Media worker response exceeded its size limit")
     if process.returncode != 0:
         raise MediaToolError(

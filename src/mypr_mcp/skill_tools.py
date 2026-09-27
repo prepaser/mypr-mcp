@@ -105,15 +105,12 @@ class SkillsWriting:
                     "diff_truncated": diff_truncated,
                     "warnings": validation["warnings"],
                 }
-            await revisions.ensure_capacity(relative, (old, text))
-            await revisions.prepare(relative, (old, text))
-            result = await self._fs.write(
+            result = await revisions.commit(
                 relative,
+                old,
                 text,
                 expected_hash=expected_hash,
-                create_parents=True,
             )
-            await revisions.record(relative, (old, text))
             return {
                 "name": name,
                 "path": relative,
@@ -200,15 +197,12 @@ class SkillsWriting:
                     "activated": False,
                     "warnings": validation["warnings"],
                 }
-            await revisions.ensure_capacity(relative, (old, text))
-            await revisions.prepare(relative, (old, text))
-            result = await self._fs.write(
+            result = await revisions.commit(
                 relative,
+                old,
                 text,
                 expected_hash=expected_hash,
-                create_parents=True,
             )
-            await revisions.record(relative, (old, text))
             return {
                 "name": name,
                 "path": relative,

@@ -173,16 +173,12 @@ class ModuleManager:
                     "diff": diff,
                     "diff_truncated": diff_truncated,
                 }
-            await self.revisions.ensure_capacity(relative, (old, source))
-            await self.revisions.prepare(relative, (old, source))
-            result = await self.fs.write(
+            result = await self.revisions.commit(
                 relative,
+                old,
                 source,
                 expected_hash=expected_hash,
-                overwrite=False,
-                create_parents=True,
             )
-            await self.revisions.record(relative, (old, source))
             return {
                 "name": name,
                 "path": relative,
@@ -262,15 +258,12 @@ class ModuleManager:
                     "old_revision": old_revision,
                     "activated": False,
                 }
-            await self.revisions.ensure_capacity(relative, (old, source))
-            await self.revisions.prepare(relative, (old, source))
-            result = await self.fs.write(
+            result = await self.revisions.commit(
                 relative,
+                old,
                 source,
                 expected_hash=expected_hash,
-                create_parents=True,
             )
-            await self.revisions.record(relative, (old, source))
             return {
                 "name": name,
                 "path": relative,

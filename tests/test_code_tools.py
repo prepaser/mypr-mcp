@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,10 @@ from mypr_mcp.code_tools import CodeError, CodeTools
 FAKE_SERVER = r"""
 import json
 import sys
+import threading
 
 log_path = sys.argv[1]
+send_lock = threading.Lock()
 
 def read_message():
     headers = {}
@@ -30,8 +33,17 @@ def read_message():
 
 def send(message):
     body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode()
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
-    sys.stdout.buffer.flush()
+    with send_lock:
+        sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        sys.stdout.buffer.flush()
+
+def publish(uri, version, message):
+    send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+          "params": {"uri": uri, "version": version, "diagnostics": [{
+              "range": {"start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}},
+              "severity": 1, "source": "fake", "message": message,
+          }]}})
 
 def log(message):
     with open(log_path, "a", encoding="utf-8") as stream:
@@ -57,6 +69,24 @@ while True:
         else:
             text = document["text"]
         log({"method": method, "version": document["version"], "text": text})
+        if "stale_then_fresh" in text:
+            publish(document["uri"], document["version"] - 1, "old source")
+            threading.Timer(
+                0.25,
+                publish,
+                args=(document["uri"], document["version"], "fresh source"),
+            ).start()
+            continue
+        if "stale_many" in text:
+            for delay in (0, 0.08, 0.16, 0.24, 0.32):
+                timer = threading.Timer(
+                    delay,
+                    publish,
+                    args=(document["uri"], document["version"] - 1, "old source"),
+                )
+                timer.daemon = True
+                timer.start()
+            continue
         diagnostics = []
         if "bad" in text:
             diagnostics = [{"range": {"start": {"line": 0, "character": 0},
@@ -189,6 +219,40 @@ async def test_unversioned_push_diagnostics_remain_uncertain(tmp_path):
         assert result["ready"] is False
         assert result["diagnostics"] is None
         assert result["state"] == "version_unknown"
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_push_diagnostics_wait_for_current_version_after_stale_snapshot(tmp_path):
+    code, workspace, _ = await _configured(tmp_path)
+    path = workspace / "sample.py"
+    path.write_text("stale_then_fresh\n", encoding="utf-8")
+    try:
+        started = time.monotonic()
+        result = await code.diagnostics("fake", path, wait_ms=1000)
+        elapsed = time.monotonic() - started
+        assert elapsed >= 0.2
+        assert result["ready"] is True
+        assert result["version"] == 1
+        assert result["diagnostics"][0]["message"] == "fresh source"
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stale_diagnostics_do_not_extend_original_wait_deadline(tmp_path):
+    code, workspace, _ = await _configured(tmp_path)
+    path = workspace / "sample.py"
+    path.write_text("stale_many\n", encoding="utf-8")
+    try:
+        started = time.monotonic()
+        result = await code.diagnostics("fake", path, wait_ms=500)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.75
+        assert result["ready"] is False
+        assert result["diagnostics"] is None
+        assert result["state"] == "stale"
     finally:
         await code.aclose()
 

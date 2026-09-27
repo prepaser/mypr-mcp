@@ -160,3 +160,13 @@ async def test_filesystem_tree_depth_zero_and_stat_metadata(tmp_path):
     assert metadata["size"] == 5
     assert isinstance(metadata["mtime_ns"], int)
     assert isinstance(metadata["mode"], int)
+
+
+@pytest.mark.parametrize("has_child", [False, True])
+async def test_tree_exact_capacity_only_reports_actual_omissions(tmp_path, has_child):
+    directory = tmp_path / "only"
+    directory.mkdir()
+    if has_child:
+        (directory / "child.txt").write_text("data")
+    result = await Filesystem(tmp_path).tree(depth=2, max_entries=1)
+    assert result["truncated"] is has_child

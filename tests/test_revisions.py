@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -151,3 +152,189 @@ async def test_revision_index_limit_fails_before_file_write(tmp_path: Path, monk
     with pytest.raises(ValueError, match="metadata size limit"):
         await modules.write("demo", "VALUE = 1\n")
     assert not (tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_index_failure_rolls_back_existing_module_and_keeps_recovery_blob(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    first = await modules.write("demo", "VALUE = 0\n")
+    path = tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py"
+    original_write = fs.write
+
+    async def fail_index(path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(path):
+            raise OSError("injected index failure")
+        return await original_write(path, text, **kwargs)
+
+    fs.write = fail_index
+    attempted = "VALUE = 1\n"
+    with pytest.raises(RuntimeError, match="file change was rolled back"):
+        await modules.write("demo", attempted, expected_hash=first["revision"])
+
+    assert path.read_text(encoding="utf-8") == "VALUE = 0\n"
+    history = await modules.history("demo")
+    assert [item["revision"] for item in history["items"]] == [first["revision"]]
+    recovered = await modules.read_revision("demo", sha256(attempted))
+    assert recovered["text"] == attempted
+    assert recovered["recorded"] is False
+
+
+@pytest.mark.asyncio
+async def test_index_failure_removes_new_module(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    path = tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py"
+    original_write = fs.write
+
+    async def fail_index(path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(path):
+            raise OSError("injected index failure")
+        return await original_write(path, text, **kwargs)
+
+    fs.write = fail_index
+    attempted = "VALUE = 1\n"
+    with pytest.raises(RuntimeError, match="file change was rolled back"):
+        await modules.write("demo", attempted)
+
+    assert not path.exists()
+    assert (await modules.history("demo"))["items"] == []
+    recovered = await modules.read_revision("demo", sha256(attempted))
+    assert recovered["text"] == attempted
+    assert recovered["recorded"] is False
+
+
+@pytest.mark.asyncio
+async def test_index_failure_after_commit_is_reported_as_success(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    first = await modules.write("demo", "VALUE = 0\n")
+    original_write = fs.write
+
+    async def commit_then_fail(path, text, **kwargs):
+        result = await original_write(path, text, **kwargs)
+        if ".mypr/revisions/index/" in str(path):
+            raise OSError("injected post-commit failure")
+        return result
+
+    fs.write = commit_then_fail
+    result = await modules.write("demo", "VALUE = 1\n", expected_hash=first["revision"])
+
+    assert result["revision"] == sha256("VALUE = 1\n")
+    assert (await modules.history("demo", limit=2))["items"][0]["revision"] == result["revision"]
+
+
+@pytest.mark.asyncio
+async def test_old_identical_history_tail_does_not_hide_rejected_write(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    first = await modules.write("demo", "VALUE = 0\n")
+    second = await modules.write("demo", "VALUE = 1\n", expected_hash=first["revision"])
+    path = tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py"
+    path.write_text("VALUE = 0\n", encoding="utf-8")
+    original_write = fs.write
+
+    async def fail_index(path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(path):
+            raise OSError("injected pre-commit failure")
+        return await original_write(path, text, **kwargs)
+
+    fs.write = fail_index
+    with pytest.raises(RuntimeError, match="file change was rolled back"):
+        await modules.write("demo", "VALUE = 1\n", expected_hash=first["revision"])
+
+    assert path.read_text(encoding="utf-8") == "VALUE = 0\n"
+    history = await modules.history("demo", limit=2)
+    assert [item["revision"] for item in history["items"]] == [
+        second["revision"],
+        first["revision"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_index_failure_preserves_concurrent_module_edit(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    first = await modules.write("demo", "VALUE = 0\n")
+    path = tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py"
+    original_write = fs.write
+    concurrent = "VALUE = 9\n"
+
+    async def concurrent_edit_then_fail(index_path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(index_path):
+            path.write_text(concurrent, encoding="utf-8")
+            raise OSError("injected index failure")
+        return await original_write(index_path, text, **kwargs)
+
+    fs.write = concurrent_edit_then_fail
+    with pytest.raises(RuntimeError, match="Recovery did not overwrite the target") as error:
+        await modules.write("demo", "VALUE = 1\n", expected_hash=first["revision"])
+
+    assert path.read_text(encoding="utf-8") == concurrent
+    assert first["revision"] in str(error.value)
+    assert (await modules.read_revision("demo", first["revision"]))["text"] == "VALUE = 0\n"
+
+
+@pytest.mark.asyncio
+async def test_skill_index_failure_rolls_back_existing_file(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    skills = Skills(tmp_path, fs)
+    first = await skills.write("demo", "# Old skill\n")
+    path = tmp_path / ".mypr" / "skills" / "demo" / "SKILL.md"
+    original_write = fs.write
+
+    async def fail_index(path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(path):
+            raise OSError("injected index failure")
+        return await original_write(path, text, **kwargs)
+
+    fs.write = fail_index
+    with pytest.raises(RuntimeError, match="file change was rolled back"):
+        await skills.write("demo", "# New skill\n", expected_hash=first["revision"])
+
+    assert path.read_text(encoding="utf-8") == "# Old skill\n"
+
+
+@pytest.mark.asyncio
+async def test_new_file_rollback_preserves_concurrent_edit(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    path = tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py"
+    original_write = fs.write
+    concurrent = "VALUE = 9\n"
+
+    async def concurrent_edit_then_fail(index_path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(index_path):
+            path.write_text(concurrent, encoding="utf-8")
+            raise OSError("injected index failure")
+        return await original_write(index_path, text, **kwargs)
+
+    fs.write = concurrent_edit_then_fail
+    with pytest.raises(RuntimeError, match="Recovery did not overwrite the target"):
+        await modules.write("demo", "VALUE = 1\n")
+
+    assert path.read_text(encoding="utf-8") == concurrent
+
+
+def test_create_rollback_restores_concurrent_broken_symlink(tmp_path: Path, monkeypatch):
+    import mypr_mcp.revisions as revisions
+
+    path = tmp_path / "created.py"
+    path.write_text("VALUE = 1\n", encoding="utf-8")
+    original_replace = os.replace
+    swapped = False
+
+    def replace_with_broken_symlink(source, destination):
+        nonlocal swapped
+        if Path(source) == path and not swapped:
+            swapped = True
+            path.unlink()
+            path.symlink_to("missing-target")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(revisions.os, "replace", replace_with_broken_symlink)
+    with pytest.raises(RuntimeError, match="no longer a regular file"):
+        revisions._unlink_if_revision(path, sha256("VALUE = 1\n"))
+
+    assert path.is_symlink()
+    assert os.readlink(path) == "missing-target"

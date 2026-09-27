@@ -21,7 +21,7 @@ await ws.fs.write(path, text) creates a file; use create_parents=True if parent 
 
 await ws.fs.apply_patch(patch_text, dry_run=False) applies multi-file Add, Update, Delete, and Move operations using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked before changes are applied. expected_hashes maps paths to revisions; use None for a path that must not exist. There is no fuzzy matching.
 
-await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Pass resize=(width, height) to fit an image into a box, or crop=(left, top, right, bottom) in source pixel coordinates. Transformations require Pillow in the workspace Python environment, run in a bounded subprocess, and never overwrite the original. await ws.fs.image_info(path) reports source dimensions and revision. Inline images share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
+await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Pass resize=(width, height) to fit an image into a box, or crop=(left, top, right, bottom) in source pixel coordinates after EXIF orientation is applied. Transformations require Pillow in the workspace Python environment, run in a bounded subprocess, and never overwrite the original. await ws.fs.image_info(path) reports oriented source dimensions and revision. Inline images share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
     ),
     "docs": (
         "Inspect, extract text from, and render PDF pages.",
@@ -118,7 +118,7 @@ Use await ws.mcp.get_config("server") to read saved configuration before changin
 
 await ws.mcp.list_resources("server") and await ws.mcp.read_resource("server", uri) expose resources. await ws.mcp.list_prompts("server") lists prompts; await ws.mcp.get_prompt("server", name, arguments={...}) returns a prompt's messages. Read the relevant server descriptions before supplying arguments. ws.help("mcp.call_tool") and other method names show live signatures.
 
-These operations preserve Python state. A busy connection requires force=True to interrupt its calls.""",
+These operations preserve Python state. A busy connection requires force=True to interrupt its calls. Initial connection and protocol initialization have a 30-second deadline, including lazy first use; startup failure reaches queued calls, and a later call can retry after cleanup. This is not a timeout on initialized tool calls.""",
     ),
     "http": (
         "Make bounded asynchronous HTTP requests and downloads.",
@@ -142,9 +142,9 @@ Scan handles provide synchronous status(), output(), and result(). Await read(),
     ),
     "skills": (
         "Discover, read, validate, and edit workspace skills.",
-        """ws.skills.list() discovers available skills; ws.skills.read("name") reads their instructions. Read a skill before using it. await ws.skills.validate(name, text) checks content. await ws.skills.write(name, text, expected_hash=revision) saves it with revision checks.
+        """ws.skills.list() discovers available skills, including nested names such as "group/review"; ws.skills.read("name") reads their instructions. Listed name values are readable relative paths; a different YAML name is preserved as declared_name. Read a skill before using it. await ws.skills.validate(name, text) checks content. await ws.skills.write(name, text, expected_hash=revision) saves it with revision checks.
 
-await ws.skills.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.skills.read_revision(name, revision, start_byte=0, max_bytes=32768) reads a revision. await ws.skills.restore(name, revision, expected_hash=current_revision) validates and restores the file. History is stored under .mypr/revisions and survives reset. Edits made outside these helpers are not continuously tracked.""",
+await ws.skills.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.skills.read_revision(name, revision, start_byte=0, max_bytes=32768) reads a revision; recorded=False identifies a verified recovery blob without an index entry. await ws.skills.restore(name, revision, expected_hash=current_revision) validates and restores the file. History is stored under .mypr/revisions and survives reset. Edits made outside these helpers are not continuously tracked.""",
     ),
     "modules": (
         "Manage reusable Python modules in the workspace library.",
@@ -152,7 +152,7 @@ await ws.skills.history(name, limit=20, cursor=None) lists saved revisions newes
 
 await ws.modules.check(name, test_code="...") validates code in a separate Python process. Saving does not activate code; use ws.modules.load(name) or ws.modules.reload(name). Reload replaces the module object, while references already held elsewhere remain unchanged.
 
-await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.modules.read_revision(name, revision, start_byte=0, max_bytes=32768) reads saved source. await ws.modules.restore(name, revision, expected_hash=current_revision) restores source after validation and revision checks. Restore does not activate the file or change existing Python references. Direct edits are captured only when a later helper write observes them.""",
+await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.modules.read_revision(name, revision, start_byte=0, max_bytes=32768) reads saved source; recorded=False identifies a verified recovery blob without an index entry. await ws.modules.restore(name, revision, expected_hash=current_revision) restores source after validation and revision checks. Restore does not activate the file or change existing Python references. Direct edits are captured only when a later helper write observes them.""",
     ),
     "packages": (
         "Install packages into the workspace Python environment.",

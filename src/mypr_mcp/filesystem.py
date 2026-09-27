@@ -385,9 +385,6 @@ def _tree(
         node = _metadata(current, current_display)
         if node["kind"] != "directory" or remaining_depth <= 0:
             return node
-        if count >= max_entries:
-            truncated = True
-            return node
         children, overflow = _children(current, max_entries - count + 1, hidden)
         truncated |= overflow
         result_children: list[dict[str, Any]] = []

@@ -58,3 +58,16 @@ def test_list_applies_read_path_policy_to_symlinks(tmp_path: Path):
     assert skills.read("internal-link") == "# Inside\n"
     with pytest.raises(ValueError, match="escapes workspace"):
         skills.read("external-link")
+
+
+async def test_nested_skills_have_readable_names_and_preserve_declared_names(tmp_path: Path):
+    skills = Skills(tmp_path)
+    await skills.write(
+        "group/demo", "---\nname: Demo\ndescription: Review changes.\n---\nRead the diff."
+    )
+    await skills.write("other/demo", "# Another demo\n")
+    items = {item["name"]: item for item in skills.list()}
+    assert set(items) == {"group/demo", "other/demo"}
+    assert items["group/demo"]["declared_name"] == "Demo"
+    assert "Read the diff." in skills.read(items["group/demo"]["name"])
+    assert "Another demo" in skills.read(items["other/demo"]["name"])
