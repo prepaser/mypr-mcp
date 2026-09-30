@@ -29,7 +29,7 @@ For clients using `mcpServers` JSON configuration:
 }
 ```
 
-Make sure `uvx` is on the client's `PATH`, or use its absolute executable path. To pin a version, use `mypr-mcp@<version>` as the first argument.
+Make sure `uvx` is on the client's `PATH`, or use its absolute executable path.
 
 ### Codex
 
