@@ -1,29 +1,20 @@
 # mypr-mcp
 
-`mypr-mcp` provides a persistent, workspace-scoped Python layer between an
-LLM agent and the workstation. Each workspace has one Python kernel. Every
-MCP connection opened for that workspace shares the same variables, imports,
-functions, and background-task handles.
+`mypr-mcp` provides a persistent, workspace-scoped Python layer between an LLM agent and the workstation. Each workspace has one Python kernel. Every MCP connection opened for that workspace shares the same variables, imports, functions, and background-task handles.
 
-The runtime is intended for Linux, Python 3.14, and [uv](https://docs.astral.sh/uv/).
-Commands run with the current OS user's permissions; mypr-mcp does not provide
-a sandbox.
+The runtime is intended for Linux, Python 3.14, and [uv](https://docs.astral.sh/uv/). Commands run with the current OS user's permissions; mypr-mcp does not provide a sandbox.
 
 Licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
 
 ## Run
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
-configure your MCP client to launch:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then configure your MCP client to launch:
 
 ```sh
 uvx mypr-mcp serve
 ```
 
-The client communicates with the server over stdio. The server's working
-directory becomes the workspace, so configure the client to launch it from
-the directory where the agent should work. `uvx` downloads and runs the
-package automatically.
+The client communicates with the server over stdio. The server's working directory becomes the workspace, so configure the client to launch it from the directory where the agent should work. `uvx` downloads and runs the package automatically.
 
 For clients using `mcpServers` JSON configuration:
 
@@ -38,15 +29,11 @@ For clients using `mcpServers` JSON configuration:
 }
 ```
 
-Make sure `uvx` is on the client's `PATH`, or use its absolute executable path.
-To pin a version, use `mypr-mcp@<version>` as the first argument.
+Make sure `uvx` is on the client's `PATH`, or use its absolute executable path. To pin a version, use `mypr-mcp@<version>` as the first argument.
 
 ### Codex
 
-With `uv` installed, add the following table to the target workspace's
-`.codex/config.toml`. Codex loads project configuration for
-trusted projects. Use `~/.codex/config.toml` instead for a user-wide registration.
-See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp).
+With `uv` installed, add the following table to the target workspace's `.codex/config.toml`. Codex loads project configuration for trusted projects. Use `~/.codex/config.toml` instead for a user-wide registration. See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp).
 
 ```toml
 [mcp_servers.mypr]
@@ -57,14 +44,9 @@ tool_timeout_sec = 60
 required = true
 ```
 
-Start Codex in the target workspace. The MCP process uses its launch directory
-as the workspace. `uvx` must be on Codex's `PATH`; use its absolute
-executable path if needed.
+Start Codex in the target workspace. The MCP process uses its launch directory as the workspace. `uvx` must be on Codex's `PATH`; use its absolute executable path if needed.
 
-The startup allowance covers the first package download and workspace venv creation. `required = true`
-makes Codex wait for this server and report a startup failure if it cannot
-initialize. The tool timeout covers individual `init`/`execute`/`poll` calls, not the
-lifetime of background jobs.
+The startup allowance covers the first package download and workspace venv creation. `required = true` makes Codex wait for this server and report a startup failure if it cannot initialize. The tool timeout covers individual `init`/`execute`/`poll` calls, not the lifetime of background jobs.
 
 Alternatively, register the launch command through the CLI:
 
@@ -72,65 +54,30 @@ Alternatively, register the launch command through the CLI:
 codex mcp add mypr -- uvx mypr-mcp serve
 ```
 
-This creates a user-wide entry. Add the timeout and `required` settings above
-to its `[mcp_servers.mypr]` table in `~/.codex/config.toml`; do not add the same
-table twice. A user-wide entry can serve different projects using each launch
-directory; use project-scoped configuration for project-specific settings.
+This creates a user-wide entry. Add the timeout and `required` settings above to its `[mcp_servers.mypr]` table in `~/.codex/config.toml`; do not add the same table twice. A user-wide entry can serve different projects using each launch directory; use project-scoped configuration for project-specific settings.
 
-Restart the Codex client after changing its configuration. Check registration
-with `codex mcp get mypr` or `codex mcp list`, then use `/mcp` in the Codex CLI
-to inspect the live connection. After connecting, the agent must call `init`
-once to bind the connection to a logical client identity before it can run
-Python code.
+Restart the Codex client after changing its configuration. Check registration with `codex mcp get mypr` or `codex mcp list`, then use `/mcp` in the Codex CLI to inspect the live connection. After connecting, the agent must call `init` once to bind the connection to a logical client identity before it can run Python code.
 
-Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers
-called from Python belong in the workspace's `.mypr/config.toml`, or can be
-registered dynamically with `await ws.mcp.configure(...)`.
+Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers called from Python belong in the workspace's `.mypr/config.toml`, or can be registered dynamically with `await ws.mcp.configure(...)`.
 
 ## Workspace runtime
 
-The first start creates `.mypr/` in the launch workspace, its Python
-environment, and a manager process. The manager and kernel continue running
-after an MCP client disconnects, so another client for the same workspace
-reconnects to the same in-memory environment.
+The first start creates `.mypr/` in the launch workspace, its Python environment, and a manager process. The manager and kernel continue running after an MCP client disconnects, so another client for the same workspace reconnects to the same in-memory environment.
 
-Symlink and bind-mount aliases of the same directory connect to the same
-workspace runtime. Discovery uses the directory's filesystem device and inode,
-not its path string. The identity is visible as `workspace_id` in runtime status
-and `.mypr/runtime.json`; copying a workspace creates a separate identity.
+Symlink and bind-mount aliases of the same directory connect to the same workspace runtime. Discovery uses the directory's filesystem device and inode, not its path string. The identity is visible as `workspace_id` in runtime status and `.mypr/runtime.json`; copying a workspace creates a separate identity.
 
-Clients must run as the same OS user and be able to reach the runtime socket.
-When using separate mount namespaces or containers, share the runtime directory
-(`$XDG_RUNTIME_DIR/mypr`, or `/tmp/mypr-<uid>/mypr` when unset). The recorded socket
-also allows discovery when clients use different runtime-directory settings,
-provided that socket remains accessible. An unreachable existing manager is
-reported instead of launching a duplicate.
+Clients must run as the same OS user and be able to reach the runtime socket. When using separate mount namespaces or containers, share the runtime directory (`$XDG_RUNTIME_DIR/mypr`, or `/tmp/mypr-<uid>/mypr` when unset). The recorded socket also allows discovery when clients use different runtime-directory settings, provided that socket remains accessible. An unreachable existing manager is reported instead of launching a duplicate.
 
-Stop the manager before moving a workspace, then start it at the new location.
-A same-filesystem rename preserves directory identity, but Python objects, venv
-entry points, and external MCP configurations can contain old absolute paths;
-these are not rewritten automatically. If the original directory is moved or
-replaced while running, new attachments and cells are rejected with a restart
-instruction. Status and stop remain available through the discovered socket.
+Stop the manager before moving a workspace, then start it at the new location. A same-filesystem rename preserves directory identity, but Python objects, venv entry points, and external MCP configurations can contain old absolute paths; these are not rewritten automatically. If the original directory is moved or replaced while running, new attachments and cells are rejected with a restart instruction. Status and stop remain available through the discovered socket.
 
 ## MCP tools
 
 Three tools are exposed to the agent:
 
-- `init(client_id=None)` binds this MCP connection to a logical client. With no
-  argument, it allocates a new readable ID such as `calm-otter`; with an
-  argument, it creates or resumes that ID. The returned ID is bound to the
-  connection, so later calls do not repeat it.
+- `init(client_id=None)` binds this MCP connection to a logical client. With no argument, it allocates a new readable ID such as `calm-otter`; with an argument, it creates or resumes that ID. The returned ID is bound to the connection, so later calls do not repeat it.
 
-- `execute(code, wait_ms=1000, request_id=None, max_bytes=None)` submits a Python cell and
-  returns its execution state and output. The connection must be initialized
-  first. `wait_ms` only controls how long the MCP call waits; it does not set a
-  Python timeout.
-- `poll(exec_id, cursor=None, wait_ms=1000, max_bytes=None)` reads a submitted cell's state and
-  output. Use the returned cursor to read later output. Polling an existing
-  execution is allowed before `init`, since the execution ID identifies the
-  target. `max_bytes` controls one response page and accepts 1 KiB–1 MiB; when
-  omitted, the workspace's configured response limit is used.
+- `execute(code, wait_ms=1000, request_id=None, max_bytes=None)` submits a Python cell and returns its execution state and output. The connection must be initialized first. `wait_ms` only controls how long the MCP call waits; it does not set a Python timeout.
+- `poll(exec_id, cursor=None, wait_ms=1000, max_bytes=None)` reads a submitted cell's state and output. Use the returned cursor to read later output. Polling an existing execution is allowed before `init`, since the execution ID identifies the target. `max_bytes` controls one response page and accepts 1 KiB–1 MiB; when omitted, the workspace's configured response limit is used.
 
 Tool responses provide readable text in `content` and the complete machine-readable payload in `structuredContent`. The text includes the current output page in full, with execution state, cursor, errors, warnings, and inbox previews. Adjacent fragments of the same stream are combined for display; the structured events and their cursors are unchanged. Initialization and runtime changes also include the running manager's API instructions.
 
@@ -150,23 +97,11 @@ execute(code="...", ...)      -> uses calm-otter automatically
 poll(exec_id="...", ...)      -> reads the execution
 ```
 
-Repeating `init()` or specifying the currently bound ID returns that same ID.
-Trying to bind an
-initialized connection to a different ID is rejected. Only one live MCP
-connection may use a logical client ID at a time; after disconnecting, another
-connection can call `init(client_id="calm-otter")` to resume it. A connection
-that has not called `init` can still be counted and inspected by operational
-status, but it cannot submit Python code.
+Repeating `init()` or specifying the currently bound ID returns that same ID. Trying to bind an initialized connection to a different ID is rejected. Only one live MCP connection may use a logical client ID at a time; after disconnecting, another connection can call `init(client_id="calm-otter")` to resume it. A connection that has not called `init` can still be counted and inspected by operational status, but it cannot submit Python code.
 
-Submitted cells run as independent asyncio tasks in the shared kernel. They
-may complete in a different order from submission, including cells from the
-same client. An `await` that is still pending yields to other cells; synchronous
-code, synchronous IPython magics, and CPU-heavy work continue to occupy the
-event loop. If one cell depends on another, wait for the prerequisite to complete
-before submitting the dependent cell.
+Submitted cells run as independent asyncio tasks in the shared kernel. They may complete in a different order from submission, including cells from the same client. An `await` that is still pending yields to other cells; synchronous code, synchronous IPython magics, and CPU-heavy work continue to occupy the event loop. If one cell depends on another, wait for the prerequisite to complete before submitting the dependent cell.
 
-Use a background handle when work should remain detached from the submitting
-cell:
+Use a background handle when work should remain detached from the submitting cell:
 
 ```python
 job = await ws.shell.start("make -j2")
@@ -181,11 +116,7 @@ job.result()
 await job.cancel()
 ```
 
-`result()` raises `NotReady` until completion. `await job` explicitly waits
-for completion of that job; other async cells continue to run. Use
-`ws.tasks.list()` and `ws.tasks.get(task_id)` to find handles created in
-another session. A disconnected MCP client does not cancel its submitted
-cells or background jobs.
+`result()` raises `NotReady` until completion. `await job` explicitly waits for completion of that job; other async cells continue to run. Use `ws.tasks.list()` and `ws.tasks.get(task_id)` to find handles created in another session. A disconnected MCP client does not cancel its submitted cells or background jobs.
 
 ## Python workspace API
 
@@ -244,16 +175,13 @@ The iterator forwards each API's `next_cursor` as `cursor`, detects an expired s
 
 See [media and document extraction](docs/media.md) for images, PDF pages, OCR, Office formats, and optional workspace packages. These operations preserve the source files. Further guides cover [structural rewrites](docs/rewrites.md), [browser observation](docs/browser.md), [HTML extraction](docs/http.md), [Git history](docs/git.md), [local diagnostics](docs/diagnostics.md), and [workspace storage](docs/storage.md). [External tool recipes](docs/tool-recipes.md) show how to use installed benchmarking, tracing, and code-analysis tools through existing shell jobs.
 
-Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths
-stay anchored to the workspace even if code changes the kernel's current directory:
+Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths stay anchored to the workspace even if code changes the kernel's current directory:
 
 ```python
 await ws.fs.write("notes.txt", "Hello from Python.\n")
 ```
 
-All clients share imports, globals, and filesystem changes. Store caller-specific
-values in `ws.local`; they persist across cells from the same logical client.
-Kernel resets and crashes clear all in-memory local dictionaries.
+All clients share imports, globals, and filesystem changes. Store caller-specific values in `ws.local`; they persist across cells from the same logical client. Kernel resets and crashes clear all in-memory local dictionaries.
 
 ### Files and search
 
@@ -269,100 +197,25 @@ await ws.fs.patch(
 )
 ```
 
-`read(path, *, start_line=1, end_line=None, start_byte=None, max_bytes=32768)`
-returns UTF-8 `text`, a SHA-256 `revision`, file `size`, line information, and
-`truncated`. Lines are one-based and `end_line` is inclusive. If the output limit
-cuts a line, continue using `next_cursor["line"]` as `start_line` and
-`next_cursor["byte"]` as `start_byte`. Compare revisions when reading multiple
-pages of a file that may change.
+`read(path, *, start_line=1, end_line=None, start_byte=None, max_bytes=32768)` returns UTF-8 `text`, a SHA-256 `revision`, file `size`, line information, and `truncated`. Lines are one-based and `end_line` is inclusive. If the output limit cuts a line, continue using `next_cursor["line"]` as `start_line` and `next_cursor["byte"]` as `start_byte`. Compare revisions when reading multiple pages of a file that may change.
 
-`search(pattern=None, *, paths=None, glob=None, fixed=False, ignore_case=False,
-hidden=False, no_ignore=False, context=0, word=False, line=False,
-multiline=False, dotall=False, before=None, after=None, regex_engine="default",
-mode=None, timeout=30, scan_bytes=16*1024*1024, scan_limit=None,
-max_matches=100, max_bytes=32768, cursor=None)` uses `rg` from the workstation's
-`PATH`. Install ripgrep to enable it; mypr-mcp does not install command-line
-tools. A string or list of patterns is accepted and is treated as an OR query.
-`paths` and `glob` also accept a string or a list. Ignore files and hidden-file
-rules apply by default.
+`search(pattern=None, *, paths=None, glob=None, fixed=False, ignore_case=False, hidden=False, no_ignore=False, context=0, word=False, line=False, multiline=False, dotall=False, before=None, after=None, regex_engine="default", mode=None, timeout=30, scan_bytes=16*1024*1024, scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` uses `rg` from the workstation's `PATH`. Install ripgrep to enable it; mypr-mcp does not install command-line tools. A string or list of patterns is accepted and is treated as an OR query. `paths` and `glob` also accept a string or a list. Ignore files and hidden-file rules apply by default.
 
-When `mode` is omitted, a pattern selects `matches` and a pattern-less query
-selects `files`. Explicit `mode` controls the result collection: `matches`
-returns matching lines and all match spans, `files` returns matching paths, `counts` returns
-`{"path": ..., "count": ...}` rows, and `exists` returns a boolean. If an
-incomplete scan found no match, `exists` is `None`. `matches` includes one-based
-lines and byte-based columns, zero-based UTF-8 byte offsets, and
-an exclusive end offset when available. `context` may add surrounding rows;
-their `kind` is `context`. `pcre2` can be selected with `regex_engine` when the
-installed `rg` supports it. Invalid patterns and unsupported engines fail
-before a scan starts.
+When `mode` is omitted, a pattern selects `matches` and a pattern-less query selects `files`. Explicit `mode` controls the result collection: `matches` returns matching lines and all match spans, `files` returns matching paths, `counts` returns `{"path": ..., "count": ...}` rows, and `exists` returns a boolean. If an incomplete scan found no match, `exists` is `None`. `matches` includes one-based lines and byte-based columns, zero-based UTF-8 byte offsets, and an exclusive end offset when available. `context` may add surrounding rows; their `kind` is `context`. `pcre2` can be selected with `regex_engine` when the installed `rg` supports it. Invalid patterns and unsupported engines fail before a scan starts.
 
-Search runs as a managed job. `timeout` includes process startup and output
-collection; `scan_bytes` and `scan_limit` bound the retained scan. The response
-has `backend`, `complete`, `stop_reason`, `scan_truncated`, `has_more`, and
-`next_cursor` fields. A timeout or scan limit preserves the partial result with
-`complete=false`; it is not a complete count. Cancellation propagates to the
-caller after the managed process is cleaned up. `max_matches` and `max_bytes`
-bound one returned page. The first request saves a bounded snapshot, so
-`await ws.fs.search(cursor=page["next_cursor"])` continues without rerunning
-the command, even after a reset or restart. `page_cursor` rereads the same
-page with a different `max_bytes` budget. A budget too small for one path and
-its metadata raises an error; increase `max_bytes`.
+Search runs as a managed job. `timeout` includes process startup and output collection; `scan_bytes` and `scan_limit` bound the retained scan. The response has `backend`, `complete`, `stop_reason`, `scan_truncated`, `has_more`, and `next_cursor` fields. A timeout or scan limit preserves the partial result with `complete=false`; it is not a complete count. Cancellation propagates to the caller after the managed process is cleaned up. `max_matches` and `max_bytes` bound one returned page. The first request saves a bounded snapshot, so `await ws.fs.search(cursor=page["next_cursor"])` continues without rerunning the command, even after a reset or restart. `page_cursor` rereads the same page with a different `max_bytes` budget. A budget too small for one path and its metadata raises an error; increase `max_bytes`.
 
-Use `search_docs(pattern, *, paths=None, glob=None, mode="matches", adapters=None,
-accurate=False, cache=True, archive_depth=5, timeout=30, scan_bytes=16*1024*1024,
-scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` for PDF, Office,
-ebook, archive, and other formats supported by `rga` (ripgrep-all). It exposes
-the same result modes and completion fields as `search`, with `backend="rga"`.
-`adapters` selects the rga adapter list, `accurate=True` enables MIME detection,
-`cache=False` uses a per-query temporary extraction cache that is removed after
-the search, and `archive_depth` limits nested archive traversal. Missing
-adapters or converters produce a partial result and warning while matches from
-other files remain available. Document locations are
-coordinates in extracted text; they are not byte offsets or editable line
-positions in the original PDF or Office document. Archive member names may be
-present in the displayed path or text according to the rga adapter.
+Use `search_docs(pattern, *, paths=None, glob=None, mode="matches", adapters=None, accurate=False, cache=True, archive_depth=5, timeout=30, scan_bytes=16*1024*1024, scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` for PDF, Office, ebook, archive, and other formats supported by `rga` (ripgrep-all). It exposes the same result modes and completion fields as `search`, with `backend="rga"`. `adapters` selects the rga adapter list, `accurate=True` enables MIME detection, `cache=False` uses a per-query temporary extraction cache that is removed after the search, and `archive_depth` limits nested archive traversal. Missing adapters or converters produce a partial result and warning while matches from other files remain available. Document locations are coordinates in extracted text; they are not byte offsets or editable line positions in the original PDF or Office document. Archive member names may be present in the displayed path or text according to the rga adapter.
 
-Use `search_ast(pattern=None, *, lang, rule=None, constraints=None, utils=None,
-paths=None, glob=None, mode="matches", timeout=30, scan_bytes=16*1024*1024,
-scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` for read-only
-structural searches through ast-grep. Provide either a pattern or a rule, not
-both. Patterns use ast-grep metavariables such as `$NAME` and `$$$ARGS`; rules
-may combine `kind`, `pattern`, `has`, `inside`, `follows`, `precedes`,
-`constraints`, and `utils`. Results include the source path, language, matched
-text, an exclusive source range, and metavariable ranges when available.
-`counts` counts matched AST nodes. Large matches may omit optional submatch or
-capture details and set `details_truncated=true`; the result retains the
-minimal path, line, and column metadata, but its source range may also be
-omitted. `page_cursor` can reread the same page with a larger byte budget. This
-API never rewrites files, runs project fixes, or installs language parsers.
-`backend="ast"` identifies the result.
+Use `search_ast(pattern=None, *, lang, rule=None, constraints=None, utils=None, paths=None, glob=None, mode="matches", timeout=30, scan_bytes=16*1024*1024, scan_limit=None, max_matches=100, max_bytes=32768, cursor=None)` for read-only structural searches through ast-grep. Provide either a pattern or a rule, not both. Patterns use ast-grep metavariables such as `$NAME` and `$$$ARGS`; rules may combine `kind`, `pattern`, `has`, `inside`, `follows`, `precedes`, `constraints`, and `utils`. Results include the source path, language, matched text, an exclusive source range, and metavariable ranges when available. `counts` counts matched AST nodes. Large matches may omit optional submatch or capture details and set `details_truncated=true`; the result retains the minimal path, line, and column metadata, but its source range may also be omitted. `page_cursor` can reread the same page with a larger byte budget. This API never rewrites files, runs project fixes, or installs language parsers. `backend="ast"` identifies the result.
 
-`await ws.fs.search_backends()` reports whether `rg`, `rga`, and ast-grep are
-available, their versions, and the document converters visible on `PATH`.
-Search tools use the current workspace permissions and Linux process namespace;
-they do not provide a sandbox. Search cache and snapshots are tool data and are
-excluded from ordinary workspace searches unless selected explicitly through `paths`.
+`await ws.fs.search_backends()` reports whether `rg`, `rga`, and ast-grep are available, their versions, and the document converters visible on `PATH`. Search tools use the current workspace permissions and Linux process namespace; they do not provide a sandbox. Search cache and snapshots are tool data and are excluded from ordinary workspace searches unless selected explicitly through `paths`.
 
-`await ws.fs.tree(path=".", depth=3, max_entries=200, hidden=False)` returns
-a deterministic directory view with `entries` and `truncated`. Symlinks are
-listed without traversing their targets. `await ws.fs.stat(path,
-follow_symlinks=False)` returns file metadata, including kind, size, modification
-time, mode, and symlink target; it does not hash file contents.
+`await ws.fs.tree(path=".", depth=3, max_entries=200, hidden=False)` returns a deterministic directory view with `entries` and `truncated`. Symlinks are listed without traversing their targets. `await ws.fs.stat(path, follow_symlinks=False)` returns file metadata, including kind, size, modification time, mode, and symlink target; it does not hash file contents.
 
-`write(path, text, *, expected_hash=None, overwrite=False, encoding="utf-8",
-create_parents=False, history=True)` creates a file. Replacing an existing file requires its
-current revision or explicit `overwrite=True`. `patch(path, edits, *,
-expected_hash=None, dry_run=False, encoding="utf-8", max_diff_bytes=32768,
-history=True)` applies
-an ordered list of exact `{"old": ..., "new": ...}` replacements. Each target
-must occur once by default; use `count=N` for the first N matches or
-`count="all"` for all matches. A missing or ambiguous target fails before writing.
-Results include old/new revisions and a bounded unified diff; `dry_run=True`
-leaves the file unchanged.
+`write(path, text, *, expected_hash=None, overwrite=False, encoding="utf-8", create_parents=False, history=True)` creates a file. Replacing an existing file requires its current revision or explicit `overwrite=True`. `patch(path, edits, *, expected_hash=None, dry_run=False, encoding="utf-8", max_diff_bytes=32768, history=True)` applies an ordered list of exact `{"old": ..., "new": ...}` replacements. Each target must occur once by default; use `count=N` for the first N matches or `count="all"` for all matches. A missing or ambiguous target fails before writing. Results include old/new revisions and a bounded unified diff; `dry_run=True` leaves the file unchanged.
 
-Use `apply_patch(patch, *, expected_hashes=None, dry_run=False,
-max_diff_bytes=32768, history=True)` for a patch spanning multiple files:
+Use `apply_patch(patch, *, expected_hashes=None, dry_run=False, max_diff_bytes=32768, history=True)` for a patch spanning multiple files:
 
 ```python
 await ws.fs.apply_patch("""*** Begin Patch
@@ -378,29 +231,11 @@ await ws.fs.apply_patch("""*** Begin Patch
 """, dry_run=True)
 ```
 
-The format uses `*** Add File`, `*** Update File`, `*** Delete File`, optional
-`*** Move to`, and `@@` context hunks inside `*** Begin Patch` / `*** End Patch`.
-Matching is exact; ambiguous context is rejected. `expected_hashes` maps file
-paths to revisions, with `None` requiring that a path does not exist. All targets
-and hunks are validated before mutation, and affected paths share the same locks
-as `write()` and `patch()`. Files are staged before application; ordinary commit
-failures trigger rollback. This is not a filesystem-wide atomic transaction:
-external writers and process or machine crashes can interrupt recovery.
-Symlink paths, duplicate targets, and hard-link aliases within one patch are
-rejected. `*** End of File` anchors the final hunk to the end of the file.
+The format uses `*** Add File`, `*** Update File`, `*** Delete File`, optional `*** Move to`, and `@@` context hunks inside `*** Begin Patch` / `*** End Patch`. Matching is exact; ambiguous context is rejected. `expected_hashes` maps file paths to revisions, with `None` requiring that a path does not exist. All targets and hunks are validated before mutation, and affected paths share the same locks as `write()` and `patch()`. Files are staged before application; ordinary commit failures trigger rollback. This is not a filesystem-wide atomic transaction: external writers and process or machine crashes can interrupt recovery. Symlink paths, duplicate targets, and hard-link aliases within one patch are rejected. `*** End of File` anchors the final hunk to the end of the file.
 
-`await ws.fs.image("plot.png")` loads a PNG/JPEG for inline MCP image output.
-Return it as the cell's last expression or pass it to IPython's `display()`.
-`max_bytes` defaults to 2 MiB, matching the inline image limit; the source file
-is left unchanged.
+`await ws.fs.image("plot.png")` loads a PNG/JPEG for inline MCP image output. Return it as the cell's last expression or pass it to IPython's `display()`. `max_bytes` defaults to 2 MiB, matching the inline image limit; the source file is left unchanged.
 
-Writes use atomic replacement and preserve existing file permissions.
-Single-file `write()` and `patch()` follow symlinks while preserving the link
-itself. Edits through these helpers serialize
-per resolved path, including across clients. Revision checks reject stale content;
-they do not lock out edits by external programs. Absolute paths are accepted under
-the current user's permissions. Ordinary Python remains available for other file
-and data operations.
+Writes use atomic replacement and preserve existing file permissions. Single-file `write()` and `patch()` follow symlinks while preserving the link itself. Edits through these helpers serialize per resolved path, including across clients. Revision checks reject stale content; they do not lock out edits by external programs. Absolute paths are accepted under the current user's permissions. Ordinary Python remains available for other file and data operations.
 
 For non-text files, use `read_bytes(path, start_byte=0, max_bytes=32768)` and `write_bytes(path, data, *, expected_hash=None, overwrite=False, create_parents=False)`. Binary reads return a Base64 payload in `data_base64`, size, revision, and a byte cursor; they never decode or rewrite the payload. `delete(path, *, expected_hash)`, `move(source, destination, *, expected_hash, overwrite=False)`, and `copy(source, destination, *, expected_hash=None, overwrite=False)` operate on regular files and use the same workspace locks. Delete and move require the source revision; copy accepts an optional source revision. Destination overwrite is rejected, so the destination must be absent.
 
@@ -418,30 +253,15 @@ await ws.git.log(path="src")
 await ws.git.blame("README.md", start_line=1, end_line=20)
 ```
 
-`status(*, cursor=None, max_entries=200, max_bytes=32768)` returns branch and
-file information, including index/worktree changes, conflicts, and renames.
-`diff(*, staged=False, rev=None, paths=None, cursor=None, max_bytes=32768)`
-returns file metadata and patch text. `show(ref="HEAD", *, path=None,
-cursor=None, max_bytes=32768)` reads a commit or a file at that revision.
-Input paths are relative to the workspace; returned file paths are relative to
-the reported repository `root`. `max_bytes` must be at least 1024. Collect both
-`files` and `patch` across diff pages; a page may contain only file metadata.
+`status(*, cursor=None, max_entries=200, max_bytes=32768)` returns branch and file information, including index/worktree changes, conflicts, and renames. `diff(*, staged=False, rev=None, paths=None, cursor=None, max_bytes=32768)` returns file metadata and patch text. `show(ref="HEAD", *, path=None, cursor=None, max_bytes=32768)` reads a commit or a file at that revision. Input paths are relative to the workspace; returned file paths are relative to the reported repository `root`. `max_bytes` must be at least 1024. Collect both `files` and `patch` across diff pages; a page may contain only file metadata.
 
-These are read-only commands with paging, color, external diff programs, and
-textconv disabled. Follow `next_cursor` with the same method while `has_more`
-is true. Pages come from a saved snapshot, so later changes to the worktree do
-not alter an existing query. Snapshots survive kernel reset and manager restart.
+These are read-only commands with paging, color, external diff programs, and textconv disabled. Follow `next_cursor` with the same method while `has_more` is true. Pages come from a saved snapshot, so later changes to the worktree do not alter an existing query. Snapshots survive kernel reset and manager restart.
 
 `log(..., follow=True)` follows a file across renames when Git can identify its previous path. `commit_info(ref, *, include_files=True, include_patch=False, cursor=None, max_bytes=32768)` returns one commit's parents, author and committer, subject and body, changed-file metadata, and insert/delete totals. Patch text is opt-in and remains bounded. Merge statistics use the first parent as the comparison base and are marked in the result. These helpers remain read-only.
 
 ### HTTP
 
-`ws.http` keeps named native `httpx2.AsyncClient` instances alive in the Python
-kernel. Clients are private to the current logical client by default; pass
-`shared=True` when every client should use the same cookie jar and connection
-pool. The default HTTP timeout is 30 seconds. Client options are fixed after creation,
-so close a named client before
-changing its configuration:
+`ws.http` keeps named native `httpx2.AsyncClient` instances alive in the Python kernel. Clients are private to the current logical client by default; pass `shared=True` when every client should use the same cookie jar and connection pool. The default HTTP timeout is 30 seconds. Client options are fixed after creation, so close a named client before changing its configuration:
 
 ```python
 response = await ws.http.get("https://example.com/api", name="api")
@@ -452,23 +272,13 @@ response = await client.post("/files", content=b"data")
 await ws.http.close("upload")
 ```
 
-`get()`, `post()`, `put()`, `patch()`, `delete()`, `head()`, and `options()`
-return native responses after consuming the body. They enforce a 16 MiB decoded
-body limit by default; set `max_bytes=None` only when the caller can safely
-handle an unbounded response. `stream()` yields the native streaming response
-for incremental processing. `download()` writes atomically (relative paths use the workspace),
-refuses to overwrite by default, and limits the decoded response to 256 MiB;
-pass `overwrite=True` or another `max_bytes` when appropriate. Cancellation
-removes incomplete downloads. The raw client returned by `client()` is an
-escape hatch for full HTTPX2 behavior and does not apply the convenience
-request limit.
+`get()`, `post()`, `put()`, `patch()`, `delete()`, `head()`, and `options()` return native responses after consuming the body. They enforce a 16 MiB decoded body limit by default; set `max_bytes=None` only when the caller can safely handle an unbounded response. `stream()` yields the native streaming response for incremental processing. `download()` writes atomically (relative paths use the workspace), refuses to overwrite by default, and limits the decoded response to 256 MiB; pass `overwrite=True` or another `max_bytes` when appropriate. Cancellation removes incomplete downloads. The raw client returned by `client()` is an escape hatch for full HTTPX2 behavior and does not apply the convenience request limit.
 
 `extract_html()` and `read_html()` accept `include_structure=True` to include heading hierarchy and bounded document metadata such as canonical URL, description, and language. The structure is optional and has its own `structure_truncated` flag. Headings use the selected content region while document metadata uses the full document.
 
 ### Browser automation
 
-`ws.browser` returns native async Playwright objects, so pages, locators,
-frames, requests, tracing, and other Playwright APIs remain available:
+`ws.browser` returns native async Playwright objects, so pages, locators, frames, requests, tracing, and other Playwright APIs remain available:
 
 ```python
 context = await ws.browser.context(
@@ -480,16 +290,9 @@ await page.get_by_role("button", name="Continue").click()
 await ws.browser.screenshot(page, "artifacts/shop.png")
 ```
 
-The first managed context automatically installs the requested Playwright
-browser engine when it is missing. Installation runs as a managed workspace
-job and reuses the configured Playwright browser cache. Set
-`PLAYWRIGHT_BROWSERS_PATH` before starting the manager to select that cache.
-Managed browsers, contexts, and pages belong to the workspace runtime and are
-closed during reset. Use `ws.browser.close(...)` to release them earlier.
+The first managed context automatically installs the requested Playwright browser engine when it is missing. Installation runs as a managed workspace job and reuses the configured Playwright browser cache. Set `PLAYWRIGHT_BROWSERS_PATH` before starting the manager to select that cache. Managed browsers, contexts, and pages belong to the workspace runtime and are closed during reset. Use `ws.browser.close(...)` to release them earlier.
 
-Use `save_state()` and `load_state()` to persist authentication explicitly;
-saved state includes IndexedDB by default and is kept under `.mypr/browser`.
-State is not saved automatically when a context closes:
+Use `save_state()` and `load_state()` to persist authentication explicitly; saved state includes IndexedDB by default and is kept under `.mypr/browser`. State is not saved automatically when a context closes:
 
 ```python
 await ws.browser.save_state(context, name="login")
@@ -497,30 +300,15 @@ state = await ws.browser.load_state("login")
 restored = await ws.browser.context("restored", storage_state=state)
 ```
 
-`shared=True` gives all logical clients the same named context or connection;
-otherwise the name is private to the current client. Use `connect(endpoint,
-protocol="playwright"|"cdp", name="remote")` for an externally managed
-browser, then pass `connection="remote"` to `context()`. Closing or resetting
-mypr-mcp disconnects from external browsers and leaves their processes and
-pre-existing tabs running. `screenshot()` saves an artifact and returns it as
-inline image content, subject to the normal 2 MiB image limit. HAR and video
-paths supplied through Playwright context options are resolved below the
-workspace.
+`shared=True` gives all logical clients the same named context or connection; otherwise the name is private to the current client. Use `connect(endpoint, protocol="playwright"|"cdp", name="remote")` for an externally managed browser, then pass `connection="remote"` to `context()`. Closing or resetting mypr-mcp disconnects from external browsers and leaves their processes and pre-existing tabs running. `screenshot()` saves an artifact and returns it as inline image content, subject to the normal 2 MiB image limit. HAR and video paths supplied through Playwright context options are resolved below the workspace.
 
 `observation = await ws.browser.observe(page)` records bounded request, response, console, page-error, and navigation events for that logical client. `await observation.read(cursor=None, types=None, url_contains=None, methods=None, status=None, wait_ms=0)` filters with AND semantics and can wait up to 30 seconds for a matching event. Cursors advance over inspected events, including events excluded by a filter; a returned `has_more` means more matching events remain. Response bodies are opt-in and capped independently. `await observation.request(request_id, body=True, body_timeout=5)` bounds a response-body read; timeout or an unknown/oversized body is returned as a `body_error`. Sensitive URL credentials and tokens are masked in structured URL fields.
 
 ### Network diagnostics and scans
 
-`ws.net.resolve(host, port=None)` returns deduplicated IPv4/IPv6 addresses.
-`connect(host, port, timeout=3)` reports `open`, `closed`, `timeout`, or
-`unreachable` without raising for ordinary connection failures. `tls()` uses
-certificate and hostname verification by default and reports the negotiated
-TLS version, cipher, peer certificate, and SHA-256 fingerprint. Set
-`verify=False` only for diagnostics; `cert_pem` or `fingerprint` can pin the
-peer certificate.
+`ws.net.resolve(host, port=None)` returns deduplicated IPv4/IPv6 addresses. `connect(host, port, timeout=3)` reports `open`, `closed`, `timeout`, or `unreachable` without raising for ordinary connection failures. `tls()` uses certificate and hostname verification by default and reports the negotiated TLS version, cipher, peer certificate, and SHA-256 fingerprint. Set `verify=False` only for diagnostics; `cert_pem` or `fingerprint` can pin the peer certificate.
 
-TCP scans default to ports 1–1024, 64 concurrent connections, 200 probes per second,
-and a one-second connection timeout. TCP scans and Nmap runs are managed background jobs:
+TCP scans default to ports 1–1024, 64 concurrent connections, 200 probes per second, and a one-second connection timeout. TCP scans and Nmap runs are managed background jobs:
 
 `resolve(timeout=5)` bounds DNS worker execution and cleanup. `scan()` accepts `max_probes` and `max_duration`; the terminal summary reports attempted probes, the elapsed duration, and a stop reason. Nmap accepts the same overall duration bound and preserves completed host results when the deadline ends. The output limit remains independent: by default collection stops when the result store is full; pass `continue_after_output_limit=True` only when partial result loss is acceptable.
 
@@ -539,22 +327,11 @@ nmap = await ws.net.nmap("127.0.0.1", args=["-sV"])
 summary = await nmap
 ```
 
-Awaiting a scan returns its terminal summary, including failed or cancelled states;
-check `state` and `error`. `result()` returns that summary once it is ready.
+Awaiting a scan returns its terminal summary, including failed or cancelled states; check `state` and `error`. `result()` returns that summary once it is ready.
 
-Scan handles support the normal task methods (`status()`, `read()`,
-`expect()`, `output()`, `result()`, `cancel()`, and `await handle`) as well as
-`summary()` and paged `results()`. `await ws.tasks.attach(scan_id)` reconnects
-to a retained scan after a reset or manager restart. TCP results and parsed
-Nmap results are retained under `.mypr/scans`; each result store is capped at
-16 MiB and each page defaults to 100 entries and 32 KiB. Nmap owns its XML
-output channel, so output flags such as `-oX`, `-oA`, and `-oN` are rejected;
-install Nmap and arrange privileges explicitly when a scan requires them.
+Scan handles support the normal task methods (`status()`, `read()`, `expect()`, `output()`, `result()`, `cancel()`, and `await handle`) as well as `summary()` and paged `results()`. `await ws.tasks.attach(scan_id)` reconnects to a retained scan after a reset or manager restart. TCP results and parsed Nmap results are retained under `.mypr/scans`; each result store is capped at 16 MiB and each page defaults to 100 entries and 32 KiB. Nmap owns its XML output channel, so output flags such as `-oX`, `-oA`, and `-oN` are rejected; install Nmap and arrange privileges explicitly when a scan requires them.
 
-HTTP clients, managed browser resources, and active scans are attached to the
-workspace runtime. A reset closes clients and managed browser resources and
-cancels active scans; saved browser state, completed scan records, and files
-remain available afterward.
+HTTP clients, managed browser resources, and active scans are attached to the workspace runtime. A reset closes clients and managed browser resources and cancels active scans; saved browser state, completed scan records, and files remain available afterward.
 
 ### Shell and async tasks
 
@@ -581,12 +358,7 @@ ws.local["term"].output()
 await ws.local["term"].cancel()
 ```
 
-PTY mode provides a controlling terminal and combines stdout/stderr into stdout.
-Terminal echo, ANSI sequences, and CRLF line endings are preserved. `write()` is
-available without `stdin=True`. `write(eof=True)` sends the terminal's EOF control
-character instead of closing its master descriptor; programs in raw mode decide
-how to interpret it. Use `cancel()` to terminate the job. `resize(rows, cols)`
-updates the terminal size and notifies its foreground process group.
+PTY mode provides a controlling terminal and combines stdout/stderr into stdout. Terminal echo, ANSI sequences, and CRLF line endings are preserved. `write()` is available without `stdin=True`. `write(eof=True)` sends the terminal's EOF control character instead of closing its master descriptor; programs in raw mode decide how to interpret it. Use `cancel()` to terminate the job. `resize(rows, cols)` updates the terminal size and notifies its foreground process group.
 
 The default `cwd` is the kernel's current directory. `env` overlays the kernel's environment; a `None` value removes that variable. Set `inherit_env=False` to start with an empty environment and use only the supplied values. This applies to both `run` and `start`, including PTY jobs. Existing callers that relied on replacement must pass `inherit_env=False` explicitly.
 
@@ -598,8 +370,7 @@ ws.local["job"] = await ws.shell.start(
 )
 ```
 
-`ws.tasks.start(awaitable, *, task_id=None, visible=True, persist_result=False)` schedules a detached
-awaitable in the kernel's event loop and returns a handle without `await`:
+`ws.tasks.start(awaitable, *, task_id=None, visible=True, persist_result=False)` schedules a detached awaitable in the kernel's event loop and returns a handle without `await`:
 
 ```python
 import asyncio
@@ -609,18 +380,9 @@ ws.local["job"] = ws.tasks.start(asyncio.sleep(2, result="done"))
 
 Set `persist_result=True` when a detached task's JSON result must remain available after the handle is evicted or the client reconnects. Only strict JSON values up to 256 KiB are stored; the task itself still succeeds when its result is not serializable, too large, or cannot be persisted. Historical `result()` then raises `ResultUnavailable` when no saved value exists.
 
-Cell, remote-job, and Python-task handles share one ID namespace. Custom task
-IDs cannot replace existing handles or use generated ID forms: 32 lowercase
-hexadecimal characters, `task-…-<number>`, or the `remote-watch:` prefix.
-Automatic task IDs use a monotonically increasing counter without retaining
-old IDs in memory. Custom IDs remain reserved until kernel reset, including
-IDs used with `visible=False`.
+Cell, remote-job, and Python-task handles share one ID namespace. Custom task IDs cannot replace existing handles or use generated ID forms: 32 lowercase hexadecimal characters, `task-…-<number>`, or the `remote-watch:` prefix. Automatic task IDs use a monotonically increasing counter without retaining old IDs in memory. Custom IDs remain reserved until kernel reset, including IDs used with `visible=False`.
 
-Async tasks must yield to the event loop. Blocking or CPU-heavy work should run
-in a separate process, for example through `ws.shell.start(...)`.
-Use `ws.tasks.start()` for detached work that needs managed status and captured
-output. Raw `asyncio.create_task()` children are not managed; output emitted
-after their submitting cell finishes is not retained by that cell.
+Async tasks must yield to the event loop. Blocking or CPU-heavy work should run in a separate process, for example through `ws.shell.start(...)`. Use `ws.tasks.start()` for detached work that needs managed status and captured output. Raw `asyncio.create_task()` children are not managed; output emitted after their submitting cell finishes is not retained by that cell.
 
 Inspect the handle in a later cell:
 
@@ -642,40 +404,15 @@ ws.tasks.get(ws.local["job"].id)
 | `await job` | Waits for completion and returns the result |
 | `await job.cancel()` | Returns `False` if already terminal, otherwise requests cancellation and returns `True` |
 
-Async jobs return the awaitable's value and propagate its exception. Successful
-shell jobs return `{"returncode": 0}`; a failed shell job raises `RPCError` when
-its result is retrieved. Cancelled jobs raise `asyncio.CancelledError`.
-Waiting with `await job` suspends the current cell until completion while
-other runnable cells continue.
+Async jobs return the awaitable's value and propagate its exception. Successful shell jobs return `{"returncode": 0}`; a failed shell job raises `RPCError` when its result is retrieved. Cancelled jobs raise `asyncio.CancelledError`. Waiting with `await job` suspends the current cell until completion while other runnable cells continue.
 
-`read()` supports stdout/stderr selection and waits up to 30 seconds for output
-or completion. Its opaque cursor belongs to that job and stream; it is separate
-from the character cursor used by `output(cursor=...)`. Check `truncated` and
-`warnings` for output loss. `expect()` distinguishes a match, EOF, timeout, and
-scan limit. A match advances its cursor just past the matched text; an unmatched
-result keeps the starting cursor for retry. Cancelling a read or expect wait
-does not cancel the job.
+`read()` supports stdout/stderr selection and waits up to 30 seconds for output or completion. Its opaque cursor belongs to that job and stream; it is separate from the character cursor used by `output(cursor=...)`. Check `truncated` and `warnings` for output loss. `expect()` distinguishes a match, EOF, timeout, and scan limit. A match advances its cursor just past the matched text; an unmatched result keeps the starting cursor for retry. Cancelling a read or expect wait does not cancel the job.
 
-`await ws.tasks.attach(task_id_or_history_id)` returns an existing live handle
-or reconnects to retained shell/package output. Historical Python and cell
-handles expose saved output and status but cannot restore Python values;
-`result()` raises `ResultUnavailable`. Use generation-qualified `history_id`
-for a specific historical Python task. Legacy records may only contain a
-limited output prefix.
+`await ws.tasks.attach(task_id_or_history_id)` returns an existing live handle or reconnects to retained shell/package output. Historical Python and cell handles expose saved output and status but cannot restore Python values; `result()` raises `ResultUnavailable`. Use generation-qualified `history_id` for a specific historical Python task. Legacy records may only contain a limited output prefix.
 
-Every submitted cell also has a task handle. Retrieve it with
-`ws.tasks.get(exec_id)`. Its status has `kind="cell"`, and `result()` returns
-the cell's actual last-expression value. `await` on a cell handle waits for
-that cell only; a cell cannot await its own handle.
+Every submitted cell also has a task handle. Retrieve it with `ws.tasks.get(exec_id)`. Its status has `kind="cell"`, and `result()` returns the cell's actual last-expression value. `await` on a cell handle waits for that cell only; a cell cannot await its own handle.
 
-Task IDs are shared across the kernel; omit `task_id` to generate one.
-An explicit ID can be reused after reset. Each kernel generation keeps a separate
-history record: `await ws.history.get(task_id)` returns the latest record, while
-`await ws.history.get(record["history_id"])` retrieves a specific generation.
-The `python:<generation>:...` history-ID namespace is reserved.
-`ws.tasks.list()` includes completed visible tasks, while `ws.tasks.active()`
-returns active handles. `visible=False` omits an async task from discovery,
-history reporting, and the reset guard; keep the default for managed work.
+Task IDs are shared across the kernel; omit `task_id` to generate one. An explicit ID can be reused after reset. Each kernel generation keeps a separate history record: `await ws.history.get(task_id)` returns the latest record, while `await ws.history.get(record["history_id"])` retrieves a specific generation. The `python:<generation>:...` history-ID namespace is reserved. `ws.tasks.list()` includes completed visible tasks, while `ws.tasks.active()` returns active handles. `visible=False` omits an async task from discovery, history reporting, and the reset guard; keep the default for managed work.
 
 ### MCP services
 
@@ -690,12 +427,7 @@ cwd = "/absolute/path/to/workspace"
 REPORTS_TOKEN = "REPORTS_TOKEN"
 ```
 
-The stdio service uses `command`, optional `args`, optional `cwd`, and
-optional `env_from`. `command` can also be an argument list. HTTP services use
-`url`, optional `headers_from`, and are connected lazily. Environment mappings
-name variables in the manager's environment; their secret values are not
-written to the config. A stdio server's default `cwd` is the workspace;
-a relative `cwd` is resolved against it.
+The stdio service uses `command`, optional `args`, optional `cwd`, and optional `env_from`. `command` can also be an argument list. HTTP services use `url`, optional `headers_from`, and are connected lazily. Environment mappings name variables in the manager's environment; their secret values are not written to the config. A stdio server's default `cwd` is the workspace; a relative `cwd` is resolved against it.
 
 For an HTTP server:
 
@@ -707,8 +439,7 @@ url = "https://example.com/mcp"
 Authorization = "REMOTE_AUTHORIZATION"
 ```
 
-`REMOTE_AUTHORIZATION` must contain the complete header value, including any
-required scheme such as `Bearer `.
+`REMOTE_AUTHORIZATION` must contain the complete header value, including any required scheme such as `Bearer `.
 
 The API is:
 
@@ -723,25 +454,11 @@ await ws.mcp.list_prompts("reports")
 await ws.mcp.get_prompt("reports", "summary", {"id": "42"})
 ```
 
-Remote results are dictionaries serialized from MCP models. Tool responses may
-contain `content`, `structuredContent`, and `isError`; check `isError` before
-using a tool result. A tool-reported error can be returned normally, while a
-transport or bridge failure raises `RPCError`.
+Remote results are dictionaries serialized from MCP models. Tool responses may contain `content`, `structuredContent`, and `isError`; check `isError` before using a tool result. A tool-reported error can be returned normally, while a transport or bridge failure raises `RPCError`.
 
-Tool, resource, and prompt listing methods require a server name and accept
-`cursor=` for pagination. Pass the response's `nextCursor` to the next call
-when it is non-null. Server discovery uses `servers` and `next_cursor` instead;
-for additional pages use
-`await ws.mcp.request("list_servers", cursor=next_cursor, limit=50)`.
-Server-list cursors must be non-negative integers or decimal strings, and
-limits must be integers from 1 to 1000. Invalid values are rejected.
+Tool, resource, and prompt listing methods require a server name and accept `cursor=` for pagination. Pass the response's `nextCursor` to the next call when it is non-null. Server discovery uses `servers` and `next_cursor` instead; for additional pages use `await ws.mcp.request("list_servers", cursor=next_cursor, limit=50)`. Server-list cursors must be non-negative integers or decimal strings, and limits must be integers from 1 to 1000. Invalid values are rejected.
 
-Calls on the same external MCP connection may run concurrently, with each
-response kept with its requesting cell. Start a call with `ws.tasks.start(...)`
-when it should remain detached while the kernel accepts later cells. Calls
-whose completion or external side effect is uncertain are not retried
-automatically. Authentication variable names refer to the manager's environment;
-changing their values still requires restarting the manager.
+Calls on the same external MCP connection may run concurrently, with each response kept with its requesting cell. Start a call with `ws.tasks.start(...)` when it should remain detached while the kernel accepts later cells. Calls whose completion or external side effect is uncertain are not retried automatically. Authentication variable names refer to the manager's environment; changing their values still requires restarting the manager.
 
 Add or replace a server directly from the kernel without resetting Python:
 
@@ -753,8 +470,7 @@ await ws.mcp.configure("reports", {
 await ws.mcp.list_tools("reports")
 ```
 
-`configure` persists a complete replacement of that server's configuration to
-`.mypr/config.toml`. To change selected fields, read the active configuration first:
+`configure` persists a complete replacement of that server's configuration to `.mypr/config.toml`. To change selected fields, read the active configuration first:
 
 ```python
 ws.local["server_config"] = await ws.mcp.get_config("reports")
@@ -766,60 +482,28 @@ await ws.mcp.reload()            # Apply direct edits to config.toml's MCP serve
 await ws.mcp.remove("reports")  # Disconnect and remove the saved server entry.
 ```
 
-The shared kernel, variables, `ws.local`, and unrelated server connections stay
-alive. New or changed configurations connect lazily on the next call; `restart`
-establishes a fresh initialized connection. It does not reread the config file.
-This lets an agent write or improve a local MCP server, reconnect it, and use
-its updated tools in the same Python session.
+The shared kernel, variables, `ws.local`, and unrelated server connections stay alive. New or changed configurations connect lazily on the next call; `restart` establishes a fresh initialized connection. It does not reread the config file. This lets an agent write or improve a local MCP server, reconnect it, and use its updated tools in the same Python session.
 
 Initial connection and protocol initialization have a 30-second deadline, including lazy first use. A timeout fails queued calls instead of leaving that server blocked indefinitely; a later request can retry once cleanup finishes. This startup deadline does not limit the duration of an initialized server's tool calls.
 
-Changes affecting active or queued calls are rejected by default. Use
-`force=True` on these management methods to close the affected connections and
-fail their pending calls. Other servers remain usable. Closing a connection does
-not undo completed external side effects.
+Changes affecting active or queued calls are rejected by default. Use `force=True` on these management methods to close the affected connections and fail their pending calls. Other servers remain usable. Closing a connection does not undo completed external side effects.
 
-Configuration is validated before changes are applied. Writes are atomic and
-preserve unrelated TOML sections and comments. If the file changed since the last
-load, `configure` and `remove` ask for `reload()` rather than overwriting those
-edits. `reload()` applies only added, changed, or removed MCP entries; unchanged
-connections stay open. A valid configuration does not guarantee that its server
-can start or authenticate: connection failures are reported when connecting.
-Management changes and their outcomes are recorded in workspace history. Once
-accepted, a management operation completes even if its caller disconnects or
-stops waiting; inspect configuration and history to confirm the outcome.
+Configuration is validated before changes are applied. Writes are atomic and preserve unrelated TOML sections and comments. If the file changed since the last load, `configure` and `remove` ask for `reload()` rather than overwriting those edits. `reload()` applies only added, changed, or removed MCP entries; unchanged connections stay open. A valid configuration does not guarantee that its server can start or authenticate: connection failures are reported when connecting. Management changes and their outcomes are recorded in workspace history. Once accepted, a management operation completes even if its caller disconnects or stops waiting; inspect configuration and history to confirm the outcome.
 
 ### Client-local state and history
 
-The first `init()` call assigns a readable logical client ID such as
-`calm-otter` or `swift-fox`. It randomly combines one of 256 adjectives with one
-of 256 animal names, giving 65,536 possible IDs per workspace. Automatically
-issued IDs are reserved in `.mypr/history.sqlite3` and never reused while that
-database is retained, even after disconnects or manager restarts. Explicit IDs
-can create a new client or resume an existing one; IDs in history remain
-reserved. If every automatic combination has been used, allocation fails with
-an explicit exhaustion error.
+The first `init()` call assigns a readable logical client ID such as `calm-otter` or `swift-fox`. It randomly combines one of 256 adjectives with one of 256 animal names, giving 65,536 possible IDs per workspace. Automatically issued IDs are reserved in `.mypr/history.sqlite3` and never reused while that database is retained, even after disconnects or manager restarts. Explicit IDs can create a new client or resume an existing one; IDs in history remain reserved. If every automatic combination has been used, allocation fails with an explicit exhaustion error.
 
-Connection IDs remain random UUIDs. Read the bound identity through
-`ws.client.id` and this particular connection through `ws.client.connection_id`.
-Before `init`, the connection has no logical client ID. These IDs identify
-callers for attribution and coordination; they are not authentication or
-security boundaries.
+Connection IDs remain random UUIDs. Read the bound identity through `ws.client.id` and this particular connection through `ws.client.connection_id`. Before `init`, the connection has no logical client ID. These IDs identify callers for attribution and coordination; they are not authentication or security boundaries.
 
-The shared Python namespace is deliberately common to every client. Use the
-client identity and local mapping for values that belong to the current agent:
+The shared Python namespace is deliberately common to every client. Use the client identity and local mapping for values that belong to the current agent:
 
 ```python
 ws.client.id
 ws.local["review_job"] = ws.tasks.start(do_review())
 ```
 
-`ws.local` is persisted in the running kernel and is namespaced by logical
-client ID. `ws.client.id` identifies the caller that submitted the current
-cell; `connection_id` identifies this particular MCP connection. They prevent
-accidental name reuse only when code follows the `ws.local` convention;
-ordinary globals remain shared. Reconnecting with the same ID resumes the same
-local dictionary while the kernel remains alive.
+`ws.local` is persisted in the running kernel and is namespaced by logical client ID. `ws.client.id` identifies the caller that submitted the current cell; `connection_id` identifies this particular MCP connection. They prevent accidental name reuse only when code follows the `ws.local` convention; ordinary globals remain shared. Reconnecting with the same ID resumes the same local dictionary while the kernel remains alive.
 
 Use `await ws.status()` for compact manager and kernel health, version, workspace identity, generation, and connection, active, and queued counts. `connection_count` includes connections waiting to call `init`; `client_count` includes only initialized logical clients. Pass `detail=True` to include connection records, active and queued execution IDs, and manager instructions. Use `await ws.history.list(...)` and `await ws.history.get(exec_id)` to inspect execution records from Python. History records include the logical client and connection IDs, timestamps, state, and output metadata. A task inherits its creator's identity even while another client executes. IDs are organizational labels, not access-control boundaries.
 
@@ -834,9 +518,7 @@ await ws.history.get(exec_id)  # Also accepts a background task ID.
 await ws.history.logs(client_id=ws.client.id, limit=20)
 ```
 
-History methods accept `limit=1..200` (default 20). Omit `client_id` to include
-all callers. Continue `list()` with its `next_cursor` until it is null. For logs,
-reuse the returned cursor with the same filter:
+History methods accept `limit=1..200` (default 20). Omit `client_id` to include all callers. Continue `list()` with its `next_cursor` until it is null. For logs, reuse the returned cursor with the same filter:
 
 ```python
 ws.local["logs"] = await ws.history.logs(client_id=ws.client.id)
@@ -851,24 +533,15 @@ ws.local["logs"] = await ws.history.logs(
 ws.local["logs"]["events"]
 ```
 
-Without a cursor, `logs()` returns recent events; `cursor=0` starts at the
-beginning. Log cursors, history-list cursors, task-output cursors, and MCP
-`poll` cursors belong to different APIs and must not be interchanged.
+Without a cursor, `logs()` returns recent events; `cursor=0` starts at the beginning. Log cursors, history-list cursors, task-output cursors, and MCP `poll` cursors belong to different APIs and must not be interchanged.
 
 `await ws.performance()` returns rolling timing summaries for manager, storage, kernel, and bridge work. Each label keeps its latest 256 samples and a `total_count` observed since manager start, with `p50`, `p95`, and `max` in milliseconds. Bridge timing for the most recent completed request appears on the next call; concurrent or disconnected calls may not all be reported. Execution results include `timing_ms` in MCP `_meta` (the Python SDK exposes `result.meta`), outside printed content and `structuredContent`. Request errors raised before a result is produced may lack these timings. Manager and RPC times include requested notification waits and are not overhead-only measurements. Nested spans overlap, so do not sum them to infer unmeasured overhead; kernel round-trip includes IPC and output persistence, not only Python execution. Time outside the MCP server, including host scheduling, external transport, and model execution, is not measured. Samples remain in memory until manager restart.
 
 See [the performance benchmark](benchmarks/README.md) for reproducible request latency, output size, and before/after comparisons.
 
-`connections` contains connection and activity timestamps, active execution
-IDs, and owned task IDs. Open IPC connections determine liveness, so a
-killed client is removed without cancelling its workspace jobs.
+`connections` contains connection and activity timestamps, active execution IDs, and owned task IDs. Open IPC connections determine liveness, so a killed client is removed without cancelling its workspace jobs.
 
-History is stored in `.mypr/history.sqlite3`. Lists return `items` and
-`next_cursor`; logs return ascending events and a cursor for subsequent reads.
-Execution details include a paged output view (continue with MCP `poll`).
-Background task details retain up to 64 KiB of output and mark truncation;
-live handles retain their normal output buffers. Logs stream cell, shell, and
-Python task output while work is running.
+History is stored in `.mypr/history.sqlite3`. Lists return `items` and `next_cursor`; logs return ascending events and a cursor for subsequent reads. Execution details include a paged output view (continue with MCP `poll`). Background task details retain up to 64 KiB of output and mark truncation; live handles retain their normal output buffers. Logs stream cell, shell, and Python task output while work is running.
 
 ### Coordinating shared work
 
@@ -878,19 +551,11 @@ async with ws.locks.acquire("module:review", "file:report", timeout=10):
 ws.locks.list()
 ```
 
-Locks belong to the current asyncio task. Names are normalized and acquired
-together; reacquiring while the same task owns locks raises an error. Leaving
-the context, completing or cancelling the task, or resetting the kernel releases
-them. Disconnecting a client does not end its running tasks or release their locks.
-`list()` shows owners and waiters. These are cooperative locks: filesystem writes
-and other clients must explicitly use the same names to participate.
+Locks belong to the current asyncio task. Names are normalized and acquired together; reacquiring while the same task owns locks raises an error. Leaving the context, completing or cancelling the task, or resetting the kernel releases them. Disconnecting a client does not end its running tasks or release their locks. `list()` shows owners and waiters. These are cooperative locks: filesystem writes and other clients must explicitly use the same names to participate.
 
 ### Client messages
 
-Every logical client has a persistent inbox in the workspace SQLite history.
-Messages remain available when the recipient is offline, across Python resets,
-and after a manager restart. The recipient must already be registered in the
-workspace, but does not need to remain connected.
+Every logical client has a persistent inbox in the workspace SQLite history. Messages remain available when the recipient is offline, across Python resets, and after a manager restart. The recipient must already be registered in the workspace, but does not need to remain connected.
 
 ```python
 await ws.messages.send("bright-fox", "The review is complete.")
@@ -899,44 +564,17 @@ ws.local["inbox"] = await ws.messages.read()
 await ws.messages.ack([message["id"] for message in ws.local["inbox"]["messages"]])
 ```
 
-`send(to, text, data=None, reply_to=None)` uses the current logical client as the sender and accepts
-non-empty text up to 16 KiB in UTF-8. It returns `id`, `from`, `to`, `text`, and
-`created_at`; text whose JSON escaping would exceed a 32 KiB page is rejected.
-`data` accepts bounded JSON-serializable values. `reply(message_id, text, data=None)`
-sends to the original sender and records `reply_to`; only the original recipient
-can reply, including after acknowledging the original message.
-`read(limit=20, after=None, wait_ms=0, sender=None, reply_to=None)` returns
-unacknowledged messages in ID order with `messages`, `next_cursor`, and
-`has_more`. The limit is 1–100, the serialized page is at most 32 KiB, and
-`wait_ms` is limited to 30 seconds. Use the returned `next_cursor` as `after`
-to continue paging. A non-zero `wait_ms` waits only when no messages match both
-the cursor and the optional sender/reply filters. Unrelated messages do not end
-a filtered wait.
+`send(to, text, data=None, reply_to=None)` uses the current logical client as the sender and accepts non-empty text up to 16 KiB in UTF-8. It returns `id`, `from`, `to`, `text`, and `created_at`; text whose JSON escaping would exceed a 32 KiB page is rejected. `data` accepts bounded JSON-serializable values. `reply(message_id, text, data=None)` sends to the original sender and records `reply_to`; only the original recipient can reply, including after acknowledging the original message. `read(limit=20, after=None, wait_ms=0, sender=None, reply_to=None)` returns unacknowledged messages in ID order with `messages`, `next_cursor`, and `has_more`. The limit is 1–100, the serialized page is at most 32 KiB, and `wait_ms` is limited to 30 seconds. Use the returned `next_cursor` as `after` to continue paging. A non-zero `wait_ms` waits only when no messages match both the cursor and the optional sender/reply filters. Unrelated messages do not end a filtered wait.
 
-`ack(ids)` explicitly acknowledges messages belonging to the current client.
-Acknowledgement is idempotent, and reading or previewing a message never marks
-it as read. It returns the number newly acknowledged; unknown or foreign IDs
-reject the entire batch. These methods require an initialized client because messages are
-scoped to its logical ID.
+`ack(ids)` explicitly acknowledges messages belonging to the current client. Acknowledgement is idempotent, and reading or previewing a message never marks it as read. It returns the number newly acknowledged; unknown or foreign IDs reject the entire batch. These methods require an initialized client because messages are scoped to its logical ID.
 
-The MCP responses from `init`, `execute`, and `poll` include up to five short
-inbox previews (within a 4 KiB budget), plus the total unacknowledged count.
-The `inbox` field contains `unacked`, `messages`, and `has_more`; each preview has
-`id`, `from`, `text`, `reply_to`, and `truncated`. Structured `data` is omitted
-from previews; use `read()` for full content.
-Messages can end an `execute` or `poll` wait early without cancelling the cell:
-check its state and continue polling if needed. Polling another client's execution
-still returns your own inbox. Before `init`, `poll` omits the inbox.
-They do not acknowledge the previews automatically. An agent that is not
-calling an MCP tool is not woken when a message arrives; use `read(wait_ms=...)`
-from a running Python task when a bounded wait is useful.
+The MCP responses from `init`, `execute`, and `poll` include up to five short inbox previews (within a 4 KiB budget), plus the total unacknowledged count. The `inbox` field contains `unacked`, `messages`, and `has_more`; each preview has `id`, `from`, `text`, `reply_to`, and `truncated`. Structured `data` is omitted from previews; use `read()` for full content. Messages can end an `execute` or `poll` wait early without cancelling the cell: check its state and continue polling if needed. Polling another client's execution still returns your own inbox. Before `init`, `poll` omits the inbox. They do not acknowledge the previews automatically. An agent that is not calling an MCP tool is not woken when a message arrives; use `read(wait_ms=...)` from a running Python task when a bounded wait is useful.
 
 `await ws.messages.clients(prefix=None, connected=None, limit=50, cursor=None)` lists registered logical clients with their current connection state, last activity, registration time, and unacknowledged message count. Use it before addressing a peer whose ID is not already known. The list is paged with `next_cursor`; offline clients remain addressable for persistent delivery.
 
 ### Skills and reusable Python
 
-Workspace skills live at `.mypr/skills/<name>/SKILL.md`. Discover and read
-them with:
+Workspace skills live at `.mypr/skills/<name>/SKILL.md`. Discover and read them with:
 
 ```python
 ws.skills.list()
@@ -957,12 +595,7 @@ skill["revision"]
 await ws.skills.validate("review")
 ```
 
-Skill text is interpreted by the agent; reading it does not execute its
-instructions or scripts. `validate()` accepts legacy Markdown without front
-matter with a warning, rejects malformed YAML and invalid metadata types, and
-reports missing or escaping local Markdown links. Existing skills require
-`expected_hash=page["revision"]` when updated. Pass `dry_run=True` to preview a
-bounded diff without writing.
+Skill text is interpreted by the agent; reading it does not execute its instructions or scripts. `validate()` accepts legacy Markdown without front matter with a warning, rejects malformed YAML and invalid metadata types, and reports missing or escaping local Markdown links. Existing skills require `expected_hash=page["revision"]` when updated. Pass `dry_run=True` to preview a bounded diff without writing.
 
 For reusable Python, use `ws.modules` for files under `.mypr/lib/ws_lib/`:
 
@@ -978,29 +611,22 @@ await ws.modules.write(
 helpers = ws.modules.reload("helpers")
 ```
 
-`modules.list()` is synchronous; `read()`, `check()`, and `write()` are async.
-Module names are public dotted Python names and cannot escape `ws_lib`. `check()`
-compiles the candidate and runs optional test code in the workspace Python
-environment with its own timeout. It returns the SHA-256 of the checked source. `write()` validates syntax, uses an atomic CAS write, and never activates the module. `load()` and `reload()` accept `expected_hash`; when supplied, they execute only the exact bytes returned by `check()`, so a source edit between verification and activation is rejected. They bind a fresh module only after successful execution; failed reloads leave the old module binding intact. References already held elsewhere keep pointing to the previous module after a successful reload. Imports can have external side effects; a failed reload does not undo those side effects.
+`modules.list()` is synchronous; `read()`, `check()`, and `write()` are async. Module names are public dotted Python names and cannot escape `ws_lib`. `check()` compiles the candidate and runs optional test code in the workspace Python environment with its own timeout. It returns the SHA-256 of the checked source. `write()` validates syntax, uses an atomic CAS write, and never activates the module. `load()` and `reload()` accept `expected_hash`; when supplied, they execute only the exact bytes returned by `check()`, so a source edit between verification and activation is rejected. They bind a fresh module only after successful execution; failed reloads leave the old module binding intact. References already held elsewhere keep pointing to the previous module after a successful reload. Imports can have external side effects; a failed reload does not undo those side effects.
 
 Module and skill writes retain content revisions. Use `await ws.modules.history(name)` or `await ws.skills.history(name)` to list revisions, `read_revision(name, revision)` to read one, and `restore(name, revision, expected_hash=current_revision)` to restore a file. Restoring a module does not reload it; existing Python references continue to point to the loaded code. See [revision history](docs/revisions.md) for paging, consistency, and recovery behavior.
 
 ### Packages and inspection
 
-`await ws.packages.add(*specs)` installs package requirements into the
-workspace's `.mypr/venv` and returns a background handle. For example:
+`await ws.packages.add(*specs)` installs package requirements into the workspace's `.mypr/venv` and returns a background handle. For example:
 
 ```python
 ws.local["install"] = await ws.packages.add("httpx", "rich>=13")
 ws.local["install"].status()
 ```
 
-Retrieve the result in a later cell with `await ws.local["install"]` before
-importing the new packages. Installation changes the kernel environment, not
-the environments of separately launched MCP servers.
+Retrieve the result in a later cell with `await ws.local["install"]` before importing the new packages. Installation changes the kernel environment, not the environments of separately launched MCP servers.
 
-The installation uses `uv pip` and writes the resulting freeze to
-`.mypr/requirements.txt`. Installation, freeze, and manifest replacement are serialized per workspace. The requirements file and manifest are written through temporary files and atomically replaced only after the operation succeeds; a failed or cancelled install leaves the previous manifest intact. Packages already imported by the current kernel may need a kernel reset before an upgrade is visible.
+The installation uses `uv pip` and writes the resulting freeze to `.mypr/requirements.txt`. Installation, freeze, and manifest replacement are serialized per workspace. The requirements file and manifest are written through temporary files and atomically replaced only after the operation succeeds; a failed or cancelled install leaves the previous manifest intact. Packages already imported by the current kernel may need a kernel reset before an upgrade is visible.
 
 `ws.inspect()` returns the workspace path, kernel generation, visible variable names and types, task summaries, and discovered skills. `await ws.status()` returns compact manager health and counts; pass `detail=True` for connection records, active and queued execution IDs, and manager instructions.
 
@@ -1021,11 +647,7 @@ gc_interval_seconds = 300
 
 ### Workstation resources
 
-`ws.system` collects a bounded snapshot of the workstation visible to the
-kernel. Collection runs in short-lived guarded helper processes, so vendor
-utilities or a slow filesystem do not block other Python cells. The result of
-each method is a JSON-compatible envelope with `collected_at`,
-`duration_seconds`, `scope`, `sources`, `warnings`, and `truncated` fields.
+`ws.system` collects a bounded snapshot of the workstation visible to the kernel. Collection runs in short-lived guarded helper processes, so vendor utilities or a slow filesystem do not block other Python cells. The result of each method is a JSON-compatible envelope with `collected_at`, `duration_seconds`, `scope`, `sources`, `warnings`, and `truncated` fields.
 
 ```python
 info = await ws.system.info()
@@ -1037,71 +659,21 @@ gpus = await ws.system.gpus(processes=True)
 workspace_disk = await ws.system.disks(path=".")
 ```
 
-The `info` envelope contains `os`, `python`, `cpu`, `memory`, `storage`, and
-`limits`. `usage` contains interval-based `cpu`, `memory`, `swap`, per-interface
-`network`, per-device `disk_io`, `disks`, and `gpus` data. `processes` returns a
-bounded `processes` list with PID, creation time, status, CPU percentage, RSS,
-and I/O counters; `sort` accepts `cpu`, `rss`, `read`, or `write`, and `limit`
-is capped at 200. The `pids` and `user` filters narrow that list, while
-`cmdline` is false by default. `gpus` reports available vendor metrics and
-optional GPU processes. `disks(path=...)` reports filesystem capacity for the
-workspace-relative path (or an absolute path).
+The `info` envelope contains `os`, `python`, `cpu`, `memory`, `storage`, and `limits`. `usage` contains interval-based `cpu`, `memory`, `swap`, per-interface `network`, per-device `disk_io`, `disks`, and `gpus` data. `processes` returns a bounded `processes` list with PID, creation time, status, CPU percentage, RSS, and I/O counters; `sort` accepts `cpu`, `rss`, `read`, or `write`, and `limit` is capped at 200. The `pids` and `user` filters narrow that list, while `cmdline` is false by default. `gpus` reports available vendor metrics and optional GPU processes. `disks(path=...)` reports filesystem capacity for the workspace-relative path (or an absolute path).
 
-All sizes are bytes and all rates are bytes per second. Whole-machine CPU usage
-is reported from 0 to 100%; process CPU usage uses one logical CPU as 100%, so
-a multi-threaded process can exceed 100%. Unsupported or inaccessible values
-are `None`, with the reason recorded in `warnings` or `sources`, rather than
-being reported as zero. A missing driver, inaccessible process, or unavailable
-vendor utility does not discard other sections. NVIDIA metrics use
-`nvidia-smi`; AMD uses `amd-smi`; Intel uses `xpu-smi` and, where available,
-`intel_gpu_top`, with Linux DRM/sysfs fallback. The API does not install
-operating-system tools automatically. Vendor utilization uses the driver's
-measurement window; DRM client counters use the requested interval. DRM engine
-activity and client memory are separate from whole-device utilization and VRAM.
-Shared DRM descriptors are counted once, with their owning PIDs listed. Vendor
-process PIDs can refer to a different PID namespace from the Python kernel.
+All sizes are bytes and all rates are bytes per second. Whole-machine CPU usage is reported from 0 to 100%; process CPU usage uses one logical CPU as 100%, so a multi-threaded process can exceed 100%. Unsupported or inaccessible values are `None`, with the reason recorded in `warnings` or `sources`, rather than being reported as zero. A missing driver, inaccessible process, or unavailable vendor utility does not discard other sections. NVIDIA metrics use `nvidia-smi`; AMD uses `amd-smi`; Intel uses `xpu-smi` and, where available, `intel_gpu_top`, with Linux DRM/sysfs fallback. The API does not install operating-system tools automatically. Vendor utilization uses the driver's measurement window; DRM client counters use the requested interval. DRM engine activity and client memory are separate from whole-device utilization and VRAM. Shared DRM descriptors are counted once, with their owning PIDs listed. Vendor process PIDs can refer to a different PID namespace from the Python kernel.
 
-The snapshot uses the kernel's PID namespace and filesystem view. `limits` separately reports CPU affinity and cgroup v2 quota or memory
-headroom when discoverable; these are execution limits and available headroom,
-not a reservation of those resources. Responses are limited to 32 KiB; `truncated` and `omitted` identify details
-removed to fit that budget. A timeout
-stops the guarded helper, and cleanup can make the completed call slightly
-longer than the requested deadline.
+The snapshot uses the kernel's PID namespace and filesystem view. `limits` separately reports CPU affinity and cgroup v2 quota or memory headroom when discoverable; these are execution limits and available headroom, not a reservation of those resources. Responses are limited to 32 KiB; `truncated` and `omitted` identify details removed to fit that budget. A timeout stops the guarded helper, and cleanup can make the completed call slightly longer than the requested deadline.
 
-The default measurement interval is 0.5 seconds and must be between 0.1 and
-10 seconds. The default timeout is 5 seconds and must exceed the interval.
-Repeated snapshots are best scheduled as ordinary async cells or background
-tasks; the API does not create a resident monitor or retain historical samples.
+The default measurement interval is 0.5 seconds and must be between 0.1 and 10 seconds. The default timeout is 5 seconds and must exceed the interval. Repeated snapshots are best scheduled as ordinary async cells or background tasks; the API does not create a resident monitor or retain historical samples.
 
 ## Reset and lifecycle
 
-`await ws.reset()` resets the shared Python memory for every agent connected to
-the workspace. By default it is rejected while any other cell or managed job
-is active. Pass `force=True` to cancel that work and reset. The reset cell's
-completion is reported by `execute`/`poll`. Saved files, skills, modules,
-package environment, and run records remain. The kernel generation changes
-and old Python job handles expire. Historical MCP
-execution IDs remain readable. Reusing a request ID within the same client
-returns the original execution instead of repeating side effects, including
-after a kernel reset or reconnecting with the same ID. Resuming that ID after
-a manager restart also retains request deduplication. A newly allocated ID
-starts a separate request-ID scope; use history to check earlier executions
-before retrying an uncertain operation.
+`await ws.reset()` resets the shared Python memory for every agent connected to the workspace. By default it is rejected while any other cell or managed job is active. Pass `force=True` to cancel that work and reset. The reset cell's completion is reported by `execute`/`poll`. Saved files, skills, modules, package environment, and run records remain. The kernel generation changes and old Python job handles expire. Historical MCP execution IDs remain readable. Reusing a request ID within the same client returns the original execution instead of repeating side effects, including after a kernel reset or reconnecting with the same ID. Resuming that ID after a manager restart also retains request deduplication. A newly allocated ID starts a separate request-ID scope; use history to check earlier executions before retrying an uncertain operation.
 
-`reset` only resets shared kernel memory. It does not update the installed
-package or replace the manager process. Globals, imports, functions, `ws.local`,
-and in-memory handles are lost; files, skills, modules, the package environment,
-messages, history, and saved task output remain.
+`reset` only resets shared kernel memory. It does not update the installed package or replace the manager process. Globals, imports, functions, `ws.local`, and in-memory handles are lost; files, skills, modules, the package environment, messages, history, and saved task output remain.
 
-Use `await ws.restart()` when a running workspace must apply the installation
-that made the request. This replaces the manager and kernel through a detached
-workspace coordinator, then reconnects planned MCP clients. It is explicit:
-package resolution and downloads belong to the command that launched the client
-(for example, `uvx mypr-mcp@latest`); restart does not resolve a new version from
-the network by itself. The default refuses while another cell, shell, scan,
-package job, or Python task is active. Use `await ws.restart(force=True)` to
-cancel active work first. The restart call's execution result is recorded and
-can be retrieved with `poll`; its Python code is never replayed.
+Use `await ws.restart()` when a running workspace must apply the installation that made the request. This replaces the manager and kernel through a detached workspace coordinator, then reconnects planned MCP clients. It is explicit: package resolution and downloads belong to the command that launched the client (for example, `uvx mypr-mcp@latest`); restart does not resolve a new version from the network by itself. The default refuses while another cell, shell, scan, package job, or Python task is active. Use `await ws.restart(force=True)` to cancel active work first. The restart call's execution result is recorded and can be retrieved with `poll`; its Python code is never replayed.
 
 The equivalent CLI command is:
 
@@ -1112,15 +684,7 @@ uvx mypr-mcp@latest restart
 uvx mypr-mcp@latest restart --force
 ```
 
-The new manager starts only after the old one exits and passes its health check.
-The coordinator records its ID, phase, old and new generation, target
-installation, and failure details under `.mypr/`. A failed start is reported
-without automatic rollback or an unbounded restart loop; inspect
-`.mypr/manager.log`, `uvx` diagnostics, and the restart record before retrying.
-External browser processes and pre-existing tabs remain owned by their launcher.
-Managed resources close during a normal replacement. In-memory Python state is
-always lost, while files, skills, modules, the package environment, messages,
-history, saved output, and completed scan records persist.
+The new manager starts only after the old one exits and passes its health check. The coordinator records its ID, phase, old and new generation, target installation, and failure details under `.mypr/`. A failed start is reported without automatic rollback or an unbounded restart loop; inspect `.mypr/manager.log`, `uvx` diagnostics, and the restart record before retrying. External browser processes and pre-existing tabs remain owned by their launcher. Managed resources close during a normal replacement. In-memory Python state is always lost, while files, skills, modules, the package environment, messages, history, saved output, and completed scan records persist.
 
 The CLI also provides operational controls. Run them from the workspace:
 
@@ -1135,71 +699,21 @@ uvx mypr-mcp restart
 uvx mypr-mcp stop
 ```
 
-`logs` prints JSONL lifecycle and output events. Without `--follow` it prints
-the most recent 20 events; `--limit` changes the page size (1–200).
-`--follow` waits for new records until interrupted. Use `ws.history.logs(client_id=...)`
-inside Python to filter by caller.
-The commands are local administration commands, not MCP tools. `reset` and
-`stop` reject active work unless `--force` is supplied.
-CLI `stop` reports success only after the original manager exits, so it is safe
-to reconnect immediately. Shutdown taking more than 30 seconds reports an error.
-Status includes the manager `pid`, `protocol_version`, manager and client
-installation versions, capabilities, `update_pending`, and a `health_error`
-when an essential runtime worker fails. Compatible package versions reuse the
-existing manager and kernel, so installing a newer `uvx` package alone does not
-clear Python memory. A protocol mismatch or an unknown legacy manager is
-reported through initialization with an actionable restart instruction rather
-than being hidden as a generic MCP handshake failure. The legacy 0.9.0 runtime
-has no `ws.restart()`; run the CLI `restart` once from the new installation to
-perform the first explicit replacement.
+`logs` prints JSONL lifecycle and output events. Without `--follow` it prints the most recent 20 events; `--limit` changes the page size (1–200). `--follow` waits for new records until interrupted. Use `ws.history.logs(client_id=...)` inside Python to filter by caller. The commands are local administration commands, not MCP tools. `reset` and `stop` reject active work unless `--force` is supplied. CLI `stop` reports success only after the original manager exits, so it is safe to reconnect immediately. Shutdown taking more than 30 seconds reports an error. Status includes the manager `pid`, `protocol_version`, manager and client installation versions, capabilities, `update_pending`, and a `health_error` when an essential runtime worker fails. Compatible package versions reuse the existing manager and kernel, so installing a newer `uvx` package alone does not clear Python memory. A protocol mismatch or an unknown legacy manager is reported through initialization with an actionable restart instruction rather than being hidden as a generic MCP handshake failure. The legacy 0.9.0 runtime has no `ws.restart()`; run the CLI `restart` once from the new installation to perform the first explicit replacement.
 
-Automatic reconnection requires the updated MCP frontend; older frontend processes
-must be reopened once after installation.
+Automatic reconnection requires the updated MCP frontend; older frontend processes must be reopened once after installation.
 
-Planned restart keeps the MCP stdio connection alive. After replacement, the
-connection receives a new connection ID and generation and rebinds its existing
-logical client ID. Other clients reconnect the same way. No submitted cell is
-replayed; use its recorded execution ID with `poll`. An ordinary crash,
-unplanned stop, or unreachable runtime does not trigger this reconnect path:
-unfinished executions become `lost`, and Python memory must be recreated.
+Planned restart keeps the MCP stdio connection alive. After replacement, the connection receives a new connection ID and generation and rebinds its existing logical client ID. Other clients reconnect the same way. No submitted cell is replayed; use its recorded execution ID with `poll`. An ordinary crash, unplanned stop, or unreachable runtime does not trigger this reconnect path: unfinished executions become `lost`, and Python memory must be recreated.
 
-Shell/package commands and local stdio MCP servers run through a supervisor.
-The supervisor's Python interpreter ignores Python-specific environment
-settings, while the command receives its configured environment unchanged.
-The supervisor closes its own standard streams after spawning the command,
-so it does not hold a terminated command's stdin/stdout pipes open.
-If the manager dies, their process groups receive SIGTERM, followed by SIGKILL
-after two seconds if needed. Same-group descendants remain supervised even
-after the original command exits. Processes that deliberately start a separate
-session are outside this boundary. HTTP MCP shutdown closes the local connection.
+Shell/package commands and local stdio MCP servers run through a supervisor. The supervisor's Python interpreter ignores Python-specific environment settings, while the command receives its configured environment unchanged. The supervisor closes its own standard streams after spawning the command, so it does not hold a terminated command's stdin/stdout pipes open. If the manager dies, their process groups receive SIGTERM, followed by SIGKILL after two seconds if needed. Same-group descendants remain supervised even after the original command exits. Processes that deliberately start a separate session are outside this boundary. HTTP MCP shutdown closes the local connection.
 
-Python memory and running handles survive normal client disconnects, but they
-cannot be restored after a manager or kernel crash. In that case unfinished
-executions are marked `lost`; mypr-mcp never silently re-runs code or external
-MCP calls. The saved `.mypr/runs/` records and files remain available for
-inspection. The logical client ID and its history remain available, so a new
-connection can call `init(client_id="calm-otter")` after the runtime is healthy;
-in-memory variables and local state must be recreated after a crash.
+Python memory and running handles survive normal client disconnects, but they cannot be restored after a manager or kernel crash. In that case unfinished executions are marked `lost`; mypr-mcp never silently re-runs code or external MCP calls. The saved `.mypr/runs/` records and files remain available for inspection. The logical client ID and its history remain available, so a new connection can call `init(client_id="calm-otter")` after the runtime is healthy; in-memory variables and local state must be recreated after a crash.
 
 ## Output limits
 
 Execution output is retained up to 16 MiB per run by default. Text events are paged with a default 32 KiB UTF-8 JSON budget, and `poll` uses cursors to retrieve later events. This is an output-page budget, not a limit on the entire MCP response: metadata, the readable text representation, inbox previews, and inline images add to it. Excess retained output is consumed and marked as truncated. Non-text display data is stored under `.mypr/artifacts/`.
 
-Inline PNG/JPEG images share a 2 MiB source-byte budget per response; base64 encoding increases their wire size. Images that exceed this budget are omitted from inline content, with their artifact paths and reasons retained in the response. Their files remain available for later inspection. Image reads are bounded even if a file grows after its metadata is checked.
-Malformed display items and unavailable image files produce bounded `warnings`
-without changing successful Python execution to failure. Valid text, execution
-state, cursors, and inbox data remain available. Excess warnings are indicated
-by `warnings_truncated`.
-Shell and package jobs report output persistence failures through `warnings` in
-`job.status()` and `job.output(cursor=0)`. Their exit status still describes the
-command itself, and output continues to be drained after a storage failure.
-Historical polling preserves readable journal entries and replaces damaged lines
-with warning events, keeping event cursors stable. `journal_truncated` identifies
-an incomplete final line; `journal_corrupt` identifies other invalid records.
-The original journal is left unchanged.
-The `error` field is a bounded summary (at most 1 KiB, smaller for small response
-budgets); `error_truncated` marks shortened summaries. Detailed traceback output
-is paged subject to the normal output limit.
+Inline PNG/JPEG images share a 2 MiB source-byte budget per response; base64 encoding increases their wire size. Images that exceed this budget are omitted from inline content, with their artifact paths and reasons retained in the response. Their files remain available for later inspection. Image reads are bounded even if a file grows after its metadata is checked. Malformed display items and unavailable image files produce bounded `warnings` without changing successful Python execution to failure. Valid text, execution state, cursors, and inbox data remain available. Excess warnings are indicated by `warnings_truncated`. Shell and package jobs report output persistence failures through `warnings` in `job.status()` and `job.output(cursor=0)`. Their exit status still describes the command itself, and output continues to be drained after a storage failure. Historical polling preserves readable journal entries and replaces damaged lines with warning events, keeping event cursors stable. `journal_truncated` identifies an incomplete final line; `journal_corrupt` identifies other invalid records. The original journal is left unchanged. The `error` field is a bounded summary (at most 1 KiB, smaller for small response budgets); `error_truncated` marks shortened summaries. Detailed traceback output is paged subject to the normal output limit.
 
 ### Completed-work retention
 
@@ -1215,52 +729,23 @@ response_bytes = 32768
 
 `response_bytes` controls the default `execute`/`poll` response page and must be between 1 KiB and 1 MiB. A per-call `max_bytes` can lower or raise the page budget within that same range.
 
-The kernel retains the most recently completed `completed_tasks` handles, in
-addition to all active handles. Older handles disappear from `ws.tasks.list()`
-and `ws.tasks.get()`; use `await ws.tasks.attach(id)` or `ws.history` for saved records. A handle saved in your
-own variable or `ws.local` remains usable. These limits release internal cache
-references, not arbitrary objects retained by Python code.
+The kernel retains the most recently completed `completed_tasks` handles, in addition to all active handles. Older handles disappear from `ws.tasks.list()` and `ws.tasks.get()`; use `await ws.tasks.attach(id)` or `ws.history` for saved records. A handle saved in your own variable or `ws.local` remains usable. These limits release internal cache references, not arbitrary objects retained by Python code.
 
-Manager record and shell-output caches each retain at most `completed_records`
-completed entries and share the serialized-byte budget equally. Counts must be
-positive and `cache_bytes` must be at least 1024. Active work is never evicted.
-If shell metadata cannot be saved, the most recent affected completed job is
-retained outside these cache limits so its result and warning remain inspectable.
-This fallback lasts only while the manager is alive and retains at most one job's
-output, subject to the normal per-job output limit.
-Execution output, Python-task journals, and shell/package journals remain on disk under `.mypr/runs/`
-and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache
-eviction. Request deduplication uses SQLite and survives eviction and restart,
-including empty request IDs. Query snapshots remain under `.mypr/searches/` and
-`.mypr/git/` until the storage retention policy removes expired, unreferenced
-data. Cache eviction alone does not delete snapshots, journals, saved files, or
-messages.
+Manager record and shell-output caches each retain at most `completed_records` completed entries and share the serialized-byte budget equally. Counts must be positive and `cache_bytes` must be at least 1024. Active work is never evicted. If shell metadata cannot be saved, the most recent affected completed job is retained outside these cache limits so its result and warning remain inspectable. This fallback lasts only while the manager is alive and retains at most one job's output, subject to the normal per-job output limit. Execution output, Python-task journals, and shell/package journals remain on disk under `.mypr/runs/` and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache eviction. Request deduplication uses SQLite and survives eviction and restart, including empty request IDs. Query snapshots remain under `.mypr/searches/` and `.mypr/git/` until the storage retention policy removes expired, unreferenced data. Cache eviction alone does not delete snapshots, journals, saved files, or messages.
 
 Execution admission, output publication, and terminal responses wait for their required records to be stored. Manager history and message I/O runs off the event loop in order; reset, restart, and shutdown settle pending records before closing storage. A storage failure is reported rather than returning an unrecorded execution success.
 
-Execution journals have rebuildable `.idx` byte-offset indexes. Historical
-polling seeks directly to the requested event cursor instead of loading the
-entire output file for each page. Older journals are indexed once on first
-read, off the manager's event loop; missing or stale indexes are rebuilt.
+Execution journals have rebuildable `.idx` byte-offset indexes. Historical polling seeks directly to the requested event cursor instead of loading the entire output file for each page. Older journals are indexed once on first read, off the manager's event loop; missing or stale indexes are rebuilt.
 
-Runtime files are created under `.mypr/`. The generated `.mypr/.gitignore`
-excludes the virtual environment, run records, artifacts, locks, logs, and
-the SQLite history, and other runtime metadata; reusable modules, skills, configuration, and
-`requirements.txt` remain available for version control as desired.
+Runtime files are created under `.mypr/`. The generated `.mypr/.gitignore` excludes the virtual environment, run records, artifacts, locks, logs, and the SQLite history, and other runtime metadata; reusable modules, skills, configuration, and `requirements.txt` remain available for version control as desired.
 
-When upgrading, launching a newer compatible package is enough to reconnect to
-an existing manager; running managers are not silently replaced. Use the
-explicit `restart` command or `ws.restart()` when the new code must be loaded.
-Existing execution files are imported into history, and logical client IDs remain
-attached to those records.
+When upgrading, launching a newer compatible package is enough to reconnect to an existing manager; running managers are not silently replaced. Use the explicit `restart` command or `ws.restart()` when the new code must be loaded. Existing execution files are imported into history, and logical client IDs remain attached to those records.
 
 ## Development and publishing
 
-For development, run `uv sync` in the checkout, then launch its
-`.venv/bin/mypr-mcp` executable from the target workspace.
+For development, run `uv sync` in the checkout, then launch its `.venv/bin/mypr-mcp` executable from the target workspace.
 
-To publish a release, update the package version, remove previous distributions,
-and rebuild:
+To publish a release, update the package version, remove previous distributions, and rebuild:
 
 Set the version in `pyproject.toml` and refresh `uv.lock`. Runtime version reporting reads the installed distribution metadata; source-only development kernels read `pyproject.toml`.
 
@@ -1271,7 +756,4 @@ uv build --no-sources
 uv publish
 ```
 
-`uv publish` uploads the distributions in `dist/` to PyPI; individual filenames
-are unnecessary when it contains only the intended release. Authenticate with `UV_PUBLISH_TOKEN`
-or configure Trusted Publishing for CI. See the
-[uv publishing guide](https://docs.astral.sh/uv/guides/package/).
+`uv publish` uploads the distributions in `dist/` to PyPI; individual filenames are unnecessary when it contains only the intended release. Authenticate with `UV_PUBLISH_TOKEN` or configure Trusted Publishing for CI. See the [uv publishing guide](https://docs.astral.sh/uv/guides/package/).
