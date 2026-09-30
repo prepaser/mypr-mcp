@@ -193,7 +193,7 @@ class NetworkTools:
     def __init__(self, workspace: str | os.PathLike[str], tasks: Any = None, rpc: Any = None):
         self.workspace = Path(workspace).resolve()
         self.tasks = tasks
-        self.rpc = rpc
+        self._rpc = rpc
         from .system_tools import SystemTools
 
         self._system = SystemTools(self.workspace)
@@ -406,16 +406,36 @@ class NetworkTools:
             if writer is not None:
                 await _close_writer(writer)
 
-    async def scan(self, targets: Any, ports: Any = "1-1024", **options: Any) -> Any:
-        return await self._delegate("scan", targets=targets, ports=ports, **options)
+    async def scan(
+        self,
+        targets: str | list[str],
+        ports: Any = "1-1024",
+        *,
+        concurrency: int = 64,
+        rate: float = 200,
+        timeout: float = 1.0,  # noqa: ASYNC109
+        max_probes: int | None = 1_000_000,
+        max_duration: float | None = 3600.0,
+        continue_after_output_limit: bool = False,
+    ) -> Any:
+        return await self._delegate(
+            "scan", targets=targets, ports=ports, concurrency=concurrency, rate=rate,
+            timeout=timeout, max_probes=max_probes, max_duration=max_duration,
+            continue_after_output_limit=continue_after_output_limit,
+        )
 
     async def nmap(
         self,
-        targets: Any,
+        targets: str | list[str],
         args: list[str] | None = None,
-        **options: Any,
+        *,
+        max_duration: float | None = 3600.0,
+        continue_after_output_limit: bool = False,
     ) -> Any:
-        return await self._delegate("nmap", targets=targets, args=args or [], **options)
+        return await self._delegate(
+            "nmap", targets=targets, args=args or [], max_duration=max_duration,
+            continue_after_output_limit=continue_after_output_limit,
+        )
 
     async def _delegate(self, kind: str, **options: Any) -> Any:
         """Load the manager scan implementation only when a scan is requested."""
@@ -423,7 +443,7 @@ class NetworkTools:
             from . import scan_api
         except ImportError as exc:
             raise RuntimeError("network scan support is not available") from exc
-        manager_net = scan_api.Net(self.rpc, self.tasks)
+        manager_net = scan_api.Net(self._rpc, self.tasks)
         if kind == "scan":
             return await manager_net.scan(
                 options.pop("targets"),

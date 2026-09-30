@@ -1,6 +1,6 @@
 # AST rewrites
 
-`ws.fs.rewrite_ast(..., history=True)` builds a bounded preview from ast-grep matches. It never changes source files. Apply a preview separately with `ws.fs.apply_rewrite(plan_id)`. A successful apply records the old and new bytes in filesystem history; set `history=False` only when that recovery entry is not needed.
+`ws.fs.rewrite_ast(..., history=True)` builds a bounded preview from ast-grep matches. It never changes source files. Apply a preview separately with `ws.fs.apply_rewrite(plan_id)`. History-enabled application holds the workspace storage transaction through preflight, file changes, and history publication, so GC cannot rewrite its revision index concurrently. A successful apply records the old and new bytes in filesystem history; set `history=False` only when that recovery entry is not needed.
 
 ```python
 preview = await ws.fs.rewrite_ast(

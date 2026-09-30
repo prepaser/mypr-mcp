@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
+import inspect
 import os
 import stat
 from pathlib import Path
 
 import pytest
 
+import mypr_mcp.filesystem as filesystem_module
 from mypr_mcp.filesystem import Filesystem
 
 
@@ -160,3 +162,104 @@ async def test_cancelled_write_waits_for_worker_before_unlocking(tmp_path: Path,
     with pytest.raises(asyncio.CancelledError):
         await task
     assert (tmp_path / "file.txt").read_text() == "new"
+
+
+async def test_move_rechecks_source_before_unlinking(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"original")
+    fs = Filesystem(tmp_path)
+    original_atomic_write = filesystem_module._atomic_write
+
+    def write_then_change(path, data, old, old_stat):
+        result = original_atomic_write(path, data, old, old_stat)
+        if path == destination:
+            source.write_bytes(b"external change")
+        return result
+
+    monkeypatch.setattr(filesystem_module, "_atomic_write", write_then_change)
+    with pytest.raises(RuntimeError, match="Source changed while moving"):
+        await fs.move("source.txt", "destination.txt", expected_hash=digest("original"))
+
+    assert source.read_bytes() == b"external change"
+    assert not destination.exists()
+
+
+async def test_read_bytes_hashes_stream_and_captures_only_requested_range(
+    tmp_path: Path, monkeypatch
+):
+    data = b"a" * (2 * 1024 * 1024 + 17)
+    (tmp_path / "large.bin").write_bytes(data)
+    reads = []
+    original_fdopen = filesystem_module.os.fdopen
+
+    class InstrumentedStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self, size=-1):
+            reads.append(size)
+            return self.stream.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    def instrumented_fdopen(fd, mode):
+        return InstrumentedStream(original_fdopen(fd, mode))
+
+    monkeypatch.setattr(filesystem_module.os, "fdopen", instrumented_fdopen)
+    result = await Filesystem(tmp_path).read_bytes("large.bin", start_byte=7, max_bytes=11)
+
+    assert result["data_base64"] == "YWFhYWFhYWFhYWE="
+    assert result["size"] == len(data)
+    assert result["revision"] == hashlib.sha256(data).hexdigest()
+    assert reads and max(reads) <= 1024 * 1024
+
+
+async def test_search_signatures_expose_backend_options_and_page_cursor(tmp_path: Path):
+    async def searcher(**kwargs):
+        return kwargs
+
+    fs = Filesystem(tmp_path, searcher=searcher)
+    assert "**options" not in str(inspect.signature(fs.search))
+    assert "**options" not in str(inspect.signature(fs.search_docs))
+    assert "**options" not in str(inspect.signature(fs.search_ast))
+
+    result = await fs.search("needle", page_cursor="cursor")
+    assert result == {"pattern": "needle", "backend": "rg", "cursor": "cursor", "mode": None,
+                      "paths": None, "glob": None, "fixed": False, "ignore_case": False,
+                      "hidden": False, "no_ignore": False, "context": 0, "word": False,
+                      "line": False, "multiline": False, "dotall": False, "before": None,
+                      "after": None, "regex_engine": "default", "timeout": 30,
+                      "scan_bytes": 16 * 1024 * 1024, "scan_limit": None, "max_matches": 100,
+                      "max_bytes": 32_768}
+    with pytest.raises(ValueError, match="cursor and page_cursor"):
+        await fs.search("needle", cursor="next", page_cursor="current")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'backend'"):
+        await fs.search("needle", backend="ast")
+
+
+async def test_document_and_ast_cursor_continuations_keep_saved_mode(tmp_path: Path):
+    calls = []
+
+    async def searcher(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("cursor") is not None:
+            if kwargs.get("mode") is not None and kwargs["mode"] != "counts":
+                raise AssertionError("continuation changed the saved result mode")
+        return {}
+
+    fs = Filesystem(tmp_path, searcher=searcher)
+    await fs.search_docs("needle", mode="counts")
+    await fs.search_docs(cursor="document-next")
+    await fs.search_ast("print($A)", lang="python", mode="counts")
+    await fs.search_ast("print($A)", lang="python", cursor="ast-next")
+
+    assert [call["mode"] for call in calls] == ["counts", None, "counts", None]

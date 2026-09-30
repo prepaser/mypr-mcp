@@ -13,7 +13,7 @@ from .diagnostics import RPCError
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, wait_ticket
 from .restart_records import poll_restart
-from .transport import attachment, find_runtime, rpc
+from .transport import HANDSHAKE_TIMEOUT, attachment, find_runtime, rpc
 
 
 class ConnectionBridge:
@@ -194,16 +194,40 @@ class ConnectionBridge:
     async def _attach(self, path):
         if self._context is not None:
             context, self._context = self._context, None
-            await context.__aexit__(None, None, None)
+            self.attachment = None
+            self.path = None
+            self._state = None
+            with contextlib.suppress(ConnectionError, OSError):
+                await context.__aexit__(None, None, None)
         self.connection_id = uuid.uuid4().hex
+        self.attachment = None
+        self.path = None
+        self._state = None
+        self._ready.clear()
         context = attachment(path, self.connection_id, target=target_installation())
-        attached = await context.__aenter__()
-        self._context = context
-        self.attachment = attached
-        self.path = path
-        self._state = check_compatibility(attached.status)
-        if self.client_id is not None:
-            await rpc(path, op="init", connection_id=self.connection_id, client_id=self.client_id)
+        try:
+            attached = await context.__aenter__()
+            self._context = context
+            self.attachment = attached
+            self.path = path
+            self._state = check_compatibility(attached.status)
+            if self.client_id is not None:
+                async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                    await rpc(
+                        path,
+                        op="init",
+                        connection_id=self.connection_id,
+                        client_id=self.client_id,
+                    )
+        except BaseException as exc:
+            if self._context is context:
+                self._context = None
+            self.attachment = None
+            self.path = None
+            self._state = None
+            with contextlib.suppress(BaseException):
+                await context.__aexit__(type(exc), exc, exc.__traceback__)
+            raise
         self._error = None
         self._ready.set()
 

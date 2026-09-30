@@ -238,12 +238,20 @@ async def apply_rewrite(fs: Any, plan_id: str) -> dict[str, Any]:
             raise RuntimeError("rewrite plan exceeds the input limit")
         resolved.append((path, actual_display or display, old_hash, new, old_size))
 
+    history_store = fs._history_store() if payload.get("history", True) else None
+    resources = sorted({
+        resource
+        for path, _, _, _, _ in resolved
+        if (resource := history_store._resource_for_path(path)) is not None
+    }) if history_store is not None else []
     locks = [fs._lock(item[0]) for item in sorted(resolved, key=lambda item: str(item[0]))]
-    acquired: list[Any] = []
-    try:
+    async with contextlib.AsyncExitStack() as stack:
+        if history_store is not None:
+            for resource in resources:
+                await stack.enter_async_context(history_store.transaction(resource))
         for lock in locks:
             await lock.acquire()
-            acquired.append(lock)
+            stack.callback(lock.release)
         states = {}
         plans = []
         for path, display, expected_hash, new, old_size in resolved:
@@ -272,9 +280,8 @@ async def apply_rewrite(fs: Any, plan_id: str) -> dict[str, Any]:
                     stat.S_IMODE(state.info.st_mode),
                 )
             )
-        history_store = fs._history_store() if payload.get("history", True) else None
         if history_store is not None:
-            history_store.prepare_changes_sync(plans)
+            await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
         result = await _to_thread_uncancelled(
             _commit, plans, states, _MAX_DIFF, history_store=history_store
         )
@@ -292,9 +299,6 @@ async def apply_rewrite(fs: Any, plan_id: str) -> dict[str, Any]:
         except OSError as exc:
             result["warnings"] = [f"rewrite plan cleanup failed: {exc}"]
         return result
-    finally:
-        for lock in reversed(acquired):
-            lock.release()
 
 
 def _validate(pattern, rule, replacement, lang, paths, glob) -> None:

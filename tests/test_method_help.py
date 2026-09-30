@@ -67,3 +67,10 @@ def test_help_aliases_and_internal_edit_coordinator(tmp_path):
     assert "wait_saved()" in ws.help("task_results")
     with pytest.raises(ValueError, match="unknown API method"):
         ws.help("fs.apply_lsp_plan")
+
+
+def test_internal_network_callback_is_not_a_help_method(tmp_path):
+    ws = Workspace(tmp_path)
+    assert "net.rpc" not in ws.help("net")
+    with pytest.raises(ValueError, match="unknown API method"):
+        ws.help("net.rpc")

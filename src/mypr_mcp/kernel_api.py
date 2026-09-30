@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .api_help import workspace_help
+from .async_utils import wait_owned
 from .browser_tools import BrowserTools
 from .code_tools import CodeTools
 from .diagnostics import RPCError, safe_error, safe_error_details
@@ -353,8 +354,8 @@ class TaskHandle:
             result["finished_at"] = self._finished_at
         if self._persist_result:
             result["result_persisted"] = self._result_persisted
-            if self._result_warnings:
-                result["warnings"] = list(self._result_warnings)
+        if self._result_warnings:
+            result["warnings"] = list(self._result_warnings)
         return result
 
     def output(self, cursor: int | None = None) -> str | dict[str, Any]:
@@ -617,22 +618,39 @@ class TaskHandle:
         if not self._task.done():
             await publish("running")
         cursor = 0
+        output_unconfirmed = False
         while True:
             for name, chunk in self._buffer.segments(cursor):
-                await publish("running", output_delta=chunk, output_stream=name)
+                if not await publish("running", output_delta=chunk, output_stream=name):
+                    output_unconfirmed = True
                 cursor += len(chunk)
             if self._task.done():
+                if cursor < len(self._buffer.get()):
+                    continue
                 break
             await asyncio.wait({self._task}, timeout=0.25)
+        terminal_output = {
+            "output": _bounded_history_output(self.output()),
+            "output_delta": "",
+            "output_truncated": (
+                self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT
+                or output_unconfirmed
+            ),
+        }
+        if output_unconfirmed:
+            warning = {
+                "code": "task_output_persistence_unknown",
+                "text": "Some task output could not be confirmed in history.",
+            }
+            self._result_warnings.append(warning)
+            terminal_output["warnings"] = [warning]
         try:
             await self._task
         except asyncio.CancelledError:
             await publish_terminal(
                 "cancelled",
                 finished=time.time(),
-                output=_bounded_history_output(self.output()),
-                output_delta="",
-                output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+                **terminal_output,
             )
         except BaseException as exc:
             error, error_truncated = safe_error_details(exc)
@@ -641,9 +659,7 @@ class TaskHandle:
                 finished=time.time(),
                 error=error,
                 error_truncated=error_truncated,
-                output=_bounded_history_output(self.output()),
-                output_delta="",
-                output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+                **terminal_output,
             )
         else:
             result_fields = {}
@@ -675,9 +691,7 @@ class TaskHandle:
             await publish_terminal(
                 "succeeded",
                 finished=time.time(),
-                output=_bounded_history_output(self.output()),
-                output_delta="",
-                output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+                **terminal_output,
                 **result_fields,
             )
 
@@ -1382,19 +1396,7 @@ class ShellError(RuntimeError):
 
 
 async def _complete_cleanup(operation):
-    task = asyncio.create_task(operation)
-    cancelled = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-            break
-        except asyncio.CancelledError:
-            if task.cancelled():
-                raise
-            cancelled = True
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await wait_owned(operation)
 
 
 class Shell:
@@ -1572,6 +1574,8 @@ class MCP:
         return await self.request("reload", force=force)
 
     async def request(self, method: str, **args: Any) -> Any:
+        if "force" in args and type(args["force"]) is not bool:
+            raise TypeError("force must be a boolean")
         return await _rpc("mcp", method=method, args=args)
 
     async def list_servers(self) -> Any:
@@ -1911,6 +1915,8 @@ class Workspace:
         return await doctor_workspace(self.workspace, ws=self)
 
     async def reset(self, force: bool = False) -> Any:
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
         if _output_buffer.get() is not None:
             raise RuntimeError("Request reset from a foreground Python cell")
         exec_id = _exec_context.get()
@@ -1922,7 +1928,7 @@ class Workspace:
             raise RuntimeError("Workspace has active tasks; pass force=True to reset")
         result = await _rpc(
             "reset",
-            force=bool(force),
+            force=force,
             from_kernel=True,
             generation=os.environ.get("MYPR_GENERATION"),
             exec_id=exec_id,
@@ -1981,25 +1987,11 @@ class Workspace:
         }
 
 
-_TASKS = TaskManager()
-
-
 def create_workspace(
     workspace: str | os.PathLike[str] | None = None,
     namespace: Mapping[str, Any] | None = None,
 ) -> Workspace:
-    global _TASKS
-    ws = Workspace(workspace, namespace)
-    ws.tasks = _TASKS
-    ws.shell = Shell(_TASKS)
-    ws.fs = Filesystem(ws.workspace, ws.shell, ws._search)
-    ws.docs = Documents(ws.fs)
-    ws.skills = Skills(ws.workspace, ws.fs)
-    ws.modules = ModuleManager(ws.workspace, ws.fs, ws.shell)
-    ws.packages = Packages(_TASKS)
-    ws.net = NetworkTools(ws.workspace, _TASKS, _rpc)
-    ws.browser = BrowserTools(ws.workspace, ws._lock_identity, _rpc, ws.fs)
-    return ws
+    return Workspace(workspace, namespace)
 
 
 __all__ = [

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
+import math
+import stat
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .change_plans import ChangePlanError, ChangePlanStore
+from .async_utils import wait_owned
+from .change_plans import PLAN_TTL, ChangePlanError, ChangePlanStore
 
 
 class EditError(ValueError):
@@ -288,10 +293,19 @@ class EditPlan:
 
 class EditPlanStore:
     def __init__(self, root: Path, *, max_plans: int = 16, ttl: float = 3600.0) -> None:
+        if type(max_plans) is not int or max_plans < 1:
+            raise ValueError("max_plans must be a positive integer")
+        if (
+            isinstance(ttl, bool) or not isinstance(ttl, (int, float))
+            or not math.isfinite(ttl) or ttl <= 0
+        ):
+            raise ValueError("ttl must be positive and finite")
         self.max_plans = max_plans
-        self.ttl = ttl
+        self.ttl = float(ttl)
         self._plans: dict[str, EditPlan] = {}
         self._durable = ChangePlanStore(root, "lsp", max_files=100)
+        self._cache_lock = threading.RLock()
+        self._workspace_key = _workspace_key(self._durable.workspace)
 
     def create(
         self,
@@ -302,54 +316,144 @@ class EditPlanStore:
         unsupported_reason: str | None = None,
         server: str | None = None,
     ) -> EditPlan:
-        plan = EditPlan(
-            "",
-            root,
-            operations,
-            generation,
-            title,
-            unsupported_reason,
-            time.monotonic(),
-            server,
+        with self._cache_lock:
+            plan = EditPlan(
+                "",
+                root,
+                operations,
+                generation,
+                title,
+                unsupported_reason,
+                time.monotonic(),
+                server,
+            )
+            try:
+                durable_id = self._durable.create(plan.payload())
+            except ChangePlanError as exc:
+                raise EditError(str(exc)) from exc
+            plan.ident = durable_id
+            self._cache(plan)
+            self._sync_cache()
+            return plan
+
+    async def acreate(
+        self,
+        root: Path,
+        operations: list[PlannedOperation],
+        generation: str,
+        title: str,
+        unsupported_reason: str | None = None,
+        server: str | None = None,
+    ) -> EditPlan:
+        return await wait_owned(
+            asyncio.to_thread(
+                self.create,
+                root,
+                operations,
+                generation,
+                title,
+                unsupported_reason,
+                server,
+            )
         )
-        try:
-            durable_id = self._durable.create(plan.payload())
-        except ChangePlanError as exc:
-            raise EditError(str(exc)) from exc
-        plan.ident = durable_id
-        self._plans[durable_id] = plan
-        while len(self._plans) > self.max_plans:
-            self._plans.pop(next(iter(self._plans)))
-        return plan
 
     def get(self, ident: str) -> EditPlan:
-        if not isinstance(ident, str) or not ident or len(ident) > 128:
-            raise EditError("invalid LSP edit plan id")
-        try:
-            plan = self._plans[ident]
-        except KeyError:
+        with self._cache_lock:
+            if not isinstance(ident, str) or not ident or len(ident) > 128:
+                raise EditError("invalid LSP edit plan id")
+            self._sync_cache()
             try:
-                payload = self._durable.load(ident)
+                payload = self._load_payload(ident)
                 plan = EditPlan.from_payload(self._durable.workspace, ident, payload)
             except (ChangePlanError, EditError) as exc:
+                self._plans.pop(ident, None)
                 raise EditError(str(exc)) from exc
-            self._plans[ident] = plan
-        if time.monotonic() - plan.created > self.ttl:
-            self._plans.pop(ident, None)
-            raise EditError("LSP edit plan has expired")
-        return plan
+            age = _payload_age(payload)
+            if age is not None:
+                plan.created = time.monotonic() - age
+            self._cache(plan)
+            return plan
+
+    async def aget(self, ident: str) -> EditPlan:
+        return await wait_owned(asyncio.to_thread(self.get, ident))
 
     def remove(self, ident: str) -> EditPlan:
-        plan = self.get(ident)
-        self._plans.pop(plan.ident, None)
-        try:
-            self._durable.remove(plan.ident)
-        except ChangePlanError as exc:
-            raise EditError(str(exc)) from exc
-        return plan
+        with self._cache_lock:
+            plan = self.get(ident)
+            try:
+                self._durable.remove(plan.ident)
+            except ChangePlanError as exc:
+                raise EditError(str(exc)) from exc
+            self._plans.pop(plan.ident, None)
+            return plan
+
+    async def aremove(self, ident: str) -> EditPlan:
+        return await wait_owned(asyncio.to_thread(self.remove, ident))
+
+    def consume(self, plan: EditPlan) -> EditPlan:
+        with self._cache_lock:
+            if not isinstance(plan, EditPlan):
+                raise TypeError("plan must be an EditPlan")
+            try:
+                self._durable.remove(plan.ident)
+            except ChangePlanError as exc:
+                raise EditError(str(exc)) from exc
+            self._plans.pop(plan.ident, None)
+            return plan
+
+    async def aconsume(self, plan: EditPlan) -> EditPlan:
+        return await wait_owned(asyncio.to_thread(self.consume, plan))
 
     def clear(self) -> None:
-        self._plans.clear()
+        with self._cache_lock:
+            self._plans.clear()
+
+    def _cache(self, plan: EditPlan) -> None:
+        self._plans.pop(plan.ident, None)
+        self._plans[plan.ident] = plan
+        while len(self._plans) > self.max_plans:
+            self._plans.pop(next(iter(self._plans)))
+
+    def _load_payload(self, ident: str) -> dict[str, Any]:
+        payload = self._durable.load(ident)
+        age = _payload_age(payload)
+        if age is not None and age > self.ttl:
+            self._durable.remove(ident)
+            raise ChangePlanError("LSP edit plan has expired")
+        return payload
+
+    def _sync_cache(self) -> None:
+        workspace_key = _workspace_key(self._durable.workspace)
+        if workspace_key != self._workspace_key:
+            self._plans.clear()
+            self._workspace_key = workspace_key
+            return
+        cutoff = min(self.ttl, PLAN_TTL)
+        for ident in tuple(self._plans):
+            try:
+                target = self._durable._target(ident)
+                info = target.lstat()
+                valid = stat.S_ISREG(info.st_mode) and not target.is_symlink()
+                valid = valid and time.time() - info.st_mtime <= cutoff
+            except (ChangePlanError, OSError):
+                valid = False
+            if not valid:
+                self._plans.pop(ident, None)
+
+
+def _payload_age(payload: dict[str, Any]) -> float | None:
+    created = payload.get("created_at")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        return None
+    return max(0.0, time.time() - float(created))
+
+
+def _workspace_key(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
 
 
 __all__ = [

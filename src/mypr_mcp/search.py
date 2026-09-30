@@ -72,58 +72,119 @@ class Search:
         utils=None,
         strictness="smart",
     ):  # noqa: ASYNC109
+        request = dict(
+            pattern=pattern,
+            backend=backend,
+            mode=mode,
+            paths=paths,
+            glob=glob,
+            fixed=fixed,
+            ignore_case=ignore_case,
+            hidden=hidden,
+            no_ignore=no_ignore,
+            context=context,
+            word=word,
+            line=line,
+            multiline=multiline,
+            dotall=dotall,
+            before=before,
+            after=after,
+            regex_engine=regex_engine,
+            timeout=timeout,
+            scan_bytes=scan_bytes,
+            scan_limit=scan_limit,
+            max_matches=max_matches,
+            max_bytes=max_bytes,
+            cursor=cursor,
+            adapters=adapters,
+            accurate=accurate,
+            cache=cache,
+            archive_depth=archive_depth,
+            lang=lang,
+            rule=rule,
+            constraints=constraints,
+            utils=utils,
+            strictness=strictness,
+        )
         if backend == "info":
-            from .search_backends import inspect_backends
-
-            slots = getattr(getattr(self.shell, "runtime", None), "search_slots", self._slots)
-            async with asyncio.timeout(30):
-                async with slots:
-                    return await inspect_backends(self.workspace, self.shell)
+            return await self._inspect_backends()
         if backend not in {"rg", "rga", "ast"}:
             raise ValueError("unknown search backend")
         self._validate_options(context, max_matches, max_bytes)
         if cursor is not None:
-            changed = (
-                pattern is not None
-                or rule is not None
-                or paths is not None
-                or glob is not None
-                or any(
-                    (
-                        fixed,
-                        ignore_case,
-                        hidden,
-                        no_ignore,
-                        context,
-                        word,
-                        line,
-                        multiline,
-                        dotall,
-                        accurate,
-                    )
+            return await self._continue(request)
+        mode, options = self._normalize_request(request)
+        collector = Results(backend, mode, parse_match=self._match_item, limit=scan_limit)
+        run, items = await self._run_backend(
+            backend, options, collector, timeout=timeout, scan_bytes=scan_bytes
+        )
+        outcome = self._classify_run(backend, mode, collector, items, run)
+        return await self._save_snapshot(
+            backend, mode, options, max_bytes, max_matches, run, items, outcome
+        )
+
+    async def _inspect_backends(self):
+        from .search_backends import inspect_backends
+
+        slots = getattr(getattr(self.shell, "runtime", None), "search_slots", self._slots)
+        async with asyncio.timeout(30):
+            async with slots:
+                return await inspect_backends(self.workspace, self.shell)
+
+    async def _continue(self, request):
+        if self._cursor_changed(request):
+            raise ValueError("cursor accepts only page budgets and its existing mode")
+        snapshot, offset = await asyncio.to_thread(self.snapshots.decode, request["cursor"])
+        if snapshot.get("backend", "rg") != request["backend"]:
+            raise ValueError("cursor belongs to a different search backend")
+        mode = request["mode"]
+        if mode is not None and mode != snapshot.get("kind", "matches"):
+            raise ValueError("cursor cannot change the search mode")
+        return await asyncio.to_thread(
+            self._page, snapshot, offset, request["max_bytes"], request["max_matches"]
+        )
+
+    @staticmethod
+    def _cursor_changed(request):
+        return (
+            request["pattern"] is not None
+            or request["rule"] is not None
+            or request["paths"] is not None
+            or request["glob"] is not None
+            or any(
+                request[key]
+                for key in (
+                    "fixed",
+                    "ignore_case",
+                    "hidden",
+                    "no_ignore",
+                    "context",
+                    "word",
+                    "line",
+                    "multiline",
+                    "dotall",
+                    "accurate",
                 )
-                or before is not None
-                or after is not None
-                or regex_engine != "default"
-                or timeout != 30
-                or scan_bytes != _QUERY_BYTES
-                or scan_limit is not None
-                or adapters is not None
-                or cache is not True
-                or archive_depth != 5
-                or lang is not None
-                or constraints is not None
-                or utils is not None
-                or strictness != "smart"
             )
-            if changed:
-                raise ValueError("cursor accepts only page budgets and its existing mode")
-            snapshot, offset = await asyncio.to_thread(self.snapshots.decode, cursor)
-            if snapshot.get("backend", "rg") != backend:
-                raise ValueError("cursor belongs to a different search backend")
-            if mode is not None and mode != snapshot.get("kind", "matches"):
-                raise ValueError("cursor cannot change the search mode")
-            return await asyncio.to_thread(self._page, snapshot, offset, max_bytes, max_matches)
+            or request["before"] is not None
+            or request["after"] is not None
+            or request["regex_engine"] != "default"
+            or request["timeout"] != 30
+            or request["scan_bytes"] != _QUERY_BYTES
+            or request["scan_limit"] is not None
+            or request["adapters"] is not None
+            or request["cache"] is not True
+            or request["archive_depth"] != 5
+            or request["lang"] is not None
+            or request["constraints"] is not None
+            or request["utils"] is not None
+            or request["strictness"] != "smart"
+        )
+
+    def _normalize_request(self, request):
+        backend = request["backend"]
+        pattern = request["pattern"]
+        mode = request["mode"]
         if mode is None:
             mode = "files" if pattern is None and backend == "rg" else "matches"
         if mode not in {"matches", "files", "counts", "exists"}:
@@ -134,45 +195,52 @@ class Search:
             patterns = self._many(pattern)
             if not patterns or any("\0" in value for value in patterns):
                 raise ValueError("pattern must be a string or nonempty list without NUL")
-        for key, value in {
-            "fixed": fixed,
-            "ignore_case": ignore_case,
-            "hidden": hidden,
-            "no_ignore": no_ignore,
-            "word": word,
-            "line": line,
-            "multiline": multiline,
-            "dotall": dotall,
-            "accurate": accurate,
-            "cache": cache,
-        }.items():
+        for key in (
+            "fixed",
+            "ignore_case",
+            "hidden",
+            "no_ignore",
+            "word",
+            "line",
+            "multiline",
+            "dotall",
+            "accurate",
+            "cache",
+        ):
+            value = request[key]
             if type(value) is not bool:
                 raise TypeError(f"{key} must be a boolean")
+        timeout = request["timeout"]
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a positive finite number")
+        scan_bytes = request["scan_bytes"]
         if type(scan_bytes) is not int or not 1 <= scan_bytes <= _QUERY_BYTES:
             raise ValueError(f"scan_bytes must be between 1 and {_QUERY_BYTES}")
+        scan_limit = request["scan_limit"]
         if scan_limit is not None and (type(scan_limit) is not int or scan_limit < 1):
             raise ValueError("scan_limit must be a positive integer")
+        before, after = request["before"], request["after"]
         for value in (before, after):
             if value is not None and (type(value) is not int or not 0 <= value <= _MAX_CONTEXT):
                 raise ValueError("before and after must be between 0 and 100")
+        context = request["context"]
         if context and (before is not None or after is not None):
             raise ValueError("context cannot be combined with before or after")
-        if word and line:
+        if request["word"] and request["line"]:
             raise ValueError("word and line cannot both be enabled")
-        if dotall and not multiline:
+        if request["dotall"] and not request["multiline"]:
             raise ValueError("dotall requires multiline=True")
+        regex_engine = request["regex_engine"]
         if regex_engine not in {"default", "pcre2"}:
             raise ValueError("regex_engine must be default or pcre2")
         if backend == "ast" and any(
             (
-                fixed,
-                ignore_case,
-                word,
-                line,
-                multiline,
-                dotall,
+                request["fixed"],
+                request["ignore_case"],
+                request["word"],
+                request["line"],
+                request["multiline"],
+                request["dotall"],
                 context,
                 before is not None,
                 after is not None,
@@ -180,18 +248,21 @@ class Search:
             )
         ):
             raise ValueError("text matching and context options cannot be used for AST searches")
-        if backend != "ast" and strictness != "smart":
+        if backend != "ast" and request["strictness"] != "smart":
             raise ValueError("strictness requires search_ast")
         if backend != "ast" and any(
-            value is not None for value in (lang, rule, constraints, utils)
+            request[key] is not None for key in ("lang", "rule", "constraints", "utils")
         ):
             raise ValueError("AST options require search_ast")
         if backend != "rga" and (
-            adapters is not None or accurate or not cache or archive_depth != 5
+            request["adapters"] is not None
+            or request["accurate"]
+            or not request["cache"]
+            or request["archive_depth"] != 5
         ):
             raise ValueError("document options require search_docs")
-        paths = self._paths(paths)
-        globs = self._many(glob)
+        paths = self._paths(request["paths"])
+        globs = self._many(request["glob"])
         if any(not value or "\0" in value for value in [*paths, *globs]):
             raise ValueError("paths and globs must be nonempty strings without NUL")
         generated = self.workspace / ".mypr" / "searches"
@@ -205,36 +276,35 @@ class Search:
             mode=mode,
             paths=paths,
             glob=globs,
-            fixed=fixed,
-            ignore_case=ignore_case,
-            hidden=hidden,
-            no_ignore=no_ignore,
+            fixed=request["fixed"],
+            ignore_case=request["ignore_case"],
+            hidden=request["hidden"],
+            no_ignore=request["no_ignore"],
             context=context,
-            word=word,
-            line=line,
-            multiline=multiline,
-            dotall=dotall,
+            word=request["word"],
+            line=request["line"],
+            multiline=request["multiline"],
+            dotall=request["dotall"],
             before=before,
             after=after,
             regex_engine=regex_engine,
-            adapters=adapters,
-            accurate=accurate,
-            cache=cache,
-            archive_depth=archive_depth,
-            lang=lang,
-            rule=rule,
-            constraints=constraints,
-            utils=utils,
-            strictness=strictness,
+            adapters=request["adapters"],
+            accurate=request["accurate"],
+            cache=request["cache"],
+            archive_depth=request["archive_depth"],
+            lang=request["lang"],
+            rule=request["rule"],
+            constraints=request["constraints"],
+            utils=request["utils"],
+            strictness=request["strictness"],
             scan_limit=scan_limit,
         )
-        collector = Results(backend, mode, parse_match=self._match_item, limit=scan_limit)
+        return mode, options
+
+    async def _run_backend(self, backend, options, collector, *, timeout, scan_bytes):  # noqa: ASYNC109
         deadline = time.monotonic() + timeout
         runtime = getattr(self.shell, "runtime", None)
-        if runtime is not None:
-            slots = runtime.search_slots
-        else:
-            slots = self._slots
+        slots = runtime.search_slots if runtime is not None else self._slots
         run = {}
         acquired = False
         temporary_cache = None
@@ -249,22 +319,13 @@ class Search:
                     command, temporary_cache = await _uncancelled(prepare, propagate=False)
                     raise
             remaining = max(0.001, deadline - time.monotonic())
-
-            async def consume(chunk):
-                parse = asyncio.create_task(asyncio.to_thread(collector.feed, chunk))
-                try:
-                    return await asyncio.shield(parse)
-                except asyncio.CancelledError:
-                    await _uncancelled(parse, propagate=False)
-                    raise
-
             if hasattr(self.shell, "stream"):
                 run = await self.shell.stream(
                     command,
                     cwd=self.workspace,
                     timeout=remaining,
                     max_bytes=scan_bytes,
-                    on_stdout=consume,
+                    on_stdout=lambda chunk: self._consume(collector, chunk),
                 )
             else:
                 run = await self.shell.run(
@@ -274,7 +335,7 @@ class Search:
                     timeout=remaining,
                     max_bytes=scan_bytes,
                 )
-                await consume(str(run.get("stdout", "")))
+                await self._consume(collector, str(run.get("stdout", "")))
         except TimeoutError:
             run = {**run, "timed_out": True, "stop_reason": "timeout"}
         finally:
@@ -287,7 +348,18 @@ class Search:
             finally:
                 if acquired:
                     slots.release()
-        items = await asyncio.to_thread(collector.finish)
+        return run, await asyncio.to_thread(collector.finish)
+
+    async def _consume(self, collector, chunk):
+        parse = asyncio.create_task(asyncio.to_thread(collector.feed, chunk))
+        try:
+            return await asyncio.shield(parse)
+        except asyncio.CancelledError:
+            await _uncancelled(parse, propagate=False)
+            raise
+
+    @staticmethod
+    def _classify_run(backend, mode, collector, items, run):
         reason = collector.stopped or run.get("stop_reason")
         if run.get("timed_out"):
             reason = "timeout"
@@ -325,6 +397,12 @@ class Search:
             found = True if positive else False if complete else None
             if positive:
                 complete, reason = True, "matched"
+        return reason, complete, found, warnings
+
+    async def _save_snapshot(
+        self, backend, mode, options, max_bytes, max_matches, run, items, outcome
+    ):
+        reason, complete, found, warnings = outcome
         ident = await asyncio.to_thread(
             self.snapshots.create,
             options,

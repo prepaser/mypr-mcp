@@ -10,6 +10,7 @@ from pathlib import Path
 from .diagnostics import RPCError
 
 MAX_MESSAGE = 32 * 1024 * 1024
+HANDSHAKE_TIMEOUT = 30
 
 
 def workspace_id(workspace: Path) -> str:
@@ -145,22 +146,25 @@ async def attachment(
     *,
     target: dict | None = None,
 ):
-    """Attach a client and keep its manager connection open until shutdown."""
-    reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_MESSAGE)
+    """Attach with a bounded handshake, then keep the connection open."""
+    deadline = asyncio.get_running_loop().time() + HANDSHAKE_TIMEOUT
+    async with asyncio.timeout_at(deadline):
+        reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_MESSAGE)
     try:
-        writer.write(
-            json.dumps(
-                {
-                    "op": "attach",
-                    "connection_id": connection_id,
-                    **({"target": target} if target is not None else {}),
-                },
-                separators=(",", ":"),
-            ).encode()
-            + b"\n"
-        )
-        await writer.drain()
-        data = await reader.readline()
+        async with asyncio.timeout_at(deadline):
+            writer.write(
+                json.dumps(
+                    {
+                        "op": "attach",
+                        "connection_id": connection_id,
+                        **({"target": target} if target is not None else {}),
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+            await writer.drain()
+            data = await reader.readline()
         if not data:
             raise ConnectionError("Workspace manager disconnected during attach")
         try:

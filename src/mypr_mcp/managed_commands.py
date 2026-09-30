@@ -7,6 +7,8 @@ import math
 from contextlib import suppress
 from typing import Any
 
+from .async_utils import wait_owned
+
 _ACTIVE = {"queued", "running", "cancelling"}
 _PAGE_BYTES = 32 * 1024
 _MAX_WARNINGS = 4
@@ -359,15 +361,4 @@ class ManagedCommands:
 
 
 async def _uncancelled(task: asyncio.Task[Any], *, propagate: bool = True) -> Any:
-    cancelled = False
-    while True:
-        try:
-            value = await asyncio.shield(task)
-            break
-        except asyncio.CancelledError:
-            if task.cancelled():
-                raise
-            cancelled = True
-    if cancelled and propagate:
-        raise asyncio.CancelledError
-    return value
+    return await wait_owned(task, propagate=propagate)

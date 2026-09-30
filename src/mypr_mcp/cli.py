@@ -20,6 +20,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 from pydantic import Field
 
 from . import __version__
+from .async_utils import wait_owned
 from .bridge import ConnectionBridge
 from .config import ConfigError, load_workspace_config
 from .diagnostics import RPCError, safe_error
@@ -119,13 +120,14 @@ async def ensure(workspace, *, locked=False):
                     write_startup_failure(root, error, operation="manager_start")
                 raise error
             try:
-                state = await rpc(path, op="status")
+                remaining = max(0.0, deadline - time.monotonic())
+                state = await asyncio.wait_for(rpc(path, op="status"), min(5, remaining))
                 if state["healthy"]:
                     clear_startup_failure(root)
                     return path
-            except OSError, ConnectionError:
+            except OSError, ConnectionError, TimeoutError:
                 pass
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         error = RPCError(
             f"Workspace startup timed out; inspect {root / 'manager.log'}",
             code="manager_start_timeout",
@@ -149,12 +151,7 @@ async def ensure(workspace, *, locked=False):
 
 
 async def _finish_owned(task):
-    while True:
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                return task.result()
+    return await wait_owned(task, propagate=False)
 
 
 async def _stop_spawned(proc):

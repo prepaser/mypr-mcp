@@ -19,6 +19,7 @@ from threading import Lock
 from typing import Any
 from weakref import WeakValueDictionary
 
+from .async_utils import wait_owned
 from .storage_lock import StorageLock
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -38,19 +39,79 @@ class RevisionIndexOutcomeUnknown(RuntimeError):
     """Raised when an index write cannot be distinguished from an external update."""
 
 
+def _empty_index(kind: str, resource: str, version: int) -> dict[str, Any]:
+    index: dict[str, Any] = {
+        "version": version,
+        "kind": kind,
+        "resource": resource,
+        "count": 0,
+        "revisions": [],
+    }
+    if version == 2:
+        index["next_sequence"] = 1
+    return index
+
+
+def _validate_index(
+    index: Any, kind: str, resource: str, encoded_size: int
+) -> dict[str, Any]:
+    if encoded_size > _MAX_INDEX_BYTES:
+        raise ValueError("revision index exceeds its size limit")
+    if (
+        not isinstance(index, dict)
+        or type(index.get("version")) is not int
+        or index.get("version") not in {1, 2}
+        or index.get("kind") != kind
+        or index.get("resource") != resource
+        or not isinstance(index.get("revisions"), list)
+        or type(index.get("count")) is not int
+        or index.get("count") != len(index["revisions"])
+    ):
+        raise ValueError("revision index metadata is invalid")
+    version = index["version"]
+    next_sequence = index.get("next_sequence", 1)
+    if version == 2 and (type(next_sequence) is not int or next_sequence < 1):
+        raise ValueError("revision index next sequence is invalid")
+    pruned_before = index.get("pruned_before", 0)
+    if version == 2 and (type(pruned_before) is not int or pruned_before < 0):
+        raise ValueError("revision index prune marker is invalid")
+    previous = 0
+    for item in index["revisions"]:
+        is_absent = (
+            isinstance(item, dict)
+            and version == 2
+            and kind == "files"
+            and item.get("revision") == _ABSENT_REVISION
+            and item.get("absent") is True
+        )
+        if (
+            not isinstance(item, dict)
+            or type(item.get("sequence")) is not int
+            or item["sequence"] <= previous
+            or version == 1
+            and item["sequence"] != previous + 1
+            or not isinstance(item.get("revision"), str)
+            or not is_absent
+            and not _HASH.fullmatch(item["revision"])
+            or type(item.get("size")) is not int
+            or not 0 <= item["size"] <= _MAX_BLOB_BYTES
+            or is_absent
+            and item["size"] != 0
+            or not isinstance(item.get("created_at"), str)
+            or len(item["created_at"]) > 64
+        ):
+            raise ValueError("revision index record is invalid")
+        previous = item["sequence"]
+    if version == 2 and next_sequence <= previous:
+        raise ValueError("revision index next sequence is behind its records")
+    records = index["revisions"]
+    if version == 2 and pruned_before and records and pruned_before >= records[0]["sequence"]:
+        raise ValueError("revision index prune marker is invalid")
+    return index
+
+
 async def _uncancelled(function, *args):
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
-    cancelled = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-        break
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await wait_owned(asyncio.to_thread(function, *args))
 
 
 @asynccontextmanager
@@ -388,26 +449,14 @@ class RevisionStore:
         try:
             raw = Path(self.workspace / path).read_bytes()
         except FileNotFoundError:
-            index = {
-                "version": self._version,
-                "kind": self.kind,
-                "resource": resource,
-                "count": 0,
-                "revisions": [],
-            }
-            if self._version == 2:
-                index["next_sequence"] = 1
-            return index
+            return _empty_index(self.kind, resource, self._version)
+        if len(raw) > _MAX_INDEX_BYTES:
+            raise ValueError("revision index exceeds its size limit")
         try:
             index = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError("revision index is invalid JSON") from exc
-        if not isinstance(index, dict):
-            raise ValueError("revision index metadata is invalid")
-        version = index.get("version")
-        if version not in {1, 2} or index.get("kind") != self.kind:
-            raise ValueError("revision index metadata is invalid")
-        return index
+        return _validate_index(index, self.kind, resource, len(raw))
 
     def _write_index_sync(self, resource: str, index: dict[str, Any]) -> None:
         path = self.workspace / self._index_path(resource)
@@ -598,34 +647,24 @@ class RevisionStore:
             raise FileNotFoundError(f"Revision {revision} is not recorded for {resource}")
         if revision == _ABSENT_REVISION:
             return None
-        return await asyncio.to_thread(self._read_blob, revision)
+        data = await asyncio.to_thread(self._read_blob, revision)
+        if len(data) != record["size"]:
+            raise RuntimeError(f"Revision {revision} has an inconsistent recorded size")
+        return data
 
     async def _store_blob(self, revision: str, data: bytes) -> None:
         if len(data) > _MAX_BLOB_BYTES:
             raise ValueError(f"revision exceeds {_MAX_BLOB_BYTES} byte storage limit")
         path = self._blob_path(revision)
-        try:
-            await asyncio.to_thread(_write_blob, path, data)
-        except FileExistsError as exc:
-            existing = await asyncio.to_thread(self._read_blob, revision)
-            if existing != data:
-                raise RuntimeError(f"Revision object {revision} does not match its hash") from exc
+        await asyncio.to_thread(_write_blob, path, data)
 
     def _read_blob(self, revision: str) -> bytes:
         path = self._blob_path(revision)
-        if path.is_symlink():
-            raise RuntimeError(f"Revision object {revision} is a symlink")
         try:
             path.relative_to(self.workspace)
         except ValueError as exc:
             raise ValueError("revision object path escapes workspace") from exc
-        with path.open("rb") as stream:
-            data = stream.read(_MAX_BLOB_BYTES + 1)
-        if len(data) > _MAX_BLOB_BYTES:
-            raise ValueError(f"revision exceeds {_MAX_BLOB_BYTES} byte read limit")
-        if hashlib.sha256(data).hexdigest() != revision:
-            raise RuntimeError(f"Revision object {revision} failed its SHA-256 check")
-        return data
+        return _read_blob_path(path, revision)
 
     async def _load_index(
         self, resource: str, path: str
@@ -634,80 +673,16 @@ class RevisionStore:
         try:
             page = await self.fs.read(path, max_bytes=_MAX_INDEX_BYTES)
         except FileNotFoundError:
-            index = {
-                "version": self._version,
-                "kind": self.kind,
-                "resource": resource,
-                "count": 0,
-                "revisions": [],
-            }
-            if self._version == 2:
-                index["next_sequence"] = 1
-            return index, None
+            return _empty_index(self.kind, resource, self._version), None
         if page.get("truncated"):
             raise ValueError("revision index exceeds its size limit")
         try:
-            index = json.loads(page["text"])
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            text = page["text"]
+            index = json.loads(text)
+            encoded_size = len(text.encode("utf-8"))
+        except (AttributeError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError("revision index is invalid JSON") from exc
-        if (
-            not isinstance(index, dict)
-            or type(index.get("version")) is not int
-            or index.get("version") not in {1, 2}
-            or index.get("kind") != self.kind
-            or index.get("resource") != resource
-            or not isinstance(index.get("revisions"), list)
-            or type(index.get("count")) is not int
-            or index.get("count") != len(index["revisions"])
-        ):
-            raise ValueError("revision index metadata is invalid")
-        if len(page["text"].encode("utf-8")) > _MAX_INDEX_BYTES:
-            raise ValueError("revision index exceeds its size limit")
-        version = index["version"]
-        next_sequence = index.get("next_sequence", 1)
-        if version == 2 and (type(next_sequence) is not int or next_sequence < 1):
-            raise ValueError("revision index next sequence is invalid")
-        pruned_before = index.get("pruned_before", 0)
-        if version == 2 and (type(pruned_before) is not int or pruned_before < 0):
-            raise ValueError("revision index prune marker is invalid")
-        previous = 0
-        for item in index["revisions"]:
-            is_absent = (
-                isinstance(item, dict)
-                and version == 2
-                and self.kind == "files"
-                and item.get("revision") == _ABSENT_REVISION
-                and item.get("absent") is True
-            )
-            if (
-                not isinstance(item, dict)
-                or type(item.get("sequence")) is not int
-                or item["sequence"] <= previous
-                or version == 1
-                and item["sequence"] != previous + 1
-                or not isinstance(item.get("revision"), str)
-                or not is_absent
-                and not _HASH.fullmatch(item["revision"])
-                or type(item.get("size")) is not int
-                or not 0 <= item["size"] <= _MAX_BLOB_BYTES
-                or is_absent
-                and item["size"] != 0
-                or not isinstance(item.get("created_at"), str)
-                or len(item["created_at"]) > 64
-            ):
-                raise ValueError("revision index record is invalid")
-            previous = item["sequence"]
-        if version == 2 and next_sequence <= previous:
-            raise ValueError("revision index next sequence is behind its records")
-        records = index["revisions"]
-        if (
-            version == 2
-            and pruned_before
-            and records
-            and pruned_before >= records[0]["sequence"]
-        ):
-            raise ValueError("revision index prune marker is invalid")
-        return index, page["revision"]
+        return _validate_index(index, self.kind, resource, encoded_size), page["revision"]
 
     def _index_path(self, resource: str) -> str:
         key = hashlib.sha256(f"{self.kind}\0{resource}".encode()).hexdigest()
@@ -919,10 +894,17 @@ def _write_index_bytes_sync(path: Path, encoded: bytes) -> None:
 
 
 def _write_blob(path: Path, data: bytes) -> None:
+    if len(data) > _MAX_BLOB_BYTES:
+        raise ValueError(f"revision exceeds {_MAX_BLOB_BYTES} byte storage limit")
+    revision = hashlib.sha256(data).hexdigest()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.is_symlink():
-            raise RuntimeError(f"Revision object is a symlink: {path}")
+    try:
+        existing = _read_blob_path(path, revision)
+    except FileNotFoundError:
+        pass
+    else:
+        if existing != data:
+            raise RuntimeError(f"Revision object {revision} does not match its hash")
         return
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary)
@@ -933,7 +915,63 @@ def _write_blob(path: Path, data: bytes) -> None:
             os.fsync(stream.fileno())
         try:
             os.link(temporary_path, path)
-        except FileExistsError:
-            pass
+        except FileExistsError as exc:
+            try:
+                existing = _read_blob_path(path, revision)
+            except FileNotFoundError:
+                raise RuntimeError(
+                    f"Revision object {revision} disappeared during install"
+                ) from exc
+            if existing != data:
+                raise RuntimeError(f"Revision object {revision} does not match its hash") from exc
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _read_blob_path(path: Path, revision: str) -> bytes:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode):
+        raise RuntimeError(f"Revision object {revision} is a symlink")
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"Revision object {revision} is not a regular file")
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError(f"Revision object {revision} is not a regular file")
+        if opened.st_size > _MAX_BLOB_BYTES:
+            raise ValueError(f"revision exceeds {_MAX_BLOB_BYTES} byte read limit")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            data = stream.read(_MAX_BLOB_BYTES + 1)
+            after = os.fstat(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        current = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Revision object changed while being validated: {path}") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or _blob_signature(before) != _blob_signature(opened)
+        or _blob_signature(opened) != _blob_signature(after)
+        or _blob_signature(after) != _blob_signature(current)
+    ):
+        raise RuntimeError(f"Revision object {revision} changed while being validated")
+    if len(data) > _MAX_BLOB_BYTES:
+        raise ValueError(f"revision exceeds {_MAX_BLOB_BYTES} byte read limit")
+    if hashlib.sha256(data).hexdigest() != revision:
+        raise RuntimeError(f"Revision object {revision} failed its SHA-256 check")
+    return data
+
+
+def _blob_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )

@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import signal
+import sys
 import tempfile
 from collections import OrderedDict
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from .async_utils import finish_owned, wait_owned
 from .lsp_config import LSPConfig, validate_servers
 from .lsp_edits import (
     EditError,
@@ -253,9 +255,21 @@ class _LanguageServer:
         self.generation = secrets.token_hex(16)
 
     async def start(self) -> None:
+        client_pid = os.getpid()
+        guard = Path(__file__).with_name("process_guard.py")
+        guarded_command = [
+            sys.executable,
+            "-I",
+            str(guard),
+            "--parent-pid",
+            str(client_pid),
+            "--tree",
+            "--",
+            *self.command,
+        ]
         try:
             self.process = await asyncio.create_subprocess_exec(
-                *self.command,
+                *guarded_command,
                 cwd=self.root,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -276,7 +290,7 @@ class _LanguageServer:
             result = await self._request(
                 "initialize",
                 {
-                    "processId": os.getpid(),
+                    "processId": client_pid,
                     "clientInfo": {"name": "mypr-mcp", "version": "1"},
                     "rootUri": root_uri,
                     "workspaceFolders": [{"uri": root_uri, "name": self.root.name}],
@@ -1490,12 +1504,7 @@ class _LanguageServer:
     async def aclose(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
-        task = self._close_task
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await asyncio.shield(task)
-            raise
+        await wait_owned(self._close_task)
 
     async def _close(self) -> None:
         if self._closed:
@@ -1633,12 +1642,17 @@ class CodeTools:
             ):
                 if existing.command == command_value and existing.languages == language_values:
                     async with existing._operation_lock:
+                        cancelled = False
+                        if persist:
+                            _, cancelled = await finish_owned(
+                                self._persist_definition(  # noqa: ASYNC109
+                                    name, command_value, language_values, timeout
+                                )
+                            )
                         existing.timeout = float(timeout)
+                    if cancelled:
+                        raise asyncio.CancelledError
                     result = existing.status()
-                    if persist:
-                        await self._persist_definition(  # noqa: ASYNC109
-                            name, command_value, language_values, timeout
-                        )
                     return result
             if existing is None and len(self._servers) >= MAX_SERVERS:
                 raise CodeError(f"at most {MAX_SERVERS} language servers may be configured")
@@ -1647,18 +1661,24 @@ class CodeTools:
             )
             await replacement.start()
             result = replacement.status()
+            persist_cancelled = False
             if persist:
                 try:
-                    await self._persist_definition(  # noqa: ASYNC109
-                        name, command_value, language_values, timeout
+                    _, persist_cancelled = await finish_owned(
+                        self._persist_definition(  # noqa: ASYNC109
+                            name, command_value, language_values, timeout
+                        )
                     )
                 except BaseException:
-                    with suppress(Exception):
+                    with suppress(BaseException):
                         await replacement.aclose()
                     raise
             self._servers[name] = replacement
+            close_cancelled = False
             if existing is not None:
-                await existing.aclose()
+                _, close_cancelled = await finish_owned(existing.aclose())
+            if persist_cancelled or close_cancelled:
+                raise asyncio.CancelledError
             return result
 
     async def _persist_definition(  # noqa: ASYNC109
@@ -1960,7 +1980,7 @@ class CodeTools:
                 await update(self._edit_uri_path(uri), edits)
         if not operations and unsupported_reason is None:
             raise EditError("language server returned an empty workspace edit")
-        plan = self._plans.create(
+        plan = await self._plans.acreate(
             self.workspace,
             operations,
             server.generation,
@@ -2103,7 +2123,7 @@ class CodeTools:
         return result
 
     async def apply_edit(self, plan_id: str) -> dict[str, Any]:
-        plan = self._plans.get(plan_id)
+        plan = await self._plans.aget(plan_id)
         server_name = self._plan_servers.get(plan.ident) or plan.server
         if server_name is None:
             raise EditError("LSP edit plan has no language server")
@@ -2135,7 +2155,7 @@ class CodeTools:
                     raise EditError("LSP edit plan is stale")
                 virtual[operation.path] = operation.new
             result = await self._apply_edit_plan(plan)
-        self._plans.remove(plan.ident)
+        await self._plans.aconsume(plan)
         self._plan_servers.pop(plan.ident, None)
         result.update({"plan_id": plan.ident, "applied": True})
         return result

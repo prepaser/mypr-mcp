@@ -53,6 +53,21 @@ class Pages:
             raise ValueError("max_pages must be between 1 and 10000")
         call, name = self._resolve(method)
         options = dict(kwargs)
+        search_method = self._search_method(method, name)
+        if (
+            search_method
+            and options.get("cursor") is not None
+            and options.get("page_cursor") is not None
+        ):
+            raise ValueError("cursor and page_cursor cannot both be provided")
+        if search_method and (
+            options.get("cursor") is not None or options.get("page_cursor") is not None
+        ):
+            cursor = options.get("cursor")
+            if cursor is None:
+                cursor = options["page_cursor"]
+            args = ()
+            options = self._search_continuation(options, cursor)
         previous_marker: Any = options.get("cursor", _MISSING)
         seen: set[str] = set()
         revision: Any = _MISSING
@@ -80,7 +95,11 @@ class Pages:
                 raise RuntimeError(f"{name} returned a non-progressing or cyclic cursor")
             seen.add(encoded)
             previous_marker = marker
-            self._advance(name, options, marker, method)
+            if search_method:
+                args = ()
+                options = self._search_continuation(options, marker)
+            else:
+                self._advance(name, options, marker, method)
             if page_number == max_pages:
                 raise PageLimitReached(
                     method,
@@ -107,6 +126,38 @@ class Pages:
         if not callable(value):
             raise TypeError(f"workspace method is not callable: {method}")
         return value, method
+
+    def _search_method(
+        self,
+        method: str | Callable[..., Awaitable[Any]],
+        name: str,
+    ) -> bool:
+        parts = name.split(".")
+        owner = parts[-2] if len(parts) > 1 else ""
+        method_name = parts[-1]
+        if callable(method):
+            bound_owner = getattr(method, "__self__", None)
+            bound_name = getattr(method, "__name__", None)
+            for candidate in ("fs", "filesystem"):
+                if getattr(self._workspace, candidate, None) is bound_owner:
+                    owner = candidate
+                    method_name = bound_name or method_name
+                    break
+        return owner in {"fs", "filesystem"} and method_name in {
+            "search",
+            "search_docs",
+            "search_ast",
+        }
+
+    @staticmethod
+    def _search_continuation(options: Mapping[str, Any], marker: Any) -> dict[str, Any]:
+        continuation: dict[str, Any] = {"cursor": marker}
+        for key in ("max_bytes", "max_matches"):
+            if key in options:
+                continuation[key] = options[key]
+        if options.get("mode") is not None:
+            continuation["mode"] = options["mode"]
+        return continuation
 
     @staticmethod
     def _marker_key(marker: Any) -> str:

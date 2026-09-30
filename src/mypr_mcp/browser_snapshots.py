@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .async_utils import finish_owned, wait_owned
 from .browser_observation import _safe_url
 
 _MAX_SNAPSHOTS = 32
@@ -297,29 +298,14 @@ class BrowserSnapshots:
     async def _finish_launch(
         self, launch: asyncio.Task[asyncio.subprocess.Process]
     ) -> tuple[asyncio.subprocess.Process, bool]:
-        cancelled = False
-        while True:
-            try:
-                return await asyncio.shield(launch), cancelled
-            except asyncio.CancelledError:
-                cancelled = True
-                if launch.done():
-                    return launch.result(), True
+        return await finish_owned(launch)
 
     async def _finish_cleanup(
         self,
         process: asyncio.subprocess.Process,
         communication: asyncio.Task | None = None,
     ) -> None:
-        cleanup = asyncio.create_task(self._stop_worker(process, communication))
-        while True:
-            try:
-                await asyncio.shield(cleanup)
-                return
-            except asyncio.CancelledError:
-                if cleanup.done():
-                    cleanup.result()
-                    return
+        await wait_owned(self._stop_worker(process, communication), propagate=False)
 
     @staticmethod
     async def _stop_worker(

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .async_utils import finish_owned
 from .browser_observation import BrowserObservation, BrowserObservations
 from .browser_snapshots import BrowserSnapshots
 
@@ -58,19 +59,7 @@ class _Context:
 
 
 async def _shielded(awaitable: Awaitable[Any]) -> tuple[Any, bool]:
-    """Finish an owned operation before propagating caller cancellation."""
-
-    task = asyncio.ensure_future(awaitable)
-    cancelled = False
-    while True:
-        try:
-            return await asyncio.shield(task), cancelled
-        except asyncio.CancelledError:
-            if task.done():
-                if task.cancelled():
-                    raise
-                return task.result(), True
-            cancelled = True
+    return await finish_owned(awaitable)
 
 
 class BrowserTools:

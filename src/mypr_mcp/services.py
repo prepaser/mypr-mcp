@@ -28,6 +28,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
+from .async_utils import finish_owned, wait_owned
 from .config import MCPConfig, validate_name, validate_servers
 from .journal import decode_event, read_page
 from .terminal import close as close_terminal
@@ -224,11 +225,9 @@ class Shells:
             close_terminal(master_fd)
             close_terminal(slave_fd)
             job_id = uuid.uuid4().hex
-            job = self._new_job(job_id, _NoProcess(), 0, state="failed", error=str(exc))
-            job.result = {"returncode": -1}
-            self._persist_metadata(job)
+            job = self._new_job(job_id, _NoProcess(), 0)
             self._jobs[job_id] = job
-            self._prune_completed()
+            self._finish_job(job, returncode=-1, error=exc)
             return {"id": job_id}
         finally:
             close_terminal(slave_fd)
@@ -594,6 +593,7 @@ class Shells:
             "cursor": output_count,
             "result": metadata.get("result"),
             "error": metadata.get("error"),
+            "finished_at": metadata.get("finished_at"),
             "truncated": bool(metadata.get("truncated", False)),
             "warnings": warnings[:_MAX_SHELL_WARNINGS],
             "warnings_truncated": warnings_truncated,
@@ -611,6 +611,7 @@ class Shells:
             "cursor": len(job.output),
             "result": job.result,
             "error": job.error,
+            "finished_at": job.finished_at,
             "truncated": job.truncated,
             "warnings": list(job.warnings),
             "warnings_truncated": job.warnings_truncated,
@@ -624,7 +625,13 @@ class Shells:
         if job is None:
             return {"id": job_id, "state": "unknown", "error": "unknown job"}
         if job.state not in {"running", "cancelling"}:
-            return {"id": job.id, "state": job.state, "result": job.result, "error": job.error}
+            return {
+                "id": job.id,
+                "state": job.state,
+                "result": job.result,
+                "error": job.error,
+                "finished_at": job.finished_at,
+            }
         job.state = "cancelling"
         self._signal_job(job, signal.SIGTERM)
         killer = asyncio.create_task(self._kill_group_later(job))
@@ -751,6 +758,7 @@ class Shells:
             "state": job.state,
             "result": job.result,
             "error": job.error,
+            "finished_at": job.finished_at,
             "truncated": job.truncated,
             "warnings": job.warnings,
             "warnings_truncated": job.warnings_truncated,
@@ -846,36 +854,53 @@ class Shells:
             self._persist_output(job, event)
             job.changed.set()
 
-    async def _wait(self, job: _Job) -> None:
-        try:
-            returncode = await job.process.wait()
-        except (OSError, ProcessLookupError) as exc:
-            job.state = "failed"
-            job.error = str(exc)
-            job.result = {"returncode": -1}
-            job.finished_at = time.time()
-            self._persist_metadata(job)
-            self._prune_completed()
-            self._close_pty(job)
-            return
-        reader_results = await asyncio.gather(*job.readers, return_exceptions=True)
-        for result in reader_results:
-            if isinstance(result, Exception):
+    async def _settle_readers(self, job: _Job, *, cancel: bool = False) -> None:
+        if cancel:
+            for reader in job.readers:
+                if not reader.done():
+                    reader.cancel()
+        results = await asyncio.gather(*job.readers, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
                 self._add_warning(job, "output_reader_failed", result)
-        tick = asyncio.Event()
-        while self._job_has_live_members(job):
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(tick.wait(), 0.05)
+
+    def _finish_job(
+        self,
+        job: _Job,
+        *,
+        returncode: int,
+        error: BaseException | str | None = None,
+    ) -> None:
         job.result = {"returncode": returncode}
-        if job.state == "cancelling":
+        if error is not None:
+            job.error = str(error)
+            job.state = "failed"
+        elif job.state == "cancelling":
             job.state = "cancelled"
         else:
             job.state = "succeeded" if returncode == 0 else "failed"
         job.finished_at = time.time()
         self._persist_metadata(job)
+        self._close_pty(job)
         job.changed.set()
         self._prune_completed()
-        self._close_pty(job)
+
+    async def _wait(self, job: _Job) -> None:
+        try:
+            returncode = await job.process.wait()
+        except Exception as exc:
+            self._close_pty(job)
+            await self._settle_readers(job, cancel=True)
+            self._finish_job(job, returncode=-1, error=exc)
+            return
+        await self._settle_readers(job)
+        tick = asyncio.Event()
+        while self._job_has_live_members(job):
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(tick.wait(), 0.05)
+        self._finish_job(job, returncode=returncode)
 
     @staticmethod
     def _close_pty(job: _Job) -> None:
@@ -1260,18 +1285,18 @@ class MCPBridge:
             return await self.configure(
                 args.get("server", args.get("server_name")),
                 args.get("config"),
-                force=bool(args.get("force", False)),
+                force=args.get("force", False),
             )
         if method == "remove":
             return await self.remove(
-                args.get("server", args.get("server_name")), force=bool(args.get("force", False))
+                args.get("server", args.get("server_name")), force=args.get("force", False)
             )
         if method == "restart":
             return await self.restart(
-                args.get("server", args.get("server_name")), force=bool(args.get("force", False))
+                args.get("server", args.get("server_name")), force=args.get("force", False)
             )
         if method == "reload":
-            return await self.reload(force=bool(args.get("force", False)))
+            return await self.reload(force=args.get("force", False))
         server_name = args.pop("server", args.pop("server_name", None))
         if not isinstance(server_name, str) or server_name not in self.config:
             raise ValueError(f"unknown MCP server: {server_name!r}")
@@ -1290,10 +1315,45 @@ class MCPBridge:
             raise ValueError(f"unknown MCP server: {server!r}")
         return copy.deepcopy(self.config[server])
 
+    async def get_lsp(self) -> dict[str, Any]:
+        """Return the saved LSP definitions and the workspace revision."""
+
+        async with self._mutation_lock:
+            self._ensure_open()
+            snapshot = await wait_owned(asyncio.to_thread(self.store.load_all))
+            return {
+                "servers": copy.deepcopy(snapshot.values["lsp"]["servers"]),
+                "revision": snapshot.revision,
+            }
+
+    async def save_lsp(
+        self,
+        definitions: dict[str, Any],
+        expected_servers: dict[str, Any],
+    ) -> dict[str, str]:
+        """Save LSP definitions with a revision and definition compare-and-swap."""
+
+        async with self._mutation_lock:
+            self._ensure_open()
+            snapshot = await wait_owned(asyncio.to_thread(self.store.load_all))
+            current = snapshot.values["lsp"]["servers"]
+            if snapshot.revision != self._revision:
+                raise RuntimeError("Workspace configuration changed on disk; reload before saving")
+            if current != expected_servers:
+                raise RuntimeError("LSP configuration changed; call ws.code.reload() before saving")
+            revision, cancelled = await finish_owned(
+                asyncio.to_thread(self.store.save_lsp, definitions, snapshot.revision)
+            )
+            self._revision = revision
+            if cancelled:
+                raise asyncio.CancelledError
+            return {"revision": revision}
+
     async def configure(
         self, server: str, config: dict[str, Any], force: bool = False
     ) -> dict[str, Any]:
         validate_name(server)
+        self._validate_force(force)
         config = validate_servers({server: config})[server]
         async with self._mutation_lock:
             self._ensure_open()
@@ -1316,11 +1376,8 @@ class MCPBridge:
                 servers = _copy_configs(self.config)
                 servers[server] = copy.deepcopy(config)
                 revision = self.store.save(servers, self._revision)
-                await self._close_connections(connection, force)
-                async with self._lock:
-                    self.config = servers
-                    self._revision = revision
-                    self._connections.pop(server, None)
+                self._commit_config(servers, revision, {server})
+                await self._close_connections_resilient(connection, force)
                 return {"server": server, "action": action, "connected": False}
             finally:
                 await self._unblock(connection if "connection" in locals() else {})
@@ -1328,6 +1385,7 @@ class MCPBridge:
 
     async def remove(self, server: str, force: bool = False) -> dict[str, Any]:
         self._check_server_name(server)
+        self._validate_force(force)
         async with self._mutation_lock:
             self._ensure_open()
             if server not in self.config:
@@ -1337,11 +1395,8 @@ class MCPBridge:
                 servers = _copy_configs(self.config)
                 del servers[server]
                 revision = self.store.save(servers, self._revision)
-                await self._close_connections(connection, force)
-                async with self._lock:
-                    self.config = servers
-                    self._revision = revision
-                    self._connections.pop(server, None)
+                self._commit_config(servers, revision, {server})
+                await self._close_connections_resilient(connection, force)
                 return {
                     "server": server,
                     "action": "removed",
@@ -1354,13 +1409,20 @@ class MCPBridge:
 
     async def restart(self, server: str, force: bool = False) -> dict[str, Any]:
         self._check_server_name(server)
+        self._validate_force(force)
         async with self._mutation_lock:
             self._ensure_open()
             if server not in self.config:
                 raise ValueError(f"unknown MCP server: {server!r}")
             try:
-                affected = await self._block_affected({server}, force)
-                await self._close_connections(affected, force)
+                async def detach_and_close():
+                    affected = await self._block_affected({server}, force)
+                    async with self._lock:
+                        if self._connections.get(server) is affected.get(server):
+                            self._connections.pop(server, None)
+                    await self._close_connections_resilient(affected, force)
+
+                await wait_owned(detach_and_close())
                 connection = _MCPConnection(self.config[server], self.workspace)
                 connection.block_admissions()
                 async with self._lock:
@@ -1373,9 +1435,9 @@ class MCPBridge:
                     "restarted": True,
                     "connected": True,
                 }
-            except Exception:
+            except BaseException:
                 if "connection" in locals():
-                    await connection.close()
+                    await wait_owned(connection.close(), propagate=False)
                     async with self._lock:
                         if self._connections.get(server) is connection:
                             self._connections.pop(server, None)
@@ -1384,6 +1446,7 @@ class MCPBridge:
                 await self._clear_changing({server})
 
     async def reload(self, force: bool = False) -> dict[str, list[str]]:
+        self._validate_force(force)
         async with self._mutation_lock:
             self._ensure_open()
             servers, revision = self.store.load()
@@ -1397,33 +1460,32 @@ class MCPBridge:
             changed = set(added) | set(removed) | set(updated)
             try:
                 connections = await self._block_affected(changed, force)
-                await self._close_connections(connections, force)
-                async with self._lock:
-                    self.config = servers
-                    self._revision = revision
-                    for name in removed + updated:
-                        self._connections.pop(name, None)
+                self._commit_config(servers, revision, set(removed) | set(updated))
+                await self._close_connections_resilient(connections, force)
                 return {"added": added, "updated": updated, "removed": removed}
             finally:
                 await self._clear_changing(changed)
 
     async def close(self) -> None:
-        async with self._mutation_lock:
-            if self._closed:
-                return
-            self._closed = True
-            async with self._lock:
-                connections = dict(self._connections)
-                self._changing.update(connections)
-                for connection in connections.values():
-                    connection.block_admissions()
-            await asyncio.gather(
-                *(connection.close() for connection in connections.values()),
-                return_exceptions=True,
-            )
-            async with self._lock:
-                self._connections.clear()
-                self._changing.clear()
+        async def cleanup():
+            async with self._mutation_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                async with self._lock:
+                    connections = dict(self._connections)
+                    self._changing.update(connections)
+                    for connection in connections.values():
+                        connection.block_admissions()
+                await asyncio.gather(
+                    *(connection.close() for connection in connections.values()),
+                    return_exceptions=True,
+                )
+                async with self._lock:
+                    self._connections.clear()
+                    self._changing.clear()
+
+        await wait_owned(cleanup())
 
     def _connection(self, name: str) -> _MCPConnection:
         connection = self._connections.get(name)
@@ -1457,6 +1519,21 @@ class MCPBridge:
         async with self._lock:
             self._changing.difference_update(names)
 
+    def _commit_config(
+        self, servers: dict[str, dict[str, Any]], revision: str | None, removed: set[str]
+    ) -> None:
+        self.config = servers
+        self._revision = revision
+        for name in removed:
+            self._connections.pop(name, None)
+
+    async def _close_connections_resilient(
+        self, connections: dict[str, _MCPConnection], force: bool
+    ) -> None:
+        if not connections:
+            return
+        await wait_owned(self._close_connections(connections, force))
+
     @staticmethod
     async def _close_connections(connections: dict[str, _MCPConnection], force: bool) -> None:
         await asyncio.gather(
@@ -1467,6 +1544,11 @@ class MCPBridge:
     @staticmethod
     def _check_server_name(server: str) -> None:
         validate_name(server)
+
+    @staticmethod
+    def _validate_force(force: bool) -> None:
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
 
     def _ensure_open(self) -> None:
         if self._closed:

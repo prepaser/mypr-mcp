@@ -37,7 +37,7 @@ def safe_error_details(exc: BaseException, limit: int = 1024) -> tuple[str, bool
     except BaseException:
         name = "Exception"
     try:
-        detail = str(exc)
+        detail = str.__str__(str(exc))
     except BaseException:
         detail = "<unprintable exception>"
     value = f"{name}: {detail}"
@@ -57,7 +57,8 @@ def safe_text(value: Any, limit: int) -> str:
     if limit < 1:
         raise ValueError("text limit must be positive")
     try:
-        text = value if isinstance(value, str) else str(value)
+        text = str.__str__(value) if isinstance(value, str) else str(value)
+        text = str.__str__(text)
     except BaseException:
         text = "<unprintable value>"
     raw = text.encode("utf-8", "replace")
@@ -138,28 +139,36 @@ def error_info(
         raise ValueError("error limit must be at least 128 bytes")
     message_limit = max(1, limit - 192)
     message, message_truncated = safe_error_details(exc, message_limit)
-    if isinstance(exc, RPCError):
-        code = exc.code
-        operation = operation or exc.operation
-        source_details = dict(exc.details)
-        error_type = exc.error_type or type(exc).__name__
-    else:
-        code = getattr(exc, "code", None) or _error_code(exc)
-        context = details if details is not None else getattr(exc, "details", None)
-        source_details = dict(context) if isinstance(context, Mapping) else {}
-        error_type = type(exc).__name__
-    for key in ("line", "column", "path"):
-        value = getattr(exc, key, None)
-        if value is not None:
-            source_details.setdefault(key, value)
+    code = "rpc_error"
+    error_type = "Exception"
     budget = [max(0, limit - len(message.encode("utf-8", "replace")) - 160)]
     nodes = [128]
-    bounded_details = _json_details(source_details or {}, budget=budget, nodes=nodes)
+    metadata_failed = False
+    try:
+        code = _error_code(exc)
+        error_type = type(exc).__name__
+        if isinstance(exc, RPCError):
+            code = exc.code
+            operation = operation or exc.operation
+            error_type = exc.error_type or error_type
+            context = exc.details
+        else:
+            code = getattr(exc, "code", None) or code
+            context = details if details is not None else getattr(exc, "details", None)
+        source_details = context if isinstance(context, Mapping) else {}
+        bounded_details = _json_details(source_details, budget=budget, nodes=nodes)
+        for key in ("line", "column", "path"):
+            value = getattr(exc, key, None)
+            if value is not None and key not in bounded_details:
+                bounded_details[key] = _json_details(value, budget=budget, nodes=nodes)
+    except BaseException:
+        bounded_details = {}
+        metadata_failed = True
     result: dict[str, Any] = {
         "code": safe_text(code, 64),
         "type": safe_text(error_type, 64),
         "message": message,
-        "truncated": message_truncated or budget[0] <= 0,
+        "truncated": message_truncated or budget[0] <= 0 or metadata_failed,
     }
     if operation is not None:
         result["operation"] = safe_text(operation, 128)

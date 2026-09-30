@@ -14,7 +14,6 @@ from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
 MAX_RESPONSE_BYTES = 1024 * 1024
-KNOWN_SECTIONS = {"mcp", "limits", "lsp", "storage"}
 
 
 class ConfigError(ValueError):
@@ -94,10 +93,16 @@ def validate_servers(servers):
             url = config["url"]
             if not isinstance(url, str):
                 raise ConfigError("must be an HTTP(S) URL", path=f"mcp.servers.{name}.url")
-            parts = urlsplit(url)
-            if parts.scheme not in {"http", "https"} or not parts.hostname:
+            try:
+                parts = urlsplit(url)
+                host = parts.hostname
+                _ = parts.port
+            except ValueError as exc:
+                raise ConfigError(
+                    f"invalid HTTP(S) URL: {exc}", path=f"mcp.servers.{name}.url"
+                ) from exc
+            if parts.scheme not in {"http", "https"} or not host:
                 raise ConfigError("must be an HTTP(S) URL", path=f"mcp.servers.{name}.url")
-            _ = parts.port
         else:
             command = config["command"]
             if not (

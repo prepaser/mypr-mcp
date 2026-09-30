@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .async_utils import wait_owned
 from .document_tools import DocumentExtractor
 
 _WORKER = Path(__file__).with_name("media_worker.py")
@@ -66,13 +67,7 @@ async def _cleanup_worker(process: asyncio.subprocess.Process, communication: as
 async def _cleanup_worker_uncancellable(
     process: asyncio.subprocess.Process, communication: asyncio.Task
 ) -> None:
-    cleanup = asyncio.create_task(_cleanup_worker(process, communication))
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            continue
-    await cleanup
+    await wait_owned(_cleanup_worker(process, communication), propagate=False)
 
 
 async def inspect_image(path: Path, display: str, *, max_input_bytes: int) -> dict[str, Any]:

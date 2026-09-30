@@ -17,6 +17,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .async_utils import wait_owned
+
 if TYPE_CHECKING:
     import httpx2
 
@@ -352,20 +354,7 @@ async def _run_blocking(function: Callable[..., Any], *args: Any) -> Any:
 
 
 async def _wait_uncancelled(task: asyncio.Task[Any]) -> Any:
-    cancelled = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-            if task.done():
-                result = task.result()
-                break
-        else:
-            break
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await wait_owned(task)
 
 
 async def _close_all(clients: tuple[Any, ...]) -> None:

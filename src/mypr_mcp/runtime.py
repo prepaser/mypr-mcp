@@ -21,6 +21,7 @@ from jupyter_client import AsyncKernelManager
 from jupyter_client.kernelspec import KernelSpec
 
 from . import __version__
+from .async_utils import wait_owned
 from .bootstrap import ensure_runtime
 from .browser_service import BrowserService
 from .config import load_workspace_config
@@ -83,6 +84,7 @@ TIMING_OPS = {
 }
 BRIDGE_TIMINGS = {"bridge_ready", "manager_rpc", "bridge_total"}
 COMMAND_TIMEOUT = 180
+_UNHANDLED = object()
 
 
 def _write_json(path, data):
@@ -269,22 +271,15 @@ class Runtime:
     async def code_config(self, req):
         if self.mcp is None:
             raise RuntimeError("Workspace configuration is not ready")
-        async with self.mcp._mutation_lock:
-            snapshot = await self.io(self.mcp.store.load_all)
-            definitions = snapshot.values["lsp"]["servers"]
-            if req.get("method") == "get_lsp":
-                return {"servers": definitions, "revision": snapshot.revision}
-            if req.get("method") != "set_lsp":
-                raise ValueError("Unknown workspace configuration operation")
-            if snapshot.revision != self.mcp._revision:
-                raise RuntimeError("Workspace configuration changed on disk; reload before saving")
-            if req.get("expected_servers") != definitions:
-                raise RuntimeError("LSP configuration changed; call ws.code.reload() before saving")
-            revision = await self.io(
-                self.mcp.store.save_lsp, req.get("definitions"), snapshot.revision, critical=True
+        method = req.get("method")
+        if method == "get_lsp":
+            return await self.mcp.get_lsp()
+        if method == "set_lsp":
+            return await self.mcp.save_lsp(
+                req.get("definitions"),
+                req.get("expected_servers"),
             )
-            self.mcp._revision = revision
-            return {"revision": revision}
+        raise ValueError("Unknown workspace configuration operation")
 
     def new_shells(self):
         return Shells(
@@ -516,12 +511,7 @@ class Runtime:
 
     @staticmethod
     async def _finish_command_launch(task):
-        while True:
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                if task.done():
-                    return task.result()
+        return await wait_owned(task, propagate=False)
 
     @staticmethod
     async def _stop_command(proc):
@@ -556,38 +546,73 @@ class Runtime:
             JUPYTER_RUNTIME_DIR=str(self.root / "jupyter"),
         )
         boot = Path(__file__).with_name("kernel_boot.py")
-        self.km = AsyncKernelManager(
+        km = AsyncKernelManager(
             autorestart=False,
             transport="ipc",
             ip=str(self.socket.with_suffix(".kernel")),
             connection_file=str(self.root / "kernel.json"),
         )
-        self.km._kernel_spec = KernelSpec(
+        km._kernel_spec = KernelSpec(
             argv=[str(self.py), str(boot), "-f", "{connection_file}"],
             display_name="mypr",
             language="python",
         )
-        await self.km.start_kernel(
-            cwd=str(self.workspace), env=env, stdout=sys.stderr, stderr=sys.stderr
-        )
-        self.kc = self.km.client()
-        self.kc.start_channels()
-        await self.kc.wait_for_ready(timeout=60)
-        self.check_persistence()
-        self.healthy = True
-        self.health_error = None
-        self.by_msg = {}
-        self.active = {}
-        self.iopub = asyncio.create_task(self.read_output())
-        self.replies = asyncio.create_task(self.read_replies())
-        self.worker = asyncio.create_task(self.run_queue())
-        self.monitor = asyncio.create_task(self.watch_kernel())
-        for name in ("iopub", "replies", "worker", "monitor"):
-            task = getattr(self, name)
-            task.set_name(f"mypr:{name}")
-            self.core_workers.add(task)
-            task.add_done_callback(self.critical_done)
-        self.write_info()
+        kc = None
+        try:
+            self.km = km
+            await km.start_kernel(
+                cwd=str(self.workspace), env=env, stdout=sys.stderr, stderr=sys.stderr
+            )
+            kc = km.client()
+            self.kc = kc
+            kc.start_channels()
+            await kc.wait_for_ready(timeout=60)
+            self.check_persistence()
+            self.healthy = True
+            self.health_error = None
+            self.by_msg = {}
+            self.active = {}
+            self.iopub = asyncio.create_task(self.read_output())
+            self.replies = asyncio.create_task(self.read_replies())
+            self.worker = asyncio.create_task(self.run_queue())
+            self.monitor = asyncio.create_task(self.watch_kernel())
+            for name in ("iopub", "replies", "worker", "monitor"):
+                task = getattr(self, name)
+                task.set_name(f"mypr:{name}")
+                self.core_workers.add(task)
+                task.add_done_callback(self.critical_done)
+            self.write_info()
+        except BaseException as exc:
+            self.healthy = False
+            self.health_error = f"Python kernel startup failed: {safe_error(exc)}"
+            await wait_owned(self._cleanup_failed_kernel(km, kc), propagate=False)
+            raise
+
+    async def _cleanup_failed_kernel(self, km, kc):
+        tasks = [self.worker, self.iopub, self.replies, self.monitor]
+        for task in tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
+        for task in tasks:
+            if task is not None:
+                self.core_workers.discard(task)
+        if kc is not None:
+            with contextlib.suppress(Exception):
+                kc.stop_channels()
+        with contextlib.suppress(Exception):
+            await km.shutdown_kernel(now=True)
+        if self.km is km:
+            self.km = None
+        if self.kc is kc:
+            self.kc = None
+        self.worker = None
+        self.iopub = None
+        self.replies = None
+        self.monitor = None
+        self.by_msg.clear()
+        self.control_waiters.clear()
+        self.submit_waiters.clear()
 
     def workspace_available(self):
         try:
@@ -615,6 +640,9 @@ class Runtime:
 
     async def _finish(self, rec, state, error=None):
         async with self.execution_lock(rec):
+            waiter = self.submit_waiters.get(rec.get("msg_id"))
+            if waiter is not None and not waiter.done():
+                waiter.set_result(None)
             if rec["state"] in TERMINAL:
                 return
             structured_error = rec.get("error_info")
@@ -1255,39 +1283,62 @@ class Runtime:
         }
 
     async def _dispatch(self, req):
+        def method(name):
+            bound = getattr(self, name, None)
+            return bound if bound is not None else getattr(Runtime, name).__get__(self)
+
         op = req.pop("op")
         requested_client = req.pop("client_id", None)
         connection_id = req.pop("connection_id", None)
         connection = self.clients.get(connection_id)
-        if self.restarting and op in {
-            "execute",
-            "reset",
-            "shell_start",
-            "packages_add",
-            "scan_start",
-            "browser_server",
-        }:
-            raise RuntimeError(f"Workspace is restarting: {self.restarting}")
-        if self.stopping.is_set() and op in {
-            "init",
-            "execute",
-            "shell_start",
-            "packages_add",
-            "reset",
-            "mcp",
-        }:
-            raise RuntimeError("Workspace manager is stopping")
+        method("_check_dispatch_admission")(op)
         if op == "init":
             return await self.initialize_client(connection_id, requested_client)
         if connection:
-            if requested_client is not None and connection["client_id"] != requested_client:
-                raise ValueError("Connection belongs to another client")
-            connection["last_activity"] = time.time()
-            if connection["client_id"] is not None and op in {"execute", "poll"}:
-                await self.io(self.history.touch_client, connection["client_id"])
+            await method("_update_connection")(connection, requested_client, op)
         client = (connection["client_id"] if connection else requested_client) or "anonymous"
         if op == "performance":
             return self.performance_snapshot()
+        if op == "status":
+            return self._dispatch_status(req, connection, op)
+        result = await method("_dispatch_history")(op, req)
+        if result is not _UNHANDLED:
+            return result
+        generation = req.pop("generation", None)
+        if generation and generation != self.generation:
+            raise RuntimeError("Expired kernel generation")
+        context = dict(client=client, connection_id=connection_id, connection=connection,
+                       requested_client=requested_client, generation=generation)
+        for handler_name in (
+            "_dispatch_execution", "_dispatch_messages", "_dispatch_storage",
+            "_dispatch_tasks", "_dispatch_scan", "_dispatch_tools", "_dispatch_shell",
+            "_dispatch_mcp", "_dispatch_lifecycle",
+        ):
+            handler = method(handler_name)
+            result = await handler(op, req, **context)
+            if result is not _UNHANDLED:
+                return result
+        raise ValueError(f"Unknown operation: {op}")
+
+    def _check_dispatch_admission(self, op):
+        if self.restarting and op in {
+            "execute", "reset", "shell_start", "packages_add",
+            "scan_start", "browser_server",
+        }:
+            raise RuntimeError(f"Workspace is restarting: {self.restarting}")
+        if self.stopping.is_set() and op in {
+            "init", "execute", "shell_start", "packages_add", "reset", "mcp",
+        }:
+            raise RuntimeError("Workspace manager is stopping")
+
+    async def _update_connection(self, connection, requested_client, op):
+        if requested_client is not None and connection["client_id"] != requested_client:
+            raise ValueError("Connection belongs to another client")
+        connection["last_activity"] = time.time()
+        if connection["client_id"] is not None and op in {"execute", "poll"}:
+            await self.io(self.history.touch_client, connection["client_id"])
+
+    def _dispatch_status(self, req, connection, op):
         if op == "status":
             detail = req.get("detail", True)
             if type(detail) is not bool:
@@ -1369,6 +1420,9 @@ class Runtime:
                 "active": list(self.active),
                 "queued": [r["id"] for r in self.execs.values() if r["state"] == "queued"],
             }
+        return _UNHANDLED
+
+    async def _dispatch_history(self, op, req):
         if op in {"history_list", "logs"}:
             method = self.history.list if op == "history_list" else self.history.logs
             return await self.io(
@@ -1482,9 +1536,12 @@ class Runtime:
                 "has_more": cursor + len(output) < total,
                 "truncated": bool(record.get("output_truncated")),
             }
-        generation = req.pop("generation", None)
-        if generation and generation != self.generation:
-            raise RuntimeError("Expired kernel generation")
+        return _UNHANDLED
+
+    async def _dispatch_execution(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "cell_terminal":
             rec = self.execs.get(req.get("exec_id"))
             if rec is None or rec["generation"] != self.generation:
@@ -1499,6 +1556,36 @@ class Runtime:
                 rec["error_info"] = req["error_info"]
             await self.finish(rec, req["state"], req.get("error"))
             return None
+        if op == "execute":
+            if not self.workspace_available():
+                raise RuntimeError("The workspace moved; stop its manager and reconnect")
+            if not self.healthy or self.resetting:
+                raise RuntimeError("Kernel unavailable; use CLI reset")
+            if connection is None or connection["client_id"] is None:
+                raise RuntimeError("Call init on an active connection before execute")
+            self.response_budget(req.get("max_bytes"))
+            rec = await self.admit_execution(client, connection_id, req)
+            return await self.poll(
+                rec["id"],
+                wait_ms=req.get("wait_ms", 1000),
+                max_bytes=req.get("max_bytes"),
+                inbox_client=client,
+                wake_on_output=False,
+            )
+        if op == "poll":
+            return await self.poll(
+                req["exec_id"],
+                req.get("cursor") or 0,
+                req.get("wait_ms", 1000),
+                max_bytes=req.get("max_bytes"),
+                inbox_client=connection["client_id"] if connection else None,
+            )
+        return _UNHANDLED
+
+    async def _dispatch_messages(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op in {"message_send", "message_reply", "message_read", "message_ack"}:
             if not (connection and connection["client_id"]) and not requested_client:
                 raise RuntimeError("Messages require a client identity")
@@ -1550,31 +1637,12 @@ class Runtime:
                     sender=req.get("sender"),
                     reply_to=req.get("reply_to"),
                 )
+        return _UNHANDLED
 
-        if op == "execute":
-            if not self.workspace_available():
-                raise RuntimeError("The workspace moved; stop its manager and reconnect")
-            if not self.healthy or self.resetting:
-                raise RuntimeError("Kernel unavailable; use CLI reset")
-            if connection is None or connection["client_id"] is None:
-                raise RuntimeError("Call init on an active connection before execute")
-            self.response_budget(req.get("max_bytes"))
-            rec = await self.admit_execution(client, connection_id, req)
-            return await self.poll(
-                rec["id"],
-                wait_ms=req.get("wait_ms", 1000),
-                max_bytes=req.get("max_bytes"),
-                inbox_client=client,
-                wake_on_output=False,
-            )
-        if op == "poll":
-            return await self.poll(
-                req["exec_id"],
-                req.get("cursor") or 0,
-                req.get("wait_ms", 1000),
-                max_bytes=req.get("max_bytes"),
-                inbox_client=connection["client_id"] if connection else None,
-            )
+    async def _dispatch_storage(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "code_config":
             return await self.code_config(req)
         if op == "storage_usage":
@@ -1597,6 +1665,12 @@ class Runtime:
             for item in page["clients"]:
                 item["connected"] = item["id"] in active_ids
             return page
+        return _UNHANDLED
+
+    async def _dispatch_tasks(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "task_result_store":
             ident = req["id"]
             async with self.task_lock(ident):
@@ -1623,6 +1697,24 @@ class Runtime:
             if not record or not record.get("result_ref") or record.get("result_evicted"):
                 raise RuntimeError("Persisted task result is unavailable or expired")
             return await self.io(load_result, self.workspace, record["result_ref"])
+        if op in {"task_event", "task_terminal"}:
+            event = dict(req["event"])
+            if op == "task_terminal" and event.get("state") not in TERMINAL:
+                raise ValueError("Expected a terminal task state")
+            event.update(
+                client_id=client,
+                connection_id=connection_id,
+                exec_id=req.get("exec_id"),
+                generation=self.generation,
+            )
+            task = asyncio.create_task(self.admit_task_event(event, client, connection_id, op))
+            return await await_completion(task)
+        return _UNHANDLED
+
+    async def _dispatch_scan(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "scan_start":
             if self.stopping.is_set() or self.resetting or not self.healthy:
                 raise RuntimeError("Workspace is not accepting scans")
@@ -1669,6 +1761,12 @@ class Runtime:
             return await self.scans.summary(req["id"], wait_ms=req.get("wait_ms", 0))
         if op == "scan_cancel":
             return await self.scans.cancel(req["id"])
+        return _UNHANDLED
+
+    async def _dispatch_tools(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "browser_server":
             if self.stopping.is_set() or self.resetting or not self.healthy:
                 raise RuntimeError("Workspace is not accepting browser requests")
@@ -1704,6 +1802,12 @@ class Runtime:
             if method not in {"status", "diff", "show", "log", "blame", "commit_info"}:
                 raise ValueError("Unknown Git method")
             return await getattr(Git(self.workspace, runner), method)(**args)
+        return _UNHANDLED
+
+    async def _dispatch_shell(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "shell_start":
             job = await self.shells.start(
                 req["command"],
@@ -1756,6 +1860,29 @@ class Runtime:
             return await self.shells.resize(req["id"], req["rows"], req["cols"])
         if op == "shell_cancel":
             return await self.shells.cancel(req["id"])
+        if op == "packages_add":
+            specs = req["specs"]
+            if (
+                not isinstance(specs, list) or not specs
+                or any(not isinstance(s, str) or not s or s.startswith("-") for s in specs)
+            ):
+                raise ValueError("Expected package requirements, not command options")
+            command = [
+                sys.executable, "-I", str(Path(__file__).with_name("package_worker.py")),
+                "--python", str(self.py), "--root", str(self.root),
+                "--spec-json", json.dumps(specs),
+            ]
+            job = await self.shells.start(command, str(self.workspace), dict(os.environ))
+            self.track_shell(
+                job["id"], client, connection_id, req.get("exec_id"), kind="package", specs=specs
+            )
+            return job
+        return _UNHANDLED
+
+    async def _dispatch_mcp(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "mcp":
             method = req["method"]
             args = req.get("args", {})
@@ -1789,35 +1916,12 @@ class Runtime:
                 critical=True,
             )
             return result
-        if op == "packages_add":
-            specs = req["specs"]
-            if (
-                not isinstance(specs, list) or not specs
-                or any(not isinstance(s, str) or not s or s.startswith("-") for s in specs)
-            ):
-                raise ValueError("Expected package requirements, not command options")
-            command = [
-                sys.executable, "-I", str(Path(__file__).with_name("package_worker.py")),
-                "--python", str(self.py), "--root", str(self.root),
-                "--spec-json", json.dumps(specs),
-            ]
-            job = await self.shells.start(command, str(self.workspace), dict(os.environ))
-            self.track_shell(
-                job["id"], client, connection_id, req.get("exec_id"), kind="package", specs=specs
-            )
-            return job
-        if op in {"task_event", "task_terminal"}:
-            event = dict(req["event"])
-            if op == "task_terminal" and event.get("state") not in TERMINAL:
-                raise ValueError("Expected a terminal task state")
-            event.update(
-                client_id=client,
-                connection_id=connection_id,
-                exec_id=req.get("exec_id"),
-                generation=self.generation,
-            )
-            task = asyncio.create_task(self.admit_task_event(event, client, connection_id, op))
-            return await await_completion(task)
+        return _UNHANDLED
+
+    async def _dispatch_lifecycle(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
         if op == "restart":
             from .restart import request_restart
 
@@ -1932,7 +2036,7 @@ class Runtime:
                     raise RuntimeError("Workspace has active work; pass --force")
                 self.stopping.set()
             return {"stopping": True, "pid": os.getpid()}
-        raise ValueError(f"Unknown operation: {op}")
+        return _UNHANDLED
 
     async def record_task_event(self, event, client, connection_id, op):
         lock = self.task_lock(event["id"])
@@ -2214,11 +2318,23 @@ class Runtime:
             *(t for t in [self.worker, self.iopub, self.replies, self.monitor] if t),
             return_exceptions=True,
         )
+        self.core_workers.difference_update(
+            task for task in [self.worker, self.iopub, self.replies, self.monitor] if task
+        )
+        self.by_msg.clear()
+        self.control_waiters.clear()
+        self.submit_waiters.clear()
         if self.kc:
             self.kc.stop_channels()
         if self.km:
             with contextlib.suppress(Exception):
                 await self.km.shutdown_kernel(now=True)
+        self.worker = None
+        self.iopub = None
+        self.replies = None
+        self.monitor = None
+        self.kc = None
+        self.km = None
 
     @staticmethod
     def public_record(rec):

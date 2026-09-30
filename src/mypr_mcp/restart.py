@@ -21,6 +21,7 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
+from .async_utils import wait_owned
 from .protocol import PROTOCOL_VERSION
 from .transport import find_runtime, rpc, workspace_id
 
@@ -84,12 +85,7 @@ async def _acquire_lock(lock) -> None:
 
 
 async def _finish_owned(task):
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-    return task.result()
+    return await wait_owned(task, propagate=False)
 
 
 def _valid_ticket(workspace: Path, value: Any, ident: str | None = None) -> dict[str, Any] | None:

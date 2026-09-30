@@ -18,6 +18,7 @@ from threading import Lock
 from typing import Any
 from weakref import WeakValueDictionary
 
+from .async_utils import wait_owned
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES
 
 _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
@@ -561,10 +562,19 @@ class Filesystem:
             for lock in locks:
                 await lock.acquire()
                 stack.callback(lock.release)
+            source_info = source_path.stat() if source_path.exists() else None
             old = await _to_thread_uncancelled(_read_optional_bytes, source_path, source_display)
             _check_expected(old, expected_hash)
             if old is None:
                 raise FileNotFoundError(source_display)
+            if source_info is None:
+                raise RuntimeError(f"File changed while reading: {source_display}")
+            try:
+                source_after_read = source_path.stat()
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"File changed while reading: {source_display}") from exc
+            if _signature(source_info) != _signature(source_after_read):
+                raise RuntimeError(f"File changed while reading: {source_display}")
             destination_old = await _to_thread_uncancelled(
                 _read_optional_bytes, destination_path, destination_display
             )
@@ -581,6 +591,7 @@ class Filesystem:
                     destination_path,
                     old,
                     destination_old,
+                    _signature(source_info),
                     move,
                 )
             except BaseException as exc:
@@ -801,14 +812,171 @@ class Filesystem:
                 result["history_recorded"] = self._history_resource(resolved) is not None
             return result
 
-    async def search(self, pattern=None, **options):
-        return await self._search_query("rg", pattern, options)
+    async def search(
+        self,
+        pattern=None,
+        *,
+        mode=None,
+        paths=None,
+        glob=None,
+        fixed=False,
+        ignore_case=False,
+        hidden=False,
+        no_ignore=False,
+        context=0,
+        word=False,
+        line=False,
+        multiline=False,
+        dotall=False,
+        before=None,
+        after=None,
+        regex_engine="default",
+        timeout=30,  # noqa: ASYNC109
+        scan_bytes=16 * 1024 * 1024,
+        scan_limit=None,
+        max_matches=100,
+        max_bytes=32_768,
+        cursor=None,
+        page_cursor=None,
+    ):  # noqa: ASYNC109
+        return await self._search_query(
+            "rg",
+            pattern,
+            dict(
+                mode=mode,
+                paths=paths,
+                glob=glob,
+                fixed=fixed,
+                ignore_case=ignore_case,
+                hidden=hidden,
+                no_ignore=no_ignore,
+                context=context,
+                word=word,
+                line=line,
+                multiline=multiline,
+                dotall=dotall,
+                before=before,
+                after=after,
+                regex_engine=regex_engine,
+                timeout=timeout,
+                scan_bytes=scan_bytes,
+                scan_limit=scan_limit,
+                max_matches=max_matches,
+                max_bytes=max_bytes,
+                cursor=cursor,
+                page_cursor=page_cursor,
+            ),
+        )
 
-    async def search_docs(self, pattern=None, **options):
-        return await self._search_query("rga", pattern, options)
+    async def search_docs(
+        self,
+        pattern=None,
+        *,
+        mode=None,
+        paths=None,
+        glob=None,
+        fixed=False,
+        ignore_case=False,
+        hidden=False,
+        no_ignore=False,
+        context=0,
+        word=False,
+        line=False,
+        multiline=False,
+        dotall=False,
+        before=None,
+        after=None,
+        regex_engine="default",
+        adapters=None,
+        accurate=False,
+        cache=True,
+        archive_depth=5,
+        timeout=30,  # noqa: ASYNC109
+        scan_bytes=16 * 1024 * 1024,
+        scan_limit=None,
+        max_matches=100,
+        max_bytes=32_768,
+        cursor=None,
+        page_cursor=None,
+    ):  # noqa: ASYNC109
+        return await self._search_query(
+            "rga",
+            pattern,
+            dict(
+                mode=mode,
+                paths=paths,
+                glob=glob,
+                fixed=fixed,
+                ignore_case=ignore_case,
+                hidden=hidden,
+                no_ignore=no_ignore,
+                context=context,
+                word=word,
+                line=line,
+                multiline=multiline,
+                dotall=dotall,
+                before=before,
+                after=after,
+                regex_engine=regex_engine,
+                adapters=adapters,
+                accurate=accurate,
+                cache=cache,
+                archive_depth=archive_depth,
+                timeout=timeout,
+                scan_bytes=scan_bytes,
+                scan_limit=scan_limit,
+                max_matches=max_matches,
+                max_bytes=max_bytes,
+                cursor=cursor,
+                page_cursor=page_cursor,
+            ),
+        )
 
-    async def search_ast(self, pattern=None, **options):
-        return await self._search_query("ast", pattern, options)
+    async def search_ast(
+        self,
+        pattern=None,
+        *,
+        lang=None,
+        rule=None,
+        constraints=None,
+        utils=None,
+        paths=None,
+        glob=None,
+        hidden=False,
+        no_ignore=False,
+        mode=None,
+        strictness="smart",
+        timeout=30,  # noqa: ASYNC109
+        scan_bytes=16 * 1024 * 1024,
+        scan_limit=None,
+        max_matches=100,
+        max_bytes=32_768,
+        cursor=None,
+        page_cursor=None,
+    ):  # noqa: ASYNC109
+        return await self._search_query(
+            "ast",
+            pattern,
+            dict(
+                lang=lang,
+                rule=rule,
+                constraints=constraints,
+                utils=utils,
+                paths=paths,
+                glob=glob,
+                hidden=hidden,
+                no_ignore=no_ignore,
+                mode=mode,
+                strictness=strictness,
+                timeout=timeout,
+                scan_bytes=scan_bytes,
+                scan_limit=scan_limit,
+                max_matches=max_matches,
+                max_bytes=max_bytes,
+                cursor=cursor,
+                page_cursor=page_cursor,
+            ),
+        )
 
     async def search_backends(self):
         return await self._search_query("info", None, {})
@@ -816,6 +984,13 @@ class Filesystem:
     async def _search_query(self, backend, pattern, options):
         if "backend" in options:
             raise ValueError("select a search method instead of overriding backend")
+        options = dict(options)
+        page_cursor = options.pop("page_cursor", None)
+        cursor = options.get("cursor")
+        if cursor is not None and page_cursor is not None:
+            raise ValueError("cursor and page_cursor cannot both be provided")
+        if page_cursor is not None:
+            options["cursor"] = page_cursor
         args = dict(pattern=pattern, backend=backend, **options)
         if self._searcher is not None:
             return await self._searcher(**args)
@@ -1072,22 +1247,43 @@ def _read_optional_bytes(path: Path, display: str) -> bytes | None:
 def _read_bytes(path: Path, display: str, start_byte: int, max_bytes: int) -> dict[str, Any]:
     before = path.stat()
     _require_regular(before, display)
-    data, opened = _read_regular(path, display)
-    after = path.stat()
-    if _signature(before) != _signature(opened) or _signature(before) != _signature(after):
-        raise RuntimeError(f"File changed while reading: {display}")
-    if start_byte > len(data):
+    size = before.st_size
+    if start_byte > size:
         raise ValueError("start_byte is beyond the file")
-    end = min(start_byte + max_bytes, len(data))
-    chunk = data[start_byte:end]
+    end = min(start_byte + max_bytes, size)
+    digest = hashlib.sha256()
+    chunk = bytearray()
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(fd)
+        _require_regular(opened, display)
+        if _signature(before) != _signature(opened):
+            raise RuntimeError(f"File changed while reading: {display}")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            offset = 0
+            while data := stream.read(1024 * 1024):
+                digest.update(data)
+                block_end = offset + len(data)
+                left = max(start_byte, offset)
+                right = min(end, block_end)
+                if left < right:
+                    chunk.extend(data[left - offset : right - offset])
+                offset = block_end
+            after = path.stat()
+        if _signature(before) != _signature(after) or offset != size:
+            raise RuntimeError(f"File changed while reading: {display}")
+    finally:
+        if fd >= 0:
+            os.close(fd)
     return {
         "path": display,
         "data_base64": base64.b64encode(chunk).decode("ascii"),
         "start_byte": start_byte,
-        "size": len(data),
-        "revision": _sha256(data),
-        "next_cursor": end if end < len(data) else None,
-        "truncated": end < len(data),
+        "size": size,
+        "revision": digest.hexdigest(),
+        "next_cursor": end if end < size else None,
+        "truncated": end < size,
     }
 
 
@@ -1478,6 +1674,7 @@ def _copy_bytes(
     destination: Path,
     data: bytes,
     destination_old: bytes | None,
+    source_signature: tuple[int, int, int, int, int],
     move: bool,
 ) -> None:
     source_mode = stat.S_IMODE(source.stat().st_mode)
@@ -1490,6 +1687,13 @@ def _copy_bytes(
         current = _read_optional_bytes(destination, str(destination))
         if current != data:
             raise RuntimeError(f"Destination changed while moving: {destination}")
+        current = _read_optional_bytes(source, str(source))
+        try:
+            source_info = source.stat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Source changed while moving: {source}") from exc
+        if current != data or _signature(source_info) != source_signature:
+            raise RuntimeError(f"Source changed while moving: {source}")
         source.unlink()
 
 
@@ -1511,15 +1715,4 @@ def _restore_transition(path: Path, old: bytes | None, new: bytes | None) -> Non
 
 
 async def _to_thread_uncancelled(function, *args, **kwargs):
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    cancelled = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-        break
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await wait_owned(asyncio.to_thread(function, *args, **kwargs))

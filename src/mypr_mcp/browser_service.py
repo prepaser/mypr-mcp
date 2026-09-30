@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .async_utils import wait_owned
+
 _ENGINES = {"chromium", "firefox", "webkit"}
 _MAX_SERVER_OUTPUT = 64 * 1024
 _SERVER_START_TIMEOUT = 30.0
@@ -141,16 +143,7 @@ class BrowserService:
     async def close(self) -> None:
         self._closing = True
         async with self._lock:
-            cleanup = asyncio.create_task(self._close_locked())
-            cancelled = False
-            while True:
-                try:
-                    await asyncio.shield(cleanup)
-                    break
-                except asyncio.CancelledError:
-                    cancelled = True
-            if cancelled:
-                raise asyncio.CancelledError
+            await wait_owned(self._close_locked())
 
     async def reset(self) -> None:
         """Close resources before a generation is replaced."""
@@ -527,13 +520,4 @@ class _InstallLock:
 
 
 async def _await_shielded(task: asyncio.Task, *, propagate: bool = True):
-    cancelled = False
-    while True:
-        try:
-            value = await asyncio.shield(task)
-            break
-        except asyncio.CancelledError:
-            cancelled = True
-    if cancelled and propagate:
-        raise asyncio.CancelledError
-    return value
+    return await wait_owned(task, propagate=propagate)

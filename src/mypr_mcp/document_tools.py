@@ -20,6 +20,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from .async_utils import wait_owned
 from .storage_lock import StorageLock
 
 _WORKER = Path(__file__).with_name("document_worker.py")
@@ -905,19 +906,8 @@ async def _cleanup_uncancelled(
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(process.wait()), 1)
 
-    task = asyncio.create_task(cleanup())
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-    await task
+    await wait_owned(cleanup(), propagate=False)
 
 
 async def _await_uncancelled(task: asyncio.Task):
-    while True:
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                return task.result()
+    return await wait_owned(task, propagate=False)
