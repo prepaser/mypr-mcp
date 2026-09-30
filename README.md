@@ -116,7 +116,7 @@ job.result()
 await job.cancel()
 ```
 
-`result()` raises `NotReady` until completion. `await job` explicitly waits for completion of that job; other async cells continue to run. Use `ws.tasks.list()` and `ws.tasks.get(task_id)` to find handles created in another session. A disconnected MCP client does not cancel its submitted cells or background jobs.
+`result()` raises `NotReady` until completion. `await job` explicitly waits for completion of that job; for `persist_result=True`, it also waits for the persistence attempt and terminal publication to settle while returning the original in-memory value. Use `await job.wait_saved()` when the caller needs confirmed saved JSON; it returns `None` on success and raises `ResultUnavailable` when saving is unavailable, unserializable, unknown, or later removed by retention. Calling it for a live job without `persist_result=True` raises `ValueError`. Cancelling the wait does not cancel the job or its reporter. Other async cells continue to run. Use `ws.tasks.list()` and `ws.tasks.get(task_id)` to find handles created in another session. A disconnected MCP client does not cancel its submitted cells or background jobs.
 
 ## Python workspace API
 
@@ -131,7 +131,7 @@ print(ws.help("search"))  # Text, document, and AST search
 print(ws.help("shell.run"))  # Live method signature, defaults, and return guidance
 ```
 
-`ws.help(topic=None)` returns a string without I/O. Topics cover workspace APIs and execution lifecycle; each API topic lists its public methods. Pass a method path such as `"shell.run"` or `"ws.mcp.read_resource"` to inspect the running implementation's signature, defaults, return annotation, and documentation. Private attributes and arbitrary attribute traversal are rejected. Follow the running manager's instructions when it differs from the installed MCP client.
+`ws.help(topic=None)` returns a string without I/O. Topics cover workspace APIs and execution lifecycle; each API topic lists its public methods. The capability aliases `filesystem_history` and `task_results` resolve to the `fs` and `tasks` topics. Pass a method path such as `"shell.run"` or `"ws.mcp.read_resource"` to inspect the running implementation's signature, defaults, return annotation, and documentation. Private attributes and arbitrary attribute traversal are rejected. Follow the running manager's instructions when it differs from the installed MCP client.
 
 | Entry point | Purpose |
 | --- | --- |
@@ -171,7 +171,7 @@ async for page in ws.pages.iter(ws.fs.search, "TODO", paths="src"):
         print(match["path"], match["line"])
 ```
 
-The iterator forwards each API's `next_cursor` as `cursor`, detects an expired snapshot or a non-advancing cursor, and stops at `max_pages`. It does not silently rerun a query against changed files.
+The iterator forwards each API's `next_cursor` as `cursor` and detects an expired snapshot or a non-advancing cursor. If `max_pages` is reached while more data remains, it raises `PageLimitReached` with `method`, `pages_read`, `next_cursor`, and `next_kwargs`; resume with `ws.pages.iter(error.method, *args, **error.next_kwargs)`. An explicit loop break is normal. It does not silently rerun a query against changed files.
 
 See [media and document extraction](docs/media.md) for images, PDF pages, OCR, Office formats, and optional workspace packages. These operations preserve the source files. Further guides cover [structural rewrites](docs/rewrites.md), [browser observation](docs/browser.md), [HTML extraction](docs/http.md), [Git history](docs/git.md), [local diagnostics](docs/diagnostics.md), and [workspace storage](docs/storage.md). [External tool recipes](docs/tool-recipes.md) show how to use installed benchmarking, tracing, and code-analysis tools through existing shell jobs.
 
@@ -378,7 +378,7 @@ import asyncio
 ws.local["job"] = ws.tasks.start(asyncio.sleep(2, result="done"))
 ```
 
-Set `persist_result=True` when a detached task's JSON result must remain available after the handle is evicted or the client reconnects. Only strict JSON values up to 256 KiB are stored; the task itself still succeeds when its result is not serializable, too large, or cannot be persisted. Historical `result()` then raises `ResultUnavailable` when no saved value exists.
+Set `persist_result=True` when a detached visible Python task's JSON result must remain available after the handle is evicted or the client reconnects. Only strict JSON values up to 256 KiB are stored; the task itself still succeeds when its result is not serializable, too large, or cannot be persisted, and `status()` reports `result_persisted` and warnings. `await job.wait_saved()` waits for the save attempt and returns `None` only after confirmed persistence; it raises `ResultUnavailable` for an unavailable, unserializable, unknown, or garbage-collected saved result. Historical `result()` remains the synchronous computation result and raises `ResultUnavailable` when no saved value exists.
 
 Cell, remote-job, and Python-task handles share one ID namespace. Custom task IDs cannot replace existing handles or use generated ID forms: 32 lowercase hexadecimal characters, `task-…-<number>`, or the `remote-watch:` prefix. Automatic task IDs use a monotonically increasing counter without retaining old IDs in memory. Custom IDs remain reserved until kernel reset, including IDs used with `visible=False`.
 
@@ -401,6 +401,7 @@ ws.tasks.get(ws.local["job"].id)
 | `await job.read(cursor=None, stream=None, max_bytes=32768, wait_ms=0)` | Bounded output page and opaque continuation cursor |
 | `await job.expect(pattern, cursor=None, stream=None, regex=False, timeout=30, max_scan_bytes=65536)` | Wait for text or a regex across output chunks |
 | `job.result()` | Completed result; raises `NotReady` while still running |
+| `await job.wait_saved()` | Waits for persisted JSON; returns `None` or raises `ResultUnavailable` |
 | `await job` | Waits for completion and returns the result |
 | `await job.cancel()` | Returns `False` if already terminal, otherwise requests cancellation and returns `True` |
 
@@ -632,7 +633,7 @@ The installation uses `uv pip` and writes the resulting freeze to `.mypr/require
 
 `await ws.doctor()` checks whether the workspace is ready for the requested workflow: Python packages, search backends, configured LSP servers, browser engine, OCR language data, MCP configuration, runtime workers, and storage. Checks are reported as ready, missing, invalid, or unknown with a bounded reason. Doctor does not install packages or modify configuration. The same check is available before a manager starts with `uvx mypr-mcp doctor`.
 
-`await ws.storage.usage()` reports managed disk use by category. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Configure the policy in `.mypr/config.toml`:
+`await ws.storage.usage()` reports managed disk use by category through a metadata-only scan; it does not hash or read file contents. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Configure the policy in `.mypr/config.toml`:
 
 ```toml
 [storage]

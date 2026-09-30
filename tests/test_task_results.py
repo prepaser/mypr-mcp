@@ -100,3 +100,126 @@ async def test_offline_client_directory_keeps_identity_and_unacked_count(tmp_pat
         assert result["clients"][0]["last_seen"] == 123
         assert result["clients"][0]["unacked"] == 1
         assert result["clients"][0]["connected"] is False
+
+
+async def test_persistent_wait_settles_storage_and_waiter_cancel_keeps_reporter(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def rpc(op, **fields):
+        if op == "task_result_store":
+            entered.set()
+            await release.wait()
+            return {"path": "result.json"}
+
+    monkeypatch.setattr(api, "_rpc", rpc)
+    tasks = api.TaskManager()
+    handle = tasks.start(asyncio.sleep(0, result={"answer": 42}), persist_result=True)
+    waiter = asyncio.create_task(handle._wait())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert handle.result() == {"answer": 42}
+        assert handle.status()["result_persisted"] is None
+        assert not waiter.done()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not handle._reporter.cancelled()
+    finally:
+        release.set()
+        await asyncio.gather(waiter, handle._reporter, return_exceptions=True)
+    assert await handle == {"answer": 42}
+    await handle.wait_saved()
+    assert handle.status()["result_persisted"] is True
+
+
+@pytest.mark.parametrize("value, store_error", [(b"binary", False), ({"answer": 42}, True)])
+async def test_storage_failure_keeps_live_result_and_wait_saved_reports_it(
+    value, store_error, monkeypatch
+):
+    async def rpc(op, **fields):
+        if op == "task_result_store" and store_error:
+            raise OSError("response lost")
+
+    monkeypatch.setattr(api, "_rpc", rpc)
+    handle = api.TaskManager().start(asyncio.sleep(0, result=value), persist_result=True)
+    assert await handle == value
+    with pytest.raises(api.ResultUnavailable):
+        await handle.wait_saved()
+    assert handle.status()["result_persisted"] is (None if store_error else False)
+    assert handle.status()["warnings"]
+
+
+async def test_cleanup_waits_for_completed_task_report_and_rejects_new_work(tmp_path, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def rpc(op, **fields):
+        if op == "task_result_store":
+            entered.set()
+            await release.wait()
+            return {"path": "result.json"}
+
+    monkeypatch.setattr(api, "_rpc", rpc)
+    ws = api.Workspace(tmp_path)
+    handle = ws.tasks.start(asyncio.sleep(0, result=42), persist_result=True)
+    await asyncio.wait_for(entered.wait(), 1)
+    assert handle._task.done()
+    cleanup = asyncio.create_task(ws._close_resources())
+    try:
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        new_work = asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="closing"):
+            ws.tasks.start(new_work)
+        assert new_work.cr_frame is None
+    finally:
+        release.set()
+        await cleanup
+    assert handle._reporter.done()
+    await handle.wait_saved()
+
+
+async def test_cleanup_timeout_cancels_report_and_marks_storage_uncertain(tmp_path, monkeypatch):
+    entered = asyncio.Event()
+
+    async def rpc(op, **fields):
+        if op == "task_result_store":
+            entered.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(api, "_rpc", rpc)
+    monkeypatch.setattr(api, "_REPORT_DRAIN_TIMEOUT", 0.01)
+    ws = api.Workspace(tmp_path)
+    handle = ws.tasks.start(asyncio.sleep(0, result=42), persist_result=True)
+    await asyncio.wait_for(entered.wait(), 1)
+    with pytest.raises(ExceptionGroup) as failure:
+        await asyncio.wait_for(ws._close_resources(), 1)
+    assert any(isinstance(error, TimeoutError) for error in failure.value.exceptions)
+    assert handle._reporter.cancelled()
+    assert await handle == 42
+    assert handle.status()["result_persisted"] is None
+    with pytest.raises(api.ResultUnavailable):
+        await handle.wait_saved()
+
+
+async def test_persistent_failed_task_waits_for_terminal_report(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def rpc(op, **fields):
+        if op == "task_event" and fields["event"]["state"] == "failed":
+            entered.set()
+            await release.wait()
+
+    async def fail():
+        raise ValueError("compute failed")
+
+    monkeypatch.setattr(api, "_rpc", rpc)
+    handle = api.TaskManager().start(fail(), persist_result=True)
+    waiter = asyncio.create_task(handle._wait())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not waiter.done()
+    finally:
+        release.set()
+    with pytest.raises(ValueError, match="compute failed"):
+        await waiter
+    assert handle._reporter.done()

@@ -9,6 +9,33 @@ from typing import Any
 _MISSING = object()
 
 
+class PageLimitReached(RuntimeError):
+    """Raised when page iteration needs a continuation after its limit."""
+
+    def __init__(
+        self,
+        method: str | Callable[..., Awaitable[Any]],
+        pages_read: int,
+        *,
+        next_cursor: Any,
+        next_kwargs: Mapping[str, Any],
+    ) -> None:
+        self.method = method
+        self.pages_read = pages_read
+        self.next_cursor = next_cursor
+        self.next_kwargs = dict(next_kwargs)
+        name = method if isinstance(method, str) else getattr(method, "__qualname__", repr(method))
+        if not isinstance(name, str):
+            name = repr(name)
+        self.code = "page_limit_reached"
+        self.details = {
+            "method": name,
+            "pages_read": pages_read,
+            "next_cursor": next_cursor,
+        }
+        super().__init__(f"{name} reached max_pages after {pages_read} pages")
+
+
 class Pages:
     """Expose bounded async iteration without hiding query failures."""
 
@@ -29,7 +56,7 @@ class Pages:
         previous_marker: Any = options.get("cursor", _MISSING)
         seen: set[str] = set()
         revision: Any = _MISSING
-        for _page_number in range(max_pages):
+        for page_number in range(1, max_pages + 1):
             result = await call(*args, **options)
             if not isinstance(result, Mapping):
                 raise TypeError(
@@ -53,7 +80,14 @@ class Pages:
                 raise RuntimeError(f"{name} returned a non-progressing or cyclic cursor")
             seen.add(encoded)
             previous_marker = marker
-            self._advance(name, options, marker)
+            self._advance(name, options, marker, method)
+            if page_number == max_pages:
+                raise PageLimitReached(
+                    method,
+                    page_number,
+                    next_cursor=marker,
+                    next_kwargs=options,
+                )
 
     def _resolve(
         self, method: str | Callable[..., Awaitable[Any]]
@@ -96,16 +130,29 @@ class Pages:
                 return page[key]
         return None
 
-    @staticmethod
-    def _advance(name: str, options: dict[str, Any], marker: Any) -> None:
+    def _advance(
+        self,
+        name: str,
+        options: dict[str, Any],
+        marker: Any,
+        method: str | Callable[..., Awaitable[Any]],
+    ) -> None:
         parts = name.split(".")
         owner = parts[-2] if len(parts) > 1 else ""
-        method = parts[-1]
-        if owner == "messages" and method == "read":
+        method_name = parts[-1]
+        if callable(method):
+            bound_owner = getattr(method, "__self__", None)
+            bound_name = getattr(method, "__name__", None)
+            for candidate in ("messages", "fs", "filesystem", "skills", "modules"):
+                if getattr(self._workspace, candidate, None) is bound_owner:
+                    owner = candidate
+                    method_name = bound_name or method_name
+                    break
+        if owner == "messages" and method_name == "read":
             options.pop("cursor", None)
             options["after"] = marker
             return
-        if owner in {"fs", "filesystem"} and method == "read":
+        if owner in {"fs", "filesystem"} and method_name == "read":
             if not isinstance(marker, Mapping):
                 raise RuntimeError("filesystem.read returned an invalid continuation cursor")
             if "line" not in marker or "byte" not in marker:
@@ -114,8 +161,11 @@ class Pages:
             options["start_line"] = marker["line"]
             options["start_byte"] = marker["byte"]
             return
-        if (owner in {"skills", "modules", "fs", "filesystem"} and method == "read_revision") or (
-            owner in {"fs", "filesystem"} and method == "read_bytes"
+        if (
+            owner in {"skills", "modules", "fs", "filesystem"}
+            and method_name == "read_revision"
+        ) or (
+            owner in {"fs", "filesystem"} and method_name == "read_bytes"
         ):
             if type(marker) is not int or marker < 0:
                 raise RuntimeError("revision cursor must be a non-negative byte offset")

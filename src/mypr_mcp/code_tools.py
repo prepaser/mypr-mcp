@@ -2141,7 +2141,9 @@ class CodeTools:
         return result
 
     async def _apply_edit_plan(self, plan: Any) -> dict[str, Any]:
-        for method_name in ("apply_lsp_plan", "apply_workspace_edit", "apply_edit_plan"):
+        for method_name in (
+            "_apply_lsp_plan", "apply_lsp_plan", "apply_workspace_edit", "apply_edit_plan"
+        ):
             method = getattr(self.fs, method_name, None) if self.fs is not None else None
             if method is not None:
                 result = method(plan)

@@ -305,8 +305,8 @@ class Storage:
             usage = self._usage(entries, truncated)
             selected = self._select(candidates, usage["total_bytes"], options["max_bytes"])
             revision_prunable = self._revision_prune_preview(entries, options["revision_keep"])
-            candidate_truncated = len(selected) > _MAX_PLAN_CANDIDATES
-            selected = selected[:_MAX_PLAN_CANDIDATES]
+            selected, candidate_truncated = self._limit_candidates(selected)
+            selected = self._hydrate_candidates(selected)
             projected = usage["total_bytes"] - sum(item["size"] for item in selected)
             plan_id = secrets.token_hex(16)
             tombstones = [
@@ -381,16 +381,7 @@ class Storage:
                     entries, records, protected, plan["options"], history_state
                 )
             }
-            fresh = self._select(
-                list(current_candidates.values()),
-                self._usage(entries, scan_truncated)["total_bytes"],
-                plan["options"]["max_bytes"],
-            )
-            for item in fresh:
-                current_candidates.setdefault(item["path"], item)
             apply_items = {item["path"]: item for item in plan["candidates"]}
-            for item in fresh:
-                apply_items.setdefault(item["path"], item)
             prevalidated: dict[str, tuple[dict[str, Any], _Entry, dict[str, Any]]] = {}
             planned_groups: dict[str, set[str]] = defaultdict(set)
             for item in apply_items.values():
@@ -403,7 +394,11 @@ class Storage:
                 if not self._inside_workspace(path):
                     skipped.append({**item, "reason": "workspace_identity_changed"})
                     continue
-                current = self._entry(path, item["category"])
+                current = self._entry(
+                    path,
+                    item["category"],
+                    with_digest=item.get("digest") is not None,
+                )
                 if current is None:
                     skipped.append({**item, "reason": "already_absent"})
                     continue
@@ -411,11 +406,20 @@ class Storage:
                     skipped.append({**item, "reason": "changed_since_plan"})
                     continue
                 prevalidated[item["path"]] = (item, current, current_plan)
-            failed_paths = {item["path"] for item in plan["candidates"]} - set(prevalidated)
+            failed_paths = set(apply_items) - set(prevalidated)
+            current_groups: dict[str, set[str]] = defaultdict(set)
+            for item in current_candidates.values():
+                current_groups[item["group"]].add(item["path"])
             invalid_groups = {
                 group
                 for group, paths in planned_groups.items()
-                if len(paths) > 1 and paths & failed_paths
+                if (
+                    len(paths) > 1
+                    and (
+                        paths & failed_paths
+                        or current_groups.get(group, set()) != paths
+                    )
+                )
             }
             for group in invalid_groups:
                 for path in planned_groups[group]:
@@ -457,7 +461,11 @@ class Storage:
                     continue
                 path = self.workspace / item["path"]
                 try:
-                    current = self._entry(path, item["category"])
+                    current = self._entry(
+                        path,
+                        item["category"],
+                        with_digest=item.get("digest") is not None,
+                    )
                 except OSError as exc:
                     skipped.append({**item, "reason": f"stat_failed: {type(exc).__name__}"})
                     continue
@@ -520,7 +528,13 @@ class Storage:
                 break
         return entries, truncated
 
-    def _entry(self, path: Path, category: str | None = None) -> _Entry | None:
+    def _entry(
+        self,
+        path: Path,
+        category: str | None = None,
+        *,
+        with_digest: bool = False,
+    ) -> _Entry | None:
         try:
             info = path.lstat()
         except OSError:
@@ -531,6 +545,18 @@ class Storage:
             relative = self._relative(path)
         except ValueError:
             return None
+        digest = self._digest(path, info.st_size) if with_digest else None
+        if with_digest and digest is not None:
+            try:
+                current = path.lstat()
+            except OSError:
+                return None
+            if (
+                current.st_ino != info.st_ino
+                or current.st_size != info.st_size
+                or current.st_mtime_ns != info.st_mtime_ns
+            ):
+                return None
         return _Entry(
             path,
             relative,
@@ -538,7 +564,7 @@ class Storage:
             info.st_size,
             info.st_mtime_ns,
             info.st_ino,
-            self._digest(path, info.st_size),
+            digest,
         )
 
     def _relative(self, path: Path) -> str:
@@ -565,9 +591,13 @@ class Storage:
         if size > _MAX_HASH_BYTES:
             return None
         digest = hashlib.sha256()
+        read = 0
         try:
             with path.open("rb") as stream:
-                while chunk := stream.read(1024 * 1024):
+                while read < _MAX_HASH_BYTES and (
+                    chunk := stream.read(min(1024 * 1024, _MAX_HASH_BYTES - read))
+                ):
+                    read += len(chunk)
                     digest.update(chunk)
         except OSError:
             return None
@@ -676,7 +706,7 @@ class Storage:
             group = entry.relative
             if entry.relative in protected_paths or entry.path.name.endswith(".lock"):
                 continue
-            if entry.digest is None:
+            if entry.size > _MAX_HASH_BYTES:
                 continue
             expired = entry.mtime_ns / 1_000_000_000 <= cutoff
             if entry.category == "revisions" and entry.path.parent.name == "objects":
@@ -722,7 +752,6 @@ class Storage:
                     if (
                         partner_entry is None
                         or partner in protected_paths
-                        or partner_entry.digest is None
                     ):
                         continue
                     group = min(entry.relative, partner)
@@ -737,7 +766,7 @@ class Storage:
                     "size": entry.size,
                     "mtime_ns": entry.mtime_ns,
                     "inode": entry.inode,
-                    "digest": entry.digest,
+                    "digest": None,
                     "reason": reason,
                     "requires_tombstone": requires_tombstone
                     and entry.relative not in history_state.get("tombstones", {}),
@@ -749,6 +778,37 @@ class Storage:
             candidates,
             key=lambda item: (not item["expired"], item["mtime_ns"], item["path"]),
         )
+
+    @staticmethod
+    def _limit_candidates(
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        grouped: list[list[dict[str, Any]]] = []
+        for item in candidates:
+            if not grouped or grouped[-1][0]["group"] != item["group"]:
+                grouped.append([])
+            grouped[-1].append(item)
+        limited: list[dict[str, Any]] = []
+        for group in grouped:
+            if len(limited) + len(group) > _MAX_PLAN_CANDIDATES:
+                continue
+            limited.extend(group)
+        return limited, len(limited) != len(candidates)
+
+    def _hydrate_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        hydrated: list[dict[str, Any]] = []
+        invalid_groups: set[str] = set()
+        for item in candidates:
+            path = self.workspace / item["path"]
+            entry = self._entry(path, item["category"], with_digest=True)
+            if entry is None or not self._same_entry(entry, item):
+                invalid_groups.add(item["group"])
+                continue
+            if entry.digest is None:
+                invalid_groups.add(item["group"])
+                continue
+            hydrated.append({**item, "digest": entry.digest})
+        return [item for item in hydrated if item["group"] not in invalid_groups]
 
     def _revision_prune_preview(self, entries: list[_Entry], keep: int) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -894,7 +954,7 @@ class Storage:
         path = (self.workspace / resource).resolve(strict=False)
         if not self._inside_workspace(path):
             return "unknown", None
-        entry = self._entry(path)
+        entry = self._entry(path, with_digest=True)
         if entry is None:
             if not path.exists():
                 return "absent", None

@@ -99,9 +99,9 @@ Use tasks help for handle status, output paging, expect, result, and cancellatio
 
 ws.tasks.start(coroutine) starts detached async work and returns a handle. Store handles in ws.local. Raw asyncio.create_task() output after its parent cell finishes is not retained. Every cell is also a task handle: ws.tasks.get(exec_id) exposes its status (kind="cell") and actual last-expression result. A cell cannot await its own handle; use MCP poll for cell output.
 
-For a retained job handle, status(), output(), and result() are synchronous; read(), expect(), and cancel() must be awaited. status() reports state, output() reads retained text, and result() raises NotReady until completion. read(cursor=None, stream=None, max_bytes=32768, wait_ms=0) returns bounded pages; its opaque cursor is separate from output() character offsets. expect(text, timeout=30, regex=False) waits for output; a failed match preserves its starting cursor, and reason identifies EOF, timeout, or limit. Cancelling an expect/read wait does not cancel the job. cancel() requests cancellation and returns False for a terminal handle. Awaiting the handle waits for that job while other async cells continue.
+For a retained job handle, status(), output(), and result() are synchronous; read(), expect(), cancel(), and wait_saved() must be awaited. status() reports state and, for persisted tasks, result_persisted and warnings; output() reads retained text, and result() raises NotReady until computation completes; it remains a synchronous computation result even when persistence was requested. read(cursor=None, stream=None, max_bytes=32768, wait_ms=0) returns bounded pages; its opaque cursor is separate from output() character offsets. expect(text, timeout=30, regex=False) waits for output; a failed match preserves its starting cursor, and reason identifies EOF, timeout, or limit. Cancelling an expect/read/wait_saved wait does not cancel the job or its reporter. cancel() requests cancellation and returns False for a terminal handle. Awaiting a persist_result=True handle waits for computation and the persistence attempt to settle while returning the original in-memory value; other async cells continue.
 
-Use ws.tasks.list() and ws.tasks.get(task_id) to find handles. Completed handles are cached up to limits.completed_tasks (default 128); keep important handles in ws.local. await ws.tasks.attach(task_id) reopens a saved job after reconnecting. Shell storage warnings appear in status() and output(cursor=0). Damaged saved output is replaced by warning events while readable output and event cursors are preserved.""",
+Use ws.tasks.list() and ws.tasks.get(task_id) to find handles. Completed handles are cached up to limits.completed_tasks (default 128); keep important handles in ws.local. Set persist_result=True when starting a visible Python task to retain a strict JSON result up to 256 KiB after handle eviction or reconnect; await job.wait_saved() returns None after confirmed persistence and raises ResultUnavailable for an unavailable, unserializable, unknown, or garbage-collected saved result. Calling it for a live job that was not started with persist_result=True raises ValueError. Persistence warnings do not change task success. await ws.tasks.attach(task_id) reopens a saved job after reconnecting. Shell and cell handles do not provide a persistent result contract. Shell storage warnings appear in status() and output(cursor=0). Damaged saved output is replaced by warning events while readable output and event cursors are preserved.""",
     ),
     "system": (
         "Inspect workstation specifications, limits, and resource usage.",
@@ -188,12 +188,7 @@ await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newe
     ),
     "pages": (
         "Consume paged workspace results without repeating queries.",
-        """ws.pages.iter(method, *args, **kwargs) is an async iterator for APIs
-that return next_cursor/has_more pages. It calls the supplied bound workspace
-method with the first arguments, then forwards each cursor using that method's
-cursor parameter. max_pages defaults to 100 and prevents accidental unbounded
-iteration. A stalled cursor or an expired snapshot raises instead of silently
-restarting the query.""",
+        """ws.pages.iter(method, *args, max_pages=100, **kwargs) is an async iterator for APIs that return next_cursor/has_more pages. It calls the supplied bound workspace method with the first arguments, then forwards each cursor using that method's cursor parameter. When max_pages is reached with more data available, PageLimitReached exposes method, pages_read, next_cursor, and next_kwargs; resume with ws.pages.iter(error.method, *args, **error.next_kwargs). An explicit loop break is normal. A stalled cursor or an expired snapshot raises instead of silently restarting the query.""",
     ),
     "performance": (
         "Inspect recent manager, storage, kernel, and bridge timings.",
@@ -201,18 +196,7 @@ restarting the query.""",
     ),
     "storage": (
         "Inspect and clean retained workspace data.",
-        """await ws.storage.usage() reports disk usage by retained output, journals,
-snapshots, artifacts, revisions, and other managed data. await
-ws.storage.gc(dry_run=True) builds a deletion plan without changing files;
-await ws.storage.gc_apply(plan_id) applies that exact plan after rechecking it.
-Automatic cleanup runs periodically and removes data older than 30 days. When
-managed data exceeds the soft 1 GiB target, it also selects the oldest eligible
-recent data until the target is reached. The `[storage]` config fields are
-`enabled`, `retention_days`, `max_bytes`, `revision_keep`, and
-`gc_interval_seconds`. Active work, current files, the latest `revision_keep`
-revisions per resource (50 by default), and shared blobs referenced by retained
-records are protected. Check `await ws.status()` for the automatic pass's
-`storage_maintenance` fields.""",
+        """await ws.storage.usage() reports disk usage by retained output, journals, snapshots, artifacts, revisions, and other managed data using a metadata-only scan that does not hash or read file contents. await ws.storage.gc(dry_run=True) builds a deletion plan without changing files; await ws.storage.gc_apply(plan_id) applies that exact plan after rechecking it. Automatic cleanup runs periodically and removes data older than 30 days. When managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. The `[storage]` config fields are `enabled`, `retention_days`, `max_bytes`, `revision_keep`, and `gc_interval_seconds`. Active work, current files, the latest `revision_keep` revisions per resource (50 by default), and shared blobs referenced by retained records are protected. Check `await ws.status()` for the automatic pass's `storage_maintenance` fields.""",
     ),
     "doctor": (
         "Diagnose workspace readiness and optional dependencies.",
@@ -242,9 +226,11 @@ Code runs with the current OS user's permissions, and exceptions do not undo ear
 }
 
 _TOPIC_NAMES = tuple(_TOPICS)
+_TOPIC_ALIASES = {"filesystem_history": "fs", "task_results": "tasks"}
 _INDEX = (
     "mypr workspace API topics\n\n"
     + "\n".join(f"{name}: {description}" for name, (description, _) in _TOPICS.items())
+    + "\n\nAliases: filesystem_history -> fs; task_results -> tasks."
     + '\n\nRead a topic with ws.help("topic") or inspect a method with ws.help("shell.run").'
 )
 
@@ -271,7 +257,8 @@ _METHOD_NOTES = {
     "fs.restore": "Restores one tracked filesystem revision only when the current revision matches the supplied precondition.",
     "code.apply_edit": "Applies a prepared, revision-checked LSP edit plan. Command-only actions are never executed.",
     "storage.gc": "Returns a dry-run cleanup plan by default; call storage.gc_apply(plan_id) to apply the exact plan.",
-    "storage.gc_apply": "Applies a previously generated cleanup plan after validating its workspace generation and protected references.",
+    "storage.gc_apply": "Applies a previously generated cleanup plan after validating its workspace identity and protected references.",
+    "storage.usage": "Reports category file counts and byte totals from a metadata-only scan without hashing or reading file contents.",
     "doctor": "Returns readiness checks for runtime, packages, tools, LSP, browser, OCR, MCP configuration, and storage without installing or changing anything.",
 }
 _WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "doctor", "reset", "restart"}
@@ -279,6 +266,8 @@ _WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "doctor", "res
 
 def _method(workspace, path):
     parts = path.removeprefix("ws.").split(".")
+    if parts:
+        parts[0] = _TOPIC_ALIASES.get(parts[0], parts[0])
     if len(parts) == 1 and parts[0] in _WORKSPACE_METHODS:
         owner, name = workspace, parts[0]
     elif len(parts) == 2 and parts[0] in _TOPICS:
@@ -316,14 +305,17 @@ def workspace_help(topic: str | None = None, *, workspace=None) -> str:
         return _INDEX
     if not isinstance(topic, str):
         raise TypeError("topic must be a string or None")
-    if workspace is not None and ("." in topic or topic in _WORKSPACE_METHODS - {"performance"}):
-        return method_help(workspace, topic)
+    parts = topic.removeprefix("ws.").split(".")
+    canonical_topic = _TOPIC_ALIASES.get(parts[0], parts[0])
+    canonical_path = ".".join([canonical_topic, *parts[1:]])
+    if workspace is not None and ("." in topic or canonical_topic in _WORKSPACE_METHODS - {"performance"}):
+        return method_help(workspace, canonical_path)
     try:
-        text = _TOPICS[topic][1]
+        text = _TOPICS[canonical_topic][1]
     except KeyError:
         available = ", ".join(_TOPIC_NAMES)
         raise ValueError(f"unknown help topic {topic!r}; available topics: {available}") from None
-    if workspace is not None and (owner := vars(workspace).get(topic)) is not None:
+    if workspace is not None and (owner := vars(workspace).get(canonical_topic)) is not None:
         methods = [
             name
             for name, member in inspect.getmembers_static(owner)
@@ -331,8 +323,8 @@ def workspace_help(topic: str | None = None, *, workspace=None) -> str:
             and (inspect.isroutine(member) or isinstance(member, (staticmethod, classmethod)))
         ]
         if methods:
-            text += "\n\nMethods: " + ", ".join(f"{topic}.{name}" for name in methods)
-            text += f'\nInspect one with ws.help("{topic}.{methods[0]}").'
+            text += "\n\nMethods: " + ", ".join(f"{canonical_topic}.{name}" for name in methods)
+            text += f'\nInspect one with ws.help("{canonical_topic}.{methods[0]}").'
     return text
 
 

@@ -48,6 +48,7 @@ _exec_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 RPC_LIMIT = 32 * 1024 * 1024
 HISTORY_OUTPUT_LIMIT = 64 * 1024
+_REPORT_DRAIN_TIMEOUT = 5.0
 try:
     OUTPUT_LIMIT = max(1024, int(os.environ.get("MYPR_OUTPUT_LIMIT", 16 * 1024 * 1024)))
 except ValueError:
@@ -319,6 +320,7 @@ class TaskHandle:
         self._persist_result = False
         self._result_persisted: bool | None = None
         self._result_warnings: list[dict[str, str]] = []
+        self._reporter: asyncio.Task[None] | None = None
         self._task.add_done_callback(self._finished)
 
     def _finished(self, task: asyncio.Task[Any]) -> None:
@@ -679,10 +681,57 @@ class TaskHandle:
                 **result_fields,
             )
 
+    def _report_finished(self, reporter: asyncio.Task[None]) -> None:
+        error = asyncio.CancelledError() if reporter.cancelled() else reporter.exception()
+        if error is not None and self._persist_result:
+            code = (
+                "task_report_incomplete" if self._result_persisted is not None
+                else "result_persistence_unknown"
+            )
+            self._result_warnings.append({
+                "code": code,
+                "text": safe_error(error),
+            })
+
+    async def _wait_reporter(self) -> None:
+        reporter = self._reporter
+        if reporter is not None:
+            if asyncio.current_task() is reporter:
+                raise RuntimeError("A task reporter cannot await itself")
+            await asyncio.shield(asyncio.gather(reporter, return_exceptions=True))
+
+    async def wait_saved(self) -> None:
+        """Wait for confirmed JSON result storage without cancelling the job."""
+        if not getattr(self, "_persist_result", False):
+            raise ValueError("Result storage requires tasks.start(..., persist_result=True)")
+        await self._wait()
+        if self._result_persisted is not True:
+            detail = self._result_warnings[-1]["text"] if self._result_warnings else "not confirmed"
+            code = (
+                "result_not_serializable" if self._result_persisted is False
+                else "result_persistence_unknown"
+            )
+            raise ResultUnavailable(
+                f"result storage for task {self.id}: {detail}",
+                code=code, operation="tasks.wait_saved", details={"task_id": self.id},
+            )
+
     async def _wait(self) -> Any:
         if asyncio.current_task() is self._task:
             raise RuntimeError("A task cannot await itself")
-        return await asyncio.shield(self._task)
+        try:
+            result = await asyncio.shield(self._task)
+        except BaseException:
+            current = asyncio.current_task()
+            if (
+                self._persist_result and self._task.done()
+                and not (current and current.cancelling())
+            ):
+                await self._wait_reporter()
+            raise
+        if self._persist_result:
+            await self._wait_reporter()
+        return result
 
     def __await__(self) -> Iterator[Any]:
         return self._wait().__await__()
@@ -696,6 +745,18 @@ class TaskManager:
         self._completed: deque[tuple[str, TaskHandle]] = deque()
         self._completed_ids: set[str] = set()
         self._explicit_ids: set[str] = set()
+        self._closing = False
+
+    async def _drain_reporters(self) -> None:
+        reporters = set(self._reporters)
+        if not reporters:
+            return
+        _, pending = await asyncio.wait(reporters, timeout=_REPORT_DRAIN_TIMEOUT)
+        if pending:
+            for reporter in pending:
+                reporter.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise TimeoutError(f"Unable to settle {len(pending)} task reports before cleanup")
 
     def _validate_new_id(self, ident: str, *, generated: bool) -> None:
         if not isinstance(ident, str) or not ident:
@@ -743,6 +804,10 @@ class TaskManager:
     ) -> TaskHandle:
         if not inspect.isawaitable(awaitable):
             raise TypeError("tasks.start expects an awaitable")
+        if self._closing:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise RuntimeError("Workspace tasks are closing")
         if type(persist_result) is not bool or (persist_result and not visible):
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
@@ -797,8 +862,10 @@ class TaskManager:
                     self._completed_handle(handle)
 
             reporter = asyncio.create_task(report(), name=f"mypr:report:{ident}")
+            handle._reporter = reporter
             self._reporters.add(reporter)
             reporter.add_done_callback(self._reporters.discard)
+            reporter.add_done_callback(handle._report_finished)
         elif not generated:
             self._explicit_ids.add(ident)
         return handle
@@ -1074,6 +1141,9 @@ class HistoricalTask(TaskHandle):
 
     async def _wait(self) -> Any:
         return self.result()
+
+    async def wait_saved(self) -> None:
+        self.result()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -1775,6 +1845,7 @@ class Workspace:
         if self._closing:
             return
         self._closing = True
+        self.tasks._closing = True
         current = asyncio.current_task()
         handles = [
             handle
@@ -1791,6 +1862,7 @@ class Workspace:
             await asyncio.wait(pending, timeout=2)
         resources = [getattr(self, name, None) for name in ("browser", "http", "code")]
         results = await asyncio.gather(
+            self.tasks._drain_reporters(),
             *(resource.aclose() for resource in resources if resource is not None),
             return_exceptions=True,
         )

@@ -18,6 +18,8 @@ from threading import Lock
 from typing import Any
 from weakref import WeakValueDictionary
 
+from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES
+
 _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
 _PATH_LOCKS_GUARD = Lock()
 
@@ -240,17 +242,46 @@ class Filesystem:
 
         return await apply_rewrite(self, plan_id)
 
-    async def replace(self, pattern: str, replacement: str, **options: Any) -> dict[str, Any]:
+    async def replace(
+        self,
+        pattern: str,
+        replacement: str,
+        *,
+        paths: str | list[str] | None = None,
+        glob: str | list[str] | None = None,
+        fixed: bool = True,
+        ignore_case: bool = False,
+        hidden: bool = False,
+        no_ignore: bool = False,
+        max_files: int = MAX_FILES,
+        max_bytes: int = MAX_INPUT_OUTPUT_BYTES,
+        timeout: float = 30,  # noqa: ASYNC109
+        history: bool = True,
+    ) -> dict[str, Any]:
         from .text_replace import replace
 
-        return await replace(self, pattern, replacement, **options)
+        return await replace(
+            self,
+            pattern,
+            replacement,
+            paths=paths,
+            glob=glob,
+            fixed=fixed,
+            ignore_case=ignore_case,
+            hidden=hidden,
+            no_ignore=no_ignore,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            timeout=timeout,
+            history=history,
+        )
 
     async def apply_replace(self, plan_id: str) -> dict[str, Any]:
         from .text_replace import apply_replace
 
         return await apply_replace(self, plan_id)
 
-    async def apply_lsp_plan(self, plan: Any) -> dict[str, Any]:
+    async def _apply_lsp_plan(self, plan: Any) -> dict[str, Any]:
         """Apply a validated LSP WorkspaceEdit as one CAS transaction."""
         from .patching import _commit, _plan, _read_state
 

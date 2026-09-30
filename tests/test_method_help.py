@@ -53,3 +53,17 @@ def test_new_tool_signatures_are_discoverable_without_optional_dependencies(tmp_
             owner, method = ws, path
             member = getattr(ws, path)
         assert f"ws.{path}{inspect.signature(member)}" in ws.help(path)
+
+
+def test_help_aliases_and_internal_edit_coordinator(tmp_path):
+    ws = Workspace(tmp_path)
+
+    assert "filesystem_history" in ws.help()
+    assert "fs.history" in ws.help("filesystem_history")
+    assert "task_results" in ws.help()
+    assert "tasks.start" in ws.help("task_results")
+    assert "**options" not in ws.help("fs.replace")
+    assert "max_files" in ws.help("fs.replace")
+    assert "wait_saved()" in ws.help("task_results")
+    with pytest.raises(ValueError, match="unknown API method"):
+        ws.help("fs.apply_lsp_plan")

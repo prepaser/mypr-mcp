@@ -145,3 +145,16 @@ def test_package_worker_accepts_freeze_at_exact_limit(tmp_path: Path):
     result = install_packages(sys.executable, root, ["new"], uv=str(uv))
     assert result["bytes"] == 16 * 1024 * 1024
     assert manifest.stat().st_size == 16 * 1024 * 1024
+
+
+def test_page_limit_error_keeps_resume_cursor_without_original_query_options():
+    from mypr_mcp.pages import PageLimitReached
+
+    error = PageLimitReached("fs.search", 3, next_cursor="saved-cursor",
+                             next_kwargs={"cursor": "saved-cursor", "token": "private"})
+    info = error_info(error, "cell.execute")
+    assert info["code"] == "page_limit_reached"
+    assert info["details"] == {
+        "method": "fs.search", "pages_read": 3, "next_cursor": "saved-cursor"
+    }
+    assert "private" not in json.dumps(info)

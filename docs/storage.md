@@ -2,7 +2,7 @@
 
 Runtime data lives below `.mypr/`. The manager keeps execution journals, background-job output, search and Git snapshots, document results, browser and scan artifacts, change plans, task results, and content-addressed revisions. Workspace files, the Python environment, skills, modules, configuration, messages, and request-deduplication state are managed separately from the cleanup candidates.
 
-Inspect usage before changing retention:
+Inspect usage before changing retention. The usage scan reads directory metadata only; it does not hash or read file contents:
 
 ```python
 usage = await ws.storage.usage()

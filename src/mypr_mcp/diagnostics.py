@@ -145,7 +145,8 @@ def error_info(
         error_type = exc.error_type or type(exc).__name__
     else:
         code = getattr(exc, "code", None) or _error_code(exc)
-        source_details = dict(details or {})
+        context = details if details is not None else getattr(exc, "details", None)
+        source_details = dict(context) if isinstance(context, Mapping) else {}
         error_type = type(exc).__name__
     for key in ("line", "column", "path"):
         value = getattr(exc, key, None)
