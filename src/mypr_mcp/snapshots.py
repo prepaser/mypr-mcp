@@ -7,10 +7,14 @@ import contextlib
 import json
 import os
 import secrets
+import stat
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+_MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+_MAX_CURSOR_BYTES = 1024
 
 
 class SnapshotStore:
@@ -40,9 +44,13 @@ class SnapshotStore:
         ):
             raise ValueError("invalid snapshot cursor")
         try:
-            payload = json.loads((self.root / f"{ident}.json").read_text(encoding="utf-8"))
+            raw = _read_snapshot(self.root / f"{ident}.json")
         except FileNotFoundError as exc:
             raise ValueError("snapshot has expired") from exc
+        try:
+            payload = json.loads(raw)
+        except (UnicodeError, ValueError) as exc:
+            raise RuntimeError("invalid persisted snapshot JSON") from exc
         if not isinstance(payload, dict) or payload.get("id") != ident:
             raise RuntimeError("invalid persisted snapshot")
         if not isinstance(payload.get("items"), list):
@@ -59,7 +67,7 @@ class SnapshotStore:
     def decode(
         self, cursor: str, *, expected_kind: str | None = None
     ) -> tuple[dict[str, Any], int]:
-        if not isinstance(cursor, str) or not cursor:
+        if not isinstance(cursor, str) or not cursor or len(cursor) > _MAX_CURSOR_BYTES:
             raise ValueError("invalid snapshot cursor")
         try:
             padding = "=" * (-len(cursor) % 4)
@@ -85,10 +93,39 @@ class SnapshotStore:
         fd, temporary = tempfile.mkstemp(prefix=f".{ident}.", suffix=".tmp", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=True, separators=(",", ":"))
+                encoder = json.JSONEncoder(ensure_ascii=True, separators=(",", ":"))
+                size = 0
+                for chunk in encoder.iterencode(payload):
+                    size += len(chunk)
+                    if size > _MAX_SNAPSHOT_BYTES:
+                        raise ValueError("snapshot exceeds its size limit")
+                    file.write(chunk)
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, target)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary)
+
+
+def _read_snapshot(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_SNAPSHOT_BYTES:
+            raise RuntimeError("invalid persisted snapshot file or size")
+        with os.fdopen(descriptor, "rb") as file:
+            descriptor = -1
+            data = file.read(_MAX_SNAPSHOT_BYTES + 1)
+            after = os.fstat(file.fileno())
+        if len(data) > _MAX_SNAPSHOT_BYTES or (
+            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+        ) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise RuntimeError("persisted snapshot changed while reading")
+        return data
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)

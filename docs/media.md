@@ -7,7 +7,7 @@ ws.local["media_install"] = await ws.packages.add("pillow", "pymupdf")
 await ws.local["media_install"]
 ```
 
-The MCP server's own environment is separate from the workspace kernel, so installing packages with `uvx` does not make them available here. Operations fail with an install hint when a package is missing. The worker limits each input to 64 MiB, each image to 40 million source pixels, PDF text reads to 10 pages and 64,000 characters, and each rendered image to 4 million pixels and 2 MiB. At most two workers run at once. On Linux, each worker also has CPU, memory, file-size, and file-descriptor limits. Operations never write over the source file.
+The MCP server's own environment is separate from the workspace kernel, so installing packages with `uvx` does not make them available here. Operations fail with an install hint when a package is missing. The worker limits each input to 64 MiB, each image to 40 million source pixels, PDF text reads to 10 pages and 64,000 characters, and each rendered image to 4 million pixels and 2 MiB. At most two workers run at once. On Linux, each worker also has CPU, memory, file-size, and file-descriptor limits, and a process guard cleans up its descendants when the kernel exits. Cancelling a media call waits for an in-progress worker launch and finishes process cleanup before propagating cancellation. Operations never write over the source file.
 
 ## Images
 

@@ -17,6 +17,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from .async_utils import wait_owned
 from .services import Shells
 
 _RESULT_LIMIT = 16 * 1024 * 1024
@@ -183,10 +184,26 @@ class ScanService:
                     mode=mode,
                     shell_id=ident,
                 )
-        except BaseException:
+        except BaseException as tracking_error:
+            cleanup_error = None
+            try:
+                await wait_owned(asyncio.create_task(self.shells.cancel(ident)), propagate=False)
+            except BaseException as exc:
+                cleanup_error = exc
+            record["state"] = "failed"
+            record["finished"] = time.time()
+            record["error"] = f"scan tracking failed: {tracking_error}"
+            record["stop_reason"] = "tracking_failed"
+            if cleanup_error is not None:
+                record["warnings"] = [
+                    {
+                        "code": "scan_cleanup_failed",
+                        "text": str(cleanup_error)[:256],
+                    }
+                ]
             with contextlib.suppress(Exception):
-                await self._finish_cancelled_launch(asyncio.create_task(self.shells.cancel(ident)))
-            self._records.pop(ident, None)
+                self._write_record(record)
+            self._cache(record)
             with contextlib.suppress(OSError):
                 config_path.unlink()
             raise
@@ -204,14 +221,7 @@ class ScanService:
 
     @staticmethod
     async def _finish_cancelled_launch(launch: asyncio.Task[Any]) -> dict[str, Any]:
-        while True:
-            try:
-                job = await asyncio.shield(launch)
-                break
-            except asyncio.CancelledError:
-                if launch.cancelled():
-                    raise
-        return job
+        return await wait_owned(launch, propagate=False)
 
     async def results(
         self,

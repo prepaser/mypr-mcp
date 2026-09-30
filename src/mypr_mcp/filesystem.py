@@ -385,7 +385,7 @@ class Filesystem:
                     )
                 else:
                     raise ValueError(f"unsupported LSP edit operation: {kind}")
-            history_store.prepare_changes_sync(plans)
+            await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
             result = await _to_thread_uncancelled(
                 _commit, plans, states, 32 * 1024, history_store=history_store
             )

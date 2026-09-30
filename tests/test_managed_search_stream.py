@@ -167,6 +167,47 @@ async def test_stream_callback_reason_cancels_job_and_is_preserved():
     assert shells.calls == 2
 
 
+class ExactTerminalOutput:
+    def __init__(self):
+        self.cancelled = []
+
+    async def start(self, command, cwd, env, *, input=None):
+        return {"id": "exact-job"}
+
+    async def read(self, ident, *, cursor, max_bytes, wait_ms):
+        return {
+            "id": ident,
+            "state": "succeeded",
+            "cursor": "done",
+            "has_more": False,
+            "output": [{"stream": "stdout", "text": "abcd"}],
+            "result": {"returncode": 0},
+        }
+
+    async def cancel(self, ident):
+        self.cancelled.append(ident)
+        return {"id": ident, "state": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_exact_terminal_budget_complete():
+    shells = ExactTerminalOutput()
+    seen = []
+
+    async def consume(text):
+        seen.append(text)
+
+    result = await ManagedCommands(Runtime(shells), "c", "conn", "exec").stream(
+        ["emit"], max_bytes=4, on_stdout=consume
+    )
+
+    assert seen == ["abcd"]
+    assert result["state"] == "succeeded"
+    assert result["truncated"] is False
+    assert "stop_reason" not in result
+    assert shells.cancelled == []
+
+
 class SlowOutput:
     def __init__(self):
         self.cancelled = False

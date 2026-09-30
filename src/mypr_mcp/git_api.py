@@ -117,6 +117,8 @@ class Git:
         cursor: str | None = None,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
     ) -> dict[str, Any]:
+        if type(staged) is not bool:
+            raise TypeError("staged must be a boolean")
         self._validate_limit(max_bytes)
         if cursor is not None:
             snapshot, offset = await asyncio.to_thread(

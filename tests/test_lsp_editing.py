@@ -140,6 +140,58 @@ async def test_code_action_can_be_selected_and_applied(tmp_path):
         await code.aclose()
 
 
+@pytest.mark.asyncio
+async def test_code_action_rejects_disk_changes_since_request(tmp_path):
+    code, workspace = await configured(tmp_path)
+    path = workspace / "sample.py"
+    path.write_text("foo\n", encoding="utf-8")
+    try:
+        actions = await code.actions("fake", path, 1, 1)
+        path.write_text("qux\n", encoding="utf-8")
+        with pytest.raises(EditError, match="document changed"):
+            await code.prepare_action(actions["actions"][0]["action_id"])
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_code_action_rejects_open_document_version_changes(tmp_path):
+    code, workspace = await configured(tmp_path)
+    path = workspace / "sample.py"
+    path.write_text("foo\n", encoding="utf-8")
+    try:
+        actions = await code.actions("fake", path, 1, 1)
+        action_id = actions["actions"][0]["action_id"]
+        path.write_text("qux\n", encoding="utf-8")
+        await code.actions("fake", path, 1, 1)
+        with pytest.raises(EditError, match="document changed"):
+            await code.prepare_action(action_id)
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rename_rechecks_document_snapshot_before_plan(tmp_path):
+    code, workspace = await configured(tmp_path)
+    path = workspace / "sample.py"
+    path.write_text("foo\n", encoding="utf-8")
+    original = code._workspace_edit_plan
+
+    async def race(server, edit, **kwargs):
+        path.write_text("qux\n", encoding="utf-8")
+        document = server.documents[path.as_uri()]
+        document.text = "qux\n"
+        document.version += 1
+        return await original(server, edit, **kwargs)
+
+    code._workspace_edit_plan = race
+    try:
+        with pytest.raises(EditError, match="document changed"):
+            await code.rename("fake", path, 1, 1, "bar")
+    finally:
+        await code.aclose()
+
+
 def test_lsp_config_roundtrip_preserves_other_sections(tmp_path):
     config = LSPConfig(tmp_path)
     config.path.parent.mkdir(parents=True)

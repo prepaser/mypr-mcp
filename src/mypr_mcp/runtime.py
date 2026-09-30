@@ -1283,25 +1283,21 @@ class Runtime:
         }
 
     async def _dispatch(self, req):
-        def method(name):
-            bound = getattr(self, name, None)
-            return bound if bound is not None else getattr(Runtime, name).__get__(self)
-
         op = req.pop("op")
         requested_client = req.pop("client_id", None)
         connection_id = req.pop("connection_id", None)
         connection = self.clients.get(connection_id)
-        method("_check_dispatch_admission")(op)
+        self._check_dispatch_admission(op)
         if op == "init":
             return await self.initialize_client(connection_id, requested_client)
         if connection:
-            await method("_update_connection")(connection, requested_client, op)
+            await self._update_connection(connection, requested_client, op)
         client = (connection["client_id"] if connection else requested_client) or "anonymous"
         if op == "performance":
             return self.performance_snapshot()
         if op == "status":
             return self._dispatch_status(req, connection, op)
-        result = await method("_dispatch_history")(op, req)
+        result = await self._dispatch_history(op, req)
         if result is not _UNHANDLED:
             return result
         generation = req.pop("generation", None)
@@ -1309,12 +1305,11 @@ class Runtime:
             raise RuntimeError("Expired kernel generation")
         context = dict(client=client, connection_id=connection_id, connection=connection,
                        requested_client=requested_client, generation=generation)
-        for handler_name in (
-            "_dispatch_execution", "_dispatch_messages", "_dispatch_storage",
-            "_dispatch_tasks", "_dispatch_scan", "_dispatch_tools", "_dispatch_shell",
-            "_dispatch_mcp", "_dispatch_lifecycle",
+        for handler in (
+            self._dispatch_execution, self._dispatch_messages, self._dispatch_storage,
+            self._dispatch_tasks, self._dispatch_scan, self._dispatch_tools,
+            self._dispatch_shell, self._dispatch_mcp, self._dispatch_lifecycle,
         ):
-            handler = method(handler_name)
             result = await handler(op, req, **context)
             if result is not _UNHANDLED:
                 return result

@@ -50,6 +50,7 @@ _exec_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 RPC_LIMIT = 32 * 1024 * 1024
 HISTORY_OUTPUT_LIMIT = 64 * 1024
 _REPORT_DRAIN_TIMEOUT = 5.0
+_REPORT_RPC_TIMEOUT = 10.0
 try:
     OUTPUT_LIMIT = max(1024, int(os.environ.get("MYPR_OUTPUT_LIMIT", 16 * 1024 * 1024)))
 except ValueError:
@@ -296,6 +297,18 @@ async def _rpc(op: str, **fields: Any) -> Any:
             error_type=info.get("type"),
         )
     return response.get("result")
+
+
+async def _report_rpc(op: str, **fields: Any) -> Any:
+    try:
+        async with asyncio.timeout(_REPORT_RPC_TIMEOUT):
+            return await _rpc(op, **fields)
+    except TimeoutError as exc:
+        raise RPCError(
+            f"workspace manager reporting timed out: {op}",
+            code="report_timeout",
+            operation=op,
+        ) from exc
 
 
 class TaskHandle:
@@ -600,7 +613,7 @@ class TaskHandle:
         async def publish(state: str, **extra: Any) -> bool:
             event = {**identity, "state": state, **extra}
             try:
-                await _rpc("task_event", event=event)
+                await _report_rpc("task_event", event=event)
                 return True
             except Exception:
                 # Reporting must never alter the task's result or lifetime.
@@ -611,7 +624,7 @@ class TaskHandle:
             if await publish(state, **extra):
                 return
             try:
-                await _rpc("task_terminal", event=event)
+                await _report_rpc("task_terminal", event=event)
             except Exception:
                 pass
 
@@ -621,6 +634,9 @@ class TaskHandle:
         output_unconfirmed = False
         while True:
             for name, chunk in self._buffer.segments(cursor):
+                if output_unconfirmed:
+                    cursor += len(chunk)
+                    continue
                 if not await publish("running", output_delta=chunk, output_stream=name):
                     output_unconfirmed = True
                 cursor += len(chunk)
@@ -676,7 +692,7 @@ class TaskHandle:
                     result_fields["result_persisted"] = False
                 else:
                     try:
-                        reference = await _rpc(
+                        reference = await _report_rpc(
                             "task_result_store", id=self.id, encoded=encoded
                         )
                     except Exception as exc:
@@ -1844,17 +1860,29 @@ class Workspace:
         self.pages = Pages(self)
         self.storage = StorageAPI(_rpc)
         self._closing = False
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def _close_resources(self):
-        if self._closing:
-            return
+        origin = asyncio.current_task()
+        cleanup = self._cleanup_task
+        if cleanup is None:
+            if self._closing:
+                return
+            self._closing = True
+            self.tasks._closing = True
+            cleanup = asyncio.create_task(
+                self._close_resources_owned(origin), name="mypr:workspace-close"
+            )
+            self._cleanup_task = cleanup
+        await wait_owned(cleanup)
+
+    async def _close_resources_owned(self, origin: asyncio.Task[Any] | None) -> None:
         self._closing = True
         self.tasks._closing = True
-        current = asyncio.current_task()
         handles = [
             handle
             for handle in self.tasks.active()
-            if getattr(handle, "_task", None) is not current
+            if getattr(handle, "_task", None) is not origin
         ]
         await asyncio.gather(*(handle.cancel() for handle in handles), return_exceptions=True)
         pending = [

@@ -283,20 +283,18 @@ async def test_shell_start_rpc_preserves_environment_mode(rpc_fields, expected_i
             self.kwargs = kwargs
             return {"id": "shell-id"}
 
-    class Manager:
-        restarting = False
-        stopping = asyncio.Event()
-        clients = {}
-        workspace = "/workspace"
+    manager = Runtime.__new__(Runtime)
+    manager.restarting = False
+    manager.stopping = asyncio.Event()
+    manager.clients = {}
+    manager.workspace = "/workspace"
+    manager.shells = ShellService()
+    manager.tracked = []
 
-        def __init__(self):
-            self.shells = ShellService()
-            self.tracked = []
+    def track_shell(*args, **kwargs):
+        manager.tracked.append((args, kwargs))
 
-        def track_shell(self, *args, **kwargs):
-            self.tracked.append((args, kwargs))
-
-    manager = Manager()
+    manager.track_shell = track_shell
     await Runtime._dispatch(
         manager,
         {"op": "shell_start", "command": "true", **rpc_fields},

@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any
 
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 from .document_tools import DocumentExtractor
 
 _WORKER = Path(__file__).with_name("media_worker.py")
+_GUARD = Path(__file__).with_name("process_guard.py")
 _WORKERS = asyncio.Semaphore(2)
 _MAX_INPUT_BYTES = 64 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 2 * 1024 * 1024
@@ -30,19 +33,35 @@ class MediaToolError(RuntimeError):
 def _kill_worker(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         try:
-            process.kill()
-        except ProcessLookupError:
-            pass
+            process.terminate()
+        except (AttributeError, ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
 
 
-async def _cleanup_worker(process: asyncio.subprocess.Process, communication: asyncio.Task) -> None:
+def _kill_worker_force(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    with contextlib.suppress(AttributeError, ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
+
+
+async def _cleanup_worker(
+    process: asyncio.subprocess.Process, communication: asyncio.Task | None
+) -> None:
     if process.stdin is not None and not process.stdin.is_closing():
         process.stdin.close()
     _kill_worker(process)
     try:
         await asyncio.wait_for(asyncio.shield(process.wait()), _CLEANUP_TIMEOUT)
     except TimeoutError:
-        pass
+        _kill_worker_force(process)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(process.wait()), _CLEANUP_TIMEOUT)
+    if communication is None:
+        return
     if communication.done():
         await asyncio.gather(communication, return_exceptions=True)
     else:
@@ -58,6 +77,7 @@ async def _cleanup_worker(process: asyncio.subprocess.Process, communication: as
         except TimeoutError:
             pass
     if process.returncode is None:
+        _kill_worker_force(process)
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), _CLEANUP_TIMEOUT)
         except TimeoutError:
@@ -65,7 +85,7 @@ async def _cleanup_worker(process: asyncio.subprocess.Process, communication: as
 
 
 async def _cleanup_worker_uncancellable(
-    process: asyncio.subprocess.Process, communication: asyncio.Task
+    process: asyncio.subprocess.Process, communication: asyncio.Task | None
 ) -> None:
     await wait_owned(_cleanup_worker(process, communication), propagate=False)
 
@@ -344,15 +364,31 @@ async def _call(
         }
     }
     async with _WORKERS:
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            str(_WORKER),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=env,
+        command = [sys.executable, "-I", str(_WORKER)]
+        if sys.platform == "linux":
+            command = [
+                sys.executable,
+                str(_GUARD),
+                "--parent-pid",
+                str(os.getpid()),
+                "--tree",
+                "--",
+                *command,
+            ]
+        launch = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+                start_new_session=sys.platform != "win32",
+            )
         )
+        process, cancelled = await finish_owned(launch)
+        if cancelled:
+            await _cleanup_worker_uncancellable(process, None)
+            raise asyncio.CancelledError
 
         async def communicate_bounded() -> tuple[bytes, bool]:
             async def read_stdout() -> tuple[bytes, bool]:

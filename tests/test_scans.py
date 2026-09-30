@@ -131,6 +131,39 @@ async def test_scan_attach_after_service_restart(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_scan_tracking_failure_persists_terminal_record(tmp_path: Path):
+    class FakeShells:
+        completed_records = 10
+
+        def __init__(self):
+            self.cancelled = []
+
+        async def start(self, *args, **kwargs):
+            return {"id": "a" * 32}
+
+        async def cancel(self, ident):
+            self.cancelled.append(ident)
+            return {"id": ident, "state": "cancelled"}
+
+    shells = FakeShells()
+
+    def fail_tracking(*args, **kwargs):
+        raise RuntimeError("tracking unavailable")
+
+    service = ScanService(tmp_path, shells, track=fail_tracking)
+    with pytest.raises(RuntimeError, match="tracking unavailable"):
+        await service.start("tcp", targets="127.0.0.1", ports=[1])
+
+    record_path = tmp_path / ".mypr" / "scans" / f"{'a' * 32}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["state"] == "failed"
+    assert record["stop_reason"] == "tracking_failed"
+    assert "tracking unavailable" in record["error"]
+    assert shells.cancelled == ["a" * 32]
+    assert not list((tmp_path / ".mypr" / "scans").glob("*.request.json"))
+
+
+@pytest.mark.asyncio
 async def test_net_diagnostics_and_scan_task_facade(tmp_path: Path):
     shells = Shells(tmp_path)
     service = ScanService(tmp_path, shells)

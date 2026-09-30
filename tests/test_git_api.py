@@ -28,6 +28,17 @@ class ShellRunner:
         }
 
 
+@pytest.mark.parametrize("staged", ["false", 0, None])
+async def test_git_diff_rejects_non_boolean_staged_before_running_git(tmp_path, staged):
+    class NoCommands:
+        async def run(self, *args, **kwargs):
+            pytest.fail("invalid staged must not run a command")
+
+    api = Git(tmp_path, NoCommands())
+    with pytest.raises(TypeError, match="staged must be a boolean"):
+        await api.diff(staged=staged)
+
+
 def _git(path: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=path, check=True, stdout=subprocess.PIPE)
 

@@ -118,4 +118,39 @@ async def test_unconfirmed_task_output_is_flagged_without_replaying(monkeypatch)
     assert events[-1]["output_truncated"]
     assert handle.status()["warnings"][0]["code"] == "task_output_persistence_unknown"
     assert events[-1]["warnings"] == handle.status()["warnings"]
-    assert sum(len(event.get("output_delta", "")) for event in events) == 10000 - 8192
+    assert sum(len(event.get("output_delta", "")) for event in events) == 0
+
+
+async def test_persistent_report_timeout_keeps_task_result(monkeypatch):
+    async def blocked_rpc(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(api, "_rpc", blocked_rpc)
+    monkeypatch.setattr(api, "_REPORT_RPC_TIMEOUT", 0.01)
+    tasks = api.TaskManager()
+    handle = tasks.start(asyncio.sleep(0, result=42), persist_result=True)
+
+    assert await asyncio.wait_for(handle, 1) == 42
+    assert handle.status()["result_persisted"] is None
+    assert handle.status()["warnings"]
+
+
+async def test_stalled_reporter_stops_after_first_unconfirmed_output(monkeypatch):
+    calls = []
+
+    async def blocked_rpc(op, **kwargs):
+        calls.append(op)
+        await asyncio.Event().wait()
+
+    async def emit():
+        api._output_buffer.get().write("x" * 200_000)
+
+    monkeypatch.setattr(api, "_rpc", blocked_rpc)
+    monkeypatch.setattr(api, "_REPORT_RPC_TIMEOUT", 0.01)
+    handle = api.TaskManager().start(emit(), persist_result=True)
+
+    assert await asyncio.wait_for(handle, 1) is None
+    assert calls.count("task_event") <= 2
+    assert calls.count("task_result_store") == 1
+    assert calls.count("task_terminal") == 1
+    assert handle.status()["warnings"][0]["code"] == "task_output_persistence_unknown"

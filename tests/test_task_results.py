@@ -201,6 +201,51 @@ async def test_cleanup_timeout_cancels_report_and_marks_storage_uncertain(tmp_pa
         await handle.wait_saved()
 
 
+async def test_cleanup_finishes_after_caller_cancellation(tmp_path):
+    ws = api.Workspace(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Resource:
+        closed = False
+
+        async def aclose(self):
+            entered.set()
+            await release.wait()
+            self.closed = True
+
+    resource = Resource()
+    ws.browser = resource
+    ws.http = None
+    ws.code = None
+    cleanup = asyncio.create_task(ws._close_resources())
+    await asyncio.wait_for(entered.wait(), 1)
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    cleanup.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+    assert resource.closed
+    assert ws._closing
+    await ws._close_resources()
+
+
+async def test_cleanup_failure_is_replayed_on_later_close(tmp_path):
+    ws = api.Workspace(tmp_path)
+
+    class Resource:
+        async def aclose(self):
+            raise RuntimeError("close failed")
+
+    ws.browser = Resource()
+    ws.http = None
+    ws.code = None
+    with pytest.raises(ExceptionGroup, match="cleanup failed"):
+        await ws._close_resources()
+    with pytest.raises(ExceptionGroup, match="cleanup failed"):
+        await ws._close_resources()
+
+
 async def test_persistent_failed_task_waits_for_terminal_report(monkeypatch):
     entered, release = asyncio.Event(), asyncio.Event()
 

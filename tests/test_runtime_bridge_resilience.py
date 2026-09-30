@@ -158,3 +158,32 @@ async def test_bridge_init_failure_closes_new_context(tmp_path: Path, monkeypatc
     assert bridge.attachment is None
     assert bridge.path is None
     assert bridge._state is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_close_finishes_context_after_caller_cancellation(tmp_path: Path):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Context:
+        exited = False
+
+        async def __aexit__(self, *args):
+            entered.set()
+            await release.wait()
+            self.exited = True
+
+    context = Context()
+    bridge = ConnectionBridge(tmp_path)
+    bridge._context = context
+    cleanup = asyncio.create_task(bridge.close())
+    await asyncio.wait_for(entered.wait(), 1)
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    cleanup.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+    assert context.exited
+    assert bridge._context is None
+    assert bridge._ready.is_set()
+    await bridge.close()

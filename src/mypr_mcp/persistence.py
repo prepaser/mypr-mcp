@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
+from .async_utils import finish_owned, wait_owned
 from .timings import Timings
 
 
@@ -32,16 +33,7 @@ class _Outcome:
 
 
 async def await_completion(task: asyncio.Future[Any]) -> Any:
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError as cancelled:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-        task.result()
-        raise cancelled
+    return await wait_owned(task)
 
 
 class PersistenceWorker:
@@ -92,18 +84,7 @@ class PersistenceWorker:
                 self._fail_pending(
                     self._failure or PersistenceUnavailable("Persistence worker is unavailable")
                 )
-        try:
-            return await asyncio.shield(result)
-        except asyncio.CancelledError as cancelled:
-            while not result.done():
-                try:
-                    await asyncio.shield(result)
-                except asyncio.CancelledError:
-                    continue
-                except BaseException as exc:
-                    raise exc from cancelled
-            result.result()
-            raise cancelled
+        return await wait_owned(result)
 
     async def _run(self) -> None:
         current = None
@@ -119,30 +100,17 @@ class PersistenceWorker:
                         self._invoke,
                         current,
                     )
-                    outcome = await asyncio.shield(work)
+                    outcome, cancelled = await finish_owned(work)
                 except asyncio.CancelledError as exc:
-                    while not work.done():
-                        try:
-                            await asyncio.shield(work)
-                        except asyncio.CancelledError:
-                            continue
-                        except BaseException:
-                            break
-                    if work.cancelled():
-                        self._fail(current, exc)
-                    else:
-                        try:
-                            outcome = work.result()
-                            self._observe(outcome)
-                            self._resolve(current, outcome)
-                        except BaseException as work_error:
-                            self._fail(current, work_error)
+                    self._fail(current, exc)
                     raise
                 except BaseException as exc:
                     self._fail(current, exc)
                 else:
                     self._observe(outcome)
                     self._resolve(current, outcome)
+                    if cancelled:
+                        raise asyncio.CancelledError
                 finally:
                     self._queue.task_done()
                     current = None
@@ -214,17 +182,7 @@ class PersistenceWorker:
     async def close(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
-        task = self._close_task
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as cancelled:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-            task.result()
-            raise cancelled
+        await wait_owned(self._close_task)
 
     async def _close(self) -> None:
         async with self._gate:

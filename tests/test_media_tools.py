@@ -197,16 +197,59 @@ async def test_cancelled_media_worker_is_reaped(tmp_path, monkeypatch):
     pid = await _worker_pid(pid_path)
     kill_called = asyncio.Event()
     process_type = asyncio.subprocess.Process
-    original_kill = process_type.kill
+    original_terminate = process_type.terminate
 
-    def kill(process):
+    def terminate(process):
         kill_called.set()
-        return original_kill(process)
+        return original_terminate(process)
 
-    monkeypatch.setattr(process_type, "kill", kill)
+    monkeypatch.setattr(process_type, "terminate", terminate)
     task.cancel()
     await kill_called.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     _assert_process_reaped(pid)
+
+
+async def test_cancelled_media_worker_launch_is_cleaned_up(tmp_path, monkeypatch):
+    from mypr_mcp import media_tools
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Stdin:
+        def is_closing(self):
+            return True
+
+    class Process:
+        pid = 999_999
+        returncode = None
+        stdin = Stdin()
+
+        def __init__(self):
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    process = Process()
+
+    async def launch(*args, **kwargs):
+        del args, kwargs
+        started.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(media_tools.asyncio, "create_subprocess_exec", launch)
+    task = asyncio.create_task(media_tools._call("test", tmp_path / "unused", "unused", {}))
+    await started.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert process.killed

@@ -11,7 +11,7 @@ import re
 import secrets
 import signal
 import sys
-import tempfile
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
@@ -41,6 +41,8 @@ MAX_RESULTS = 500
 MAX_DIAGNOSTICS = 256
 MAX_HOVER_CHARS = 64 * 1024
 MAX_STDERR_BYTES = 16 * 1024
+MAX_ACTIONS = 1024
+ACTION_TTL = 3600.0
 MAX_SYMBOL_DEPTH = 32
 MAX_SYMBOL_TEXT = 1024
 MAX_HIERARCHY_ITEMS = 64
@@ -79,6 +81,17 @@ class _Document:
     language: str
     text: str
     version: int
+
+
+@dataclass(slots=True)
+class _StoredAction:
+    server_name: str
+    action: dict[str, Any]
+    generation: str
+    document_version: int
+    document_uri: str
+    document_text: str
+    created: float
 
 
 def _position(text: str, line: Any, character: Any, encoding: str) -> dict[str, int]:
@@ -1559,6 +1572,10 @@ class CodeTools:
         config_rpc: Callable[..., Any] | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
+        if fs is None:
+            from .filesystem import Filesystem
+
+            fs = Filesystem(self.workspace)
         self.fs = fs
         self._config_rpc = config_rpc
         self._config = LSPConfig(self.workspace)
@@ -1572,11 +1589,11 @@ class CodeTools:
         self._servers: dict[str, _LanguageServer] = {}
         self._lock = asyncio.Lock()
         self._plans = EditPlanStore(self.workspace)
-        self._plan_servers: dict[str, str] = {}
-        self._actions: dict[str, tuple[str, dict[str, Any], str, int, str]] = {}
+        self._actions: OrderedDict[str, _StoredAction] = OrderedDict()
         self._workspace_diag_results: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self._diagnostic_snapshots = SnapshotStore(self.workspace / ".mypr", name="lsp-diagnostics")
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _name(name: str) -> str:
@@ -1633,6 +1650,8 @@ class CodeTools:
         if self._closed:
             raise CodeError("code tools are closed")
         async with self._lock:
+            if self._closed:
+                raise CodeError("code tools are closed")
             existing = self._servers.get(name)
             if (
                 existing is not None
@@ -1872,6 +1891,7 @@ class CodeTools:
         *,
         title: str,
         unsupported_reason: str | None = None,
+        document_preconditions: dict[Path, bytes] | None = None,
     ) -> Any:
         if edit is None:
             raise EditError("language server returned no workspace edit")
@@ -1884,6 +1904,9 @@ class CodeTools:
         async def state(path: Path) -> bytes | None:
             if path not in states:
                 states[path] = await self._read_edit_bytes(path)
+                expected = (document_preconditions or {}).get(path)
+                if expected is not None and states[path] != expected:
+                    raise EditError(f"LSP document changed since the request: {path}")
             return states[path]
 
         def expected_version(path: Path, version: Any) -> None:
@@ -1988,8 +2011,40 @@ class CodeTools:
             unsupported_reason,
             server.name,
         )
-        self._plan_servers[plan.ident] = server.name
         return plan
+
+    async def _validate_document_snapshot(
+        self, server: _LanguageServer, uri: str, version: int, text: str
+    ) -> dict[Path, bytes]:
+        document = server.documents.get(uri)
+        if (
+            document is None
+            or document.version != version
+            or document.text != text
+            or document.uri != uri
+        ):
+            raise EditError("LSP document changed since the request")
+        try:
+            expected = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise EditError("LSP document text is not valid UTF-8") from exc
+        current = await self._read_edit_bytes(document.path)
+        if current != expected:
+            raise EditError(f"LSP document changed since the request: {document.path}")
+        return {document.path: expected}
+
+    def _prune_actions(self) -> None:
+        now = time.monotonic()
+        for action_id, stored in tuple(self._actions.items()):
+            server = self._servers.get(stored.server_name)
+            if (
+                server is None
+                or now - stored.created > ACTION_TTL
+                or server.generation != stored.generation
+            ):
+                self._actions.pop(action_id, None)
+        while len(self._actions) > MAX_ACTIONS:
+            self._actions.popitem(last=False)
 
     async def rename(
         self,
@@ -2003,13 +2058,24 @@ class CodeTools:
     ) -> dict[str, Any]:
         server = await self._get_server(name)
         document, edit = await server.rename(path, line, character, new_name, language=language)
-        plan = await self._workspace_edit_plan(server, edit, title=f"Rename to {new_name}")
+        version = document.version
+        text = document.text
+        async with server._operation_lock:
+            preconditions = await self._validate_document_snapshot(
+                server, document.uri, version, text
+            )
+            plan = await self._workspace_edit_plan(
+                server,
+                edit,
+                title=f"Rename to {new_name}",
+                document_preconditions=preconditions,
+            )
         result = plan.result()
         result.update(
             {
                 "operation": "rename",
                 "path": str(document.path),
-                "document_version": document.version,
+                "document_version": version,
             }
         )
         return result
@@ -2052,12 +2118,14 @@ class CodeTools:
             if not isinstance(title, str):
                 title = str(raw.get("command", ""))
             action_id = secrets.token_urlsafe(18)
-            self._actions[action_id] = (
+            self._actions[action_id] = _StoredAction(
                 server.name,
                 copy.deepcopy(raw),
                 server.generation,
                 document.version,
                 document.uri,
+                document.text,
+                time.monotonic(),
             )
             command = raw.get("command")
             if isinstance(command, dict):
@@ -2082,49 +2150,64 @@ class CodeTools:
                 result["actions"].pop()
                 result["truncated"] = True
                 break
+        self._prune_actions()
         return result
 
     async def prepare_action(self, action_id: str) -> dict[str, Any]:
         if not isinstance(action_id, str) or not action_id:
             raise ValueError("action_id must be a non-empty string")
+        self._prune_actions()
         try:
-            server_name, action, generation, version, _uri = self._actions[action_id]
+            stored = self._actions[action_id]
         except KeyError as exc:
             raise EditError("unknown or expired code action") from exc
+        server_name = stored.server_name
+        action = stored.action
+        generation = stored.generation
+        version = stored.document_version
         server = await self._get_server(server_name)
         if server.generation != generation:
             raise EditError("code action belongs to an older language-server generation")
-        command = action.get("command")
-        has_command = isinstance(command, str) or (
-            isinstance(command, dict) and isinstance(command.get("command"), str)
-        )
-        if "edit" not in action and not has_command:
-            provider = server.capabilities.get("codeActionProvider")
-            if not isinstance(provider, dict) or provider.get("resolveProvider") is not True:
-                raise EditError("code action requires unsupported codeAction/resolve")
-            action = await server.resolve_code_action(action)
-        unsupported = None
-        if has_command:
-            unsupported = "code actions requiring command execution are unsupported"
-        if not isinstance(action.get("edit"), dict):
-            if unsupported is None:
-                unsupported = "code action did not return a workspace edit"
-            edit = {"changes": {}}
-        else:
-            edit = action["edit"]
-        plan = await self._workspace_edit_plan(
-            server,
-            edit,
-            title=str(action.get("title", "Code action"))[:1024],
-            unsupported_reason=unsupported,
-        )
+        async with server._operation_lock:
+            preconditions = await self._validate_document_snapshot(
+                server, stored.document_uri, version, stored.document_text
+            )
+            command = action.get("command")
+            has_command = isinstance(command, str) or (
+                isinstance(command, dict) and isinstance(command.get("command"), str)
+            )
+            if "edit" not in action and not has_command:
+                provider = server.capabilities.get("codeActionProvider")
+                if not isinstance(provider, dict) or provider.get("resolveProvider") is not True:
+                    raise EditError("code action requires unsupported codeAction/resolve")
+                action = await server.resolve_code_action(action)
+                command = action.get("command")
+                has_command = isinstance(command, str) or (
+                    isinstance(command, dict) and isinstance(command.get("command"), str)
+                )
+            unsupported = None
+            if has_command:
+                unsupported = "code actions requiring command execution are unsupported"
+            if not isinstance(action.get("edit"), dict):
+                if unsupported is None:
+                    unsupported = "code action did not return a workspace edit"
+                edit = {"changes": {}}
+            else:
+                edit = action["edit"]
+            plan = await self._workspace_edit_plan(
+                server,
+                edit,
+                title=str(action.get("title", "Code action"))[:1024],
+                unsupported_reason=unsupported,
+                document_preconditions=preconditions,
+            )
         result = plan.result()
         result.update({"action_id": action_id, "document_version": version})
         return result
 
     async def apply_edit(self, plan_id: str) -> dict[str, Any]:
         plan = await self._plans.aget(plan_id)
-        server_name = self._plan_servers.get(plan.ident) or plan.server
+        server_name = plan.server
         if server_name is None:
             raise EditError("LSP edit plan has no language server")
         server = await self._get_server(server_name)
@@ -2156,111 +2239,20 @@ class CodeTools:
                 virtual[operation.path] = operation.new
             result = await self._apply_edit_plan(plan)
         await self._plans.aconsume(plan)
-        self._plan_servers.pop(plan.ident, None)
         result.update({"plan_id": plan.ident, "applied": True})
         return result
 
     async def _apply_edit_plan(self, plan: Any) -> dict[str, Any]:
-        for method_name in (
-            "_apply_lsp_plan", "apply_lsp_plan", "apply_workspace_edit", "apply_edit_plan"
-        ):
-            method = getattr(self.fs, method_name, None) if self.fs is not None else None
-            if method is not None:
-                result = method(plan)
-                if inspect.isawaitable(result):
-                    result = await result
-                if not isinstance(result, dict):
-                    raise EditError("filesystem edit coordinator returned an invalid result")
-                return result
-        if self.fs is not None and all(
-            hasattr(self.fs, method)
-            for method in ("write_bytes", "delete", "move")
-        ):
-            changes = []
-            for operation in plan.operations:
-                try:
-                    if operation.operation == "rename":
-                        assert operation.source is not None
-                        result = self.fs.move(
-                            str(operation.source),
-                            str(operation.path),
-                            expected_hash=sha256(operation.source_old),
-                            overwrite=False,
-                            history=True,
-                        )
-                        if inspect.isawaitable(result):
-                            result = await result
-                        if operation.new != operation.source_old:
-                            result = self.fs.write_bytes(
-                                str(operation.path),
-                                operation.new or b"",
-                                expected_hash=sha256(operation.source_old),
-                                overwrite=True,
-                                create_parents=False,
-                                history=True,
-                            )
-                            if inspect.isawaitable(result):
-                                result = await result
-                    elif operation.operation == "delete":
-                        result = self.fs.delete(
-                            str(operation.path), expected_hash=operation.expected, history=True
-                        )
-                        if inspect.isawaitable(result):
-                            result = await result
-                    else:
-                        result = self.fs.write_bytes(
-                            str(operation.path),
-                            operation.new or b"",
-                            expected_hash=operation.expected,
-                            overwrite=operation.old is not None,
-                            create_parents=True,
-                            history=True,
-                        )
-                        if inspect.isawaitable(result):
-                            result = await result
-                    changes.append(result)
-                except Exception as exc:
-                    raise EditError(f"filesystem edit failed: {exc}") from exc
-            return {"changes": changes}
-        backups: dict[Path, bytes | None] = {}
-        touched = {operation.path for operation in plan.operations}
-        touched.update(
-            operation.source
-            for operation in plan.operations
-            if operation.source is not None
-        )
-        for path in touched:
-            backups[path] = await self._read_edit_bytes(path)
-        try:
-            for operation in plan.operations:
-                if operation.operation == "rename":
-                    assert operation.source is not None
-                    operation.path.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(operation.source, operation.path)
-                elif operation.operation == "delete":
-                    operation.path.unlink()
-                else:
-                    operation.path.parent.mkdir(parents=True, exist_ok=True)
-                    fd, temporary = tempfile.mkstemp(
-                        prefix=f".{operation.path.name}.", dir=operation.path.parent
-                    )
-                    try:
-                        with os.fdopen(fd, "wb") as stream:
-                            stream.write(operation.new or b"")
-                            stream.flush()
-                            os.fsync(stream.fileno())
-                        os.replace(temporary, operation.path)
-                    finally:
-                        Path(temporary).unlink(missing_ok=True)  # noqa: ASYNC240
-        except BaseException:
-            for path, data in backups.items():
-                if data is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(data)
-            raise
-        return plan.result()
+        coordinator = getattr(self.fs, "_apply_lsp_plan", None)
+        if not callable(coordinator):
+            raise EditError("filesystem does not provide the _apply_lsp_plan coordinator")
+        result = coordinator(plan)
+        if not inspect.isawaitable(result):
+            raise EditError("filesystem _apply_lsp_plan must be asynchronous")
+        result = await result
+        if not isinstance(result, dict):
+            raise EditError("filesystem edit coordinator returned an invalid result")
+        return result
 
     async def workspace_diagnostics(
         self,
@@ -2432,19 +2424,21 @@ class CodeTools:
 
     async def reload(self) -> dict[str, Any]:
         """Reload saved definitions without starting stopped language servers."""
-        if self._config_rpc is not None:
-            loaded = self._config_rpc("get_lsp")
-            if inspect.isawaitable(loaded):
-                loaded = await loaded
-            if not isinstance(loaded, dict):
-                raise CodeError("LSP configuration callback returned an invalid snapshot")
-            definitions = validate_servers(loaded.get("servers", {}))
-            revision = loaded.get("revision")
-            if revision is not None and not isinstance(revision, str):
-                raise CodeError("LSP configuration callback returned an invalid revision")
-        else:
-            definitions, revision = self._config.load()
         async with self._lock:
+            if self._closed:
+                raise CodeError("code tools are closed")
+            if self._config_rpc is not None:
+                loaded = self._config_rpc("get_lsp")
+                if inspect.isawaitable(loaded):
+                    loaded = await loaded
+                if not isinstance(loaded, dict):
+                    raise CodeError("LSP configuration callback returned an invalid snapshot")
+                definitions = validate_servers(loaded.get("servers", {}))
+                revision = loaded.get("revision")
+                if revision is not None and not isinstance(revision, str):
+                    raise CodeError("LSP configuration callback returned an invalid revision")
+            else:
+                definitions, revision = self._config.load()
             changed = {
                 name
                 for name in set(self._definitions) | set(definitions)
@@ -2514,17 +2508,32 @@ class CodeTools:
                 key = self._name(name)
                 server = self._servers.pop(key, None)
                 targets = [(key, server)] if server is not None else []
-            await asyncio.gather(
-                *(server.aclose() for _, server in targets if server is not None),
-                return_exceptions=False,
-            )
+            await wait_owned(self._close_servers(targets))
 
     async def aclose(self) -> None:
         """Stop all configured language servers during workspace reset or shutdown."""
-        if self._closed:
-            return
-        self._closed = True
-        await self.close()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_all())
+        await wait_owned(self._close_task)
+
+    async def _close_all(self) -> None:
+        async with self._lock:
+            self._closed = True
+            targets = list(self._servers.items())
+            self._servers.clear()
+            self._actions.clear()
+            self._workspace_diag_results.clear()
+            await self._close_servers(targets)
+
+    @staticmethod
+    async def _close_servers(targets: list[tuple[str, Any]]) -> None:
+        results = await asyncio.gather(
+            *(server.aclose() for _, server in targets if server is not None),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("language server cleanup failed", failures)
 
 
 __all__ = ["CodeError", "CodeTools"]

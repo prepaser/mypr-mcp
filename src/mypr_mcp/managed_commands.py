@@ -255,7 +255,7 @@ class ManagedCommands:
                             stop_reason = reason
                             break
 
-                if len(kept) < len(raw) or consumed >= max_bytes:
+                if len(kept) < len(raw):
                     if stop_reason is None and not preserve_reason:
                         stop_reason = "scan_bytes"
                     break
@@ -270,6 +270,13 @@ class ManagedCommands:
             warnings_truncated |= bool(value.get("warnings_truncated"))
             if "cursor" in value:
                 cursor = value["cursor"]
+            if (
+                not preserve_reason
+                and stop_reason is None
+                and consumed >= max_bytes
+                and (value.get("has_more") or value.get("state") in _ACTIVE)
+            ):
+                stop_reason = "scan_bytes"
 
         async def drain() -> None:
             nonlocal page

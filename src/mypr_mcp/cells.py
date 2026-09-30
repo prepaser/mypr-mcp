@@ -34,6 +34,12 @@ _cell_execution_count: contextvars.ContextVar[int | None] = contextvars.ContextV
 _cell_source: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mypr_cell_source", default=None
 )
+_CELL_REPORT_TIMEOUT = 10.0
+
+
+async def _report_rpc(op: str, **fields: Any) -> Any:
+    async with asyncio.timeout(_CELL_REPORT_TIMEOUT):
+        return await _rpc(op, **fields)
 
 
 class ContextDisplayHookMixin:
@@ -504,7 +510,7 @@ class CellExecutor:
             fields["error_truncated"] = truncated
             fields["error_info"] = error_info(error, operation="cell.execute")
         try:
-            await _rpc("cell_terminal", **fields)
+            await _report_rpc("cell_terminal", **fields)
         except Exception:
             pass
         finally:

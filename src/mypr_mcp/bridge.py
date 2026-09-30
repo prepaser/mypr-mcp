@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .async_utils import wait_owned
 from .diagnostics import RPCError
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, wait_ticket
@@ -31,6 +32,7 @@ class ConnectionBridge:
         self._state = None
         self._reported_generation = None
         self._last_timing = None
+        self._close_task = None
 
     @property
     def generation(self):
@@ -232,12 +234,42 @@ class ConnectionBridge:
         self._ready.set()
 
     async def close(self):
+        cleanup = self._close_task
+        if cleanup is None:
+            if self._stopped and self._context is None:
+                self._ready.set()
+                return
+            origin = asyncio.current_task()
+            cleanup = asyncio.create_task(
+                self._close_owned(origin), name="mypr:bridge-close"
+            )
+            self._close_task = cleanup
+
+            def clear_cleanup(task: asyncio.Task[None]) -> None:
+                if self._close_task is task:
+                    self._close_task = None
+
+            cleanup.add_done_callback(clear_cleanup)
+        await wait_owned(cleanup)
+
+    async def _close_owned(self, origin: asyncio.Task[Any] | None) -> None:
         self._stopped = True
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-        if self._context is not None:
-            context, self._context = self._context, None
-            with contextlib.suppress(ConnectionError, OSError):
-                await context.__aexit__(None, None, None)
-        self._ready.set()
+        try:
+            task = self._task
+            if task is not None and task is not origin:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            context = self._context
+            if context is not None:
+                try:
+                    await context.__aexit__(None, None, None)
+                except (ConnectionError, OSError):
+                    pass
+                else:
+                    if self._context is context:
+                        self._context = None
+                    self.attachment = None
+                    self.path = None
+                    self._state = None
+        finally:
+            self._ready.set()

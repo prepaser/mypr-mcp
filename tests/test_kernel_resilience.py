@@ -193,3 +193,32 @@ async def test_cell_terminal_uses_manager_rpc_fallback(monkeypatch):
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_cell_terminal_fallback_timeout_completes_handle(monkeypatch):
+    async def blocked_rpc(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cells, "_rpc", blocked_rpc)
+    monkeypatch.setattr(cells, "_CELL_REPORT_TIMEOUT", 0.01)
+
+    class Session:
+        def send(self, *args, **kwargs):
+            raise OSError("closed IOPub")
+
+    class Kernel:
+        session = Session()
+        iopub_socket = object()
+
+    class Shell:
+        execution_count = 0
+
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    handle = CellHandle("f" * 32, task, kernel_api.OutputBuffer(), generation="generation")
+    executor = CellExecutor(Kernel(), Shell(), kernel_api.TaskManager())
+    executor._send_terminal(handle, {}, "failed", ValueError("broken"))
+
+    await asyncio.sleep(0.05)
+    assert handle.status()["status"] == "queued"

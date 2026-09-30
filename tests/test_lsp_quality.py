@@ -71,6 +71,123 @@ async def test_reused_lsp_cas_failure_keeps_active_timeout_and_definitions(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_aclose_finishes_cleanup_when_cancelled_while_waiting_for_lock(tmp_path):
+    code = CodeTools(tmp_path)
+    server = _running_server(("fake-lsp",))
+    code._servers["fake"] = server
+    await code._lock.acquire()
+    task = asyncio.create_task(code.aclose())
+    await asyncio.sleep(0)
+    task.cancel()
+    code._lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert server.closed is True
+    assert code._servers == {}
+    await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_all_servers_before_reporting_failures(tmp_path):
+    code = CodeTools(tmp_path)
+    failed = _running_server(("failed-lsp",))
+    gated = _running_server(("gated-lsp",))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail():
+        raise RuntimeError("failed to close")
+
+    async def wait_for_release():
+        started.set()
+        await release.wait()
+        gated.closed = True
+
+    failed.aclose = fail
+    gated.aclose = wait_for_release
+    code._servers.update(failed=failed, gated=gated)
+    task = asyncio.create_task(code.close())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(BaseExceptionGroup, match="language server cleanup failed"):
+        await task
+    assert gated.closed is True
+    assert code._servers == {}
+
+
+@pytest.mark.asyncio
+async def test_reload_serializes_config_snapshot_with_configure(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    command = ("fake-lsp",)
+    old_definition = {
+        "fake": {"command": list(command), "languages": ["python"], "timeout": 10.0}
+    }
+
+    async def config_rpc(method, definitions=None, **_options):
+        if method == "get_lsp":
+            started.set()
+            await release.wait()
+            return {"servers": old_definition, "revision": "old"}
+        assert method == "set_lsp"
+        return {"revision": "new"}
+
+    code = CodeTools(tmp_path, config_rpc=config_rpc)
+    server = _running_server(command)
+    code._servers["fake"] = server
+    code._definitions = old_definition
+    code._config_revision = "old"
+    try:
+        reload_task = asyncio.create_task(code.reload())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        configure_task = asyncio.create_task(
+            code.configure("fake", command, ["python"], timeout=20)
+        )
+        await asyncio.sleep(0)
+        assert not configure_task.done()
+        release.set()
+        await reload_task
+        await configure_task
+        assert code._definitions["fake"]["timeout"] == 20.0
+        assert server.timeout == 20.0
+    finally:
+        release.set()
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_action_cache_is_bounded_and_generation_aware(tmp_path, monkeypatch):
+    monkeypatch.setattr(code_tools_module, "MAX_ACTIONS", 1)
+    code = CodeTools(tmp_path)
+    server = _running_server(("fake-lsp",))
+    path = tmp_path / "sample.py"
+    path.write_text("foo\n", encoding="utf-8")
+    document = SimpleNamespace(path=path, uri=path.as_uri(), version=1, text="foo\n")
+    server.documents = {}
+    server.name = "fake"
+    server.generation = "generation"
+    server.documents[document.uri] = document
+
+    async def code_actions(*_args, **_kwargs):
+        return document, [{"title": "Replace", "edit": {"changes": {}}}]
+
+    server.code_actions = code_actions
+    code._servers["fake"] = server
+    try:
+        first = (await code.actions("fake", path, 1, 1))["actions"][0]["action_id"]
+        second = (await code.actions("fake", path, 1, 1))["actions"][0]["action_id"]
+        assert first not in code._actions
+        assert second in code._actions
+        server.generation = "new-generation"
+        with pytest.raises(EditError, match="unknown or expired"):
+            await code.prepare_action(second)
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reused_lsp_cancel_while_operation_is_locked_does_not_persist(tmp_path):
     command = ("fake-lsp",)
     entered = asyncio.Event()
@@ -223,7 +340,6 @@ async def test_apply_consumes_admitted_plan_if_durable_file_disappears(tmp_path)
         "replace",
         server="fake",
     )
-    code._plan_servers[plan.ident] = "fake"
     try:
         result = await code.apply_edit(plan.ident)
         assert result["applied"] is True

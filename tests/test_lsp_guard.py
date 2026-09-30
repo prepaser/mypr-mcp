@@ -16,7 +16,7 @@ def _alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as stream:
             state = stream.read().rsplit(") ", 1)[1].split()[0]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return state not in {"Z", "X"}
 
