@@ -177,6 +177,10 @@ async def test_cell_terminal_uses_manager_rpc_fallback(monkeypatch):
     executor._send_terminal(handle, {}, "failed", ValueError("broken"))
     await asyncio.sleep(0)
 
+    info = calls[0][1].pop("error_info")
+    assert info["type"] == "ValueError"
+    assert info["operation"] == "cell.execute"
+    assert info["message"] == "ValueError: broken"
     assert calls == [
         (
             "cell_terminal",

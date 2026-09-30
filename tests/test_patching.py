@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.patching import apply_patch, parse_patch
+from mypr_mcp.revisions import RevisionStore
 
 
 def patch_body(*parts: str) -> str:
@@ -413,7 +415,9 @@ async def test_cancellation_waits_for_worker_and_cleans_staging(tmp_path: Path, 
     with pytest.raises(asyncio.CancelledError):
         await task
     assert (tmp_path / "value.txt").read_text() == "value\n"
-    assert not await asyncio.to_thread(lambda: list(tmp_path.glob(".*")))
+    hidden = await asyncio.to_thread(lambda: list(tmp_path.glob(".*")))
+    assert [path.name for path in hidden] == [".mypr"]
+    assert (tmp_path / ".mypr" / "revisions").is_dir()
 
 
 async def test_alias_and_symlink_are_rejected(tmp_path: Path):
@@ -452,6 +456,41 @@ async def test_worker_cleanup_leaves_no_temporary_files(tmp_path: Path):
     fs = Filesystem(tmp_path)
     await apply_patch(fs, patch_body("*** Add File: value.txt", "+value"))
     assert not await asyncio.to_thread(lambda: list(tmp_path.glob(".*.")))
+
+
+async def test_history_index_failure_rolls_back_all_indexes(tmp_path: Path, monkeypatch):
+    (tmp_path / "one.txt").write_text("one\n")
+    (tmp_path / "two.txt").write_text("two\n")
+    fs = Filesystem(tmp_path)
+    patch = patch_body(
+        "*** Update File: one.txt",
+        "@@ -1,1 +1,1 @@",
+        "-one",
+        "+ONE",
+        "*** Update File: two.txt",
+        "@@ -1,1 +1,1 @@",
+        "-two",
+        "+TWO",
+    )
+    original = RevisionStore._write_index_sync
+    calls = 0
+
+    def fail_second(store, resource, index):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected index failure")
+        return original(store, resource, index)
+
+    monkeypatch.setattr(RevisionStore, "_write_index_sync", fail_second)
+    with pytest.raises(RuntimeError, match="history record failed"):
+        await apply_patch(fs, patch)
+    assert (tmp_path / "one.txt").read_text() == "one\n"
+    assert (tmp_path / "two.txt").read_text() == "two\n"
+    assert (await fs.history("one.txt"))["items"] == []
+    assert (await fs.history("two.txt"))["items"] == []
+    orphan = await fs.read_revision("one.txt", hashlib.sha256(b"ONE\n").hexdigest())
+    assert orphan["recorded"] is False
 
 
 def test_parser_requires_native_boundaries():

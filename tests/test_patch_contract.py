@@ -139,7 +139,7 @@ async def test_failed_commit_after_move_restores_original_paths(monkeypatch, tmp
     assert (tmp_path / "source").read_text() == "before\n"
     assert (tmp_path / "other").read_text() == "old\n"
     assert not (tmp_path / "destination").exists()
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["other", "source"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".mypr", "other", "source"]
 
 
 async def test_cancelled_lock_acquisition_releases_previous_locks(tmp_path):
@@ -156,13 +156,13 @@ async def test_cancelled_lock_acquisition_releases_previous_locks(tmp_path):
 *** End Patch""")
     )
     try:
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
         assert first.locked()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not first.locked()
-        assert not list(tmp_path.iterdir())
+        assert {entry.name for entry in tmp_path.iterdir()} <= {".mypr"}
     finally:
         if first.locked():
             first.release()

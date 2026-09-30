@@ -118,7 +118,13 @@ async def _finish_launch(task: asyncio.Task[asyncio.subprocess.Process]):
                 return task.result()
 
 
-async def _run_worker(html: str, *, url: str | None, selector: str | None) -> dict[str, Any]:
+async def _run_worker(
+    html: str,
+    *,
+    url: str | None,
+    selector: str | None,
+    include_structure: bool = False,
+) -> dict[str, Any]:
     try:
         encoded = html.encode("utf-8")
     except UnicodeEncodeError:
@@ -126,7 +132,13 @@ async def _run_worker(html: str, *, url: str | None, selector: str | None) -> di
     if len(encoded) > MAX_INPUT_BYTES:
         raise ValueError(f"html exceeds the {MAX_INPUT_BYTES} byte input limit")
     header = json.dumps(
-        {"url": url, "selector": selector}, ensure_ascii=False, separators=(",", ":")
+        {
+            "url": url,
+            "selector": selector,
+            "include_structure": include_structure,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
     ).encode("utf-8")
     request = header + b"\n" + encoded
 
@@ -286,26 +298,31 @@ class HTMLExtractor:
         *,
         url: str | None = None,
         selector: str | None = None,
+        include_structure: bool = False,
         max_bytes: int = _DEFAULT_OUTPUT_BYTES,
         cursor: str | None = None,
     ) -> dict[str, Any]:
         _validate_output_limit(max_bytes)
+        if not isinstance(include_structure, bool):
+            raise ValueError("include_structure must be a boolean")
         owner = _client_id(self._http_tools._identity)
         if cursor is not None:
             if html is not None:
                 raise ValueError("html must be omitted when cursor is provided")
             if url is not None or selector is not None:
                 raise ValueError("url and selector cannot be combined with cursor")
-            ident, offset = self._decode_cursor(cursor)
+            ident, offset, structure_offset = self._decode_cursor(cursor)
             snapshot = self._load(owner, ident)
-            return self._page(snapshot, offset, max_bytes)
+            return self._page(snapshot, offset, max_bytes, structure_offset)
         if not isinstance(html, str):
             raise TypeError("html must be a string")
         if url is not None and (not isinstance(url, str) or len(url) > 8192):
             raise ValueError("url must be a string no longer than 8192 characters")
         if selector is not None and (not isinstance(selector, str) or len(selector) > 4096):
             raise ValueError("selector must be a string no longer than 4096 characters")
-        result = await _run_worker(html, url=url, selector=selector)
+        result = await _run_worker(
+            html, url=url, selector=selector, include_structure=include_structure
+        )
         items = await asyncio.to_thread(_text_items, result.get("text", ""))
         for link in result.get("links", []):
             items.append({"kind": "link", "url": link["url"], "text": link["text"]})
@@ -328,6 +345,12 @@ class HTMLExtractor:
             "warnings": warnings,
             "created": time.monotonic(),
         }
+        if include_structure:
+            snapshot["structure"] = result.get(
+                "structure",
+                {"headings": [], "metadata": {}},
+            )
+            snapshot["structure_truncated"] = bool(result.get("structure_truncated", False))
         snapshot["size"] = len(
             json.dumps(
                 {key: value for key, value in snapshot.items() if key not in {"created", "size"}},
@@ -373,12 +396,13 @@ class HTMLExtractor:
         return snapshot
 
     @staticmethod
-    def _decode_cursor(cursor: str) -> tuple[str, int]:
+    def _decode_cursor(cursor: str) -> tuple[str, int, int]:
         if not isinstance(cursor, str) or len(cursor) > 512:
             raise ValueError("invalid HTML result cursor")
         try:
             payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
             ident, offset = payload["id"], payload["offset"]
+            structure_offset = payload.get("structure_offset", 0)
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise ValueError("invalid HTML result cursor") from exc
         if (
@@ -387,20 +411,31 @@ class HTMLExtractor:
             or any(char not in "0123456789abcdef" for char in ident)
             or type(offset) is not int
             or offset < 0
+            or type(structure_offset) is not int
+            or structure_offset < 0
         ):
             raise ValueError("invalid HTML result cursor")
-        return ident, offset
+        return ident, offset, structure_offset
 
     @staticmethod
-    def _cursor(ident: str, offset: int) -> str:
-        payload = json.dumps({"id": ident, "offset": offset}, separators=(",", ":")).encode()
+    def _cursor(ident: str, offset: int, structure_offset: int = 0) -> str:
+        payload = json.dumps(
+            {"id": ident, "offset": offset, "structure_offset": structure_offset},
+            separators=(",", ":"),
+        ).encode()
         return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
     def _page(
-        self, snapshot: dict[str, Any], offset: int, max_bytes: int
+        self,
+        snapshot: dict[str, Any],
+        offset: int,
+        max_bytes: int,
+        structure_offset: int = 0,
     ) -> dict[str, Any]:
         items = snapshot["items"]
-        if offset > len(items):
+        structure = snapshot.get("structure")
+        structure_entries = _structure_entries(structure) if structure else []
+        if offset > len(items) or structure_offset > len(structure_entries):
             raise ValueError("invalid HTML result cursor")
         ident = snapshot["id"]
         page: dict[str, Any] = {
@@ -411,7 +446,7 @@ class HTMLExtractor:
             "text": "",
             "links": [],
             "snapshot_id": ident,
-            "page_cursor": self._cursor(ident, offset),
+            "page_cursor": self._cursor(ident, offset, structure_offset),
             "next_cursor": None,
             "has_more": False,
             "truncated": False,
@@ -419,17 +454,47 @@ class HTMLExtractor:
             "stop_reason": snapshot["stop_reason"],
             "warnings": list(snapshot["warnings"]),
         }
-        page["next_cursor"] = self._cursor(ident, len(items)) if offset < len(items) else None
+        if structure is not None:
+            page["structure"] = {"headings": [], "metadata": {}}
+            page["structure_truncated"] = bool(snapshot.get("structure_truncated", False))
+            page["structure_has_more"] = structure_offset < len(structure_entries)
         size = len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode())
+        structure_index = structure_offset
+        while structure_index < len(structure_entries):
+            entry = structure_entries[structure_index]
+            candidate = json.loads(
+                json.dumps(page, ensure_ascii=False, separators=(",", ":"))
+            )
+            if entry[0] == "metadata":
+                candidate["structure"]["metadata"][entry[1]] = entry[2]
+            else:
+                candidate["structure"]["headings"].append(entry[1])
+            candidate_size = len(
+                json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode()
+            )
+            if candidate_size > max_bytes:
+                if structure_index == structure_offset:
+                    raise ValueError(
+                        "max_bytes is too small for the next HTML structure item; increase it"
+                    )
+                break
+            page = candidate
+            size = candidate_size
+            structure_index += 1
+        if "structure" in page:
+            page["structure_has_more"] = structure_index < len(structure_entries)
         index = offset
         while index < len(items):
             item = items[index]
             item_size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode())
             if size + item_size + 2 > max_bytes:
                 if index == offset:
-                    raise ValueError(
-                        "max_bytes is too small for the next result item; increase it to continue"
-                    )
+                    if structure_index == structure_offset:
+                        raise ValueError(
+                            "max_bytes is too small for the next result item; "
+                            "increase it to continue"
+                        )
+                    break
                 break
             if item["kind"] == "text":
                 page["text"] += item["text"]
@@ -437,10 +502,12 @@ class HTMLExtractor:
                 page["links"].append({"url": item["url"], "text": item["text"]})
             size += item_size + 2
             index += 1
-        more = index < len(items)
+        more = index < len(items) or structure_index < len(structure_entries)
         page["has_more"] = more
         page["truncated"] = more
-        page["next_cursor"] = self._cursor(ident, index) if more else None
+        page["next_cursor"] = (
+            self._cursor(ident, index, structure_index) if more else None
+        )
         if len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
             raise HTMLToolError("HTML result page exceeded its byte limit")
         return page
@@ -452,6 +519,19 @@ def _truncate_text(value: Any, max_bytes: int) -> str:
     value = "".join(char for char in value if ord(char) >= 32)
     encoded = value.encode("utf-8")
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _structure_entries(structure: dict[str, Any] | None) -> list[tuple[str, Any, Any]]:
+    if not isinstance(structure, dict):
+        return []
+    entries: list[tuple[str, Any, Any]] = []
+    metadata = structure.get("metadata", {})
+    if isinstance(metadata, dict):
+        entries.extend(("metadata", key, value) for key, value in metadata.items())
+    headings = structure.get("headings", [])
+    if isinstance(headings, list):
+        entries.extend(("heading", heading, None) for heading in headings)
+    return entries
 
 
 __all__ = ["HTMLExtractor", "HTMLToolError", "MAX_INPUT_BYTES"]

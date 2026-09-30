@@ -1,5 +1,9 @@
 """Kernel proxies for manager-owned workspace queries."""
 
+from .pages import Pages
+
+__all__ = ["Git", "Pages"]
+
 
 class Git:
     def __init__(self, rpc):
@@ -49,6 +53,7 @@ class Git:
         author=None,
         since=None,
         until=None,
+        follow=False,
         cursor=None,
         max_entries=50,
         max_bytes=32768,
@@ -62,8 +67,30 @@ class Git:
                 "author": author,
                 "since": since,
                 "until": until,
+                "follow": follow,
                 "cursor": cursor,
                 "max_entries": max_entries,
+                "max_bytes": max_bytes,
+            },
+        )
+
+    async def commit_info(
+        self,
+        ref="HEAD",
+        *,
+        include_files=True,
+        include_patch=False,
+        cursor=None,
+        max_bytes=32768,
+    ):
+        return await self._rpc(
+            "git",
+            method="commit_info",
+            args={
+                "ref": ref,
+                "include_files": include_files,
+                "include_patch": include_patch,
+                "cursor": cursor,
                 "max_bytes": max_bytes,
             },
         )

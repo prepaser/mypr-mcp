@@ -119,6 +119,9 @@ class Net:
         concurrency: int = 64,
         rate: float = 200,
         timeout: float = 1.0,  # noqa: ASYNC109
+        max_probes: int | None = 1_000_000,
+        max_duration: float | None = 3600.0,
+        continue_after_output_limit: bool = False,
     ) -> Any:
         result = await self._rpc(
             "scan_start",
@@ -128,14 +131,31 @@ class Net:
             concurrency=concurrency,
             rate=rate,
             timeout=timeout,
+            max_probes=max_probes,
+            max_duration=max_duration,
+            continue_after_output_limit=continue_after_output_limit,
         )
         ident = result.get("id") if isinstance(result, Mapping) else result
         if not ident:
             raise RuntimeError("scan_start returned no task id")
         return self._task(str(ident))
 
-    async def nmap(self, targets: str | list[str], *, args: list[str] | None = None) -> Any:
-        result = await self._rpc("scan_start", mode="nmap", targets=targets, args=args or [])
+    async def nmap(
+        self,
+        targets: str | list[str],
+        *,
+        args: list[str] | None = None,
+        max_duration: float | None = 3600.0,
+        continue_after_output_limit: bool = False,
+    ) -> Any:
+        result = await self._rpc(
+            "scan_start",
+            mode="nmap",
+            targets=targets,
+            args=args or [],
+            max_duration=max_duration,
+            continue_after_output_limit=continue_after_output_limit,
+        )
         ident = result.get("id") if isinstance(result, Mapping) else result
         if not ident:
             raise RuntimeError("scan_start returned no task id")

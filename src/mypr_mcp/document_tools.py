@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import secrets
@@ -14,9 +15,12 @@ import stat
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from threading import RLock
 from typing import Any
+
+from .storage_lock import StorageLock
 
 _WORKER = Path(__file__).with_name("document_worker.py")
 _GUARD = Path(__file__).with_name("process_guard.py")
@@ -40,7 +44,14 @@ class _ResultStore:
     def __init__(self, workspace: Path) -> None:
         self.root = workspace / ".mypr" / "document-results"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._storage_lock_path = self.root.parent / "storage.lock"
         self._lock = RLock()
+
+    @contextlib.contextmanager
+    def _store_locked(self):
+        with StorageLock(self._storage_lock_path):
+            with self._locked():
+                yield
 
     @contextlib.contextmanager
     def _locked(self):
@@ -68,10 +79,24 @@ class _ResultStore:
     def create(self, payload: dict[str, Any]) -> str:
         ident = secrets.token_hex(16)
         payload = {"id": ident, "created": time.time(), **payload}
+        resume = payload.get("resume")
+        resume_cache: bytes | None = None
+        if isinstance(resume, dict) and isinstance(resume.get("tsv"), str):
+            resume_cache = _decode_resume_tsv(resume["tsv"], compressed=True)
+            resume = {key: value for key, value in resume.items() if key != "tsv"}
+            resume.update(
+                {
+                    "cache": f"{ident}.resume",
+                    "cache_bytes": len(resume_cache),
+                    "cache_sha256": hashlib.sha256(resume_cache).hexdigest(),
+                }
+            )
+            payload["resume"] = resume
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > _MAX_RESULT_BYTES:
             raise DocumentToolError("Document result exceeds its 7 MiB snapshot limit")
-        with self._locked():
+        with self._store_locked():
+            cache_temporary = None
             fd, temporary = tempfile.mkstemp(prefix=f".{ident}.", suffix=".tmp", dir=self.root)
             try:
                 with os.fdopen(fd, "wb") as stream:
@@ -79,6 +104,26 @@ class _ResultStore:
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temporary, self.root / f"{ident}.json")
+                if resume_cache is not None:
+                    cache_path = self.root / f"{ident}.resume"
+                    cache_fd, cache_temporary = tempfile.mkstemp(
+                        prefix=f".{ident}.", suffix=".resume.tmp", dir=self.root
+                    )
+                    try:
+                        with os.fdopen(cache_fd, "wb") as stream:
+                            stream.write(resume_cache)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        os.replace(cache_temporary, cache_path)
+                        cache_temporary = None
+                    except BaseException:
+                        with contextlib.suppress(FileNotFoundError):
+                            (self.root / f"{ident}.json").unlink()
+                        raise
+                    finally:
+                        if cache_temporary is not None:
+                            with contextlib.suppress(FileNotFoundError):
+                                os.unlink(cache_temporary)
                 directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
                 try:
                     os.fsync(directory_fd)
@@ -92,7 +137,11 @@ class _ResultStore:
                 with contextlib.suppress(FileNotFoundError):
                     info = path.lstat()
                     if stat.S_ISREG(info.st_mode):
-                        files.append((path, info.st_size, info.st_mtime_ns))
+                        cache_path = path.with_suffix(".resume")
+                        cache_info = cache_path.stat() if cache_path.is_file() else None
+                        total = info.st_size + (cache_info.st_size if cache_info else 0)
+                        mtime = max(info.st_mtime_ns, cache_info.st_mtime_ns if cache_info else 0)
+                        files.append((path, total, mtime))
             files.sort(key=lambda item: item[2])
             sizes = {path: size for path, size, _ in files}
             while files and (len(files) > _MAX_RESULTS or sum(sizes.values()) > _MAX_STORED_BYTES):
@@ -100,9 +149,15 @@ class _ResultStore:
                 sizes.pop(oldest, None)
                 with contextlib.suppress(FileNotFoundError):
                     oldest.unlink()
+                with contextlib.suppress(FileNotFoundError):
+                    oldest.with_suffix(".resume").unlink()
         return ident
 
     def load(self, ident: str) -> dict[str, Any]:
+        with self._store_locked():
+            return self._load_unlocked(ident)
+
+    def _load_unlocked(self, ident: str) -> dict[str, Any]:
         if (
             not isinstance(ident, str)
             or len(ident) != 32
@@ -164,6 +219,91 @@ class _ResultStore:
         raw = json.dumps({"id": ident, "offset": offset}, separators=(",", ":")).encode()
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
+    @staticmethod
+    def resume_cursor(ident: str, offset: int, tsv_offset: int = 0) -> str:
+        raw = json.dumps(
+            {
+                "id": ident,
+                "offset": offset,
+                "tsv_offset": tsv_offset,
+                "kind": "ocr-resume",
+            },
+            separators=(",", ":"),
+        ).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def decode_resume(
+        self, cursor: str, *, path: str
+    ) -> tuple[dict[str, Any], int, int, bytes]:
+        if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
+            raise ValueError("invalid OCR resume cursor")
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            payload = json.loads(raw)
+        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid OCR resume cursor") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("kind") != "ocr-resume"
+            or type(payload.get("offset")) is not int
+            or payload["offset"] < 0
+            or type(payload.get("tsv_offset", 0)) is not int
+            or payload.get("tsv_offset", 0) < 0
+        ):
+            raise ValueError("invalid OCR resume cursor")
+        with self._store_locked():
+            snapshot = self._load_unlocked(payload.get("id"))
+            if snapshot.get("kind") != "ocr" or snapshot.get("source", {}).get("path") != path:
+                raise ValueError("cursor belongs to a different OCR query")
+            resume = snapshot.get("resume")
+            if not isinstance(resume, dict) or not (
+                isinstance(resume.get("tsv"), str) or isinstance(resume.get("cache"), str)
+            ):
+                raise ValueError("OCR result has no resumable page")
+            if payload["offset"] < resume.get("word_offset", 0):
+                raise ValueError("invalid OCR resume cursor")
+            data = self._load_resume_unlocked(snapshot)
+            if not _valid_resume_position(
+                data, payload["offset"], payload.get("tsv_offset", 0)
+            ):
+                raise ValueError("invalid OCR resume cursor")
+        return snapshot, payload["offset"], payload.get("tsv_offset", 0), data
+
+    def load_resume(self, snapshot: dict[str, Any]) -> bytes:
+        with self._store_locked():
+            return self._load_resume_unlocked(snapshot)
+
+    def _load_resume_unlocked(self, snapshot: dict[str, Any]) -> bytes:
+        resume = snapshot.get("resume")
+        if not isinstance(resume, dict):
+            raise DocumentToolError("OCR result has no resumable page")
+        if isinstance(resume.get("tsv"), str):
+            return _decode_resume_tsv(resume["tsv"])
+        cache = resume.get("cache")
+        ident = snapshot.get("id")
+        if cache != f"{ident}.resume":
+            raise DocumentToolError("Stored OCR resume cache is invalid")
+        path = self.root / cache
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError as exc:
+            raise ValueError("OCR resume cache has expired") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise DocumentToolError("Stored OCR resume cache is invalid")
+            with os.fdopen(fd, "rb") as stream:
+                fd = -1
+                encoded = stream.read(12 * 1024 * 1024 + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if len(encoded) > 12 * 1024 * 1024:
+            raise DocumentToolError("Stored OCR resume data exceeds its encoded size limit")
+        if hashlib.sha256(encoded).hexdigest() != resume.get("cache_sha256"):
+            raise DocumentToolError("Stored OCR resume cache is corrupt")
+        return _decode_resume_bytes(encoded)
+
 
 class DocumentExtractor:
     """Run OCR and Office parsing outside the persistent Python kernel."""
@@ -185,6 +325,7 @@ class DocumentExtractor:
         max_pages: int = 5,
         dpi: int = 200,
         cursor: str | None = None,
+        resume_cursor: str | None = None,
         max_bytes: int = 32_768,
         max_input_bytes: int = _MAX_INPUT_BYTES,
     ) -> dict[str, Any]:
@@ -196,6 +337,8 @@ class DocumentExtractor:
             raise ValueError("dpi must be between 36 and 300")
         _validate_page_bytes(max_bytes)
         _validate_range("max_input_bytes", max_input_bytes, _MAX_INPUT_BYTES)
+        if cursor is not None and resume_cursor is not None:
+            raise ValueError("cursor and resume_cursor cannot be combined")
         if (
             not isinstance(language, str)
             or not language
@@ -206,6 +349,13 @@ class DocumentExtractor:
         resolved, display = self._filesystem._path(path)
         if Path(display).suffix.lower() in {".png", ".jpg", ".jpeg"} and start_page != 1:
             raise ValueError("start_page must be 1 for image files")
+        if resume_cursor is not None:
+            snapshot, offset, tsv_offset, raw = await _thread_settle(
+                self._store.decode_resume, resume_cursor, path=display
+            )
+            return await self._resume_ocr(
+                snapshot, offset, tsv_offset, raw, resolved, display, max_bytes
+            )
         if cursor is not None:
             snapshot, offset = await _thread_settle(
                 self._store.decode, cursor, kind="ocr", path=display
@@ -225,11 +375,118 @@ class DocumentExtractor:
         )
         snapshot = {
             "kind": "ocr",
+            "options": {
+                "language": language,
+                "start_page": start_page,
+                "max_pages": max_pages,
+                "dpi": dpi,
+                "max_input_bytes": max_input_bytes,
+            },
             **result,
         }
-        ident = await _thread_settle(self._store.create, snapshot)
+        try:
+            ident = await _thread_settle(self._store.create, snapshot)
+        except DocumentToolError:
+            if "resume" not in snapshot:
+                raise
+            snapshot.pop("resume", None)
+            snapshot.setdefault("warnings", []).append(
+                "The truncated OCR page could not be cached for resumption"
+            )
+            ident = await _thread_settle(self._store.create, snapshot)
         snapshot["id"] = ident
         return await asyncio.to_thread(_page, self._store, snapshot, 0, max_bytes)
+
+    async def _resume_ocr(
+        self,
+        snapshot: dict[str, Any],
+        offset: int,
+        tsv_offset: int,
+        raw: bytes,
+        resolved: Path,
+        display: str,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        resume = snapshot["resume"]
+        items, item_offsets = await asyncio.to_thread(
+            _ocr_tsv_items_with_offsets,
+            raw,
+            int(resume["page"]),
+            offset,
+            tsv_offset,
+        )
+        if items:
+            page_snapshot = {
+                **snapshot,
+                "items": items,
+                "complete": False,
+                "truncated": True,
+                "truncation_reason": "result_size_limit",
+                "resume": resume,
+            }
+            page = await asyncio.to_thread(_page, self._store, page_snapshot, 0, max_bytes)
+            consumed = _cursor_offset(page.get("next_cursor"))
+            if consumed is None:
+                consumed = len(items)
+            absolute = offset + consumed
+            if absolute < len(items) + offset:
+                page["next_cursor"] = None
+                page["has_more"] = False
+                page["resume_cursor"] = self._store.resume_cursor(
+                    snapshot["id"], absolute, item_offsets[consumed]
+                )
+                page["complete"] = False
+                page["truncated"] = True
+                return page
+            if resume.get("next_page") is None:
+                page.pop("resume_cursor", None)
+                page["complete"] = True
+                page["truncated"] = False
+                page["truncation_reason"] = None
+                return page
+        next_page = resume.get("next_page")
+        if next_page is None:
+            terminal = {
+                **snapshot,
+                "items": [],
+                "complete": True,
+                "truncated": False,
+                "truncation_reason": None,
+            }
+            terminal.pop("resume", None)
+            return await asyncio.to_thread(_page, self._store, terminal, 0, max_bytes)
+        options = snapshot.get("options", {})
+        remaining_pages = max(1, int(resume.get("remaining_pages", 1)))
+        current_revision = await asyncio.to_thread(
+            _file_revision, resolved, int(options.get("max_input_bytes", _MAX_INPUT_BYTES))
+        )
+        if current_revision != snapshot.get("source", {}).get("revision"):
+            raise ValueError("source changed before the next OCR page was processed")
+        result = await _run_worker(
+            "ocr",
+            resolved,
+            display,
+            {
+                "language": options.get("language", "eng"),
+                "start_page": int(next_page),
+                "max_pages": remaining_pages,
+                "dpi": int(options.get("dpi", 200)),
+                "max_input_bytes": int(options.get("max_input_bytes", _MAX_INPUT_BYTES)),
+            },
+        )
+        next_snapshot = {"kind": "ocr", "options": options, **result}
+        try:
+            ident = await _thread_settle(self._store.create, next_snapshot)
+        except DocumentToolError:
+            if "resume" not in next_snapshot:
+                raise
+            next_snapshot.pop("resume", None)
+            next_snapshot.setdefault("warnings", []).append(
+                "The truncated OCR page could not be cached for resumption"
+            )
+            ident = await _thread_settle(self._store.create, next_snapshot)
+        next_snapshot["id"] = ident
+        return await asyncio.to_thread(_page, self._store, next_snapshot, 0, max_bytes)
 
     async def extract(
         self,
@@ -302,6 +559,12 @@ def _page(
             "snapshot_id": snapshot["id"],
             "warnings": snapshot.get("warnings", []),
         }
+        if snapshot.get("resume"):
+            result["resume_cursor"] = store.resume_cursor(
+                snapshot["id"],
+                int(snapshot["resume"].get("word_offset", 0)),
+                int(snapshot["resume"].get("tsv_offset", 0)),
+            )
         if "coordinate_space" in snapshot:
             result["coordinate_space"] = snapshot["coordinate_space"]
             result["pages"] = snapshot.get("pages", [])
@@ -321,6 +584,119 @@ def _page(
         selected.append(items[offset])
         offset += 1
     return response(selected, offset)
+
+
+def _file_revision(path: Path, limit: int) -> str:
+    with path.open("rb") as stream:
+        digest = hashlib.sha256()
+        size = 0
+        while chunk := stream.read(1024 * 1024):
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("File exceeds max_input_bytes")
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _decode_resume_tsv(encoded: str, *, compressed: bool = False) -> bytes:
+    try:
+        if len(encoded) > 12 * 1024 * 1024:
+            raise DocumentToolError("Stored OCR resume data exceeds its encoded size limit")
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, zlib.error) as exc:
+        raise DocumentToolError("Stored OCR resume data is invalid") from exc
+    if compressed:
+        _decode_resume_bytes(data)
+        return data
+    return _decode_resume_bytes(data)
+
+
+def _decode_resume_bytes(data: bytes) -> bytes:
+    try:
+        decoder = zlib.decompressobj()
+        tsv = decoder.decompress(data, 8 * 1024 * 1024 + 1)
+        if len(tsv) <= 8 * 1024 * 1024:
+            tsv += decoder.flush(8 * 1024 * 1024 + 1 - len(tsv))
+        if len(tsv) > 8 * 1024 * 1024 or decoder.unconsumed_tail:
+            raise DocumentToolError("Stored OCR resume data exceeds its 8 MiB limit")
+    except zlib.error as exc:
+        raise DocumentToolError("Stored OCR resume data is invalid") from exc
+    return tsv
+
+
+def _ocr_tsv_items(tsv: bytes, page: int, offset: int) -> list[dict[str, Any]]:
+    items, _ = _ocr_tsv_items_with_offsets(tsv, page, offset, 0)
+    return items
+
+
+def _ocr_tsv_items_with_offsets(
+    tsv: bytes, page: int, offset: int, tsv_offset: int = 0
+) -> tuple[list[dict[str, Any]], list[int]]:
+    items: list[dict[str, Any]] = []
+    item_offsets: list[int] = []
+    word_index = offset if tsv_offset else 0
+    rows = tsv.splitlines(keepends=True)
+    byte_offset = len(rows[0]) if rows else 0
+    for row_bytes in rows[1:]:
+        row_offset = byte_offset
+        byte_offset = row_offset + len(row_bytes)
+        if row_offset < tsv_offset:
+            continue
+        row = row_bytes.decode("utf-8", "replace").rstrip("\r\n")
+        fields = row.split("\t", 11)
+        if len(fields) != 12 or fields[0] != "5":
+            continue
+        word = _clean_ocr_text(fields[11])
+        if not word:
+            continue
+        try:
+            confidence = float(fields[10])
+            left, top, box_width, box_height = map(int, fields[6:10])
+            block, paragraph, line = map(int, fields[2:5])
+        except ValueError:
+            continue
+        if word_index >= offset:
+            item_offsets.append(row_offset)
+            items.append(
+                {
+                    "type": "word",
+                    "page": page,
+                    "text": word,
+                    "confidence": confidence,
+                    "bbox": [left, top, box_width, box_height],
+                    "block": block,
+                    "paragraph": paragraph,
+                    "line": line,
+                }
+            )
+        word_index += 1
+    item_offsets.append(byte_offset)
+    return items, item_offsets
+
+
+def _valid_resume_position(tsv: bytes, offset: int, tsv_offset: int) -> bool:
+    if tsv_offset == 0:
+        return offset == 0
+    items, positions = _ocr_tsv_items_with_offsets(tsv, 1, 0, 0)
+    del items
+    if tsv_offset not in positions:
+        return False
+    return positions.index(tsv_offset) == offset
+
+
+def _clean_ocr_text(text: str) -> str:
+    return "".join(char if char in "\t\n\r" or char.isprintable() else " " for char in text)
+
+
+def _cursor_offset(cursor: str | None) -> int | None:
+    if not cursor:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+        return payload.get("offset") if type(payload.get("offset")) is int else None
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
 
 def _validate_page(name: str, value: int) -> None:

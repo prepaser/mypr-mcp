@@ -19,3 +19,5 @@ detail["warnings"]
 ```
 
 Both methods run their psutil collectors in the existing isolated system worker, so a slow operating-system query does not block Python execution. The process detail response uses the standard 32 KiB result cap. These methods inspect the workstation under the current user's OS permissions; they do not elevate privileges or terminate processes.
+
+`await ws.doctor()` is the readiness check for optional workstation features. It reports the workspace Python interpreter and packages, `rg`/`rga`/AST backends, configured LSP commands, browser engine, OCR executable and language data, external MCP configuration, runtime worker health, and available storage. Each check is independent, so a missing optional dependency does not hide unrelated results. The same checks can run before manager startup with `uvx mypr-mcp doctor`; neither form installs packages or changes configuration.

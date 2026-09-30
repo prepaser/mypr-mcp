@@ -174,6 +174,57 @@ async def test_history_task_read_preserves_generation_and_owner_metadata(tmp_pat
         )
 
 
+@pytest.mark.asyncio
+async def test_history_task_read_reports_evicted_output_without_touching_disk(tmp_path):
+    history = History(tmp_path)
+    record = {
+        "id": "task-evicted",
+        "kind": "python",
+        "generation": "oldgen",
+        "client_id": "client",
+        "connection_id": "connection",
+        "state": "succeeded",
+        "output_evicted": True,
+    }
+    history_id = "python:oldgen:task-evicted"
+    history.record("python", record, entity_id=history_id)
+    runtime = Runtime(tmp_path)
+    runtime.history = history
+    runtime.output_limit = 1024 * 1024
+    try:
+        result = await Runtime._dispatch(
+            runtime,
+            {"op": "history_task_read", "id": history_id, "cursor": 4},
+        )
+        assert result["output"] == []
+        assert result["cursor"] == 4
+        assert not result["has_more"]
+        assert result["warnings"][0]["code"] == "output_expired"
+    finally:
+        history.close()
+
+
+@pytest.mark.asyncio
+async def test_historical_task_preserves_expired_output_warning():
+    task = HistoricalTask(
+        {
+            **_record(output=[], cursor=0, has_more=False),
+            "output_evicted": True,
+            "warnings": [{"code": "output_expired", "text": "expired"}],
+            "warnings_truncated": True,
+        }
+    )
+    status = task.status()
+    assert status["output_evicted"] is True
+    assert status["warnings"][0]["code"] == "output_expired"
+    assert status["warnings_truncated"] is True
+    result = await task.read(max_bytes=1024)
+    assert result["output"] == ""
+    assert result["truncated"] is True
+    assert result["output_evicted"] is True
+    assert result["warnings"][0]["code"] == "output_expired"
+
+
 async def test_historical_expect_loads_from_cursor_after_large_prefix(monkeypatch):
     async def rpc(op, **fields):
         assert fields["max_bytes"] == 10

@@ -1,6 +1,6 @@
 # Git history API
 
-`ws.git.log()` returns commit metadata and `ws.git.blame()` attributes committed lines. Both resolve the requested ref to a commit when the query starts, then keep that result in a bounded workspace snapshot. Later pages use the same snapshot even if the branch moves.
+`ws.git.log()` returns commit metadata and `ws.git.blame()` attributes committed lines. Both resolve the requested ref to a commit when the query starts, then keep that result in a bounded workspace snapshot. Later pages use the same snapshot even if the branch moves. Pass `follow=True` to `log()` when a path should follow Git renames.
 
 ```python
 page = await ws.git.log(path="src/app.py", author="Ada", since="2025-01-01")
@@ -11,6 +11,8 @@ while page["next_cursor"]:
 
 page = await ws.git.blame("src/app.py", start_line=10, end_line=30)
 ```
+
+`await ws.git.commit_info(ref, include_files=True, include_patch=False)` returns one commit's parents, author and committer, subject, body, changed files, and insert/delete statistics. Patch text is opt-in and remains bounded by `max_bytes`. Merge statistics use the first parent as the comparison base and identify that choice in the result. The method is read-only and does not change the repository.
 
 `log(ref="HEAD", *, path=None, author=None, since=None, until=None, cursor=None, max_entries=50, max_bytes=32768)` supports Git's author regular expression and date filter syntax. A path is workspace-relative (or an absolute path inside the repository) and matched literally. Each commit contains its hash, author, email, authored timestamp, and subject. The resolved commit hash is returned as `ref`.
 

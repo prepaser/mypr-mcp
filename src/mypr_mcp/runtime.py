@@ -12,7 +12,6 @@ import signal
 import sqlite3
 import sys
 import time
-import tomllib
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -24,7 +23,8 @@ from jupyter_client.kernelspec import KernelSpec
 from . import __version__
 from .bootstrap import ensure_runtime
 from .browser_service import BrowserService
-from .diagnostics import safe_error
+from .config import load_workspace_config
+from .diagnostics import error_info, error_response, safe_error
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
@@ -36,6 +36,8 @@ from .restart_records import poll_restart
 from .scan_service import ScanService
 from .search import Search
 from .services import MCPBridge, Shells
+from .storage import Storage
+from .task_results import load_result, store_result
 from .timings import Timings
 from .transport import MAX_MESSAGE, socket_path, workspace_id
 
@@ -128,6 +130,17 @@ def _close_stores(history, messages):
         history.close()
 
 
+def _store_task_result(workspace, history, record, encoded):
+    def commit(reference):
+        history.record(
+            "python", dict(record, result_ref=reference, result_persisted=True),
+            entity_id=f"python:{record['generation']}:{record['id']}",
+        )
+    return store_result(
+        workspace, record["id"], record["generation"], encoded, commit=commit
+    )
+
+
 def _recover_runs(root, history):
     for path in (root / "runs").glob("*.json"):
         try:
@@ -190,10 +203,10 @@ class Runtime:
         self.control_waiters = {}
         self.submit_waiters = {}
         self.monitor = None
-        self.config = {}
-        config = self.root / "config.toml"
-        if config.exists():
-            self.config = tomllib.loads(config.read_text())
+        self.config = load_workspace_config(self.workspace).values
+        self.storage_policy = self.config.get("storage", {})
+        self.storage = None
+        self.storage_maintenance = {"running": False, "last_run": None, "last_error": None}
         limits = self.config.get("limits", {})
         self.output_limit = int(limits.get("output_bytes", 16 * 1024 * 1024))
         self.response_limit = int(limits.get("response_bytes", 32768))
@@ -211,6 +224,67 @@ class Runtime:
         self._resource_lock = asyncio.Lock()
         self.search_slots = asyncio.Semaphore(2)
         self.background = set()
+
+    def storage_active_ids(self):
+        records = [*self.execs.values(), *self.task_records.values()]
+        active = {record["id"] for record in records if record.get("state") not in TERMINAL}
+        if self.restarting:
+            active.add(self.restarting)
+        return active
+
+    async def storage_call(self, method, **fields):
+        if self.storage is None:
+            raise RuntimeError("Workspace storage is not ready")
+        task = asyncio.create_task(getattr(self.storage, method)(**fields))
+        return await await_completion(task)
+
+    async def maintain_storage(self):
+        while not self.stopping.is_set():
+            if self.healthy and not self.resetting and not self.restarting:
+                self.storage_maintenance["running"] = True
+                try:
+                    result = await self.storage_call(
+                        "gc", dry_run=False,
+                        older_than_days=self.storage_policy["retention_days"],
+                        max_bytes=self.storage_policy["max_bytes"],
+                        revision_keep=self.storage_policy["revision_keep"],
+                    )
+                    self.storage_maintenance.update(
+                        last_run=time.time(), last_error=None,
+                        last_deleted_bytes=result.get("deleted_bytes", 0),
+                    )
+                except Exception as exc:
+                    self.storage_maintenance.update(
+                        last_run=time.time(), last_error=safe_error(exc)
+                    )
+                finally:
+                    self.storage_maintenance["running"] = False
+            try:
+                await asyncio.wait_for(
+                    self.stopping.wait(), self.storage_policy["gc_interval_seconds"]
+                )
+            except TimeoutError:
+                pass
+
+    async def code_config(self, req):
+        if self.mcp is None:
+            raise RuntimeError("Workspace configuration is not ready")
+        async with self.mcp._mutation_lock:
+            snapshot = await self.io(self.mcp.store.load_all)
+            definitions = snapshot.values["lsp"]["servers"]
+            if req.get("method") == "get_lsp":
+                return {"servers": definitions, "revision": snapshot.revision}
+            if req.get("method") != "set_lsp":
+                raise ValueError("Unknown workspace configuration operation")
+            if snapshot.revision != self.mcp._revision:
+                raise RuntimeError("Workspace configuration changed on disk; reload before saving")
+            if req.get("expected_servers") != definitions:
+                raise RuntimeError("LSP configuration changed; call ws.code.reload() before saving")
+            revision = await self.io(
+                self.mcp.store.save_lsp, req.get("definitions"), snapshot.revision, critical=True
+            )
+            self.mcp._revision = revision
+            return {"revision": revision}
 
     def new_shells(self):
         return Shells(
@@ -284,6 +358,9 @@ class Runtime:
     async def prepare(self):
         self.persistence = PersistenceWorker(on_failure=self.persistence_failed)
         self.history, self.messages = await self.persistence.call(_open_stores, self.workspace)
+        self.storage = Storage(
+            self.workspace, history=self.history, active_ids=self.storage_active_ids
+        )
         for name in ["lib/ws_lib", "skills", "runs", "artifacts", "ipython", "jupyter"]:
             (self.root / name).mkdir(parents=True, exist_ok=True)
         (self.root / "lib/ws_lib/__init__.py").touch(exist_ok=True)
@@ -306,6 +383,9 @@ class Runtime:
             "document-results/",
             "git-history/",
             "rewrites/",
+            "html-results/",
+            "task-results/",
+            "change-plans/",
         ]
         missing = [entry for entry in required if entry not in entries]
         if missing:
@@ -537,10 +617,13 @@ class Runtime:
         async with self.execution_lock(rec):
             if rec["state"] in TERMINAL:
                 return
+            structured_error = rec.get("error_info")
             if error is not None:
                 full = str(error)
                 error = full.encode(errors="replace")[:1024].decode(errors="ignore")
                 error_truncated = rec.get("error_truncated", False) or error != full
+                if not isinstance(structured_error, dict):
+                    structured_error = error_info(error, operation="execute")
             else:
                 error_truncated = rec.get("error_truncated", False)
             fields = dict(
@@ -548,6 +631,7 @@ class Runtime:
                 error=error,
                 error_truncated=error_truncated,
                 finished=time.time(),
+                **({"error_info": structured_error} if structured_error is not None else {}),
             )
             candidate = {**self.public_record(rec), **fields}
             try:
@@ -688,6 +772,8 @@ class Runtime:
                     rec["idle"].set()
                 elif state in {"succeeded", "failed", "cancelled"}:
                     rec["error_truncated"] = content.get("error_truncated", False)
+                    if isinstance(content.get("error_info"), dict):
+                        rec["error_info"] = content["error_info"]
                     await self.finish(rec, state, content.get("error"))
                 continue
             if rec["state"] in TERMINAL:
@@ -715,7 +801,8 @@ class Runtime:
                         if rec["bytes"] + len(raw) > self.output_limit:
                             rec["truncated"] = True
                             continue
-                        path = self.root / "artifacts" / uuid.uuid4().hex
+                        path = self.root / "artifacts" / rec["id"] / uuid.uuid4().hex
+                        await self.io(path.parent.mkdir, parents=True, exist_ok=True, critical=True)
                         await self.io(path.write_bytes, raw, critical=True)
                     except (ValueError, TypeError, OSError) as exc:
                         await self.warn(rec, "artifact_error", safe_error(exc, limit=256))
@@ -883,7 +970,25 @@ class Runtime:
                 return_exceptions=True,
             )
 
-    async def poll(self, ident, cursor=0, wait_ms=1000, *, inbox_client=None, wake_on_output=True):
+    def response_budget(self, max_bytes):
+        if max_bytes is None:
+            return self.response_limit
+        if type(max_bytes) is not int or not 1024 <= max_bytes <= 1024 * 1024:
+            raise ValueError("max_bytes must be between 1024 and 1048576 bytes")
+        return max_bytes
+
+    async def poll(
+        self,
+        ident,
+        cursor=0,
+        wait_ms=1000,
+        *,
+        max_bytes=None,
+        inbox_client=None,
+        wake_on_output=True,
+    ):
+        explicit_budget = max_bytes is not None
+        response_budget = self.response_budget(max_bytes)
         if type(cursor) is not int or cursor < 0:
             raise ValueError("Invalid output cursor")
         if (
@@ -895,8 +1000,42 @@ class Runtime:
         rec = self.execs.get(ident)
         cold = rec is None
         if cold or rec.get("restart_id"):
-            restarted = await self.io(poll_restart, self.workspace, ident, cursor)
+            restarted = await self.io(
+                poll_restart, self.workspace, ident, cursor, max_bytes=max_bytes
+            )
             if restarted is not None:
+                if explicit_budget:
+                    restart_error = restarted.get("error")
+                    if restart_error is not None:
+                        error_limit = min(1024, response_budget // 4)
+                        restart_error = restart_error.encode(errors="replace")[
+                            :error_limit
+                        ].decode(errors="ignore")
+                    error_size = len(
+                        json.dumps(restart_error, ensure_ascii=False).encode()
+                    )
+                    bounded = []
+                    size = error_size
+                    for event in restarted.get("output", []):
+                        event_size = len(json.dumps(event, ensure_ascii=False).encode())
+                        if not bounded and size + event_size > response_budget:
+                            raise ValueError(
+                                f"Output event at cursor {cursor} requires "
+                                f"{size + event_size} bytes; increase max_bytes to "
+                                "continue (cursor unchanged)"
+                            )
+                        if bounded and size + event_size > response_budget:
+                            break
+                        bounded.append(event)
+                        size += event_size
+                    restarted = {
+                        **restarted,
+                        "error": restart_error,
+                        "output": bounded,
+                        "cursor": cursor + len(bounded),
+                        "has_more": bool(restarted.get("has_more"))
+                        or len(bounded) < len(restarted.get("output", [])),
+                    }
                 return {**restarted, "generation": self.generation}
         if cold:
             path = self.root / "runs" / f"{ident}.json"
@@ -907,7 +1046,7 @@ class Runtime:
 
         async def page():
             error = rec.get("error")
-            error_limit = min(1024, self.response_limit // 4)
+            error_limit = min(1024, response_budget // 4)
             if error is not None:
                 error = error.encode(errors="replace")[:error_limit].decode(errors="ignore")
             size = len(json.dumps(error, ensure_ascii=False).encode())
@@ -916,9 +1055,16 @@ class Runtime:
                     read_page,
                     self.root / "runs" / f"{ident}.jsonl",
                     cursor,
-                    self.response_limit,
+                    response_budget,
                     size,
                 )
+                if explicit_budget and output:
+                    first_size = len(json.dumps(output[0], ensure_ascii=False).encode())
+                    if size + first_size > response_budget:
+                        raise ValueError(
+                            f"Output event at cursor {cursor} requires {size + first_size} "
+                            f"bytes; increase max_bytes to continue (cursor unchanged)"
+                        )
             else:
                 total = len(rec["events"])
                 if cursor > total:
@@ -926,7 +1072,12 @@ class Runtime:
                 output = []
                 for event in rec["events"][cursor:]:
                     n = len(json.dumps(event, ensure_ascii=False).encode())
-                    if output and size + n > self.response_limit:
+                    if not output and explicit_budget and size + n > response_budget:
+                        raise ValueError(
+                            f"Output event at cursor {cursor} requires {size + n} bytes; "
+                            f"increase max_bytes to continue (cursor unchanged)"
+                        )
+                    if output and size + n > response_budget:
                         break
                     output.append(event)
                     size += n
@@ -952,6 +1103,11 @@ class Runtime:
                 **(
                     {"error_truncated": True}
                     if rec.get("error_truncated") or error != rec.get("error")
+                    else {}
+                ),
+                **(
+                    {"error_info": rec["error_info"]}
+                    if isinstance(rec.get("error_info"), dict)
                     else {}
                 ),
                 **({"warnings": warnings[:4]} if warnings else {}),
@@ -1127,6 +1283,8 @@ class Runtime:
             if requested_client is not None and connection["client_id"] != requested_client:
                 raise ValueError("Connection belongs to another client")
             connection["last_activity"] = time.time()
+            if connection["client_id"] is not None and op in {"execute", "poll"}:
+                await self.io(self.history.touch_client, connection["client_id"])
         client = (connection["client_id"] if connection else requested_client) or "anonymous"
         if op == "performance":
             return self.performance_snapshot()
@@ -1162,6 +1320,7 @@ class Runtime:
                             if item["client_id"]
                         }
                     ),
+                    "storage_maintenance": dict(self.storage_maintenance),
                     "active_count": len(self.active),
                     "queued_count": sum(
                         record["state"] == "queued" for record in self.execs.values()
@@ -1206,6 +1365,7 @@ class Runtime:
                 "client_count": len(
                     {c["client_id"] for c in connections if c["client_id"] is not None}
                 ),
+                "storage_maintenance": dict(self.storage_maintenance),
                 "active": list(self.active),
                 "queued": [r["id"] for r in self.execs.values() if r["state"] == "queued"],
             }
@@ -1221,6 +1381,17 @@ class Runtime:
             record = await self.io(self.history.get, req.get("id", req.get("exec_id")))
             if record is None:
                 raise ValueError("Unknown history ID")
+            output_evicted = bool(
+                record.get("output_evicted") or record.get("scan_output_evicted")
+            )
+            if output_evicted:
+                record.update(
+                    self.expired_output(
+                        record,
+                        history_id=record.get("history_id") or record.get("id"),
+                    )
+                )
+                return record
             if (
                 record["kind"] in {"shell", "package", "scan"}
                 and record["id"] in self.task_records
@@ -1260,6 +1431,8 @@ class Runtime:
                             has_more=len(output) < total,
                             output_truncated=bool(record.get("output_truncated")),
                         )
+                elif journal is not None and not isinstance(record.get("output"), str):
+                    record.update(self.expired_output(record, history_id=record.get("history_id")))
             return record
         if op == "history_task_read":
             history_id = req.get("id")
@@ -1277,26 +1450,25 @@ class Runtime:
             budget = req.get("max_bytes", self.response_limit)
             if type(budget) is not int or budget < 0 or budget > self.output_limit:
                 raise ValueError("Invalid task output budget")
+            if record.get("output_evicted") or record.get("scan_output_evicted"):
+                return self.expired_output(record, cursor=cursor, history_id=expected_history_id)
             journal = (
                 self.task_journal_path(record)
                 if record.get("kind") == "python"
                 else self.root / "runs" / f"{record['id']}.jsonl"
             )
             if journal is None:
-                return {
-                    "id": record.get("id"),
-                    "history_id": expected_history_id,
-                    "kind": record.get("kind"),
-                    "generation": record.get("generation"),
-                    "client_id": record.get("client_id", record.get("client")),
-                    "connection_id": record.get("connection_id"),
-                    "exec_id": record.get("exec_id"),
-                    "output": [],
-                    "cursor": cursor,
-                    "has_more": False,
-                    "truncated": True,
-                }
-            output, total = await self.io(read_page, journal, cursor, budget)
+                return self.expired_output(record, cursor=cursor, history_id=expected_history_id)
+            if not await self.io(journal.is_file):
+                return self.expired_output(record, cursor=cursor, history_id=expected_history_id)
+            try:
+                output, total = await self.io(read_page, journal, cursor, budget)
+            except (FileNotFoundError, ValueError):
+                if not await self.io(journal.is_file):
+                    return self.expired_output(
+                        record, cursor=cursor, history_id=expected_history_id
+                    )
+                raise
             return {
                 "id": record.get("id"),
                 "history_id": expected_history_id,
@@ -1323,6 +1495,8 @@ class Runtime:
             if req.get("state") not in TERMINAL:
                 raise ValueError("Expected a terminal cell state")
             rec["error_truncated"] = req.get("error_truncated", False)
+            if isinstance(req.get("error_info"), dict):
+                rec["error_info"] = req["error_info"]
             await self.finish(rec, req["state"], req.get("error"))
             return None
         if op in {"message_send", "message_reply", "message_read", "message_ack"}:
@@ -1384,10 +1558,12 @@ class Runtime:
                 raise RuntimeError("Kernel unavailable; use CLI reset")
             if connection is None or connection["client_id"] is None:
                 raise RuntimeError("Call init on an active connection before execute")
+            self.response_budget(req.get("max_bytes"))
             rec = await self.admit_execution(client, connection_id, req)
             return await self.poll(
                 rec["id"],
                 wait_ms=req.get("wait_ms", 1000),
+                max_bytes=req.get("max_bytes"),
                 inbox_client=client,
                 wake_on_output=False,
             )
@@ -1396,8 +1572,57 @@ class Runtime:
                 req["exec_id"],
                 req.get("cursor") or 0,
                 req.get("wait_ms", 1000),
+                max_bytes=req.get("max_bytes"),
                 inbox_client=connection["client_id"] if connection else None,
             )
+        if op == "code_config":
+            return await self.code_config(req)
+        if op == "storage_usage":
+            return await self.storage_call("usage")
+        if op == "storage_gc":
+            return await self.storage_call(
+                "gc", dry_run=req.get("dry_run", True),
+                older_than_days=req.get("older_than_days", self.storage_policy["retention_days"]),
+                max_bytes=req.get("max_bytes", self.storage_policy["max_bytes"]),
+                revision_keep=req.get("revision_keep", self.storage_policy["revision_keep"]),
+            )
+        if op == "storage_gc_apply":
+            return await self.storage_call("gc_apply", plan_id=req["plan_id"])
+        if op == "message_clients":
+            active_ids = {info["client_id"] for info in self.clients.values() if info["client_id"]}
+            page = await self.io(
+                self.history.clients, prefix=req.get("prefix"), cursor=req.get("cursor"),
+                limit=req.get("limit", 50), connected=req.get("connected"), active_ids=active_ids,
+            )
+            for item in page["clients"]:
+                item["connected"] = item["id"] in active_ids
+            return page
+        if op == "task_result_store":
+            ident = req["id"]
+            async with self.task_lock(ident):
+                record = self.task_records.get(ident)
+                if record is None:
+                    record = {
+                        "id": ident, "kind": "python", "generation": self.generation,
+                        "client_id": client, "connection_id": connection_id,
+                        "exec_id": req.get("exec_id"), "state": "running", "created": time.time(),
+                    }
+                if record.get("generation") != self.generation or record.get("state") in TERMINAL:
+                    raise ValueError("Task result no longer belongs to an active generation")
+                if record.get("client_id") != client:
+                    raise ValueError("Task belongs to another client")
+                reference = await self.io(
+                    _store_task_result, self.workspace, self.history, record, req["encoded"],
+                    critical=True,
+                )
+                record.update(result_ref=reference, result_persisted=True)
+                self.task_records[ident] = record
+                return reference
+        if op == "task_result_get":
+            record = await self.io(self.history.get, req["id"])
+            if not record or not record.get("result_ref") or record.get("result_evicted"):
+                raise RuntimeError("Persisted task result is unavailable or expired")
+            return await self.io(load_result, self.workspace, record["result_ref"])
         if op == "scan_start":
             if self.stopping.is_set() or self.resetting or not self.healthy:
                 raise RuntimeError("Workspace is not accepting scans")
@@ -1412,8 +1637,28 @@ class Runtime:
                 client_id=client,
                 connection_id=connection_id,
                 exec_id=req.get("exec_id"),
+                max_probes=req.get("max_probes", 1_000_000),
+                max_duration=req.get("max_duration", 3600),
+                continue_after_output_limit=req.get("continue_after_output_limit", False),
             )
         if op == "scan_results":
+            history_record = await self.io(self.history.get, req["id"])
+            if history_record and (
+                history_record.get("output_evicted")
+                or history_record.get("scan_output_evicted")
+            ):
+                expired = self.expired_output(history_record, cursor=req.get("cursor"))
+                return {
+                    "id": req["id"],
+                    "results": [],
+                    "cursor": None,
+                    "next_cursor": None,
+                    "has_more": False,
+                    "state": history_record.get("state", "unknown"),
+                    "truncated": True,
+                    "expired": True,
+                    "warnings": expired["warnings"],
+                }
             return await self.scans.results(
                 req["id"],
                 cursor=req.get("cursor"),
@@ -1456,7 +1701,7 @@ class Runtime:
             if op == "search":
                 return await Search(self.workspace, runner).search(**args)
             method = req.get("method")
-            if method not in {"status", "diff", "show", "log", "blame"}:
+            if method not in {"status", "diff", "show", "log", "blame", "commit_info"}:
                 raise ValueError("Unknown Git method")
             return await getattr(Git(self.workspace, runner), method)(**args)
         if op == "shell_start":
@@ -1486,8 +1731,14 @@ class Runtime:
             )
             return job
         if op == "shell_poll":
+            history_record = await self.io(self.history.get, req["id"])
+            if history_record and history_record.get("output_evicted"):
+                return self.expired_output(history_record, cursor=req.get("cursor", 0))
             return await self.shells.poll(req["id"], req.get("cursor", 0))
         if op == "shell_read":
+            history_record = await self.io(self.history.get, req["id"])
+            if history_record and history_record.get("output_evicted"):
+                return self.expired_output(history_record, cursor=req.get("cursor", 0))
             return await self.shells.read(
                 req["id"],
                 req.get("cursor", 0),
@@ -1539,16 +1790,17 @@ class Runtime:
             )
             return result
         if op == "packages_add":
-            import shlex
-
             specs = req["specs"]
-            if not specs or any(not s or s.startswith("-") for s in specs):
+            if (
+                not isinstance(specs, list) or not specs
+                or any(not isinstance(s, str) or not s or s.startswith("-") for s in specs)
+            ):
                 raise ValueError("Expected package requirements, not command options")
-            command = shlex.join(["uv", "pip", "install", "--python", str(self.py), *specs])
-            command += " && " + shlex.join(
-                ["uv", "--color", "never", "pip", "freeze", "--python", str(self.py)]
-            )
-            command += " > " + shlex.quote(str(self.root / "requirements.txt"))
+            command = [
+                sys.executable, "-I", str(Path(__file__).with_name("package_worker.py")),
+                "--python", str(self.py), "--root", str(self.root),
+                "--spec-json", json.dumps(specs),
+            ]
             job = await self.shells.start(command, str(self.workspace), dict(os.environ))
             self.track_shell(
                 job["id"], client, connection_id, req.get("exec_id"), kind="package", specs=specs
@@ -1977,6 +2229,38 @@ class Runtime:
         }
 
     @staticmethod
+    def expired_output(record, *, cursor=0, history_id=None):
+        warnings = list(record.get("warnings", []))
+        warning = {
+            "code": "output_expired",
+            "text": "Retained task output has expired and is no longer available.",
+        }
+        if warning not in warnings:
+            warnings.append(warning)
+        return {
+            "id": record.get("id"),
+            "history_id": history_id or record.get("history_id"),
+            "kind": record.get("kind"),
+            "generation": record.get("generation"),
+            "client_id": record.get("client_id", record.get("client")),
+            "connection_id": record.get("connection_id"),
+            "exec_id": record.get("exec_id"),
+            "state": record.get("state", "unknown"),
+            "result": record.get("result"),
+            "error": record.get("error"),
+            "output": [],
+            "cursor": cursor,
+            "has_more": False,
+            "truncated": True,
+            "output_evicted": True,
+            "warnings": warnings,
+            "warnings_truncated": bool(record.get("warnings_truncated", False)),
+            "pty": bool(record.get("pty", False)),
+            "rows": record.get("rows", 24),
+            "cols": record.get("cols", 80),
+        }
+
+    @staticmethod
     def task_history_id(record):
         if record.get("kind") == "python" and record.get("generation"):
             return f"python:{record['generation']}:{record['id']}"
@@ -2029,6 +2313,7 @@ class Runtime:
             await self.io(self.history.reserve_client_id, client_id, critical=True)
         initialized = dict(connection, client_id=client_id, last_activity=time.time())
         await self.io(self.history.append, "connection", "initialized", initialized, critical=True)
+        await self.io(self.history.touch_client, client_id, critical=True)
         connection.update(initialized)
         return {"client_id": client_id}
 
@@ -2072,6 +2357,9 @@ class Runtime:
             self.clients.pop(connection_id, None)
             self.attachments.pop(connection_id, None)
             if self.history:
+                if info.get("client_id") is not None:
+                    with contextlib.suppress(Exception):
+                        await self.io(self.history.touch_client, info["client_id"], critical=True)
                 with contextlib.suppress(Exception):
                     await self.io(
                         self.history.append,
@@ -2210,8 +2498,12 @@ class Runtime:
             await asyncio.gather(failure, return_exceptions=True)
 
     async def connection(self, reader, writer):
+        operation_name = None
         try:
             req = json.loads(await reader.readline())
+            if not isinstance(req, dict):
+                raise TypeError("request must be an object")
+            operation_name = req.get("op")
             if req.get("op") == "attach":
                 await self.attach(reader, writer, req)
                 return
@@ -2250,7 +2542,7 @@ class Runtime:
                 result = await self.dispatch(req)
             response = {"ok": True, "result": result}
         except Exception as exc:
-            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            response = error_response(exc, operation_name)
         try:
             writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
             await writer.drain()
@@ -2273,6 +2565,8 @@ class Runtime:
             )
             try:
                 await self.start_kernel()
+                if self.storage_policy["enabled"]:
+                    self.spawn(self.maintain_storage())
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     asyncio.get_running_loop().add_signal_handler(sig, self.stopping.set)
                 await self.stopping.wait()

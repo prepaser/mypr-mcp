@@ -37,10 +37,19 @@ def test_new_tool_signatures_are_discoverable_without_optional_dependencies(tmp_
         "mcp.list_resource_templates", "net.sockets", "system.process",
         "browser.observe", "browser.snapshot", "browser.find", "browser.diff",
         "code.document_symbols", "code.workspace_symbols", "code.calls",
-        "fs.rewrite_ast", "fs.apply_rewrite", "http.extract_html", "http.read_html",
-        "git.log", "git.blame", "docs.ocr", "docs.extract", "docs.backends",
+        "fs.rewrite_ast", "fs.apply_rewrite", "fs.read_bytes", "fs.write_bytes",
+        "fs.delete", "fs.move", "fs.copy", "fs.history", "fs.restore",
+        "fs.replace", "fs.apply_replace", "http.extract_html", "http.read_html",
+        "git.log", "git.blame", "git.commit_info", "docs.ocr", "docs.extract",
+        "docs.backends", "code.rename", "code.actions", "code.prepare_action",
+        "code.apply_edit", "code.workspace_diagnostics", "messages.clients",
+        "storage.usage", "storage.gc", "storage.gc_apply", "pages.iter", "doctor",
     )
     for path in paths:
-        owner, method = path.split(".")
-        member = getattr(getattr(ws, owner), method)
+        if "." in path:
+            owner, method = path.split(".")
+            member = getattr(getattr(ws, owner), method)
+        else:
+            owner, method = ws, path
+            member = getattr(ws, path)
         assert f"ws.{path}{inspect.signature(member)}" in ws.help(path)

@@ -87,3 +87,38 @@ async def test_historical_restart_poll_reports_current_manager_generation(tmp_pa
     assert result["generation"] == "current"
     assert result["execution_generation"] == "old"
     assert result["restart"]["new_generation"] == "previous"
+
+
+async def test_disconnected_bridge_restart_poll_keeps_budget_and_expiry(tmp_path, monkeypatch):
+    from mypr_mcp import restart
+    from mypr_mcp.bridge import ConnectionBridge
+    from mypr_mcp.diagnostics import RPCError
+    from mypr_mcp.journal import append_events
+
+    ident, ticket_id = "e" * 32, "f" * 32
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    record = {"id": ident, "kind": "execution", "generation": "old", "state": "succeeded",
+              "restart_id": ticket_id, "restart_result": "completed", "truncated": False}
+    (root / f"{ident}.json").write_text(json.dumps(record))
+    append_events(root / f"{ident}.jsonl", [{"type": "stream", "text": "x" * 1500}])
+    ticket = {"id": ticket_id, "state": "succeeded", "origin": {"exec_id": ident},
+              "new_generation": "new"}
+    monkeypatch.setattr(restart, "read_ticket", lambda *args: ticket)
+    bridge = ConnectionBridge(tmp_path)
+    with pytest.raises(RPCError, match="cursor unchanged"):
+        await bridge.request("poll", exec_id=ident, cursor=0, max_bytes=1024)
+    page = await bridge.request("poll", exec_id=ident, cursor=0, max_bytes=4096)
+    assert page["cursor"] == 2
+    assert not page["has_more"]
+    history = History(tmp_path)
+    try:
+        history.record("execution", record)
+        history.mark_storage_evicted([f".mypr/runs/{ident}.jsonl"])
+        expired = await bridge.request("poll", exec_id=ident, cursor=page["cursor"], max_bytes=1024)
+        assert expired["output"] == []
+        assert expired["output_evicted"]
+        assert expired["warnings"][0]["code"] == "output_expired"
+        assert expired["cursor"] == page["cursor"]
+    finally:
+        history.close()

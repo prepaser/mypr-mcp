@@ -67,7 +67,17 @@ def _find(value: dict) -> dict:
         output_bytes += item_size
         next_line = line_number + 1
         if len(matches) >= limit:
-            has_more = stream.tell() < len(text)
+            continuation = next_line
+            for _look_line_number, look_raw in enumerate(stream, continuation):
+                look_line = look_raw.rstrip("\r\n")
+                look_match = pattern.search(look_line) if pattern is not None else None
+                look_column = (
+                    look_match.start() if look_match is not None else -1
+                ) if regex else look_line.find(query)
+                if look_column >= 0:
+                    has_more = True
+                    break
+            next_line = continuation
             break
     return {"matches": matches, "next_line": next_line, "has_more": has_more}
 

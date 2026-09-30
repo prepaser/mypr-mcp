@@ -16,6 +16,7 @@ _MAX_HISTORY_SCAN_BYTES = 2 * 1024 * 1024
 _MAX_HISTORY_SNAPSHOTS = 32
 _MAX_HISTORY_SNAPSHOT_BYTES = 16 * 1024 * 1024
 _DEFAULT_RESPONSE_BYTES = 32 * 1024
+_MAX_COMMIT_SCAN_BYTES = 16 * 1024 * 1024
 _HISTORY_SNAPSHOT_LOCK = threading.Lock()
 
 
@@ -226,6 +227,7 @@ class Git:
         author: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        follow: bool = False,
         cursor: str | None = None,
         max_entries: int = 50,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
@@ -239,6 +241,10 @@ class Git:
             return await asyncio.to_thread(
                 self._history_page, snapshot, offset, max_entries, max_bytes
             )
+        if type(follow) is not bool:
+            raise TypeError("follow must be a boolean")
+        if follow and path is None:
+            raise ValueError("follow=True requires path")
         self._validate_ref(ref)
         self._validate_filter("path", path)
         self._validate_filter("author", author)
@@ -252,6 +258,7 @@ class Git:
             "author": author,
             "since": since,
             "until": until,
+            "follow": follow,
         }
         args = ["log", "-z", "--format=%H%x00%an%x00%ae%x00%aI%x00%s"]
         if author is not None:
@@ -262,6 +269,8 @@ class Git:
             args.append(f"--until={until}")
         args.append(commit)
         if path is not None:
+            if follow:
+                args.insert(1, "--follow")
             args.extend(["--", ":(top,literal)" + self._path(path, root)])
         result = await self._run(args, max_bytes=_MAX_HISTORY_SCAN_BYTES)
         items = self._parse_log(result["stdout"], truncated=bool(result.get("truncated")))
@@ -276,6 +285,123 @@ class Git:
             warnings=list(result.get("warnings", [])),
         )
         page = await asyncio.to_thread(self._history_page, snapshot, 0, max_entries, max_bytes)
+        page["snapshot_id"] = ident
+        return page
+
+    async def commit_info(
+        self,
+        ref: str = "HEAD",
+        *,
+        include_files: bool = True,
+        include_patch: bool = False,
+        cursor: str | None = None,
+        max_bytes: int = _DEFAULT_RESPONSE_BYTES,
+    ) -> dict[str, Any]:
+        """Return one resolved commit with bounded, cursor-paged details."""
+        self._validate_limit(max_bytes)
+        if type(include_files) is not bool or type(include_patch) is not bool:
+            raise TypeError("include_files and include_patch must be booleans")
+        if cursor is not None:
+            snapshot, offset = await asyncio.to_thread(
+                self.history_snapshots.decode, cursor, expected_kind="commit_info"
+            )
+            return await asyncio.to_thread(self._commit_info_page, snapshot, offset, max_bytes)
+        self._validate_ref(ref)
+        root = await self._repo_root()
+        commit = await self._resolve_commit(ref)
+        metadata_result = await self._run(
+            [
+                "show",
+                "-s",
+                "--encoding=UTF-8",
+                "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B%x00",
+                "--end-of-options",
+                commit,
+            ],
+            max_bytes=_MAX_HISTORY_SCAN_BYTES,
+        )
+        metadata = self._parse_commit_metadata(
+            metadata_result["stdout"], truncated=bool(metadata_result.get("truncated"))
+        )
+        records: list[dict[str, Any]] = []
+        warnings = list(metadata_result.get("warnings", []))
+        scan_truncated = bool(metadata_result.get("truncated"))
+        if include_files:
+            names = await self._run(
+                [
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-z",
+                    "-r",
+                    "--find-renames",
+                    "--find-copies",
+                    commit,
+                ],
+                max_bytes=_MAX_HISTORY_SCAN_BYTES,
+            )
+            stats = await self._run(
+                [
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--numstat",
+                    "-z",
+                    "-r",
+                    "--find-renames",
+                    "--find-copies",
+                    commit,
+                ],
+                max_bytes=_MAX_HISTORY_SCAN_BYTES,
+            )
+            records = self._merge_file_records(names["stdout"], stats["stdout"])
+            scan_truncated |= bool(names.get("truncated") or stats.get("truncated"))
+            warnings.extend(names.get("warnings", []))
+            warnings.extend(stats.get("warnings", []))
+        if include_patch:
+            patch_result = await self._run(
+                [
+                    "show",
+                    "--format=",
+                    "--binary",
+                    "--full-index",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--end-of-options",
+                    commit,
+                ],
+                max_bytes=_MAX_COMMIT_SCAN_BYTES,
+            )
+            patch = patch_result["stdout"]
+            scan_truncated |= bool(patch_result.get("truncated"))
+            warnings.extend(patch_result.get("warnings", []))
+        else:
+            patch = None
+        items: list[dict[str, Any]] = [{"kind": "file", "value": item} for item in records]
+        if patch is not None:
+            items.extend(
+                {"kind": "patch", "value": chunk}
+                for chunk in self._chunk_text(patch, chunk_bytes=16)
+            )
+        query = {
+            "ref": ref,
+            "include_files": include_files,
+            "include_patch": include_patch,
+        }
+        ident, snapshot = await asyncio.to_thread(
+            self._create_history_snapshot,
+            query,
+            items,
+            kind="commit_info",
+            root=str(root),
+            ref=commit,
+            commit=metadata,
+            truncated=scan_truncated,
+            warnings=warnings,
+        )
+        page = await asyncio.to_thread(self._commit_info_page, snapshot, 0, max_bytes)
         page["snapshot_id"] = ident
         return page
 
@@ -346,6 +472,183 @@ class Git:
             raise RuntimeError("git did not resolve ref to a commit")
         return commit.lower()
 
+    @staticmethod
+    def _parse_commit_metadata(text: str, *, truncated: bool) -> dict[str, Any]:
+        fields = text.split("\0")
+        while fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) < 9:
+            if truncated:
+                raise RuntimeError("git output was truncated before commit metadata")
+            raise RuntimeError("git returned malformed commit metadata")
+        oid, parents, aname, aemail, adate, cname, cemail, cdate = fields[:8]
+        body = fields[8].removesuffix("\n")
+        if not oid or any(char not in "0123456789abcdefABCDEF" for char in oid):
+            raise RuntimeError("git returned malformed commit metadata")
+        parent_list = [item.lower() for item in parents.split() if item]
+        return {
+            "commit": oid.lower(),
+            "hash": oid.lower(),
+            "parents": parent_list,
+            "parent": parent_list[0] if parent_list else None,
+            "first_parent": parent_list[0] if parent_list else None,
+            "root": not parent_list,
+            "root_commit": not parent_list,
+            "merge": len(parent_list) > 1,
+            "author": {
+                "name": aname,
+                "email": aemail.removeprefix("<").removesuffix(">"),
+                "date": adate,
+            },
+            "committer": {
+                "name": cname,
+                "email": cemail.removeprefix("<").removesuffix(">"),
+                "date": cdate,
+            },
+            "body": body,
+            "subject": body.splitlines()[0] if body.splitlines() else "",
+        }
+
+    @staticmethod
+    def _parse_name_status(text: str) -> list[dict[str, Any]]:
+        fields = text.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        output: list[dict[str, Any]] = []
+        index = 0
+        while index < len(fields):
+            record = fields[index]
+            index += 1
+            status, separator, path = record.partition("\t")
+            if separator:
+                item: dict[str, Any] = {"status": status, "path": path}
+            else:
+                status = record
+                if index >= len(fields):
+                    break
+                path = fields[index]
+                index += 1
+                item = {"status": status, "path": path}
+            if status[:1] in {"R", "C"} and index < len(fields):
+                item["old_path"] = item["path"]
+                item["path"] = fields[index]
+                index += 1
+            output.append(item)
+        return output
+
+    @staticmethod
+    def _parse_numstat(text: str) -> list[dict[str, Any]]:
+        fields = text.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        output: list[dict[str, Any]] = []
+        index = 0
+        while index < len(fields):
+            record = fields[index]
+            index += 1
+            parts = record.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            additions, deletions, path = parts
+            item = {
+                "additions": int(additions) if additions.isdigit() else None,
+                "deletions": int(deletions) if deletions.isdigit() else None,
+                "path": path,
+            }
+            if index < len(fields) and "\t" not in fields[index]:
+                item["old_path"] = path
+                item["path"] = fields[index]
+                index += 1
+            output.append(item)
+        return output
+
+    @classmethod
+    def _merge_file_records(cls, names: str, stats: str) -> list[dict[str, Any]]:
+        name_items = cls._parse_name_status(names)
+        stat_items = cls._parse_numstat(stats)
+        output = []
+        for index, item in enumerate(name_items):
+            merged = dict(item)
+            if index < len(stat_items):
+                stat = stat_items[index]
+                merged["additions"] = stat["additions"]
+                merged["deletions"] = stat["deletions"]
+            else:
+                merged.update(additions=None, deletions=None)
+            output.append(merged)
+        return output
+
+    def _commit_info_page(
+        self, snapshot: dict[str, Any], offset: int, max_bytes: int
+    ) -> dict[str, Any]:
+        metadata = snapshot.get("commit")
+        if not isinstance(metadata, dict):
+            raise RuntimeError("invalid persisted commit metadata")
+        base: dict[str, Any] = {
+            "root": snapshot.get("root", str(self.workspace)),
+            "workspace": str(self.workspace),
+            "ref": snapshot.get("ref"),
+            "commit": metadata,
+            "files": [],
+            "patch": "",
+            "cursor": None,
+            "next_cursor": None,
+            "has_more": False,
+            "truncated": bool(snapshot.get("truncated")),
+            "scan_truncated": bool(snapshot.get("truncated")),
+            "warnings": list(snapshot.get("warnings", [])),
+        }
+        if len(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
+            raise ValueError("max_bytes is too small for commit metadata; increase the budget")
+        selected: list[dict[str, Any]] = []
+        cursor_reserve = "x" * 128
+        patch = ""
+        index = offset
+        while index < len(snapshot["items"]):
+            item = snapshot["items"][index]
+            candidate_files = list(base["files"])
+            candidate_patch = patch
+            if item.get("kind") == "file":
+                candidate_files.append(item["value"])
+            else:
+                candidate_patch += item.get("value", "")
+            provisional_cursor = cursor_reserve if index + 1 < len(snapshot["items"]) else None
+            candidate = {
+                **base,
+                "files": candidate_files,
+                "patch": candidate_patch,
+                "cursor": provisional_cursor,
+                "next_cursor": provisional_cursor,
+                "has_more": provisional_cursor is not None,
+            }
+            if (
+                len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode())
+                > max_bytes
+            ):
+                if not selected:
+                    raise ValueError(
+                        "max_bytes is too small for a commit record; increase the budget"
+                    )
+                break
+            selected.append(item)
+            base = candidate
+            patch = candidate_patch
+            index += 1
+        more = index < len(snapshot["items"])
+        cursor = (
+            self.history_snapshots.cursor(snapshot["id"], index, "commit_info")
+            if more
+            else None
+        )
+        base["cursor"] = cursor
+        base["next_cursor"] = cursor
+        base["has_more"] = more
+        base["truncated"] = bool(snapshot.get("truncated")) or more
+        base["scan_truncated"] = bool(snapshot.get("truncated"))
+        if len(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
+            raise ValueError("max_bytes is too small for commit metadata; increase the budget")
+        return base
+
     def _create_history_snapshot(
         self,
         query: dict[str, Any],
@@ -357,6 +660,7 @@ class Git:
         truncated: bool,
         warnings: list[str],
         path: str | None = None,
+        commit: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         with _HISTORY_SNAPSHOT_LOCK:
             ident = self.history_snapshots.create(
@@ -368,6 +672,7 @@ class Git:
                 path=path,
                 truncated=truncated,
                 warnings=warnings,
+                **({"commit": commit} if commit is not None else {}),
             )
             files = []
             for item in self.history_snapshots.root.glob("*.json"):
@@ -405,6 +710,7 @@ class Git:
                 "path": path,
                 "truncated": truncated,
                 "warnings": warnings,
+                **({"commit": commit} if commit is not None else {}),
             }
 
     def _history_page(
@@ -552,6 +858,8 @@ class Git:
                 "color.ui=false",
                 "-c",
                 "diff.relative=false",
+                "-c",
+                "core.quotePath=false",
                 "-C",
                 str(getattr(self, "repo", self.workspace)),
                 *args,

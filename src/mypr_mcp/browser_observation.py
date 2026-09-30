@@ -8,6 +8,7 @@ import json
 import re
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,10 +18,12 @@ _MAX_EVENTS = 1000
 _MAX_BYTES = 4 * 1024 * 1024
 _MAX_EVENT_BYTES = 24 * 1024
 _MAX_BODY_BYTES = 256 * 1024
+_DEFAULT_BODY_TIMEOUT = 5.0
 _MAX_REQUESTS = 256
 _MAX_PAGES = 64
 _DEFAULT_PAGE_SIZE = 100
 _SENSITIVE_HEADER = re.compile(r"(?:auth|cookie|token|secret|api.?key|session|credential)", re.I)
+_EVENT_TYPES = frozenset({"console", "pageerror", "request", "response", "requestfailed"})
 
 
 def _safe_url(value: Any) -> str:
@@ -135,6 +138,7 @@ class _ClientBuffer:
     next_request: int = 1
     next_page: int = 1
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
 
     def append(self, event: dict[str, Any]) -> None:
         event["cursor"] = self.next_event
@@ -150,6 +154,7 @@ class _ClientBuffer:
             size = _encoded_size(event)
         self.events.append((event, size))
         self.bytes_used += size
+        self.changed.set()
         while len(self.events) > _MAX_EVENTS or self.bytes_used > _MAX_BYTES:
             old, old_size = self.events.popleft()
             self.bytes_used -= old_size
@@ -217,10 +222,11 @@ class BrowserObservation:
         if self._closed:
             return
         event["page_id"] = self.page_id
-        try:
-            event["url"] = _safe_url(self.page.url)
-        except Exception:
-            pass
+        if "url" not in event:
+            try:
+                event["url"] = _safe_url(self.page.url)
+            except Exception:
+                pass
         self._buffer.append(event)
 
     def _on_console(self, message: Any) -> None:
@@ -357,7 +363,66 @@ class BrowserObservation:
             self._requests.clear()
             self.page = None
             self.context = None
+            self._buffer.changed.set()
         return {"closed": True, "page_id": self.page_id}
+
+    @staticmethod
+    def _values(value: Any, name: str, *, strings: bool = True) -> set[Any] | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and strings:
+            value = (value,)
+        elif isinstance(value, int) and not isinstance(value, bool) and not strings:
+            value = (value,)
+        elif not isinstance(value, (list, tuple, set, frozenset)):
+            kind = "strings" if strings else "integers"
+            raise TypeError(f"{name} must be a {kind} collection or None")
+        result = set(value)
+        if not result:
+            raise ValueError(f"{name} must not be empty")
+        if strings and any(not isinstance(item, str) or not item for item in result):
+            raise TypeError(f"{name} must contain non-empty strings")
+        if not strings and any(
+            isinstance(item, bool) or not isinstance(item, int) for item in result
+        ):
+            raise TypeError(f"{name} must contain integers")
+        return result
+
+    def _matches(
+        self,
+        event: dict[str, Any],
+        event_types: set[str] | None,
+        url_contains: str | None,
+        methods: set[str] | None,
+        statuses: set[int] | None,
+    ) -> bool:
+        if event_types is not None and event.get("type") not in event_types:
+            return False
+        if url_contains is not None and url_contains not in str(event.get("url", "")):
+            return False
+        if methods is not None and str(event.get("method", "")).upper() not in methods:
+            return False
+        if statuses is not None and event.get("status") not in statuses:
+            return False
+        return True
+
+    @staticmethod
+    def _page(
+        events: list[dict[str, Any]],
+        next_cursor: int,
+        has_more: bool,
+        dropped: bool,
+        closed: bool,
+        truncated: bool,
+    ) -> dict[str, Any]:
+        return {
+            "events": events,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "dropped": dropped,
+            "closed": closed,
+            "truncated": truncated,
+        }
 
     async def read(
         self,
@@ -365,6 +430,11 @@ class BrowserObservation:
         *,
         limit: int = _DEFAULT_PAGE_SIZE,
         max_bytes: int = 32 * 1024,
+        types: Any = None,
+        url_contains: str | None = None,
+        methods: Any = None,
+        status: Any = None,
+        wait_ms: int = 0,
     ) -> dict[str, Any]:
         self._check_owner()
         if type(limit) is not int or not 1 <= limit <= _MAX_EVENTS:
@@ -373,49 +443,108 @@ class BrowserObservation:
             raise ValueError("max_bytes must be an integer from 1024 to 32768")
         if cursor is not None and (type(cursor) is not int or cursor < 0):
             raise ValueError("cursor must be a non-negative integer or None")
-        async with self._buffer.lock:
-            events = list(self._buffer.events)
-            oldest = events[0][0]["cursor"] if events else self._buffer.next_event
-            latest = events[-1][0]["cursor"] if events else self._buffer.next_event - 1
-            start = cursor if cursor is not None else max(0, oldest - 1)
-            dropped = start < oldest - 1
-            result = []
-            result_bytes = 0
-            truncated = False
-            page_events = [event for event, _ in events if event.get("page_id") == self.page_id]
-            payload_limit = max_bytes - 512
-            for event in page_events:
-                if event["cursor"] <= start:
-                    continue
-                if len(result) >= limit:
-                    break
-                candidate = deepcopy(event)
-                size = _encoded_size(candidate)
-                if result_bytes + size > payload_limit:
-                    budget = payload_limit - result_bytes
-                    if budget < 256:
+        if type(wait_ms) is not int or not 0 <= wait_ms <= 30_000:
+            raise ValueError("wait_ms must be an integer from 0 to 30000")
+        event_types = self._values(types, "types")
+        if event_types is not None:
+            unknown = event_types - _EVENT_TYPES
+            if unknown:
+                raise ValueError(f"unknown event types: {sorted(unknown)!r}")
+        if url_contains is not None and (
+            not isinstance(url_contains, str) or len(url_contains) > 1024
+        ):
+            raise ValueError("url_contains must be a string of at most 1024 characters or None")
+        methods_value = self._values(methods, "methods")
+        methods_set = {value.upper() for value in methods_value} if methods_value else None
+        statuses = self._values(status, "status", strings=False)
+        deadline = asyncio.get_running_loop().time() + wait_ms / 1000
+        start = cursor
+        while True:
+            async with self._buffer.lock:
+                events = list(self._buffer.events)
+                oldest = events[0][0]["cursor"] if events else self._buffer.next_event
+                latest = events[-1][0]["cursor"] if events else self._buffer.next_event - 1
+                if start is None:
+                    start = max(0, oldest - 1)
+                dropped = start < oldest - 1
+                page_events = [event for event, _ in events if event.get("page_id") == self.page_id]
+                matching = [
+                    event
+                    for event in page_events
+                    if event["cursor"] > start
+                    and self._matches(event, event_types, url_contains, methods_set, statuses)
+                ]
+                selected: list[dict[str, Any]] = []
+                truncated = False
+                blocked = False
+                for source in matching[:limit]:
+                    candidate = deepcopy(source)
+                    page = self._page(
+                        selected + [candidate],
+                        candidate["cursor"],
+                        True,
+                        dropped,
+                        self._closed,
+                        truncated,
+                    )
+                    if _encoded_size(page) > max_bytes:
+                        base = self._page(
+                            selected,
+                            candidate["cursor"],
+                            True,
+                            dropped,
+                            self._closed,
+                            True,
+                        )
+                        budget = max_bytes - _encoded_size(base) + 2
+                        if budget >= 256:
+                            candidate = _fit_event(candidate, budget)
+                            truncated = True
+                            page = self._page(
+                                selected + [candidate],
+                                candidate["cursor"],
+                                True,
+                                dropped,
+                                self._closed,
+                                truncated,
+                            )
+                    if _encoded_size(page) > max_bytes:
+                        blocked = True
                         break
-                    candidate = _fit_event(candidate, budget)
-                    truncated = True
-                    size = _encoded_size(candidate)
-                if size > payload_limit - result_bytes:
-                    break
-                result.append(candidate)
-                result_bytes += size
-            next_cursor = result[-1]["cursor"] if result else start
-            if len(result) < limit and not any(
-                event["cursor"] > next_cursor for event in page_events
-            ):
-                next_cursor = latest
-            has_more = any(event["cursor"] > next_cursor for event in page_events)
-            return {
-                "events": result,
-                "next_cursor": next_cursor,
-                "has_more": has_more,
-                "dropped": dropped,
-                "closed": self._closed,
-                "truncated": truncated,
-            }
+                    selected.append(candidate)
+
+                next_cursor = selected[-1]["cursor"] if selected else start
+                remaining = [event for event in matching if event["cursor"] > next_cursor]
+                has_more = bool(remaining) or blocked
+                if not has_more and (not selected or len(selected) < limit):
+                    next_cursor = latest
+                result = self._page(
+                    selected,
+                    next_cursor,
+                    has_more,
+                    dropped,
+                    self._closed,
+                    truncated,
+                )
+                if _encoded_size(result) > max_bytes:
+                    raise RuntimeError("browser observation page exceeded its byte limit")
+                should_wait = (
+                    wait_ms
+                    and not result["events"]
+                    and not result["has_more"]
+                    and not self._closed
+                )
+                if should_wait:
+                    self._buffer.changed.clear()
+            if not should_wait:
+                return result
+            remaining_time = deadline - asyncio.get_running_loop().time()
+            if remaining_time <= 0:
+                return result
+            try:
+                await asyncio.wait_for(self._buffer.changed.wait(), remaining_time)
+            except TimeoutError:
+                return result
 
     async def request(
         self,
@@ -423,10 +552,17 @@ class BrowserObservation:
         *,
         body: bool = False,
         include_sensitive_headers: bool = False,
+        body_timeout: float = _DEFAULT_BODY_TIMEOUT,
     ) -> dict[str, Any]:
         self._check_owner()
         if type(body) is not bool or type(include_sensitive_headers) is not bool:
             raise TypeError("body and include_sensitive_headers must be booleans")
+        if (
+            isinstance(body_timeout, bool)
+            or not isinstance(body_timeout, (int, float))
+            or not 0 < float(body_timeout) <= 60
+        ):
+            raise ValueError("body_timeout must be a finite number from 0 to 60 seconds")
         if not isinstance(request_id, str):
             raise TypeError("request_id must be a string")
         record = self._buffer.requests.get(request_id)
@@ -493,8 +629,25 @@ class BrowserObservation:
                             f"response body exceeds the {_MAX_BODY_BYTES}-byte limit"
                         )
                     else:
+                        body_task: asyncio.Task[Any] | None = None
                         try:
-                            value = await response.body()
+                            body_task = asyncio.create_task(response.body())
+                            async with asyncio.timeout(float(body_timeout)):
+                                value = await asyncio.shield(body_task)
+                        except TimeoutError:
+                            if body_task is not None and not body_task.done():
+                                body_task.cancel()
+                                with suppress(Exception, asyncio.CancelledError):
+                                    await asyncio.wait_for(asyncio.shield(body_task), 1.0)
+                            result["response"]["body_error"] = (
+                                f"response body timed out after {float(body_timeout):g} seconds"
+                            )
+                        except asyncio.CancelledError:
+                            if body_task is not None and not body_task.done():
+                                body_task.cancel()
+                                with suppress(Exception, asyncio.CancelledError):
+                                    await asyncio.wait_for(asyncio.shield(body_task), 1.0)
+                            raise
                         except Exception as exc:
                             result["response"]["body_error"] = _text(exc, 2048)
                         else:

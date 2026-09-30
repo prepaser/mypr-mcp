@@ -1,6 +1,6 @@
 # AST rewrites
 
-`ws.fs.rewrite_ast()` builds a bounded preview from ast-grep matches. It never changes source files. Apply a preview separately with `ws.fs.apply_rewrite(plan_id)`.
+`ws.fs.rewrite_ast(..., history=True)` builds a bounded preview from ast-grep matches. It never changes source files. Apply a preview separately with `ws.fs.apply_rewrite(plan_id)`. A successful apply records the old and new bytes in filesystem history; set `history=False` only when that recovery entry is not needed.
 
 ```python
 preview = await ws.fs.rewrite_ast(
@@ -24,3 +24,21 @@ Each operation is limited to 100 matching files, 16 MiB total for captured origi
 Plans are stored under `.mypr/rewrites` for one hour, with a limit of 16 plans and 64 MiB total. Creating a plan can evict the oldest plans after the new plan is durably installed. Plans are bound to the canonical workspace path and directory identity, so copying or moving a workspace invalidates them. Applying one checks every original file hash before writing any file, then uses the filesystem's multi-file transaction and rollback path. A changed source rejects the entire apply before writing. A successful apply consumes the plan; an interrupted or stale plan expires automatically.
 
 Install ast-grep in the workstation environment to use this API. No Python package is required.
+
+## Text replacements
+
+`ws.fs.replace(pattern, replacement, paths=None, glob=None, fixed=True, ignore_case=False, hidden=False, no_ignore=False, max_files=100, max_bytes=16777216, timeout=30, history=True)` creates a multi-file preview for ordinary text files. Literal matching is the default; pass `fixed=False` for Python regular-expression matching and `ignore_case=True` when needed. The search must complete before a plan can be applied. `max_files`, `max_bytes`, and `timeout` bound the preview, and `history=True` records the old and new bytes when it is applied.
+
+```python
+preview = await ws.fs.replace(
+    "timeout=10",
+    "timeout=30",
+    paths="src",
+    glob="*.py",
+    fixed=True,
+)
+if preview["applicable"]:
+    result = await ws.fs.apply_replace(preview["plan_id"])
+```
+
+The apply step rechecks every source revision and uses the same transaction and rollback path as other multi-file edits. Stale or expired plans fail without partially applying the remaining files.

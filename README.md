@@ -122,18 +122,21 @@ Three tools are exposed to the agent:
   argument, it creates or resumes that ID. The returned ID is bound to the
   connection, so later calls do not repeat it.
 
-- `execute(code, wait_ms=1000, request_id=None)` submits a Python cell and
+- `execute(code, wait_ms=1000, request_id=None, max_bytes=None)` submits a Python cell and
   returns its execution state and output. The connection must be initialized
   first. `wait_ms` only controls how long the MCP call waits; it does not set a
   Python timeout.
-- `poll(exec_id, cursor=None, wait_ms=1000)` reads a submitted cell's state and
+- `poll(exec_id, cursor=None, wait_ms=1000, max_bytes=None)` reads a submitted cell's state and
   output. Use the returned cursor to read later output. Polling an existing
   execution is allowed before `init`, since the execution ID identifies the
-  target.
+  target. `max_bytes` controls one response page and accepts 1 KiB–1 MiB; when
+  omitted, the workspace's configured response limit is used.
 
 Tool responses provide readable text in `content` and the complete machine-readable payload in `structuredContent`. The text includes the current output page in full, with execution state, cursor, errors, warnings, and inbox previews. Adjacent fragments of the same stream are combined for display; the structured events and their cursors are unchanged. Initialization and runtime changes also include the running manager's API instructions.
 
 Clients must parse `structuredContent` (the Python MCP SDK exposes `result.structured_content`), rather than treating text blocks as JSON. For older servers, a client may fall back to parsing their JSON text when structured content is absent. The new text format intentionally no longer mirrors the complete JSON payload.
+
+When an operation fails, inspect both the bounded `error` string and the optional `error_info` object. `error_info.code` identifies categories such as `conflict`, `dependency_missing`, `timeout`, `invalid_cursor`, `outcome_unknown`, and `python_exception`; `operation` and bounded `details` provide machine-readable context. Branch on the code and inspect the execution or transaction ID before retrying a state-changing operation.
 
 `execute` waits for completion, inbox activity, or its wait deadline so short cells normally need only one call. `poll` returns immediately when the requested output is available or the execution is terminal; otherwise it waits for output, completion, inbox activity, or its wait deadline. `wait_ms` bounds this notification wait, not total request latency or Python execution time. Continue polling running cells, and read remaining pages while `has_more` is true even after execution finishes.
 
@@ -218,6 +221,9 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | `ws.locks` | Coordinate shared work with task-scoped logical locks |
 | `ws.packages` | Install kernel packages |
 | `ws.history` | Query saved execution and task records |
+| `ws.storage` | Inspect retained workspace data and run planned cleanup |
+| `ws.pages` | Iterate bounded cursor-based API results |
+| `await ws.doctor()` | Check runtime, package, tool, and configuration readiness |
 | `await ws.performance()` | Read recent timing summaries |
 | `ws.help()`, `ws.help("topic")` | Read the topic index or API guidance from the running kernel |
 | `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
@@ -226,7 +232,17 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 
 For language-server setup and coordinate semantics, see [code navigation](docs/code.md).
 
-See [media and document extraction](docs/media.md) for images, PDF pages, OCR, Office formats, and optional workspace packages. These operations preserve the source files. Further guides cover [structural rewrites](docs/rewrites.md), [browser observation](docs/browser.md), [HTML extraction](docs/http.md), [Git history](docs/git.md), and [local diagnostics](docs/diagnostics.md). [External tool recipes](docs/tool-recipes.md) show how to use installed benchmarking, tracing, and code-analysis tools through existing shell jobs.
+Most workspace queries return bounded pages. `ws.pages.iter(method, *args, max_pages=100, **kwargs)` is an async iterator for consuming them without resubmitting the query:
+
+```python
+async for page in ws.pages.iter(ws.fs.search, "TODO", paths="src"):
+    for match in page["matches"]:
+        print(match["path"], match["line"])
+```
+
+The iterator forwards each API's `next_cursor` as `cursor`, detects an expired snapshot or a non-advancing cursor, and stops at `max_pages`. It does not silently rerun a query against changed files.
+
+See [media and document extraction](docs/media.md) for images, PDF pages, OCR, Office formats, and optional workspace packages. These operations preserve the source files. Further guides cover [structural rewrites](docs/rewrites.md), [browser observation](docs/browser.md), [HTML extraction](docs/http.md), [Git history](docs/git.md), [local diagnostics](docs/diagnostics.md), and [workspace storage](docs/storage.md). [External tool recipes](docs/tool-recipes.md) show how to use installed benchmarking, tracing, and code-analysis tools through existing shell jobs.
 
 Use the async helpers for everyday file work. `ws.workspace` and `ws.fs` paths
 stay anchored to the workspace even if code changes the kernel's current directory:
@@ -335,9 +351,10 @@ follow_symlinks=False)` returns file metadata, including kind, size, modificatio
 time, mode, and symlink target; it does not hash file contents.
 
 `write(path, text, *, expected_hash=None, overwrite=False, encoding="utf-8",
-create_parents=False)` creates a file. Replacing an existing file requires its
+create_parents=False, history=True)` creates a file. Replacing an existing file requires its
 current revision or explicit `overwrite=True`. `patch(path, edits, *,
-expected_hash=None, dry_run=False, encoding="utf-8", max_diff_bytes=32768)` applies
+expected_hash=None, dry_run=False, encoding="utf-8", max_diff_bytes=32768,
+history=True)` applies
 an ordered list of exact `{"old": ..., "new": ...}` replacements. Each target
 must occur once by default; use `count=N` for the first N matches or
 `count="all"` for all matches. A missing or ambiguous target fails before writing.
@@ -345,7 +362,7 @@ Results include old/new revisions and a bounded unified diff; `dry_run=True`
 leaves the file unchanged.
 
 Use `apply_patch(patch, *, expected_hashes=None, dry_run=False,
-max_diff_bytes=32768)` for a patch spanning multiple files:
+max_diff_bytes=32768, history=True)` for a patch spanning multiple files:
 
 ```python
 await ws.fs.apply_patch("""*** Begin Patch
@@ -385,6 +402,12 @@ they do not lock out edits by external programs. Absolute paths are accepted und
 the current user's permissions. Ordinary Python remains available for other file
 and data operations.
 
+For non-text files, use `read_bytes(path, start_byte=0, max_bytes=32768)` and `write_bytes(path, data, *, expected_hash=None, overwrite=False, create_parents=False)`. Binary reads return a Base64 payload in `data_base64`, size, revision, and a byte cursor; they never decode or rewrite the payload. `delete(path, *, expected_hash)`, `move(source, destination, *, expected_hash, overwrite=False)`, and `copy(source, destination, *, expected_hash=None, overwrite=False)` operate on regular files and use the same workspace locks. Delete and move require the source revision; copy accepts an optional source revision. Destination overwrite is rejected, so the destination must be absent.
+
+`history(path, cursor=None, limit=20)` lists successful changes made through `ws.fs`, including creates, deletes, moves, and binary writes. `read_revision(path, revision, start_byte=0, max_bytes=32768)` reads a stored text or binary revision; a deleted file is represented by the revision `"absent"` and an empty absent result. `restore(path, revision, *, expected_hash=None)` restores one entry only when the current file still matches the precondition. The latest `revision_keep` revisions (50 by default) and the current content are protected by automatic retention; history is local to the workspace and does not watch edits made by external programs.
+
+For a repeated text change, use `replace(pattern, replacement, *, paths=None, glob=None, fixed=True, ignore_case=False, hidden=False, no_ignore=False, max_files=100, max_bytes=16777216, timeout=30, history=True)` to create a bounded plan. Review its files, revisions, and diff, then call `apply_replace(plan_id)` to recheck every source revision and apply the plan. Plans are immutable, expire, and cannot be applied when the search was incomplete. Literal matching is the default; set `fixed=False` for Python regular-expression matching and `ignore_case=True` for case-insensitive matching.
+
 ### Git
 
 ```python
@@ -408,6 +431,8 @@ These are read-only commands with paging, color, external diff programs, and
 textconv disabled. Follow `next_cursor` with the same method while `has_more`
 is true. Pages come from a saved snapshot, so later changes to the worktree do
 not alter an existing query. Snapshots survive kernel reset and manager restart.
+
+`log(..., follow=True)` follows a file across renames when Git can identify its previous path. `commit_info(ref, *, include_files=True, include_patch=False, cursor=None, max_bytes=32768)` returns one commit's parents, author and committer, subject and body, changed-file metadata, and insert/delete totals. Patch text is opt-in and remains bounded. Merge statistics use the first parent as the comparison base and are marked in the result. These helpers remain read-only.
 
 ### HTTP
 
@@ -437,6 +462,8 @@ pass `overwrite=True` or another `max_bytes` when appropriate. Cancellation
 removes incomplete downloads. The raw client returned by `client()` is an
 escape hatch for full HTTPX2 behavior and does not apply the convenience
 request limit.
+
+`extract_html()` and `read_html()` accept `include_structure=True` to include heading hierarchy and bounded document metadata such as canonical URL, description, and language. The structure is optional and has its own `structure_truncated` flag. Headings use the selected content region while document metadata uses the full document.
 
 ### Browser automation
 
@@ -480,6 +507,8 @@ inline image content, subject to the normal 2 MiB image limit. HAR and video
 paths supplied through Playwright context options are resolved below the
 workspace.
 
+`observation = await ws.browser.observe(page)` records bounded request, response, console, page-error, and navigation events for that logical client. `await observation.read(cursor=None, types=None, url_contains=None, methods=None, status=None, wait_ms=0)` filters with AND semantics and can wait up to 30 seconds for a matching event. Cursors advance over inspected events, including events excluded by a filter; a returned `has_more` means more matching events remain. Response bodies are opt-in and capped independently. `await observation.request(request_id, body=True, body_timeout=5)` bounds a response-body read; timeout or an unknown/oversized body is returned as a `body_error`. Sensitive URL credentials and tokens are masked in structured URL fields.
+
 ### Network diagnostics and scans
 
 `ws.net.resolve(host, port=None)` returns deduplicated IPv4/IPv6 addresses.
@@ -492,6 +521,8 @@ peer certificate.
 
 TCP scans default to ports 1–1024, 64 concurrent connections, 200 probes per second,
 and a one-second connection timeout. TCP scans and Nmap runs are managed background jobs:
+
+`resolve(timeout=5)` bounds DNS worker execution and cleanup. `scan()` accepts `max_probes` and `max_duration`; the terminal summary reports attempted probes, the elapsed duration, and a stop reason. Nmap accepts the same overall duration bound and preserves completed host results when the deadline ends. The output limit remains independent: by default collection stops when the result store is full; pass `continue_after_output_limit=True` only when partial result loss is acceptable.
 
 ```python
 scan = await ws.net.scan(
@@ -567,7 +598,7 @@ ws.local["job"] = await ws.shell.start(
 )
 ```
 
-`ws.tasks.start(awaitable, *, task_id=None, visible=True)` schedules a detached
+`ws.tasks.start(awaitable, *, task_id=None, visible=True, persist_result=False)` schedules a detached
 awaitable in the kernel's event loop and returns a handle without `await`:
 
 ```python
@@ -575,6 +606,8 @@ import asyncio
 
 ws.local["job"] = ws.tasks.start(asyncio.sleep(2, result="done"))
 ```
+
+Set `persist_result=True` when a detached task's JSON result must remain available after the handle is evicted or the client reconnects. Only strict JSON values up to 256 KiB are stored; the task itself still succeeds when its result is not serializable, too large, or cannot be persisted. Historical `result()` then raises `ResultUnavailable` when no saved value exists.
 
 Cell, remote-job, and Python-task handles share one ID namespace. Custom task
 IDs cannot replace existing handles or use generated ID forms: 32 lowercase
@@ -898,6 +931,8 @@ They do not acknowledge the previews automatically. An agent that is not
 calling an MCP tool is not woken when a message arrives; use `read(wait_ms=...)`
 from a running Python task when a bounded wait is useful.
 
+`await ws.messages.clients(prefix=None, connected=None, limit=50, cursor=None)` lists registered logical clients with their current connection state, last activity, registration time, and unacknowledged message count. Use it before addressing a peer whose ID is not already known. The list is paged with `next_cursor`; offline clients remain addressable for persistent delivery.
+
 ### Skills and reusable Python
 
 Workspace skills live at `.mypr/skills/<name>/SKILL.md`. Discover and read
@@ -946,12 +981,7 @@ helpers = ws.modules.reload("helpers")
 `modules.list()` is synchronous; `read()`, `check()`, and `write()` are async.
 Module names are public dotted Python names and cannot escape `ws_lib`. `check()`
 compiles the candidate and runs optional test code in the workspace Python
-environment with its own timeout. `write()` validates syntax, uses an atomic
-CAS write, and never activates the module. `load()` and `reload()` execute a
-fresh module and bind it only after successful execution; failed reloads leave
-the old module binding intact. References already held elsewhere keep pointing
-to the previous module after a successful reload. Imports can have external side
-effects; a failed reload does not undo those side effects.
+environment with its own timeout. It returns the SHA-256 of the checked source. `write()` validates syntax, uses an atomic CAS write, and never activates the module. `load()` and `reload()` accept `expected_hash`; when supplied, they execute only the exact bytes returned by `check()`, so a source edit between verification and activation is rejected. They bind a fresh module only after successful execution; failed reloads leave the old module binding intact. References already held elsewhere keep pointing to the previous module after a successful reload. Imports can have external side effects; a failed reload does not undo those side effects.
 
 Module and skill writes retain content revisions. Use `await ws.modules.history(name)` or `await ws.skills.history(name)` to list revisions, `read_revision(name, revision)` to read one, and `restore(name, revision, expected_hash=current_revision)` to restore a file. Restoring a module does not reload it; existing Python references continue to point to the loaded code. See [revision history](docs/revisions.md) for paging, consistency, and recovery behavior.
 
@@ -970,10 +1000,24 @@ importing the new packages. Installation changes the kernel environment, not
 the environments of separately launched MCP servers.
 
 The installation uses `uv pip` and writes the resulting freeze to
-`.mypr/requirements.txt`. Packages already imported by the current kernel may
-need a kernel reset before an upgrade is visible.
+`.mypr/requirements.txt`. Installation, freeze, and manifest replacement are serialized per workspace. The requirements file and manifest are written through temporary files and atomically replaced only after the operation succeeds; a failed or cancelled install leaves the previous manifest intact. Packages already imported by the current kernel may need a kernel reset before an upgrade is visible.
 
 `ws.inspect()` returns the workspace path, kernel generation, visible variable names and types, task summaries, and discovered skills. `await ws.status()` returns compact manager health and counts; pass `detail=True` for connection records, active and queued execution IDs, and manager instructions.
+
+`await ws.doctor()` checks whether the workspace is ready for the requested workflow: Python packages, search backends, configured LSP servers, browser engine, OCR language data, MCP configuration, runtime workers, and storage. Checks are reported as ready, missing, invalid, or unknown with a bounded reason. Doctor does not install packages or modify configuration. The same check is available before a manager starts with `uvx mypr-mcp doctor`.
+
+`await ws.storage.usage()` reports managed disk use by category. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Configure the policy in `.mypr/config.toml`:
+
+```toml
+[storage]
+enabled = true
+retention_days = 30
+max_bytes = 1073741824
+revision_keep = 50
+gc_interval_seconds = 300
+```
+
+`await ws.status()` includes `storage_maintenance` with `running`, `last_run`, `last_deleted_bytes`, and `last_error` for the automatic pass.
 
 ### Workstation resources
 
@@ -1083,6 +1127,7 @@ The CLI also provides operational controls. Run them from the workspace:
 ```sh
 cd /absolute/path/to/workspace
 uvx mypr-mcp status
+uvx mypr-mcp doctor
 uvx mypr-mcp logs
 uvx mypr-mcp logs --limit 50 --follow
 uvx mypr-mcp reset
@@ -1165,7 +1210,10 @@ Configure retention in `.mypr/config.toml`; changes apply on manager restart:
 completed_tasks = 128
 completed_records = 128
 cache_bytes = 33554432
+response_bytes = 32768
 ```
+
+`response_bytes` controls the default `execute`/`poll` response page and must be between 1 KiB and 1 MiB. A per-call `max_bytes` can lower or raise the page budget within that same range.
 
 The kernel retains the most recently completed `completed_tasks` handles, in
 addition to all active handles. Older handles disappear from `ws.tasks.list()`
@@ -1184,8 +1232,9 @@ Execution output, Python-task journals, and shell/package journals remain on dis
 and `.mypr/jobs/`, so historical polling and delayed job monitors survive cache
 eviction. Request deduplication uses SQLite and survives eviction and restart,
 including empty request IDs. Query snapshots remain under `.mypr/searches/` and
-`.mypr/git/`. Cache retention does not delete these snapshots, journals, saved
-files, or messages.
+`.mypr/git/` until the storage retention policy removes expired, unreferenced
+data. Cache eviction alone does not delete snapshots, journals, saved files, or
+messages.
 
 Execution admission, output publication, and terminal responses wait for their required records to be stored. Manager history and message I/O runs off the event loop in order; reset, restart, and shutdown settle pending records before closing storage. A storage failure is reported rather than returning an unrecorded execution success.
 

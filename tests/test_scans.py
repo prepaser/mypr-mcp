@@ -51,6 +51,68 @@ async def test_tcp_scan_persists_rows_and_pages(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_tcp_scan_stops_at_probe_limit(tmp_path: Path):
+    async def handler(reader, writer):
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    shells = Shells(tmp_path)
+    try:
+        service = ScanService(tmp_path, shells)
+        launched = await service.start(
+            "tcp",
+            targets="127.0.0.1",
+            ports=[port, port + 1],
+            concurrency=2,
+            rate=10000,
+            max_probes=1,
+        )
+        summary = await service.wait(launched["id"])
+        assert summary["state"] == "succeeded"
+        assert summary["attempts"] == 1
+        assert summary["stop_reason"] == "probe_limit"
+        assert summary["estimate"] == 2
+    finally:
+        await shells.close()
+        server.close()
+        await server.wait_closed()
+
+
+def test_estimate_probes_matches_ipaddress_hosts_for_ipv6():
+    assert scan_worker.estimate_probes(["2001:db8::/126"], [443]) == 3
+    assert scan_worker.estimate_probes(["2001:db8::/127"], [443]) == 2
+    assert scan_worker.estimate_probes(["2001:db8::/128"], [443]) == 1
+
+
+@pytest.mark.asyncio
+async def test_nmap_result_limit_keeps_partial_hosts_successful(tmp_path: Path, monkeypatch):
+    fake = tmp_path / "nmap"
+    script = """#!/usr/bin/env python3
+print('<nmaprun><host><status state="up"/><address addr="127.0.0.1"/></host></nmaprun>')
+"""
+    await asyncio.to_thread(fake.write_text, script, encoding="utf-8")
+    await asyncio.to_thread(fake.chmod, 0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setattr(scan_worker, "_RESULT_LIMIT", 1)
+    config = {
+        "mode": "nmap",
+        "targets": ["127.0.0.1"],
+        "args": [],
+        "result_path": str(tmp_path / "results.jsonl"),
+        "artifact_path": str(tmp_path / "artifact.xml"),
+        "summary_path": str(tmp_path / "summary.json"),
+        "max_duration": 30,
+    }
+    assert await scan_worker.run(config) == 0
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["stop_reason"] == "result_size_limit"
+    assert summary["error"] is None
+    assert summary["artifact_truncated"]
+
+
+@pytest.mark.asyncio
 async def test_scan_attach_after_service_restart(tmp_path: Path):
     shells = Shells(tmp_path)
     try:

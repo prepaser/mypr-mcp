@@ -8,6 +8,7 @@ import difflib
 import hashlib
 import importlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -74,6 +75,7 @@ class ModuleManager:
         source: str | None = None,
         *,
         test_code: str | None = None,
+        expected_hash: str | None = None,
         timeout: float | None = 30,  # noqa: ASYNC109
         max_bytes: int = 32 * 1024,
     ) -> dict[str, Any]:
@@ -85,6 +87,17 @@ class ModuleManager:
             if page.get("truncated"):
                 raise ValueError("module source exceeds max_bytes; pass the full source explicitly")
             source = page["text"]
+            source_revision = page["revision"]
+        else:
+            source_revision = _sha256(source.encode("utf-8"))
+        if expected_hash is not None:
+            current = await self.read(name, max_bytes=4 * 1024 * 1024)
+            if current.get("truncated"):
+                raise ValueError("module source exceeds max_bytes")
+            if current["revision"] != expected_hash:
+                raise ValueError(
+                    f"Revision mismatch: expected {expected_hash}, got {current['revision']}"
+                )
         _compile(source, self._module_path(name))
         if test_code is not None and not isinstance(test_code, str):
             raise TypeError("test_code must be a string or None")
@@ -116,6 +129,7 @@ class ModuleManager:
             "stderr": result.get("stderr", ""),
             "truncated": bool(result.get("truncated")),
             "error": result.get("error"),
+            "revision": source_revision,
         }
 
     async def write(
@@ -273,15 +287,19 @@ class ModuleManager:
                 **result,
             }
 
-    def load(self, name: str) -> ModuleType:
-        return self._activate(name)
+    def load(self, name: str, *, expected_hash: str | None = None) -> ModuleType:
+        return self._activate(name, expected_hash=expected_hash)
 
-    def reload(self, name: str) -> ModuleType:
-        return self._activate(name)
+    def reload(self, name: str, *, expected_hash: str | None = None) -> ModuleType:
+        return self._activate(name, expected_hash=expected_hash)
 
-    def _activate(self, name: str) -> ModuleType:
+    def _activate(self, name: str, *, expected_hash: str | None = None) -> ModuleType:
         path = self._module_path(name)
         qualified = self._qualified(name)
+        data = path.read_bytes()
+        revision = _sha256(data)
+        if expected_hash is not None and revision != expected_hash:
+            raise ValueError(f"Revision mismatch: expected {expected_hash}, got {revision}")
         self._ensure_import_path()
         parent_name, _, child_name = qualified.rpartition(".")
         parent = importlib.import_module(parent_name)
@@ -293,8 +311,9 @@ class ModuleManager:
         old_attribute = getattr(parent, child_name, _MISSING)
         sys.modules[qualified] = candidate
         try:
-            with tokenize.open(path) as source_file:
-                exec(compile(source_file.read(), str(path), "exec"), candidate.__dict__)
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+            source = data.decode(encoding)
+            exec(compile(source, str(path), "exec"), candidate.__dict__)
         except BaseException:
             if old_module is None:
                 sys.modules.pop(qualified, None)

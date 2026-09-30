@@ -14,7 +14,7 @@ from typing import Any
 
 from IPython.core.interactiveshell import ExecutionInfo, ExecutionResult, InteractiveShell
 
-from .diagnostics import safe_error, safe_error_details
+from .diagnostics import error_info, safe_error, safe_error_details
 from .kernel_api import (
     NotReady,
     OutputBuffer,
@@ -144,6 +144,7 @@ class CellHandle(TaskHandle):
             error, error_truncated = safe_error_details(self._cell_error)
             result["error"] = error
             result["error_truncated"] = error_truncated
+            result["error_info"] = error_info(self._cell_error, operation="cell.execute")
         return result
 
     def result(self) -> Any:
@@ -465,6 +466,7 @@ class CellExecutor:
             text, truncated = safe_error_details(error)
             content["error"] = text
             content["error_truncated"] = truncated
+            content["error_info"] = error_info(error, operation="cell.execute")
         self.kernel.session.send(self.kernel.iopub_socket, "mypr_cell", content, parent=parent)
 
     def _send_terminal(
@@ -500,6 +502,7 @@ class CellExecutor:
             text, truncated = safe_error_details(error)
             fields["error"] = text
             fields["error_truncated"] = truncated
+            fields["error_info"] = error_info(error, operation="cell.execute")
         try:
             await _rpc("cell_terminal", **fields)
         except Exception:

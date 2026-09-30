@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextvars
 import hashlib
 import json
 import os
@@ -17,44 +19,96 @@ from threading import Lock
 from typing import Any
 from weakref import WeakValueDictionary
 
+from .storage_lock import StorageLock
+
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _TRANSACTION_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
 _TRANSACTION_LOCKS_GUARD = Lock()
 _MAX_INDEX_BYTES = 16 * 1024 * 1024
 _MAX_BLOB_BYTES = 64 * 1024 * 1024
+_MAX_HISTORY_RECORDS = 10_000
+_V2_KINDS = {"modules", "skills", "files"}
+_ABSENT_REVISION = "absent"
+_ACTIVE_STORAGE_LOCKS: contextvars.ContextVar[frozenset[tuple[str, int]]] = contextvars.ContextVar(
+    "mypr_revision_storage_locks", default=frozenset()
+)
 
 
 class RevisionIndexOutcomeUnknown(RuntimeError):
     """Raised when an index write cannot be distinguished from an external update."""
 
 
+async def _uncancelled(function, *args):
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+        break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+@asynccontextmanager
+async def _storage_transaction(workspace: Path):
+    key = str(workspace)
+    active = _ACTIVE_STORAGE_LOCKS.get()
+    owner = id(asyncio.current_task())
+    marker = (key, owner)
+    if marker in active:
+        yield
+        return
+    lock = StorageLock(workspace / ".mypr" / "storage.lock")
+    try:
+        await _uncancelled(lock.__enter__)
+    except asyncio.CancelledError:
+        await _uncancelled(lock.__exit__, None, None, None)
+        raise
+    token = _ACTIVE_STORAGE_LOCKS.set(active | {marker})
+    try:
+        yield
+    finally:
+        _ACTIVE_STORAGE_LOCKS.reset(token)
+        await _uncancelled(lock.__exit__, None, None, None)
+
+
 class RevisionStore:
     def __init__(self, workspace: str | os.PathLike[str], fs: Any, kind: str) -> None:
-        if kind not in {"modules", "skills"}:
-            raise ValueError("revision kind must be modules or skills")
+        if kind not in {"modules", "skills", "files"}:
+            raise ValueError("revision kind must be modules, skills, or files")
         self.workspace = Path(workspace).expanduser().resolve()
         self.fs = fs
         self.kind = kind
+        self._version = 2 if kind in _V2_KINDS else 1
+        self._prepared_index_snapshot: dict[str, bytes | None] | None = None
 
     @asynccontextmanager
     async def transaction(self, resource_path: str):
         target = self._safe_path(resource_path)
         with _TRANSACTION_LOCKS_GUARD:
             lock = _TRANSACTION_LOCKS.setdefault(target, asyncio.Lock())
-        async with lock:
-            yield
+        async with _storage_transaction(self.workspace):
+            async with lock:
+                yield
 
-    async def record(self, resource_path: str, contents: Iterable[str | None]) -> None:
+    async def record(self, resource_path: str, contents: Iterable[str | bytes | None]) -> None:
         resource = _validate_resource(resource_path)
-        unique = _content_map(contents)
+        unique = _content_map(contents, include_absent=self.kind == "files")
         if not unique:
             return
-        await self.prepare(resource, (data.decode("utf-8") for data in unique.values()))
+        await self.prepare_bytes(resource, unique.values())
         index_path = self._index_path(resource)
         index, index_hash = await self._load_index(resource, index_path)
+        _upgrade_index(index)
         previous_count = index["count"]
-        _append_records(index, unique)
-        if index["count"] == previous_count:
+        previous_next = index.get("next_sequence")
+        _append_records(index, unique, version=self._version)
+        _prune_index(index)
+        if index["count"] == previous_count and index.get("next_sequence") == previous_next:
             return
         _check_index_size(index)
         encoded = json.dumps(index, ensure_ascii=False, separators=(",", ":"))
@@ -65,6 +119,7 @@ class RevisionStore:
                 encoded,
                 expected_hash=index_hash,
                 create_parents=True,
+                history=False,
             )
         except BaseException as write_error:
             try:
@@ -92,6 +147,12 @@ class RevisionStore:
                 ) from write_error
             raise
 
+    async def record_bytes(
+        self, resource_path: str, contents: Iterable[str | bytes | None]
+    ) -> None:
+        """Record UTF-8 or binary content revisions for a resource."""
+        await self.record(resource_path, contents)
+
     async def commit(
         self,
         resource_path: str,
@@ -112,6 +173,7 @@ class RevisionStore:
                 new,
                 expected_hash=expected_hash,
                 create_parents=True,
+                history=False,
             )
         except BaseException as exc:
             try:
@@ -158,23 +220,208 @@ class RevisionStore:
             ) from exc
         return result
 
-    async def ensure_capacity(self, resource_path: str, contents: Iterable[str | None]) -> None:
+    async def ensure_capacity(
+        self, resource_path: str, contents: Iterable[str | bytes | None]
+    ) -> None:
         resource = _validate_resource(resource_path)
         index, _ = await self._load_index(resource, self._index_path(resource))
-        unique = _content_map(contents)
-        _append_records(index, unique)
+        _upgrade_index(index)
+        unique = _content_map(contents, include_absent=self.kind == "files")
+        _append_records(index, unique, version=self._version)
+        _prune_index(index)
         _check_index_size(index)
 
-    async def prepare(self, resource_path: str, contents: Iterable[str | None]) -> None:
+    async def prepare(self, resource_path: str, contents: Iterable[str | bytes | None]) -> None:
+        await self.prepare_bytes(resource_path, contents)
+
+    async def prepare_bytes(
+        self, resource_path: str, contents: Iterable[str | bytes | None]
+    ) -> None:
         _validate_resource(resource_path)
-        unique: dict[str, bytes] = {}
-        for content in contents:
-            if content is None:
-                continue
-            data = content.encode("utf-8")
-            unique.setdefault(hashlib.sha256(data).hexdigest(), data)
+        unique = _content_map(contents)
         for revision, data in unique.items():
-            await self._store_blob(revision, data)
+            if data is not None:
+                await self._store_blob(revision, data)
+
+    def prepare_changes_sync(
+        self, plans: Iterable[dict[str, Any]]
+    ) -> dict[str, bytes | None]:
+        """Preflight and store blobs for a multi-file filesystem transaction."""
+        changes = list(self._plan_changes(plans))
+        resources = {resource for resource, _, _ in changes}
+        snapshots = {resource: self._read_index_bytes_sync(resource) for resource in resources}
+        for resource, old, new in changes:
+            for data in (old, new):
+                if data is not None and len(data) > _MAX_BLOB_BYTES:
+                    raise ValueError(
+                        f"history for {resource} exceeds {_MAX_BLOB_BYTES} bytes; "
+                        "retry with history=False"
+                    )
+                self._store_blob_sync(data)
+            index = self._load_index_sync(resource)
+            _upgrade_index(index)
+            _append_records(
+                index,
+                _content_map((old, new), include_absent=self.kind == "files"),
+                version=self._version,
+            )
+            _prune_index(index)
+            _check_index_size(index)
+        self._prepared_index_snapshot = snapshots
+        return snapshots
+
+    def record_changes_sync(self, plans: Iterable[dict[str, Any]]) -> None:
+        changes = list(self._plan_changes(plans))
+        snapshots = self._prepared_index_snapshot
+        if snapshots is None:
+            resources = {resource for resource, _, _ in changes}
+            snapshots = {
+                resource: self._read_index_bytes_sync(resource) for resource in resources
+            }
+        expected: dict[str, bytes] = {}
+        try:
+            for resource, old, new in changes:
+                current = self._read_index_bytes_sync(resource)
+                if current != snapshots.get(resource):
+                    raise RevisionIndexOutcomeUnknown(
+                        f"revision index changed before recording {resource}"
+                    )
+                self._record_one_sync(resource, old, new, expected=expected)
+        except BaseException:
+            if expected:
+                try:
+                    self._restore_index_changes_sync(snapshots, expected)
+                except BaseException as rollback_error:
+                    raise RevisionIndexOutcomeUnknown(
+                        "revision index rollback is uncertain; inspect history before retrying"
+                    ) from rollback_error
+            raise
+        finally:
+            self._prepared_index_snapshot = None
+
+    def _plan_changes(self, plans: Iterable[dict[str, Any]]):
+        for plan in plans:
+            operation = plan.get("operation")
+            if operation == "move":
+                source = plan.get("source")
+                source_old = plan.get("source_old")
+                if source is not None and source_old is not None:
+                    resource = self._resource_for_path(source)
+                    if resource is not None:
+                        yield resource, source_old, None
+                target = self._resource_for_path(plan["path"])
+                if target is not None:
+                    yield target, None, plan.get("new")
+                continue
+            resource = self._resource_for_path(plan["path"])
+            if resource is not None:
+                yield resource, plan.get("old"), plan.get("new")
+
+    def _resource_for_path(self, path: Path) -> str | None:
+        try:
+            relative = path.resolve(strict=False).relative_to(self.workspace)
+        except ValueError:
+            return None
+        if not relative.parts:
+            return None
+        if relative.parts[0] == ".mypr":
+            editable = relative.parts[1:2] == ("skills",) or relative.parts[:3] == (
+                ".mypr",
+                "lib",
+                "ws_lib",
+            )
+            if self.kind != "files" or not editable:
+                return None
+        return relative.as_posix()
+
+    def _record_one_sync(
+        self,
+        resource: str,
+        old: bytes | None,
+        new: bytes | None,
+        *,
+        expected: dict[str, bytes] | None = None,
+    ) -> None:
+        self._store_blob_sync(old)
+        self._store_blob_sync(new)
+        index = self._load_index_sync(resource)
+        _upgrade_index(index)
+        _append_records(
+            index,
+            _content_map((old, new), include_absent=self.kind == "files"),
+            version=self._version,
+        )
+        _prune_index(index)
+        _check_index_size(index)
+        encoded = _encode_index(index)
+        if expected is not None:
+            expected[resource] = encoded
+        self._write_index_sync(resource, index)
+
+    def _read_index_bytes_sync(self, resource: str) -> bytes | None:
+        path = self.workspace / self._index_path(resource)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def _restore_index_changes_sync(
+        self, snapshots: dict[str, bytes | None], expected: dict[str, bytes]
+    ) -> None:
+        for resource in reversed(tuple(expected)):
+            path = self.workspace / self._index_path(resource)
+            current = self._read_index_bytes_sync(resource)
+            original = snapshots.get(resource)
+            if current == original:
+                continue
+            if current != expected[resource]:
+                raise RevisionIndexOutcomeUnknown(
+                    f"revision index changed during rollback for {resource}"
+                )
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                _write_index_bytes_sync(path, original)
+
+    def _load_index_sync(self, resource: str) -> dict[str, Any]:
+        path = self._index_path(resource)
+        try:
+            raw = Path(self.workspace / path).read_bytes()
+        except FileNotFoundError:
+            index = {
+                "version": self._version,
+                "kind": self.kind,
+                "resource": resource,
+                "count": 0,
+                "revisions": [],
+            }
+            if self._version == 2:
+                index["next_sequence"] = 1
+            return index
+        try:
+            index = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("revision index is invalid JSON") from exc
+        if not isinstance(index, dict):
+            raise ValueError("revision index metadata is invalid")
+        version = index.get("version")
+        if version not in {1, 2} or index.get("kind") != self.kind:
+            raise ValueError("revision index metadata is invalid")
+        return index
+
+    def _write_index_sync(self, resource: str, index: dict[str, Any]) -> None:
+        path = self.workspace / self._index_path(resource)
+        _write_index_bytes_sync(path, _encode_index(index))
+
+    def _store_blob_sync(self, data: bytes | None) -> None:
+        if data is None:
+            return
+        revision = hashlib.sha256(data).hexdigest()
+        if len(data) > _MAX_BLOB_BYTES:
+            raise ValueError(
+                f"history revision exceeds {_MAX_BLOB_BYTES} bytes; retry with history=False"
+            )
+        _write_blob(self._blob_path(revision), data)
 
     async def history(
         self, resource_path: str, *, limit: int = 20, cursor: int | None = None
@@ -187,12 +434,15 @@ class RevisionStore:
             eligible = [item for item in eligible if item["sequence"] < cursor]
         page = list(reversed(eligible[-limit:]))
         has_more = len(eligible) > len(page)
-        return {
+        result = {
             "resource": resource,
             "items": page,
             "next_cursor": page[-1]["sequence"] if page and has_more else None,
             "has_more": has_more,
         }
+        if index.get("version") == 2:
+            result["pruned_before"] = index.get("pruned_before", 0)
+        return result
 
     async def read_revision(
         self,
@@ -202,7 +452,7 @@ class RevisionStore:
         start_byte: int = 0,
         max_bytes: int = 32_768,
     ) -> dict[str, Any]:
-        _validate_hash(revision)
+        _validate_revision(self.kind, revision)
         _validate_page_size(start_byte, max_bytes)
         resource = _validate_resource(resource_path)
         index_error = None
@@ -214,6 +464,23 @@ class RevisionStore:
         except Exception as exc:
             record = None
             index_error = str(exc)
+        if revision == _ABSENT_REVISION:
+            if record is None:
+                raise FileNotFoundError(f"Revision {revision} is not recorded for {resource}")
+            if start_byte:
+                raise ValueError("start_byte is past the end of the absent revision")
+            return {
+                "resource": resource,
+                "revision": revision,
+                "recorded": True,
+                "absent": True,
+                "text": "",
+                "binary": False,
+                "start_byte": 0,
+                "size": 0,
+                "next_cursor": None,
+                "truncated": False,
+            }
         data = await asyncio.to_thread(self._read_blob, revision)
         if record is not None and len(data) != record["size"]:
             raise RuntimeError(f"Revision {revision} has an inconsistent recorded size")
@@ -223,16 +490,23 @@ class RevisionStore:
         try:
             text = chunk.decode("utf-8")
             consumed = len(chunk)
+            binary = False
         except UnicodeDecodeError as exc:
-            if exc.reason != "unexpected end of data" or exc.end != len(chunk):
-                raise ValueError("start_byte must point to a UTF-8 boundary") from exc
-            chunk = chunk[: exc.start]
-            if not chunk and start_byte < len(data):
-                lead = data[start_byte]
-                width = 2 if lead & 0xE0 == 0xC0 else 3 if lead & 0xF0 == 0xE0 else 4
-                chunk = data[start_byte : start_byte + width]
-            text = chunk.decode("utf-8")
-            consumed = len(chunk)
+            if exc.reason == "unexpected end of data" and exc.end == len(chunk):
+                chunk = chunk[: exc.start]
+                if not chunk and start_byte < len(data):
+                    lead = data[start_byte]
+                    width = 2 if lead & 0xE0 == 0xC0 else 3 if lead & 0xF0 == 0xE0 else 4
+                    chunk = data[start_byte : start_byte + width]
+                text = chunk.decode("utf-8")
+                consumed = len(chunk)
+                binary = False
+            else:
+                if self.kind != "files":
+                    raise ValueError("start_byte must point to a UTF-8 boundary") from exc
+                text = None
+                consumed = len(chunk)
+                binary = True
         next_byte = start_byte + consumed
         result = {
             "resource": resource,
@@ -244,6 +518,11 @@ class RevisionStore:
             "next_cursor": next_byte if next_byte < len(data) else None,
             "truncated": next_byte < len(data),
         }
+        if self.kind == "files":
+            result["binary"] = binary
+        if binary:
+            result["data_base64"] = base64.b64encode(chunk).decode("ascii")
+            result.pop("text", None)
         if index_error is not None:
             result["index_error"] = index_error
         return result
@@ -265,6 +544,7 @@ class RevisionStore:
                     old,
                     expected_hash=new_revision,
                     create_parents=True,
+                    history=False,
                 )
             except BaseException:
                 if await self._target_revision(resource) == _hash_text(old):
@@ -301,21 +581,31 @@ class RevisionStore:
         )
 
     async def restore_content(self, resource_path: str, revision: str) -> str:
-        _validate_hash(revision)
+        data = await self.restore_bytes(resource_path, revision)
+        if data is None:
+            raise ValueError(f"Revision {revision} represents an absent file")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Revision {revision} is binary") from exc
+
+    async def restore_bytes(self, resource_path: str, revision: str) -> bytes | None:
+        _validate_revision(self.kind, revision)
         resource = _validate_resource(resource_path)
         index, _ = await self._load_index(resource, self._index_path(resource))
-        if not any(item["revision"] == revision for item in index["revisions"]):
+        record = next((item for item in index["revisions"] if item["revision"] == revision), None)
+        if record is None:
             raise FileNotFoundError(f"Revision {revision} is not recorded for {resource}")
-        data = await asyncio.to_thread(self._read_blob, revision)
-        return data.decode("utf-8")
+        if revision == _ABSENT_REVISION:
+            return None
+        return await asyncio.to_thread(self._read_blob, revision)
 
     async def _store_blob(self, revision: str, data: bytes) -> None:
         if len(data) > _MAX_BLOB_BYTES:
             raise ValueError(f"revision exceeds {_MAX_BLOB_BYTES} byte storage limit")
         path = self._blob_path(revision)
-        relative = str(path.relative_to(self.workspace))
         try:
-            await self.fs.write(relative, data.decode("utf-8"), create_parents=True)
+            await asyncio.to_thread(_write_blob, path, data)
         except FileExistsError as exc:
             existing = await asyncio.to_thread(self._read_blob, revision)
             if existing != data:
@@ -344,13 +634,16 @@ class RevisionStore:
         try:
             page = await self.fs.read(path, max_bytes=_MAX_INDEX_BYTES)
         except FileNotFoundError:
-            return {
-                "version": 1,
+            index = {
+                "version": self._version,
                 "kind": self.kind,
                 "resource": resource,
                 "count": 0,
                 "revisions": [],
-            }, None
+            }
+            if self._version == 2:
+                index["next_sequence"] = 1
+            return index, None
         if page.get("truncated"):
             raise ValueError("revision index exceeds its size limit")
         try:
@@ -360,7 +653,7 @@ class RevisionStore:
         if (
             not isinstance(index, dict)
             or type(index.get("version")) is not int
-            or index.get("version") != 1
+            or index.get("version") not in {1, 2}
             or index.get("kind") != self.kind
             or index.get("resource") != resource
             or not isinstance(index.get("revisions"), list)
@@ -370,21 +663,50 @@ class RevisionStore:
             raise ValueError("revision index metadata is invalid")
         if len(page["text"].encode("utf-8")) > _MAX_INDEX_BYTES:
             raise ValueError("revision index exceeds its size limit")
+        version = index["version"]
+        next_sequence = index.get("next_sequence", 1)
+        if version == 2 and (type(next_sequence) is not int or next_sequence < 1):
+            raise ValueError("revision index next sequence is invalid")
+        pruned_before = index.get("pruned_before", 0)
+        if version == 2 and (type(pruned_before) is not int or pruned_before < 0):
+            raise ValueError("revision index prune marker is invalid")
         previous = 0
         for item in index["revisions"]:
+            is_absent = (
+                isinstance(item, dict)
+                and version == 2
+                and self.kind == "files"
+                and item.get("revision") == _ABSENT_REVISION
+                and item.get("absent") is True
+            )
             if (
                 not isinstance(item, dict)
                 or type(item.get("sequence")) is not int
-                or item["sequence"] != previous + 1
+                or item["sequence"] <= previous
+                or version == 1
+                and item["sequence"] != previous + 1
                 or not isinstance(item.get("revision"), str)
-                or not _HASH.fullmatch(item["revision"])
+                or not is_absent
+                and not _HASH.fullmatch(item["revision"])
                 or type(item.get("size")) is not int
                 or not 0 <= item["size"] <= _MAX_BLOB_BYTES
+                or is_absent
+                and item["size"] != 0
                 or not isinstance(item.get("created_at"), str)
                 or len(item["created_at"]) > 64
             ):
                 raise ValueError("revision index record is invalid")
             previous = item["sequence"]
+        if version == 2 and next_sequence <= previous:
+            raise ValueError("revision index next sequence is behind its records")
+        records = index["revisions"]
+        if (
+            version == 2
+            and pruned_before
+            and records
+            and pruned_before >= records[0]["sequence"]
+        ):
+            raise ValueError("revision index prune marker is invalid")
         return index, page["revision"]
 
     def _index_path(self, resource: str) -> str:
@@ -418,6 +740,12 @@ def _validate_hash(revision: str) -> None:
         raise ValueError("revision must be a lowercase SHA-256 hash")
 
 
+def _validate_revision(kind: str, revision: str) -> None:
+    if kind == "files" and revision == _ABSENT_REVISION:
+        return
+    _validate_hash(revision)
+
+
 def _validate_page(limit: int, cursor: int | None) -> None:
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ValueError("limit must be an integer between 1 and 100")
@@ -432,12 +760,21 @@ def _validate_page_size(start_byte: int, max_bytes: int) -> None:
         raise ValueError("max_bytes must be an integer between 1 and 1048576")
 
 
-def _content_map(contents: Iterable[str | None]) -> dict[str, bytes]:
-    unique: dict[str, bytes] = {}
+def _content_map(
+    contents: Iterable[str | bytes | None], *, include_absent: bool = False
+) -> dict[str, bytes | None]:
+    unique: dict[str, bytes | None] = {}
     for content in contents:
         if content is None:
+            if include_absent:
+                unique.setdefault(_ABSENT_REVISION, None)
             continue
-        data = content.encode("utf-8")
+        if isinstance(content, str):
+            data = content.encode("utf-8")
+        elif isinstance(content, bytes):
+            data = content
+        else:
+            raise TypeError("revision contents must be text, bytes, or None")
         unique.setdefault(hashlib.sha256(data).hexdigest(), data)
     return unique
 
@@ -506,23 +843,97 @@ def _unlink_if_revision(path: Path, expected_revision: str) -> tuple[str, str]:
             backup.unlink(missing_ok=True)
 
 
-def _append_records(index: dict[str, Any], contents: dict[str, bytes]) -> None:
+def _upgrade_index(index: dict[str, Any]) -> None:
+    if index.get("version") != 1:
+        return
+    records = index.get("revisions", [])
+    last = records[-1]["sequence"] if records else 0
+    index["version"] = 2
+    index["next_sequence"] = last + 1
+    index.setdefault("pruned_before", 0)
+
+
+def _append_records(
+    index: dict[str, Any], contents: dict[str, bytes | None], *, version: int
+) -> None:
     records = index["revisions"]
+    next_sequence = index.get("next_sequence", records[-1]["sequence"] + 1 if records else 1)
     for revision, data in contents.items():
         if records and records[-1]["revision"] == revision:
             continue
-        records.append(
-            {
-                "sequence": (records[-1]["sequence"] if records else 0) + 1,
-                "revision": revision,
-                "size": len(data),
-                "created_at": datetime.now(UTC).isoformat(),
-            }
-        )
+        item = {
+            "sequence": next_sequence,
+            "revision": revision,
+            "size": 0 if data is None else len(data),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        if revision == _ABSENT_REVISION:
+            item["absent"] = True
+        records.append(item)
+        next_sequence += 1
     index["count"] = len(records)
+    if version == 2:
+        index["next_sequence"] = next_sequence
+
+
+def _prune_index(index: dict[str, Any]) -> None:
+    if index.get("version") != 2:
+        return
+    records = index["revisions"]
+    removed: list[dict[str, Any]] = []
+    if len(records) > _MAX_HISTORY_RECORDS:
+        count = len(records) - _MAX_HISTORY_RECORDS
+        removed.extend(records[:count])
+        del records[:count]
+    while len(records) > 1 and len(
+        json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ) > _MAX_INDEX_BYTES:
+        removed.append(records.pop(0))
+    if removed:
+        index["count"] = len(records)
+        index["pruned_before"] = removed[-1]["sequence"]
 
 
 def _check_index_size(index: dict[str, Any]) -> None:
     encoded = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > _MAX_INDEX_BYTES:
         raise ValueError("revision history has reached its metadata size limit")
+
+
+def _encode_index(index: dict[str, Any]) -> bytes:
+    return json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _write_index_bytes_sync(path: Path, encoded: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _write_blob(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.is_symlink():
+            raise RuntimeError(f"Revision object is a symlink: {path}")
+        return
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            pass
+    finally:
+        temporary_path.unlink(missing_ok=True)

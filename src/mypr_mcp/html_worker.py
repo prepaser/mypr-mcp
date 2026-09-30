@@ -6,12 +6,27 @@ import hashlib
 import json
 import sys
 from copy import deepcopy
+from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_TEXT_BYTES = 8 * 1024 * 1024
 _MAX_LINK_BYTES = 1024 * 1024
 _MAX_LINKS = 10_000
+_MAX_STRUCTURE_BYTES = 64 * 1024
+_MAX_HEADINGS = 256
+_MAX_HEADING_TEXT = 2048
+_META_NAMES = {
+    "description",
+    "keywords",
+    "author",
+    "robots",
+    "viewport",
+    "theme-color",
+    "og:title",
+    "og:description",
+    "twitter:card",
+}
 
 
 class _Failure(Exception):
@@ -54,6 +69,72 @@ def _clean(value: str) -> str:
     return "".join(char for char in value if char in "\n\r\t" or ord(char) >= 32)
 
 
+def _structure(root, selected, base_url: str | None) -> tuple[dict[str, Any], bool]:
+    metadata: dict[str, str] = {}
+    structure_truncated = False
+    title_nodes = root.xpath("(//title)[1]")
+    if title_nodes:
+        value, cut = _truncate(_clean(" ".join(title_nodes[0].itertext()).strip()), 2048)
+        metadata["title"] = value
+        structure_truncated |= cut
+    language = root.get("lang")
+    if not language:
+        html_nodes = root.xpath("(//html)[1]")
+        language = html_nodes[0].get("lang") if html_nodes else None
+    if language:
+        value, cut = _truncate(_clean(language.strip()), 128)
+        metadata["language"] = value
+        structure_truncated |= cut
+    canonical_nodes = root.xpath(
+        "(//link[translate(@rel, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+        "'abcdefghijklmnopqrstuvwxyz')='canonical'][@href])[1]"
+    )
+    if canonical_nodes:
+        try:
+            canonical = urljoin(base_url or "", canonical_nodes[0].get("href", "").strip())
+        except ValueError:
+            canonical = ""
+        if canonical:
+            value, cut = _truncate(_clean(canonical), 2048)
+            metadata["canonical"] = value
+            structure_truncated |= cut
+    for node in root.xpath("//meta[@name or @property]"):
+        name = (node.get("name") or node.get("property") or "").strip().lower()
+        content = node.get("content")
+        if name not in _META_NAMES or not content or name in metadata:
+            continue
+        value, cut = _truncate(_clean(content.strip()), 2048)
+        metadata[name.replace(":", "_")] = value
+        structure_truncated |= cut
+
+    headings: list[dict[str, Any]] = []
+    if selected is not None:
+        heading_tags = {f"h{level}" for level in range(1, 7)}
+        nodes = []
+        if getattr(selected, "tag", None) in heading_tags:
+            nodes.append(selected)
+        nodes.extend(selected.xpath(".//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6"))
+        for node in nodes:
+            text = _clean(" ".join(node.itertext()).strip())
+            if not text:
+                continue
+            text, cut = _truncate(text, _MAX_HEADING_TEXT)
+            structure_truncated |= cut
+            headings.append({"level": int(node.tag[1:]), "text": text})
+            if len(headings) >= _MAX_HEADINGS:
+                structure_truncated = True
+                break
+    structure = {"headings": headings, "metadata": metadata}
+    encoded = json.dumps(structure, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(encoded) <= _MAX_STRUCTURE_BYTES:
+        return structure, structure_truncated
+    while headings and len(
+        json.dumps(structure, ensure_ascii=False, separators=(",", ":")).encode()
+    ) > _MAX_STRUCTURE_BYTES:
+        headings.pop()
+    return structure, True
+
+
 def _links(root, base_url: str | None) -> tuple[list[dict[str, str]], bool]:
     links: list[dict[str, str]] = []
     size = 0
@@ -94,6 +175,9 @@ def _extract(request: dict) -> dict:
 
     url = request.get("url")
     selector = request.get("selector")
+    include_structure = request.get("include_structure", False)
+    if not isinstance(include_structure, bool):
+        raise _Failure("ValueError", "include_structure must be a boolean")
     if url is not None and (not isinstance(url, str) or len(url) > 8192):
         raise _Failure("ValueError", "url must be a string no longer than 8192 characters")
     if url is not None:
@@ -166,6 +250,7 @@ def _extract(request: dict) -> dict:
 
     title_nodes = root.xpath("(//title)[1]")
     title = " ".join(title_nodes[0].itertext()).strip() if title_nodes else ""
+    structure, structure_truncated = _structure(root, selected, link_base)
     if selected is None:
         text = ""
         extracted_title = ""
@@ -206,7 +291,7 @@ def _extract(request: dict) -> dict:
     if links_truncated:
         warnings.append("links exceeded the extraction limit")
 
-    return {
+    result = {
         "title": _truncate(title or extracted_title, 1024)[0],
         "text": text,
         "links": links,
@@ -216,6 +301,10 @@ def _extract(request: dict) -> dict:
         "complete": not text_truncated and not links_truncated,
         "stop_reason": "output_limit" if text_truncated or links_truncated else None,
     }
+    if include_structure:
+        result["structure"] = structure
+        result["structure_truncated"] = structure_truncated
+    return result
 
 
 def main() -> None:

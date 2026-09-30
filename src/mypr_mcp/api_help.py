@@ -16,12 +16,16 @@ Read bounded text and retain its revision when you plan an edit:
 
 Long lines may return next_cursor. Continue using its line as start_line and byte as start_byte. await ws.fs.tree(path) lists a bounded directory tree; await ws.fs.stat(path) returns file metadata.
 
-await ws.fs.write(path, text) creates a file; use create_parents=True if parent directories do not exist. To replace an existing file, pass expected_hash from a prior read or explicitly set overwrite=True. patch(path, edits, expected_hash=...) applies exact text replacements with conflict detection; each old value must match once unless count is given, and dry_run=True previews the diff.
+await ws.fs.write(path, text, history=True) creates a file; use create_parents=True if parent directories do not exist. To replace an existing file, pass expected_hash from a prior read or explicitly set overwrite=True. Set history=False only to opt out of the recovery entry. patch(path, edits, expected_hash=..., history=True) applies exact text replacements with conflict detection; each old value must match once unless count is given, and dry_run=True previews the diff.
     await ws.fs.patch("src/app.py", [{"old": "before", "new": "after"}], expected_hash=ws.local["page"]["revision"])
 
 await ws.fs.apply_patch(patch_text, dry_run=False) applies multi-file Add, Update, Delete, and Move operations using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked before changes are applied. expected_hashes maps paths to revisions; use None for a path that must not exist. There is no fuzzy matching.
 
-await ws.fs.rewrite_ast(...) previews structural replacements without changing files. Keep the returned plan_id and inspect the diff before await ws.fs.apply_rewrite(plan_id). Applying a plan checks every original file hash first; incomplete scans cannot be applied.
+All mutating filesystem helpers share revision checks, per-path locks, and the workspace change history. Use await ws.fs.read_bytes() and write_bytes() for binary data. delete() and move() require the source revision; copy() accepts an optional source revision. All three reject destination overwrite. history() lists changes made through ws.fs; read_revision() returns an empty `absent` result for a deleted file; restore() reverts one entry only when the current revision still matches its precondition.
+
+For repeated text changes, await ws.fs.replace(...) creates a bounded preview and await ws.fs.apply_replace(plan_id) applies it after rechecking every source revision. Literal matching is the default; set fixed=False for Python regular-expression matching and ignore_case=True for case-insensitive matching.
+
+await ws.fs.rewrite_ast(..., history=True) previews structural replacements without changing files. Keep the returned plan_id and inspect the diff before await ws.fs.apply_rewrite(plan_id). Applying a plan checks every original file hash first; incomplete scans cannot be applied. Successful applies record recovery history unless history=False was requested when creating the plan.
 
 await ws.fs.image(path) returns a PNG or JPEG as inline image content; the default file size limit is 2 MiB. Pass resize=(width, height) to fit an image into a box, or crop=(left, top, right, bottom) in source pixel coordinates after EXIF orientation is applied. Transformations require Pillow in the workspace Python environment, run in a bounded subprocess, and never overwrite the original. await ws.fs.image_info(path) reports oriented source dimensions and revision. Inline images share a 2 MiB source-byte budget per MCP response; omitted images retain their artifact paths and a warning.""",
     ),
@@ -29,7 +33,7 @@ await ws.fs.image(path) returns a PNG or JPEG as inline image content; the defau
         "Inspect, extract text from, and render PDF pages.",
         """PDF helpers require PyMuPDF in the workspace Python environment. Install it explicitly: job = await ws.packages.add("pymupdf"); await job. Image transformations also need "pillow". Installing packages only in the MCP client's environment does not install them in the workspace kernel.
 
-await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR. Use await ws.docs.ocr(path, ...) explicitly for scanned PDF pages or PNG/JPEG images. await ws.docs.extract(path, ...) reads DOCX paragraphs/tables, PPTX slides, or XLSX cells. await ws.docs.backends() checks optional packages and OCR language data. These operations run outside the kernel, preserve source files, and return bounded pages tied to the source revision.
+await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR. Use await ws.docs.ocr(path, ...) explicitly for scanned PDF pages or PNG/JPEG images. OCR accepts resume_cursor for continuing a bounded cached page result; it cannot be combined with the ordinary result cursor. Cached words remain readable after a source edit, while the next unprocessed page rechecks the source revision before OCR. await ws.docs.extract(path, ...) reads DOCX paragraphs/tables, PPTX slides, or XLSX cells. await ws.docs.backends() checks optional packages and OCR language data. These operations run outside the kernel, preserve source files, and return bounded pages tied to the source revision.
 
 await ws.docs.render_page(path, page=1, dpi=120) returns an inline page image. clip=(left, top, right, bottom) selects a region in PDF points. Source path, page, revision, geometry, and rendering details accompany the result. Workers bound input size, output size, pixel count, and execution time. Read ws.help("docs.render_page") for the current method signature.""",
     ),
@@ -52,7 +56,16 @@ await ws.fs.search_ast(pattern, lang="python", paths=...) performs read-only str
 
 await ws.code.definition("clangd", "src/main.c", line=10, character=5), references(...), and hover(...) query saved source. Public line and character values are one-based Unicode code-point positions; mypr converts the server's negotiated position encoding. Source changes are synchronized before queries. Inspect result truncation and coordinate metadata; diagnostics report the synchronized document version.
 
-await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostics for the synchronized document; pending or stale results must not be treated as a clean bill of health. ws.code.status() lists configured servers. await ws.code.close("clangd") stops one. await ws.code.document_symbols(server, path) returns the document outline. workspace_symbols(server, query) searches project symbols; calls(server, path, line=..., character=..., direction="incoming") returns one level of callers, or use direction="outgoing" for callees. Server capability checks distinguish unsupported features from empty results. Structure queries default to max_bytes=32768; inspect truncated before treating a result as complete. Call hierarchy uses one overall server timeout. This API does not apply edits or rename symbols. Use ws.help("code.configure") and the query method names for current signatures and result details.""",
+await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostics for the synchronized document; pending or stale results must not be treated as a clean bill of health. ws.code.status() lists configured servers. await ws.code.close("clangd") stops one. await ws.code.document_symbols(server, path) returns the document outline. workspace_symbols(server, query) searches project symbols; calls(server, path, line=..., character=..., direction="incoming") returns one level of callers, or use direction="outgoing" for callees. Server capability checks distinguish unsupported features from empty results. Structure queries default to max_bytes=32768; inspect truncated before treating a result as complete. Call hierarchy uses one overall server timeout.
+
+Code navigation settings can be persisted with configure(..., persist=True),
+then reused after reset or restart. rename(...) and actions(...) create
+revision-checked change previews; prepare_action(...) resolves one selected
+action and apply_edit(...) applies only supported WorkspaceEdit file changes.
+Actions that require command execution are reported but never run by mypr.
+workspace_diagnostics(...) requests project-wide diagnostics when the server
+advertises that capability. Use ws.help("code.configure") and the live method
+signatures for current defaults and result fields.""",
     ),
     "git": (
         "Inspect repository status, diffs, and file history.",
@@ -61,7 +74,7 @@ await ws.code.diagnostics("clangd", "src/main.c", wait_ms=1500) reads diagnostic
     await ws.git.diff()
     await ws.git.show("HEAD", path="README.md")
 
-await ws.git.log(...) returns structured commit history and await ws.git.blame(path, ...) returns line attribution. Both default to HEAD and pin the resolved commit for subsequent pages. Responses are bounded. When has_more is true, continue with cursor=next_cursor.""",
+await ws.git.log(...) returns structured commit history and await ws.git.blame(path, ...) returns line attribution. Both default to HEAD and pin the resolved commit for subsequent pages. Use follow=True to follow a path across renames. await ws.git.commit_info(ref, include_files=True) returns commit metadata, parents, body, changed files, and statistics; patch text remains opt-in. Responses are bounded. When has_more is true, continue with cursor=next_cursor.""",
     ),
     "shell": (
         "Run commands and manage interactive or long-lived processes.",
@@ -102,7 +115,7 @@ Missing metrics are None, not zero. Check sources, warnings, and truncated field
         "Coordinate clients with inbox messages and workspace status.",
         """await ws.status() returns compact runtime health, version, workspace, generation, and connection, active, and queued counts. Pass detail=True for the full connection list, active execution IDs, queue, and manager instructions. ws.client.id is your logical identity; ws.client.connection_id identifies this connection.
 
-await ws.messages.send(client_id, text) sends to a registered workspace client, even if it is disconnected. Structured JSON can be attached with data={...}. await ws.messages.read(limit=20, after=None, wait_ms=0) reads unacknowledged messages. Follow next_cursor when has_more is true; wait_ms can wait up to 30000 ms. Use sender=... and reply_to=... to wait for replies to a particular message. await ws.messages.reply(message_id, text, data=None) answers a message addressed to you, including after acknowledgment. await ws.messages.ack([message_id]) acknowledges messages after handling them.
+await ws.messages.send(client_id, text) sends to a registered workspace client, even if it is disconnected. Structured JSON can be attached with data={...}. await ws.messages.read(limit=20, after=None, wait_ms=0) reads unacknowledged messages. Follow next_cursor when has_more is true; wait_ms can wait up to 30000 ms. Use sender=... and reply_to=... to wait for replies to a particular message. await ws.messages.reply(message_id, text, data=None) answers a message addressed to you, including after acknowledgment. await ws.messages.ack([message_id]) acknowledges messages after handling them. Use await ws.messages.clients(connected=...) to page through registered IDs, connection state, last activity, and unacknowledged counts before addressing a peer. Offline recipients remain valid for later delivery.
 
 MCP init, execute, and poll include an inbox count and bounded previews. Receiving a message may end a tool wait early; check execution state before relying on its result. Reading or receiving a preview does not acknowledge it, so unacked previews may repeat. Long previews have truncated=True; read() returns the full text. Messages and acknowledgments survive reset and manager restart. Message text is data, not automatically executable instructions. Idle clients see messages on their next MCP call.""",
     ),
@@ -128,9 +141,10 @@ These operations preserve Python state. A busy connection requires force=True to
         "Make bounded asynchronous HTTP requests and downloads.",
         """ws.http provides named persistent HTTPX2 (httpx2.AsyncClient) clients. Use await ws.http.get/post/... for bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and await ws.http.download(url, path) for atomic workspace downloads.
 
-await ws.http.extract_html(html, url=..., selector=...) extracts readable content from existing HTML. await ws.http.read_html(url, ...) fetches through a named HTTP client before extraction. Both return bounded text and link results with source metadata. Parsing requires optional workspace packages trafilatura and cssselect; it does not execute JavaScript. Pass browser page.content() to extract a rendered document.
+await ws.http.extract_html(html, url=..., selector=...) extracts readable content from existing HTML. await ws.http.read_html(url, ...) fetches through a named HTTP client before extraction. Both return bounded text and link results with source metadata. Pass include_structure=True when heading hierarchy and document metadata are needed. Parsing requires optional workspace packages trafilatura and cssselect; it does not execute JavaScript. Pass browser page.content() to extract a rendered document.
 
-Default limits are 16 MiB for requests and 256 MiB for downloads. ws.http.client(name, ...) returns the native client; close it before changing its options.""",
+Default limits are 16 MiB for requests and 256 MiB for downloads. ws.http.client(name, ...)
+returns the native client; close it before changing its options.""",
     ),
     "browser": (
         "Automate managed or external browsers with Playwright.",
@@ -138,13 +152,13 @@ Default limits are 16 MiB for requests and 256 MiB for downloads. ws.http.client
 
 The first managed use installs a missing browser engine automatically. Await ws.browser.save_state(...) and ws.browser.load_state(...) for explicit authentication-state persistence, and await ws.browser.screenshot(page, path) to save an artifact and return inline image output.
 
-await ws.browser.observe(page) starts a client-owned bounded event collector; use await observation.read(...) and await observation.request(...) on the returned handle; observation.close() is synchronous. Response bodies are opt-in and sensitive headers are masked by default. await ws.browser.snapshot(page, ...) captures a bounded accessibility snapshot. Follow its cursor to read the same capture; await ws.browser.find(snapshot_id, text, ...) searches a saved capture and await ws.browser.diff(before_id, after_id, ...) compares two captures. These helpers reuse native Playwright and do not replace locators.
+await ws.browser.observe(page) starts a client-owned bounded event collector; use await observation.read(...) and await observation.request(...) on the returned handle; observation.close() is synchronous. Response bodies are opt-in, bounded, and accept body_timeout; sensitive headers and structured URLs are masked by default. observation.read(types=..., url_contains=..., methods=..., status=...) applies AND filters; wait_ms waits for a matching event for at most 30 seconds. await ws.browser.snapshot(page, ...) captures a bounded accessibility snapshot. Follow its cursor to read the same capture; await ws.browser.find(snapshot_id, text, ...) searches a saved capture and await ws.browser.diff(before_id, after_id, ...) compares two captures. These helpers reuse native Playwright and do not replace locators.
 
 Managed resources close on reset. External browser processes and pre-existing tabs survive.""",
     ),
     "net": (
         "Run bounded DNS, TCP, TLS, and port-scan diagnostics.",
-        """await ws.net.resolve(...), await ws.net.connect(...), and await ws.net.tls(...) provide bounded DNS, TCP, and verified TLS diagnostics. await ws.net.scan(targets, ports=...) starts a TCP scan; await ws.net.nmap(targets, args=[...]) starts Nmap.
+        """await ws.net.resolve(...), await ws.net.connect(...), and await ws.net.tls(...) provide bounded DNS, TCP, and verified TLS diagnostics. resolve(timeout=...) includes worker cleanup and reports an explicit timeout result. await ws.net.scan(targets, ports=..., max_probes=..., max_duration=...) starts a bounded TCP scan; await ws.net.nmap(targets, args=[...], max_duration=...) starts Nmap. Scan results report attempted probes and the stop reason when a limit ends collection.
 
 await ws.net.sockets(...) inspects local TCP, UDP, and Unix sockets with address, port, state, and PID filters. This is local listener/connection inspection, separate from remote scanning.
 
@@ -160,21 +174,54 @@ await ws.skills.history(name, limit=20, cursor=None) lists saved revisions newes
         "Manage reusable Python modules in the workspace library.",
         """ws.modules.list() and await ws.modules.read(name) inspect modules under ws.root / "lib/ws_lib". await ws.modules.write(name, source, expected_hash=...) writes a module; existing files require expected_hash.
 
-await ws.modules.check(name, test_code="...") validates code in a separate Python process. Saving does not activate code; use ws.modules.load(name) or ws.modules.reload(name). Reload replaces the module object, while references already held elsewhere remain unchanged.
+await ws.modules.check(name, test_code="...") validates code in a separate Python process and returns the checked source hash. Saving does not activate code; use ws.modules.load(name, expected_hash=...) or ws.modules.reload(name, expected_hash=...) to activate exactly the bytes that were checked. A mismatched hash refuses activation. Reload replaces the module object, while references already held elsewhere remain unchanged.
 
 await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newest first. await ws.modules.read_revision(name, revision, start_byte=0, max_bytes=32768) reads saved source; recorded=False identifies a verified recovery blob without an index entry. await ws.modules.restore(name, revision, expected_hash=current_revision) restores source after validation and revision checks. Restore does not activate the file or change existing Python references. Direct edits are captured only when a later helper write observes them.""",
     ),
     "packages": (
         "Install packages into the workspace Python environment.",
-        """await ws.packages.add("package") starts an installation and returns a task handle. Keep the handle in ws.local to inspect or await the installation.""",
+        """await ws.packages.add("package") starts an installation and returns a task handle. Keep the handle in ws.local to inspect or await the installation. Package changes are serialized per workspace; requirements and the frozen manifest are replaced atomically after installation succeeds. A failed or cancelled job leaves the previous manifest intact. Reset is not required for unrelated imports, but already-imported modules may need a reset before an upgrade is visible.""",
     ),
     "history": (
         "Find execution records and inspect event logs.",
         """await ws.history.list(client_id=ws.client.id) finds your executions and jobs. await ws.history.get(record_id) reads a record; await ws.history.logs() reads events. Python task records expose history_id to distinguish reused IDs across resets.""",
     ),
+    "pages": (
+        "Consume paged workspace results without repeating queries.",
+        """ws.pages.iter(method, *args, **kwargs) is an async iterator for APIs
+that return next_cursor/has_more pages. It calls the supplied bound workspace
+method with the first arguments, then forwards each cursor using that method's
+cursor parameter. max_pages defaults to 100 and prevents accidental unbounded
+iteration. A stalled cursor or an expired snapshot raises instead of silently
+restarting the query.""",
+    ),
     "performance": (
         "Inspect recent manager, storage, kernel, and bridge timings.",
         """await ws.performance() returns rolling timing summaries for manager, storage, kernel, and bridge work. Each label keeps its latest 256 samples and a total_count observed since manager start, with p50, p95, and max in milliseconds. Bridge timing for the most recent completed request appears on the next call; concurrent or disconnected calls may not all be reported. Execution results include timing_ms in MCP _meta (result.meta in the Python SDK), outside printed content and structuredContent; request errors may lack timings. Manager and RPC times include requested notification waits and are not overhead-only measurements. Nested spans overlap, so do not sum them to infer unmeasured overhead; kernel round-trip includes IPC and output persistence, not only Python execution. Time outside the MCP server, including host scheduling, external transport, and model execution, is not measured. Samples remain in memory until manager restart.""",
+    ),
+    "storage": (
+        "Inspect and clean retained workspace data.",
+        """await ws.storage.usage() reports disk usage by retained output, journals,
+snapshots, artifacts, revisions, and other managed data. await
+ws.storage.gc(dry_run=True) builds a deletion plan without changing files;
+await ws.storage.gc_apply(plan_id) applies that exact plan after rechecking it.
+Automatic cleanup runs periodically and removes data older than 30 days. When
+managed data exceeds the soft 1 GiB target, it also selects the oldest eligible
+recent data until the target is reached. The `[storage]` config fields are
+`enabled`, `retention_days`, `max_bytes`, `revision_keep`, and
+`gc_interval_seconds`. Active work, current files, the latest `revision_keep`
+revisions per resource (50 by default), and shared blobs referenced by retained
+records are protected. Check `await ws.status()` for the automatic pass's
+`storage_maintenance` fields.""",
+    ),
+    "doctor": (
+        "Diagnose workspace readiness and optional dependencies.",
+        """await ws.doctor() checks the workspace Python environment, packages,
+search backends, LSP configuration, browser engine, OCR data, MCP settings,
+runtime health, and available storage. Each check reports ready, missing,
+invalid, or unknown with a bounded reason and suggested action. The same
+diagnostics are available without starting a manager through `mypr-mcp doctor`.
+The command does not install packages, start servers, or rewrite configuration.""",
     ),
     "lifecycle": (
         "Understand client identity, persistence, reset, restart, and recovery.",
@@ -217,10 +264,17 @@ _METHOD_NOTES = {
     "mcp.get_prompt": "Returns the external server's prompt messages. Inspect list_prompts for supported arguments.",
     "status": "Returns compact runtime health, versions, generation, and counts. detail=True includes connection records, active/queued execution IDs, and manager instructions.",
     "performance": "Returns manager_dispatch, bridge, storage, and kernel timing summaries. See ws.help('performance') for sample limits and measurement semantics.",
-    "modules.load": "Returns a Python module object. Loading activates saved code; writing or restoring a module does not activate it.",
-    "modules.reload": "Returns a new Python module object. Existing references held elsewhere are not automatically updated.",
+    "modules.load": "If expected_hash is supplied, only the exact bytes returned by check() may be activated; a mismatch leaves the current binding untouched.",
+    "modules.reload": "If expected_hash is supplied, activation is refused when the checked source is stale. Existing references held elsewhere are not automatically updated.",
+    "fs.replace": "Builds a bounded multi-file replacement preview. It never mutates files; retain plan_id and call fs.apply_replace after reviewing it.",
+    "fs.apply_replace": "Rechecks every source revision before applying a replacement plan and records the change in filesystem history.",
+    "fs.restore": "Restores one tracked filesystem revision only when the current revision matches the supplied precondition.",
+    "code.apply_edit": "Applies a prepared, revision-checked LSP edit plan. Command-only actions are never executed.",
+    "storage.gc": "Returns a dry-run cleanup plan by default; call storage.gc_apply(plan_id) to apply the exact plan.",
+    "storage.gc_apply": "Applies a previously generated cleanup plan after validating its workspace generation and protected references.",
+    "doctor": "Returns readiness checks for runtime, packages, tools, LSP, browser, OCR, MCP configuration, and storage without installing or changing anything.",
 }
-_WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "reset", "restart"}
+_WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "doctor", "reset", "restart"}
 
 
 def _method(workspace, path):

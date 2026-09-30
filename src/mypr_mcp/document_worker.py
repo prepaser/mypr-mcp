@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -13,11 +14,12 @@ import sys
 import tempfile
 import warnings
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any
 
 _MAX_INPUT = 64 * 1024 * 1024
-_MAX_OUTPUT = 6 * 1024 * 1024
+_MAX_OUTPUT = 8 * 1024 * 1024
 _MAX_ITEMS = 50_000
 _MAX_TEXT = 1024
 _MAX_SCANNED_CELLS = 1_000_000
@@ -27,6 +29,7 @@ _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBER = 128 * 1024 * 1024
 _MAX_ARCHIVE_ENTRIES = 10_000
 _MAX_COMPRESSION_RATIO = 200
+_MAX_RESUME_TSV = 8 * 1024 * 1024
 
 
 class _Failure(Exception):
@@ -336,19 +339,29 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
             raise _Failure("ValueError", f"Expected a valid PNG or JPEG: {exc}") from None
         coordinate_space = "exif_normalized_image_pixels"
         more_pages = False
+        last_page = 1
     else:
         raise _Failure("ValueError", "OCR supports PDF, PNG, and JPEG files")
 
     collector = _Collector()
     page_info = []
+    resume: dict[str, Any] | None = None
 
     def extract_page(
         number: int, image_data: bytes, width: int, height: int, effective_dpi: int
     ) -> None:
+        nonlocal resume
         tsv = _tesseract(executable, image_data, language)
+        if len(tsv) > _MAX_RESUME_TSV:
+            raise _Failure("ValueError", "Tesseract output exceeds the 8 MiB page limit")
         page_info.append({"page": number, "width": width, "height": height, "dpi": effective_dpi})
-        lines = tsv.decode("utf-8", "replace").splitlines()
-        for row in lines[1:]:
+        rows = tsv.splitlines(keepends=True)
+        word_offset = 0
+        tsv_offset = len(rows[0]) if rows else 0
+        for raw_row in rows[1:]:
+            row_offset = tsv_offset
+            tsv_offset += len(raw_row)
+            row = raw_row.decode("utf-8", "replace").rstrip("\r\n")
             fields = row.split("\t", 11)
             if len(fields) != 12 or fields[0] != "5":
                 continue
@@ -361,19 +374,29 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
                 block, paragraph, line = map(int, fields[2:5])
             except ValueError:
                 continue
-            if not collector.add(
-                {
-                    "type": "word",
-                    "page": number,
-                    "text": word,
-                    "confidence": confidence,
-                    "bbox": [left, top, box_width, box_height],
-                    "block": block,
-                    "paragraph": paragraph,
-                    "line": line,
-                }
-            ):
+            item = {
+                "type": "word",
+                "page": number,
+                "text": word,
+                "confidence": confidence,
+                "bbox": [left, top, box_width, box_height],
+                "block": block,
+                "paragraph": paragraph,
+                "line": line,
+            }
+            if not collector.add(item):
+                if collector.reason in {"result_size_limit", "item_limit"}:
+                    resume = {
+                        "page": number,
+                        "width": width,
+                        "height": height,
+                        "dpi": effective_dpi,
+                        "word_offset": word_offset,
+                        "tsv_offset": row_offset,
+                        "tsv": base64.b64encode(zlib.compress(tsv, 6)).decode("ascii"),
+                    }
                 break
+            word_offset += 1
 
     if suffix == ".pdf":
         try:
@@ -407,7 +430,7 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
     else:
         next_page = None
         truncation_reason = None
-    return {
+    result = {
         "source": _source(display, data, revision, suffix[1:]),
         "coordinate_space": coordinate_space,
         "pages": page_info,
@@ -418,6 +441,13 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
         "truncation_reason": truncation_reason,
         "warnings": [],
     }
+    if resume is not None:
+        resume["next_page"] = (
+            resume["page"] + 1 if resume["page"] < last_page else None
+        )
+        resume["remaining_pages"] = max(0, last_page - resume["page"])
+        result["resume"] = resume
+    return result
 
 
 def _tesseract(executable: str, image_data: bytes, language: str) -> bytes:
@@ -657,6 +687,24 @@ def main() -> int:
     except BaseException as exc:
         response = {"ok": False, "kind": "DocumentError", "error": f"{type(exc).__name__}: {exc}"}
     encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _MAX_OUTPUT and response.get("ok") is True:
+        result = response.get("result")
+        if isinstance(result, dict) and result.get("resume") is not None:
+            result["items"] = []
+            result["resume"]["word_offset"] = 0
+            result["resume"]["tsv_offset"] = 0
+            encoded = json.dumps(
+                response, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        if (
+            len(encoded) > _MAX_OUTPUT
+            and isinstance(result, dict)
+            and result.pop("resume", None) is not None
+        ):
+            response["result"] = result
+            encoded = json.dumps(
+                response, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
     if len(encoded) > _MAX_OUTPUT:
         encoded = json.dumps(
             {

@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import json
 import os
+import signal
 import socket
 import ssl
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+_DNS_WORKERS = asyncio.Semaphore(2)
+_DNS_TIMEOUT = 5.0
+_DNS_OUTPUT_LIMIT = 64 * 1024
+_DNS_CLEANUP_TIMEOUT = 2.0
 
 
 def _timeout(value: float) -> float:
@@ -58,6 +67,124 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
         raise
     except OSError:
         pass
+
+
+async def _stop_dns_worker(
+    process: asyncio.subprocess.Process, communication: asyncio.Task[Any] | None = None
+) -> None:
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+
+    async def wait() -> None:
+        await process.wait()
+        if communication is not None:
+            await asyncio.gather(communication, return_exceptions=True)
+
+    waiter = asyncio.create_task(wait())
+    try:
+        await asyncio.wait_for(asyncio.shield(waiter), _DNS_CLEANUP_TIMEOUT)
+    except TimeoutError:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(waiter), _DNS_CLEANUP_TIMEOUT)
+    finally:
+        if communication is not None and not communication.done():
+            communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
+        if not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def _resolve_worker(
+    host: str,
+    port: int | None,
+    family: int,
+    kind: int,
+    proto: int,
+    timeout: float,  # noqa: ASYNC109
+) -> list[dict[str, Any]]:
+    payload = json.dumps(
+        {"host": host, "port": port, "family": family, "type": kind, "proto": proto},
+        separators=(",", ":"),
+    ).encode()
+    guard = Path(__file__).with_name("process_guard.py")
+    worker = Path(__file__).with_name("dns_worker.py")
+    async with _DNS_WORKERS:
+        launch = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                str(guard),
+                "--parent-pid",
+                str(os.getpid()),
+                "--tree",
+                "--",
+                sys.executable,
+                str(worker),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        )
+        process: asyncio.subprocess.Process | None = None
+        communication: asyncio.Task[Any] | None = None
+        try:
+            process = await asyncio.shield(launch)
+            communication = asyncio.create_task(process.communicate(payload))
+            try:
+                output, errors = await asyncio.wait_for(
+                    asyncio.shield(communication), timeout
+                )
+            except TimeoutError as exc:
+                await _stop_dns_worker(process, communication)
+                raise TimeoutError(f"DNS resolution exceeded its {timeout:g}-second limit") from exc
+            except BaseException:
+                await _stop_dns_worker(process, communication)
+                raise
+        except asyncio.CancelledError:
+            if process is None:
+                while True:
+                    try:
+                        process = await asyncio.shield(launch)
+                        break
+                    except asyncio.CancelledError:
+                        if launch.done():
+                            process = launch.result()
+                            break
+            if process.returncode is None:
+                await _stop_dns_worker(process, communication)
+            raise
+        except BaseException:
+            if process is None:
+                with contextlib.suppress(Exception):
+                    process = await asyncio.shield(launch)
+            if process is not None and process.returncode is None:
+                await _stop_dns_worker(process, communication)
+            raise
+    if len(output) > _DNS_OUTPUT_LIMIT:
+        raise RuntimeError("DNS worker returned too much output")
+    try:
+        response = json.loads(output)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("DNS worker returned invalid JSON") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError("DNS worker returned an invalid response")
+    if response.get("ok") is not True:
+        if response.get("kind") == "gaierror":
+            errno = response.get("errno")
+            message = str(response.get("error", "DNS resolution failed"))
+            if errno is None:
+                raise socket.gaierror(message)
+            raise socket.gaierror(errno, message)
+        raise OSError(str(response.get("error", "DNS resolution failed")))
+    result = response.get("result")
+    if not isinstance(result, list):
+        raise RuntimeError("DNS worker returned an invalid result")
+    return result
 
 
 class NetworkTools:
@@ -115,22 +242,27 @@ class NetworkTools:
         family: int = socket.AF_UNSPEC,
         type: int = socket.SOCK_STREAM,
         proto: int = 0,
+        timeout: float = _DNS_TIMEOUT,  # noqa: ASYNC109
     ) -> dict[str, Any]:
         _host(host)
         if port is not None:
             _port(port)
-        result = await asyncio.to_thread(
-            socket.getaddrinfo,
-            host,
-            port,
-            family,
-            type,
-            proto,
-            0,
-        )
+        timeout = _timeout(timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                result = await _resolve_worker(host, port, family, type, proto, timeout)
+        except TimeoutError as exc:
+            raise TimeoutError(f"DNS resolution exceeded its {timeout:g}-second limit") from exc
         addresses: list[dict[str, Any]] = []
         seen: set[tuple[int, str, int]] = set()
-        for item_family, _item_type, _item_proto, canonname, sockaddr in result:
+        for item in result:
+            if not isinstance(item, dict):
+                raise RuntimeError("DNS worker returned an invalid address")
+            item_family = int(item["family"])
+            canonname = item.get("canonical_name")
+            sockaddr = item.get("sockaddr")
+            if not isinstance(sockaddr, (list, tuple)) or not sockaddr:
+                raise RuntimeError("DNS worker returned an invalid socket address")
             address = sockaddr[0]
             item_port = sockaddr[1] if len(sockaddr) > 1 else None
             key = (item_family, address, item_port or 0)
@@ -277,8 +409,13 @@ class NetworkTools:
     async def scan(self, targets: Any, ports: Any = "1-1024", **options: Any) -> Any:
         return await self._delegate("scan", targets=targets, ports=ports, **options)
 
-    async def nmap(self, targets: Any, args: list[str] | None = None) -> Any:
-        return await self._delegate("nmap", targets=targets, args=args or [])
+    async def nmap(
+        self,
+        targets: Any,
+        args: list[str] | None = None,
+        **options: Any,
+    ) -> Any:
+        return await self._delegate("nmap", targets=targets, args=args or [], **options)
 
     async def _delegate(self, kind: str, **options: Any) -> Any:
         """Load the manager scan implementation only when a scan is requested."""
@@ -293,7 +430,9 @@ class NetworkTools:
                 ports=options.pop("ports", "1-1024"),
                 **options,
             )
-        return await manager_net.nmap(options.pop("targets"), args=options.pop("args", []))
+        return await manager_net.nmap(
+            options.pop("targets"), args=options.pop("args", []), **options
+        )
 
 
 __all__ = ["NetworkTools"]

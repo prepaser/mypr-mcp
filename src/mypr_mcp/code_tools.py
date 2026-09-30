@@ -3,16 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import json
 import os
 import re
+import secrets
 import signal
+import tempfile
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from .lsp_config import LSPConfig, validate_servers
+from .lsp_edits import (
+    EditError,
+    EditPlanStore,
+    PlannedOperation,
+    _safe_path,
+    apply_text_edits,
+    sha256,
+)
+from .snapshots import SnapshotStore
 
 MAX_SERVERS = 4
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -77,7 +93,12 @@ def _position(text: str, line: Any, character: Any, encoding: str) -> dict[str, 
     if column > len(value):
         raise ValueError("character is outside the line")
     prefix = value[:column]
-    units = len(prefix) if encoding == "utf-32" else len(prefix.encode("utf-16-le")) // 2
+    if encoding == "utf-32":
+        units = len(prefix)
+    elif encoding == "utf-8":
+        units = len(prefix.encode("utf-8"))
+    else:
+        units = len(prefix.encode("utf-16-le")) // 2
     return {"line": line - 1, "character": units}
 
 
@@ -86,6 +107,15 @@ def _user_character(line: str, offset: Any, encoding: str) -> int:
         return 1
     if encoding == "utf-32":
         return min(offset, len(line)) + 1
+    if encoding == "utf-8":
+        units = 0
+        chars = 0
+        for char in line:
+            if units >= offset:
+                break
+            units += len(char.encode("utf-8"))
+            chars += 1
+        return chars + 1
     units = 0
     chars = 0
     for char in line:
@@ -193,7 +223,7 @@ class _LanguageServer:
         name: str,
         command: tuple[str, ...],
         languages: frozenset[str],
-        timeout: float,
+        timeout: float,  # noqa: ASYNC109
     ) -> None:
         self.root = root
         self.name = name
@@ -220,6 +250,7 @@ class _LanguageServer:
         self._stderr = bytearray()
         self._stderr_truncated = False
         self.initialized = False
+        self.generation = secrets.token_hex(16)
 
     async def start(self) -> None:
         try:
@@ -250,7 +281,7 @@ class _LanguageServer:
                     "rootUri": root_uri,
                     "workspaceFolders": [{"uri": root_uri, "name": self.root.name}],
                     "capabilities": {
-                        "general": {"positionEncodings": ["utf-16"]},
+                        "general": {"positionEncodings": ["utf-8", "utf-16"]},
                         "workspace": {
                             "configuration": True,
                             "workspaceFolders": True,
@@ -271,7 +302,7 @@ class _LanguageServer:
             if not isinstance(caps, dict):
                 raise CodeError("language server returned no capabilities")
             encoding = caps.get("positionEncoding", "utf-16")
-            if encoding != "utf-16":
+            if encoding not in {"utf-8", "utf-16"}:
                 raise CodeError(
                     f"language server selected unsupported position encoding {encoding!r}"
                 )
@@ -1325,6 +1356,98 @@ class _LanguageServer:
             "truncated": truncated,
         }
 
+    async def rename(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+        new_name: str,
+        *,
+        language: str | None = None,
+    ) -> tuple[_Document, Any]:
+        provider = self.capabilities.get("renameProvider")
+        if not _supports(provider):
+            raise CodeError(f"language server {self.name!r} does not support renameProvider")
+        if (
+            not isinstance(new_name, str)
+            or not new_name
+            or len(new_name) > 1024
+            or "\x00" in new_name
+        ):
+            raise ValueError("new_name must be a non-empty string of at most 1024 characters")
+        async with self._operation_lock:
+            doc, _ = await self._document(path, language)
+            position = _position(doc.text, line, character, self.position_encoding)
+            result = await self._request(
+                "textDocument/rename",
+                {
+                    "textDocument": {"uri": doc.uri},
+                    "position": position,
+                    "newName": new_name,
+                },
+            )
+            return doc, result
+
+    async def code_actions(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+        *,
+        end_line: int | None = None,
+        end_character: int | None = None,
+        language: str | None = None,
+        only: list[str] | None = None,
+    ) -> tuple[_Document, list[Any]]:
+        provider = self.capabilities.get("codeActionProvider")
+        if not _supports(provider):
+            raise CodeError(f"language server {self.name!r} does not support codeActionProvider")
+        if end_line is None:
+            end_line = line
+        if end_character is None:
+            end_character = character
+        async with self._operation_lock:
+            doc, _ = await self._document(path, language)
+            start = _position(doc.text, line, character, self.position_encoding)
+            end = _position(doc.text, end_line, end_character, self.position_encoding)
+            context: dict[str, Any] = {"diagnostics": []}
+            if only is not None:
+                if not isinstance(only, list) or not all(isinstance(item, str) for item in only):
+                    raise ValueError("only must be a list of strings")
+                context["only"] = only
+            result = await self._request(
+                "textDocument/codeAction",
+                {
+                    "textDocument": {"uri": doc.uri},
+                    "range": {"start": start, "end": end},
+                    "context": context,
+                },
+            )
+            if result is None:
+                result = []
+            if not isinstance(result, list):
+                raise CodeError("language server returned malformed code actions")
+            return doc, result
+
+    async def resolve_code_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(action, dict):
+            raise ValueError("action must be an object")
+        if not _supports(self.capabilities.get("codeActionProvider")):
+            raise CodeError(f"language server {self.name!r} does not support codeActionProvider")
+        return await self._request("codeAction/resolve", action)
+
+    async def workspace_diagnostics(self, previous_result_ids: list[dict[str, Any]] | None) -> Any:
+        provider = self.capabilities.get("diagnosticProvider")
+        if not isinstance(provider, dict) or provider.get("workspaceDiagnostics") is not True:
+            raise CodeError(
+                f"language server {self.name!r} does not support workspace diagnostics"
+            )
+        params: dict[str, Any] = {"identifier": self.name}
+        if previous_result_ids:
+            params["previousResultIds"] = previous_result_ids
+        async with self._operation_lock:
+            return await self._request("workspace/diagnostic", params)
+
     def status(self) -> dict[str, Any]:
         process = self.process
         return {
@@ -1349,6 +1472,8 @@ class _LanguageServer:
                     "workspaceSymbolProvider",
                     "callHierarchyProvider",
                     "diagnosticProvider",
+                    "renameProvider",
+                    "codeActionProvider",
                 )
                 if _supports(self.capabilities.get(feature))
             ],
@@ -1416,12 +1541,32 @@ class _LanguageServer:
 
 
 class CodeTools:
-    """Manage a bounded set of explicitly configured read-only LSP clients."""
+    """Manage configured language servers and bounded LSP edit plans."""
 
-    def __init__(self, workspace: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str],
+        fs: Any = None,
+        config_rpc: Callable[..., Any] | None = None,
+    ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
+        self.fs = fs
+        self._config_rpc = config_rpc
+        self._config = LSPConfig(self.workspace)
+        try:
+            self._definitions, self._config_revision = self._config.load()
+        except (OSError, UnicodeError, ValueError) as exc:
+            self._definitions, self._config_revision = {}, None
+            self._config_error = str(exc)
+        else:
+            self._config_error = None
         self._servers: dict[str, _LanguageServer] = {}
         self._lock = asyncio.Lock()
+        self._plans = EditPlanStore(self.workspace)
+        self._plan_servers: dict[str, str] = {}
+        self._actions: dict[str, tuple[str, dict[str, Any], str, int, str]] = {}
+        self._workspace_diag_results: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._diagnostic_snapshots = SnapshotStore(self.workspace / ".mypr", name="lsp-diagnostics")
         self._closed = False
 
     @staticmethod
@@ -1463,6 +1608,7 @@ class CodeTools:
         languages: list[str] | tuple[str, ...],
         *,
         timeout: float = 10,  # noqa: ASYNC109
+        persist: bool = True,
     ) -> dict[str, Any]:  # noqa: ASYNC109
         """Start an installed server with ``command=[..., '--stdio']`` and LSP language IDs.
 
@@ -1470,6 +1616,8 @@ class CodeTools:
         replaces that process after the new server initializes successfully.
         """
         name = self._name(name)
+        if type(persist) is not bool:
+            raise TypeError("persist must be a boolean")
         command_value, language_values = self._configuration(command, languages)
         if type(timeout) not in (int, float) or not 1 <= timeout <= 60:
             raise ValueError("timeout must be between 1 and 60 seconds")
@@ -1486,17 +1634,64 @@ class CodeTools:
                 if existing.command == command_value and existing.languages == language_values:
                     async with existing._operation_lock:
                         existing.timeout = float(timeout)
-                    return existing.status()
+                    result = existing.status()
+                    if persist:
+                        await self._persist_definition(  # noqa: ASYNC109
+                            name, command_value, language_values, timeout
+                        )
+                    return result
             if existing is None and len(self._servers) >= MAX_SERVERS:
                 raise CodeError(f"at most {MAX_SERVERS} language servers may be configured")
             replacement = _LanguageServer(
                 self.workspace, name, command_value, language_values, float(timeout)
             )
             await replacement.start()
+            result = replacement.status()
+            if persist:
+                try:
+                    await self._persist_definition(  # noqa: ASYNC109
+                        name, command_value, language_values, timeout
+                    )
+                except BaseException:
+                    with suppress(Exception):
+                        await replacement.aclose()
+                    raise
             self._servers[name] = replacement
             if existing is not None:
                 await existing.aclose()
-            return replacement.status()
+            return result
+
+    async def _persist_definition(  # noqa: ASYNC109
+        self,
+        name: str,
+        command: tuple[str, ...],
+        languages: frozenset[str],
+        timeout: float,  # noqa: ASYNC109
+    ) -> None:
+        definitions = dict(self._definitions)
+        definitions[name] = {
+            "command": list(command),
+            "languages": sorted(languages),
+            "timeout": float(timeout),
+        }
+        validate_servers(definitions)
+        if self._config_rpc is not None:
+            result = self._config_rpc(
+                "set_lsp",
+                definitions,
+                expected_revision=self._config_revision,
+                expected_servers=self._definitions,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, dict):
+                result = result.get("revision")
+            if not isinstance(result, str) or not result:
+                raise CodeError("LSP configuration callback returned no revision")
+            self._config_revision = result
+        else:
+            self._config_revision = self._config.save(definitions, self._config_revision)
+        self._definitions = definitions
 
     async def start(
         self,
@@ -1505,9 +1700,10 @@ class CodeTools:
         languages: list[str] | tuple[str, ...],
         *,
         timeout: float = 10,  # noqa: ASYNC109
+        persist: bool = True,
     ) -> dict[str, Any]:  # noqa: ASYNC109
         """Alias for configure; the command must name an already installed server."""
-        return await self.configure(name, command, languages, timeout=timeout)
+        return await self.configure(name, command, languages, timeout=timeout, persist=persist)
 
     def _server(self, name: str) -> _LanguageServer:
         name = self._name(name)
@@ -1519,6 +1715,24 @@ class CodeTools:
             raise CodeError(server._failure or f"language server {name!r} exited")
         return server
 
+    async def _get_server(self, name: str) -> _LanguageServer:
+        key = self._name(name)
+        server = self._servers.get(key)
+        if server is None:
+            definition = self._definitions.get(key)
+            if definition is None:
+                if self._config_error:
+                    raise CodeError(f"unable to load saved LSP configuration: {self._config_error}")
+                raise CodeError(f"language server {key!r} is not configured")
+            await self.configure(
+                key,
+                definition["command"],
+                definition["languages"],
+                timeout=definition["timeout"],
+                persist=False,
+            )
+        return self._server(key)
+
     async def definition(
         self,
         name: str,
@@ -1529,7 +1743,8 @@ class CodeTools:
         language: str | None = None,
     ) -> dict[str, Any]:
         """Find definitions at one-based source line and Unicode character."""
-        return await self._server(name).definition(path, line, character, language=language)
+        server = await self._get_server(name)
+        return await server.definition(path, line, character, language=language)
 
     async def references(
         self,
@@ -1542,7 +1757,8 @@ class CodeTools:
         language: str | None = None,
     ) -> dict[str, Any]:
         """Find references at one-based source line and Unicode character."""
-        return await self._server(name).references(
+        server = await self._get_server(name)
+        return await server.references(
             path, line, character, include_declaration=include_declaration, language=language
         )
 
@@ -1556,7 +1772,8 @@ class CodeTools:
         language: str | None = None,
     ) -> dict[str, Any] | None:
         """Return hover documentation at one-based source coordinates."""
-        return await self._server(name).hover(path, line, character, language=language)
+        server = await self._get_server(name)
+        return await server.hover(path, line, character, language=language)
 
     async def document_symbols(
         self,
@@ -1567,7 +1784,8 @@ class CodeTools:
         max_bytes: int = DEFAULT_RESULT_BYTES,
     ) -> dict[str, Any]:
         """Return the symbol tree for a workspace document."""
-        return await self._server(name).document_symbols(
+        server = await self._get_server(name)
+        return await server.document_symbols(
             path, language=language, max_bytes=max_bytes
         )
 
@@ -1575,7 +1793,8 @@ class CodeTools:
         self, name: str, query: str = "", *, max_bytes: int = DEFAULT_RESULT_BYTES
     ) -> dict[str, Any]:
         """Search workspace symbols."""
-        return await self._server(name).workspace_symbols(query, max_bytes=max_bytes)
+        server = await self._get_server(name)
+        return await server.workspace_symbols(query, max_bytes=max_bytes)
 
     async def calls(
         self,
@@ -1589,7 +1808,8 @@ class CodeTools:
         max_bytes: int = DEFAULT_RESULT_BYTES,
     ) -> dict[str, Any]:
         """Return one-hop incoming or outgoing calls for symbols at a position."""
-        return await self._server(name).calls(
+        server = await self._get_server(name)
+        return await server.calls(
             path,
             line,
             character,
@@ -1607,7 +1827,556 @@ class CodeTools:
         wait_ms: int = 1500,
     ) -> dict[str, Any]:
         """Read diagnostics for a file; ready is false until a snapshot arrives."""
-        return await self._server(name).diagnostics(path, language=language, wait_ms=wait_ms)
+        server = await self._get_server(name)
+        return await server.diagnostics(path, language=language, wait_ms=wait_ms)
+
+    async def _read_edit_bytes(self, path: Path) -> bytes | None:
+        def read() -> bytes | None:
+            if not path.exists():
+                return None
+            if path.is_symlink() or not path.is_file():
+                raise EditError(f"LSP edit target is not a regular file: {path}")
+            return path.read_bytes()
+
+        return await asyncio.to_thread(read)
+
+    def _edit_uri_path(self, uri: Any) -> Path:
+        if not isinstance(uri, str):
+            raise EditError("LSP workspace edit URI is invalid")
+        return _safe_path(self.workspace, uri)
+
+    async def _workspace_edit_plan(
+        self,
+        server: _LanguageServer,
+        edit: Any,
+        *,
+        title: str,
+        unsupported_reason: str | None = None,
+    ) -> Any:
+        if edit is None:
+            raise EditError("language server returned no workspace edit")
+        if not isinstance(edit, dict):
+            raise EditError("language server returned malformed workspace edit")
+        operations: list[PlannedOperation] = []
+        states: dict[Path, bytes | None] = {}
+        versions: dict[Path, int | None] = {}
+
+        async def state(path: Path) -> bytes | None:
+            if path not in states:
+                states[path] = await self._read_edit_bytes(path)
+            return states[path]
+
+        def expected_version(path: Path, version: Any) -> None:
+            if version is None:
+                return
+            if type(version) is not int or version < 0:
+                raise EditError("LSP workspace edit document version is invalid")
+            for document in server.documents.values():
+                if document.path == path and document.version != version:
+                    raise EditError("LSP workspace edit document version is stale")
+            versions[path] = version
+
+        async def update(path: Path, edits: Any, version: Any = None) -> None:
+            current = await state(path)
+            if current is None:
+                raise EditError(f"LSP text edit target does not exist: {path}")
+            expected_version(path, version)
+            try:
+                text = current.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise EditError(f"LSP text edit target is not UTF-8: {path}") from exc
+            new_text = apply_text_edits(text, edits, server.position_encoding)
+            new = new_text.encode("utf-8")
+            original = current
+            states[path] = new
+            for operation in operations:
+                if operation.path == path and operation.operation in {"create", "update", "rename"}:
+                    operation.new = new
+                    return
+            operations.append(
+                PlannedOperation("update", path, original, new, sha256(original), version=version)
+            )
+
+        document_changes = edit.get("documentChanges")
+        if document_changes is not None:
+            if not isinstance(document_changes, list):
+                raise EditError("LSP documentChanges must be a list")
+            for change in document_changes:
+                if not isinstance(change, dict):
+                    raise EditError("LSP document change is malformed")
+                kind = change.get("kind")
+                if kind in ("create", "rename", "delete"):
+                    options = change.get("options")
+                    if options is not None and not isinstance(options, dict):
+                        raise EditError("LSP document change options are malformed")
+                    if options and any(options.get(key) for key in ("ignoreIfExists", "overwrite")):
+                        raise EditError("LSP document change overwrite options are unsupported")
+                    if kind == "create":
+                        path = self._edit_uri_path(change.get("uri"))
+                        if await state(path) is not None:
+                            raise EditError(f"LSP create target already exists: {path}")
+                        states[path] = b""
+                        operations.append(PlannedOperation("create", path, None, b"", None))
+                    elif kind == "delete":
+                        path = self._edit_uri_path(change.get("uri"))
+                        old = await state(path)
+                        if old is None:
+                            raise EditError(f"LSP delete target does not exist: {path}")
+                        states[path] = None
+                        operations.append(PlannedOperation("delete", path, old, None, sha256(old)))
+                    else:
+                        source = self._edit_uri_path(change.get("oldUri"))
+                        destination = self._edit_uri_path(change.get("newUri"))
+                        old = await state(source)
+                        if old is None:
+                            raise EditError(f"LSP rename source does not exist: {source}")
+                        if await state(destination) is not None:
+                            raise EditError(f"LSP rename destination already exists: {destination}")
+                        states[source] = None
+                        states[destination] = old
+                        operations.append(
+                            PlannedOperation(
+                                "rename",
+                                destination,
+                                None,
+                                old,
+                                None,
+                                source=source,
+                                source_old=old,
+                                destination_expected=None,
+                            )
+                        )
+                    continue
+                text_document = change.get("textDocument")
+                if not isinstance(text_document, dict):
+                    raise EditError("LSP text document edit is malformed")
+                path = self._edit_uri_path(text_document.get("uri"))
+                await update(path, change.get("edits"), text_document.get("version"))
+        changes = edit.get("changes")
+        if changes is not None:
+            if not isinstance(changes, dict):
+                raise EditError("LSP workspace changes must be an object")
+            for uri, edits in changes.items():
+                await update(self._edit_uri_path(uri), edits)
+        if not operations and unsupported_reason is None:
+            raise EditError("language server returned an empty workspace edit")
+        plan = self._plans.create(
+            self.workspace,
+            operations,
+            server.generation,
+            title,
+            unsupported_reason,
+            server.name,
+        )
+        self._plan_servers[plan.ident] = server.name
+        return plan
+
+    async def rename(
+        self,
+        name: str,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+        new_name: str,
+        *,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        server = await self._get_server(name)
+        document, edit = await server.rename(path, line, character, new_name, language=language)
+        plan = await self._workspace_edit_plan(server, edit, title=f"Rename to {new_name}")
+        result = plan.result()
+        result.update(
+            {
+                "operation": "rename",
+                "path": str(document.path),
+                "document_version": document.version,
+            }
+        )
+        return result
+
+    async def actions(
+        self,
+        name: str,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+        *,
+        end_line: int | None = None,
+        end_character: int | None = None,
+        language: str | None = None,
+        only: list[str] | None = None,
+        max_bytes: int = DEFAULT_RESULT_BYTES,
+    ) -> dict[str, Any]:
+        max_bytes = _result_limit(max_bytes)
+        server = await self._get_server(name)
+        document, raw_actions = await server.code_actions(
+            path,
+            line,
+            character,
+            end_line=end_line,
+            end_character=end_character,
+            language=language,
+            only=only,
+        )
+        result: dict[str, Any] = {
+            "path": str(document.path),
+            "document_version": document.version,
+            "actions": [],
+            "truncated": len(raw_actions) > MAX_RESULTS,
+        }
+        for raw in raw_actions[:MAX_RESULTS]:
+            if not isinstance(raw, dict):
+                result["truncated"] = True
+                continue
+            title = raw.get("title")
+            if not isinstance(title, str):
+                title = str(raw.get("command", ""))
+            action_id = secrets.token_urlsafe(18)
+            self._actions[action_id] = (
+                server.name,
+                copy.deepcopy(raw),
+                server.generation,
+                document.version,
+                document.uri,
+            )
+            command = raw.get("command")
+            if isinstance(command, dict):
+                has_command = isinstance(command.get("command"), str)
+            else:
+                has_command = isinstance(command, str)
+            edit_value = raw.get("edit")
+            item = {
+                "action_id": action_id,
+                "title": title[:1024],
+                "kind": raw.get("kind") if isinstance(raw.get("kind"), str) else None,
+                "has_edit": isinstance(edit_value, dict),
+                "has_command": has_command,
+                "supported": isinstance(edit_value, dict) and not has_command,
+            }
+            if isinstance(raw.get("disabled"), dict):
+                item["disabled"] = str(raw["disabled"].get("reason", ""))[:1024]
+            elif isinstance(raw.get("disabled"), str):
+                item["disabled"] = raw["disabled"][:1024]
+            result["actions"].append(item)
+            if _json_size(result) > max_bytes:
+                result["actions"].pop()
+                result["truncated"] = True
+                break
+        return result
+
+    async def prepare_action(self, action_id: str) -> dict[str, Any]:
+        if not isinstance(action_id, str) or not action_id:
+            raise ValueError("action_id must be a non-empty string")
+        try:
+            server_name, action, generation, version, _uri = self._actions[action_id]
+        except KeyError as exc:
+            raise EditError("unknown or expired code action") from exc
+        server = await self._get_server(server_name)
+        if server.generation != generation:
+            raise EditError("code action belongs to an older language-server generation")
+        command = action.get("command")
+        has_command = isinstance(command, str) or (
+            isinstance(command, dict) and isinstance(command.get("command"), str)
+        )
+        if "edit" not in action and not has_command:
+            provider = server.capabilities.get("codeActionProvider")
+            if not isinstance(provider, dict) or provider.get("resolveProvider") is not True:
+                raise EditError("code action requires unsupported codeAction/resolve")
+            action = await server.resolve_code_action(action)
+        unsupported = None
+        if has_command:
+            unsupported = "code actions requiring command execution are unsupported"
+        if not isinstance(action.get("edit"), dict):
+            if unsupported is None:
+                unsupported = "code action did not return a workspace edit"
+            edit = {"changes": {}}
+        else:
+            edit = action["edit"]
+        plan = await self._workspace_edit_plan(
+            server,
+            edit,
+            title=str(action.get("title", "Code action"))[:1024],
+            unsupported_reason=unsupported,
+        )
+        result = plan.result()
+        result.update({"action_id": action_id, "document_version": version})
+        return result
+
+    async def apply_edit(self, plan_id: str) -> dict[str, Any]:
+        plan = self._plans.get(plan_id)
+        server_name = self._plan_servers.get(plan.ident) or plan.server
+        if server_name is None:
+            raise EditError("LSP edit plan has no language server")
+        server = await self._get_server(server_name)
+        if server.generation != plan.generation:
+            raise EditError("LSP edit plan belongs to an older language-server generation")
+        if plan.unsupported_reason is not None:
+            raise EditError(plan.unsupported_reason)
+        async with server._operation_lock:
+            virtual: dict[Path, bytes | None] = {}
+            for operation in plan.operations:
+                if operation.operation == "rename":
+                    assert operation.source is not None
+                    if operation.source not in virtual:
+                        virtual[operation.source] = await self._read_edit_bytes(operation.source)
+                    if operation.path not in virtual:
+                        virtual[operation.path] = await self._read_edit_bytes(operation.path)
+                    if (
+                        virtual[operation.source] != operation.source_old
+                        or virtual[operation.path] is not None
+                    ):
+                        raise EditError("LSP edit plan is stale")
+                    virtual[operation.source] = None
+                    virtual[operation.path] = operation.new
+                    continue
+                if operation.path not in virtual:
+                    virtual[operation.path] = await self._read_edit_bytes(operation.path)
+                if sha256(virtual[operation.path]) != operation.expected:
+                    raise EditError("LSP edit plan is stale")
+                virtual[operation.path] = operation.new
+            result = await self._apply_edit_plan(plan)
+        self._plans.remove(plan.ident)
+        self._plan_servers.pop(plan.ident, None)
+        result.update({"plan_id": plan.ident, "applied": True})
+        return result
+
+    async def _apply_edit_plan(self, plan: Any) -> dict[str, Any]:
+        for method_name in ("apply_lsp_plan", "apply_workspace_edit", "apply_edit_plan"):
+            method = getattr(self.fs, method_name, None) if self.fs is not None else None
+            if method is not None:
+                result = method(plan)
+                if inspect.isawaitable(result):
+                    result = await result
+                if not isinstance(result, dict):
+                    raise EditError("filesystem edit coordinator returned an invalid result")
+                return result
+        if self.fs is not None and all(
+            hasattr(self.fs, method)
+            for method in ("write_bytes", "delete", "move")
+        ):
+            changes = []
+            for operation in plan.operations:
+                try:
+                    if operation.operation == "rename":
+                        assert operation.source is not None
+                        result = self.fs.move(
+                            str(operation.source),
+                            str(operation.path),
+                            expected_hash=sha256(operation.source_old),
+                            overwrite=False,
+                            history=True,
+                        )
+                        if inspect.isawaitable(result):
+                            result = await result
+                        if operation.new != operation.source_old:
+                            result = self.fs.write_bytes(
+                                str(operation.path),
+                                operation.new or b"",
+                                expected_hash=sha256(operation.source_old),
+                                overwrite=True,
+                                create_parents=False,
+                                history=True,
+                            )
+                            if inspect.isawaitable(result):
+                                result = await result
+                    elif operation.operation == "delete":
+                        result = self.fs.delete(
+                            str(operation.path), expected_hash=operation.expected, history=True
+                        )
+                        if inspect.isawaitable(result):
+                            result = await result
+                    else:
+                        result = self.fs.write_bytes(
+                            str(operation.path),
+                            operation.new or b"",
+                            expected_hash=operation.expected,
+                            overwrite=operation.old is not None,
+                            create_parents=True,
+                            history=True,
+                        )
+                        if inspect.isawaitable(result):
+                            result = await result
+                    changes.append(result)
+                except Exception as exc:
+                    raise EditError(f"filesystem edit failed: {exc}") from exc
+            return {"changes": changes}
+        backups: dict[Path, bytes | None] = {}
+        touched = {operation.path for operation in plan.operations}
+        touched.update(
+            operation.source
+            for operation in plan.operations
+            if operation.source is not None
+        )
+        for path in touched:
+            backups[path] = await self._read_edit_bytes(path)
+        try:
+            for operation in plan.operations:
+                if operation.operation == "rename":
+                    assert operation.source is not None
+                    operation.path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(operation.source, operation.path)
+                elif operation.operation == "delete":
+                    operation.path.unlink()
+                else:
+                    operation.path.parent.mkdir(parents=True, exist_ok=True)
+                    fd, temporary = tempfile.mkstemp(
+                        prefix=f".{operation.path.name}.", dir=operation.path.parent
+                    )
+                    try:
+                        with os.fdopen(fd, "wb") as stream:
+                            stream.write(operation.new or b"")
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        os.replace(temporary, operation.path)
+                    finally:
+                        Path(temporary).unlink(missing_ok=True)  # noqa: ASYNC240
+        except BaseException:
+            for path, data in backups.items():
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+            raise
+        return plan.result()
+
+    async def workspace_diagnostics(
+        self,
+        name: str,
+        *,
+        cursor: str | None = None,
+        max_bytes: int = DEFAULT_RESULT_BYTES,
+    ) -> dict[str, Any]:
+        """Read the server's workspace diagnostic report as a bounded snapshot."""
+        max_bytes = _result_limit(max_bytes)
+        server = await self._get_server(name)
+        if cursor is not None:
+            snapshot, offset = self._diagnostic_snapshots.decode(
+                cursor, expected_kind="workspace-diagnostic"
+            )
+            query = snapshot.get("query")
+            if not isinstance(query, dict) or query.get("server") != server.name:
+                raise ValueError("cursor belongs to a different language server")
+        else:
+            previous = []
+            for uri, report in self._workspace_diag_results.get(server.name, {}).items():
+                result_id = report.get("result_id")
+                if result_id is not None:
+                    previous.append({"uri": uri, "value": result_id})
+            raw = await server.workspace_diagnostics(previous or None)
+            if not isinstance(raw, dict):
+                raise CodeError("language server returned malformed workspace diagnostics")
+            reports = raw.get("items", [])
+            if not isinstance(reports, list):
+                raise CodeError("language server returned malformed workspace diagnostic items")
+            previous_reports = self._workspace_diag_results.setdefault(server.name, {})
+            items: list[dict[str, Any]] = []
+            for report in reports:
+                if not isinstance(report, dict) or not isinstance(report.get("uri"), str):
+                    continue
+                uri = report["uri"]
+                path = server._workspace_uri_path(uri)
+                if path is None:
+                    continue
+                kind = report.get("kind", "full")
+                if kind == "unchanged":
+                    result_id = report.get("resultId")
+                    cached = previous_reports.get(uri)
+                    if cached is None:
+                        continue
+                    cleaned = copy.deepcopy(cached)
+                    cleaned["kind"] = "unchanged"
+                    cleaned["result_id"] = result_id
+                    items.append(cleaned)
+                    continue
+                if kind != "full" or not isinstance(report.get("items", []), list):
+                    continue
+                text = await server._text_for_uri(uri, {})
+                diagnostics = []
+                dropped = False
+                values = report.get("items", [])
+                for value in values[:MAX_DIAGNOSTICS]:
+                    clean = _clean_diagnostic(value)
+                    if clean is None:
+                        dropped = True
+                        continue
+                    clean["range"] = _range(clean["range"], text, server.position_encoding)
+                    diagnostics.append(clean)
+                item = {
+                    "uri": uri,
+                    "path": str(path),
+                    "kind": "full",
+                    "version": report.get("version"),
+                    "result_id": report.get("resultId"),
+                    "diagnostics": diagnostics,
+                    "truncated": len(values) > MAX_DIAGNOSTICS or dropped,
+                }
+                previous_reports[uri] = copy.deepcopy(item)
+                items.append(item)
+            ident = self._diagnostic_snapshots.create(
+                {"server": server.name}, items, kind="workspace-diagnostic"
+            )
+            snapshot = self._diagnostic_snapshots.load(ident)
+            offset = 0
+        items = snapshot.get("items")
+        if not isinstance(items, list):
+            raise CodeError("invalid workspace diagnostic snapshot")
+        page_items: list[Any] = []
+        truncated = False
+        index = offset
+        while index < len(items):
+            item = items[index]
+            candidate = page_items + [item]
+            page = {
+                "server": name,
+                "snapshot_id": snapshot["id"],
+                "reports": candidate,
+                "complete": False,
+                "truncated": truncated,
+            }
+            if _json_size(page) > max_bytes:
+                if not page_items:
+                    reduced = dict(item)
+                    diagnostics = reduced.get("diagnostics")
+                    if isinstance(diagnostics, list):
+                        reduced["diagnostics"] = []
+                    reduced["truncated"] = True
+                    if _json_size({**page, "reports": [reduced]}) <= max_bytes:
+                        page_items.append(reduced)
+                        index += 1
+                    else:
+                        truncated = True
+                break
+            page_items.append(item)
+            index += 1
+        has_more = index < len(items)
+        next_cursor = (
+            self._diagnostic_snapshots.cursor(snapshot["id"], index, "workspace-diagnostic")
+            if has_more
+            else None
+        )
+        output = {
+            "server": name,
+            "snapshot_id": snapshot["id"],
+            "reports": page_items,
+            "complete": not has_more,
+            "truncated": truncated,
+            "next_cursor": next_cursor,
+        }
+        while page_items and _json_size(output) > max_bytes:
+            page_items.pop()
+            index -= 1
+            has_more = True
+            next_cursor = self._diagnostic_snapshots.cursor(
+                snapshot["id"], index, "workspace-diagnostic"
+            )
+            output["reports"] = page_items
+            output["complete"] = False
+            output["next_cursor"] = next_cursor
+            output["truncated"] = True
+        if _json_size(output) > max_bytes:
+            raise EditError("workspace diagnostic metadata exceeds max_bytes")
+        return output
 
     def status(self, name: str | None = None) -> dict[str, Any]:
         """Show configured LSP processes and their supported features."""
@@ -1616,11 +2385,105 @@ class CodeTools:
             try:
                 return self._servers[key].status()
             except KeyError as exc:
-                raise CodeError(f"language server {key!r} is not configured") from exc
-        return {"servers": [server.status() for server in self._servers.values()]}
+                definition = self._definitions.get(key)
+                if definition is None:
+                    raise CodeError(f"language server {key!r} is not configured") from exc
+                return {
+                    "name": key,
+                    "languages": list(definition["languages"]),
+                    "running": False,
+                    "initialized": False,
+                    "pid": None,
+                    "documents": 0,
+                    "capabilities": [],
+                    "saved": True,
+                    "error": self._config_error,
+                }
+        names = set(self._definitions) | set(self._servers)
+        servers = []
+        for key in sorted(names):
+            if key in self._servers:
+                servers.append(self._servers[key].status())
+            else:
+                servers.append(self.status(key))
+        return {"servers": servers, "config_error": self._config_error}
+
+    async def reload(self) -> dict[str, Any]:
+        """Reload saved definitions without starting stopped language servers."""
+        if self._config_rpc is not None:
+            loaded = self._config_rpc("get_lsp")
+            if inspect.isawaitable(loaded):
+                loaded = await loaded
+            if not isinstance(loaded, dict):
+                raise CodeError("LSP configuration callback returned an invalid snapshot")
+            definitions = validate_servers(loaded.get("servers", {}))
+            revision = loaded.get("revision")
+            if revision is not None and not isinstance(revision, str):
+                raise CodeError("LSP configuration callback returned an invalid revision")
+        else:
+            definitions, revision = self._config.load()
+        async with self._lock:
+            changed = {
+                name
+                for name in set(self._definitions) | set(definitions)
+                if self._definitions.get(name) != definitions.get(name)
+            }
+            targets = [
+                (name, self._servers.pop(name))
+                for name in changed
+                if name in self._servers
+            ]
+            self._definitions = definitions
+            self._config_revision = revision
+            self._config_error = None
+            await asyncio.gather(*(server.aclose() for _, server in targets))
+        return {"changed": sorted(changed), "servers": self.status()["servers"]}
+
+    async def remove(self, name: str, *, persist: bool = True) -> dict[str, Any]:
+        """Stop and optionally remove a saved language-server definition."""
+        key = self._name(name)
+        if type(persist) is not bool:
+            raise TypeError("persist must be a boolean")
+        async with self._lock:
+            server = self._servers.get(key)
+            exists = key in self._definitions or server is not None
+            if persist and key in self._definitions:
+                definitions = dict(self._definitions)
+                definitions.pop(key)
+                if self._config_rpc is not None:
+                    result = self._config_rpc(
+                        "set_lsp",
+                        definitions,
+                        expected_revision=self._config_revision,
+                        expected_servers=self._definitions,
+                    )
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if isinstance(result, dict):
+                        result = result.get("revision")
+                    if not isinstance(result, str) or not result:
+                        raise CodeError("LSP configuration callback returned no revision")
+                    self._config_revision = result
+                else:
+                    self._config_revision = self._config.save(
+                        definitions, self._config_revision
+                    )
+                self._definitions = definitions
+            if server is not None:
+                self._servers.pop(key, None)
+                await server.aclose()
+            removed = exists if persist else server is not None
+        if not exists:
+            raise CodeError(f"language server {key!r} is not configured")
+        return {
+            "name": key,
+            "removed": removed,
+            "running": False,
+            "saved": key in self._definitions,
+        }
 
     async def close(self, name: str | None = None) -> None:
-        """Stop one configured server or all servers."""
+        """Stop one running server or all servers while keeping saved definitions."""
         async with self._lock:
             if name is None:
                 targets = list(self._servers.items())

@@ -216,3 +216,37 @@ async def test_new_history_page_survives_eviction_before_initial_page_build(
 
     assert page["commits" if method == "log" else "lines"]
     assert not (first.history_snapshots.root / f"{page['snapshot_id']}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_commit_info_includes_root_metadata_unicode_files_and_exact_pages(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "한글.txt").write_text("one\n", encoding="utf-8")
+    first = _commit(tmp_path, "initial body", "Ada", "2020-06-01T12:00:00+0000")
+    api = Git(tmp_path, ShellRunner())
+    page = await api.commit_info(first, max_bytes=1024)
+    assert page["ref"] == first
+    assert page["commit"]["root"] is True
+    assert page["commit"]["parents"] == []
+    assert page["commit"]["body"] == "initial body"
+    assert page["files"] == [
+        {"status": "A", "path": "한글.txt", "additions": 1, "deletions": 0}
+    ]
+    import json
+
+    assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) <= 1024
+
+
+@pytest.mark.asyncio
+async def test_log_follow_requires_path_and_preserves_path_history(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    path = tmp_path / "file.txt"
+    path.write_text("one\n", encoding="utf-8")
+    first = _commit(tmp_path, "first", "Ada", "2020-06-01T12:00:00+0000")
+    path.rename(tmp_path / "renamed.txt")
+    second = _commit(tmp_path, "rename", "Ada", "2021-06-01T12:00:00+0000")
+    api = Git(tmp_path, ShellRunner())
+    with pytest.raises(ValueError, match="requires path"):
+        await api.log(follow=True)
+    result = await api.log(path="renamed.txt", follow=True)
+    assert [item["commit"] for item in result["commits"]] == [second, first]

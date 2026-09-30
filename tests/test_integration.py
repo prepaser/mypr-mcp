@@ -189,6 +189,8 @@ async def test_exception_and_output_limit(workspace: Path):
         failed = await execute(session, "raise ValueError('expected failure')")
         assert failed["state"] == "failed"
         assert "expected failure" in (failed["error"] or "")
+        assert failed["error_info"]["type"] == "ValueError"
+        assert failed["error_info"]["code"] == "invalid_request"
 
         large = await execute(session, "print('x' * 5000)")
         assert large["state"] == "succeeded"

@@ -72,6 +72,7 @@ class HTTPTools:
         *,
         url: str | None = None,
         selector: str | None = None,
+        include_structure: bool = False,
         max_bytes: int = 32 * 1024,
         cursor: str | None = None,
     ) -> dict[str, Any]:
@@ -83,7 +84,12 @@ class HTTPTools:
         if self._html is None:
             self._html = HTMLExtractor(self)
         return await self._html.extract_html(
-            html, url=url, selector=selector, max_bytes=max_bytes, cursor=cursor
+            html,
+            url=url,
+            selector=selector,
+            include_structure=include_structure,
+            max_bytes=max_bytes,
+            cursor=cursor,
         )
 
     async def read_html(
@@ -96,6 +102,7 @@ class HTTPTools:
         max_bytes: int = 32 * 1024,
         cursor: str | None = None,
         selector: str | None = None,
+        include_structure: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Fetch HTML with a named client, then extract a bounded paged view."""
@@ -107,7 +114,12 @@ class HTTPTools:
                 raise ValueError(
                     "url, selector, and request options cannot be combined with cursor"
                 )
-            return await self.extract_html(None, max_bytes=max_bytes, cursor=cursor)
+            return await self.extract_html(
+                None,
+                include_structure=include_structure,
+                max_bytes=max_bytes,
+                cursor=cursor,
+            )
         if not isinstance(url, str) or not url:
             raise ValueError("url must be a non-empty string")
         if (
@@ -128,6 +140,7 @@ class HTTPTools:
             response.text,
             url=str(response.url),
             selector=selector,
+            include_structure=include_structure,
             max_bytes=max_bytes,
         )
 

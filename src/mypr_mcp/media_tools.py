@@ -175,6 +175,7 @@ class Documents:
         max_pages: int = 5,
         dpi: int = 200,
         cursor: str | None = None,
+        resume_cursor: str | None = None,
         max_bytes: int = 32_768,
         max_input_bytes: int = _MAX_INPUT_BYTES,
     ) -> dict[str, Any]:
@@ -186,6 +187,7 @@ class Documents:
             max_pages=max_pages,
             dpi=dpi,
             cursor=cursor,
+            resume_cursor=resume_cursor,
             max_bytes=max_bytes,
             max_input_bytes=max_input_bytes,
         )

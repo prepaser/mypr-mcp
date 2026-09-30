@@ -8,6 +8,7 @@ second process during recovery or inspection.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -107,6 +108,10 @@ class History:
                     WHERE json_extract(data, '$.client') IS NOT NULL;
                 """
             )
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(client_ids)")}
+            for column in ("created", "last_seen"):
+                if column not in columns:
+                    self._db.execute(f"ALTER TABLE client_ids ADD COLUMN {column} REAL")
 
     def allocate_client_id(self) -> str:
         """Reserve a readable ID permanently, including connections that do no work."""
@@ -144,7 +149,254 @@ class History:
 
     def _remember_client(self, value: Any) -> None:
         if value is not None:
-            self._db.execute("INSERT OR IGNORE INTO client_ids(id) VALUES (?)", (str(value),))
+            self._db.execute(
+                "INSERT OR IGNORE INTO client_ids(id, created) VALUES (?, ?)",
+                (str(value), time.time()),
+            )
+
+    def touch_client(self, client_id: str, timestamp: float | None = None) -> None:
+        self._ensure_open()
+        timestamp = time.time() if timestamp is None else timestamp
+        with self._lock:
+            self._remember_client(client_id)
+            self._db.execute(
+                "UPDATE client_ids SET last_seen = MAX(COALESCE(last_seen, 0), ?) WHERE id = ?",
+                (timestamp, client_id),
+            )
+
+    def clients(
+        self, *, prefix: str | None = None, cursor: str | None = None,
+        limit: int = 50, connected: bool | None = None, active_ids=(),
+    ):
+        self._ensure_open()
+        limit = _limit(limit)
+        if prefix is not None and not isinstance(prefix, str):
+            raise TypeError("prefix must be a string or None")
+        if cursor is not None and not isinstance(cursor, str):
+            raise TypeError("cursor must be a string or None")
+        if connected is not None and type(connected) is not bool:
+            raise TypeError("connected must be a boolean or None")
+        clauses, values = [], []
+        if prefix is not None:
+            clauses.append("substr(id, 1, ?) = ?")
+            values.extend((len(prefix), prefix))
+        if cursor is not None:
+            clauses.append("id > ?")
+            values.append(cursor)
+        if connected is not None:
+            operator = "IN" if connected else "NOT IN"
+            clauses.append(f"id {operator} (SELECT value FROM json_each(?))")
+            values.append(json.dumps(sorted(active_ids)))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, created, last_seen, "
+                "(SELECT COUNT(*) FROM messages WHERE recipient=client_ids.id "
+                "AND acknowledged IS NULL) AS unacked FROM client_ids"
+                + where + " ORDER BY id LIMIT ?",
+                (*values, limit + 1),
+            ).fetchall()
+        items = [dict(row) for row in rows[:limit]]
+        more = len(rows) > limit
+        return {
+            "clients": items,
+            "has_more": more,
+            "next_cursor": items[-1]["id"] if more and items else None,
+        }
+
+    def storage_records(self) -> list[dict[str, Any]]:
+        self._ensure_open()
+        with self._lock:
+            fields = (
+                "id", "kind", "state", "generation", "history_id", "exec_id",
+                "client_id", "connection_id", "result_ref", "output_evicted",
+                "result_evicted", "scan_output_evicted", "created", "finished", "artifacts",
+            )
+            select = ", ".join(f"json_extract(data, '$.{field}') AS {field}" for field in fields)
+            rows = self._db.execute(f"SELECT {select} FROM entities").fetchall()
+        records = []
+        for row in rows:
+            record = dict(row)
+            for field in ("result_ref", "artifacts"):
+                if isinstance(record[field], str):
+                    record[field] = json.loads(record[field])
+            records.append(record)
+        return records
+
+    def _relative_storage_path(self, value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        try:
+            relative = candidate.resolve(strict=False).relative_to(self.root)
+        except (OSError, ValueError):
+            return None
+        normalized = relative.as_posix()
+        return normalized if normalized.startswith(".mypr/") else None
+
+    def _artifact_paths(self, record: Mapping[str, Any]) -> set[str]:
+        paths: set[str] = set()
+        for item in record.get("artifacts") or ():
+            if isinstance(item, Mapping):
+                path = self._relative_storage_path(item.get("path"))
+                if path is not None:
+                    paths.add(path)
+        owner = record.get("exec_id") or record.get("id")
+        if not isinstance(owner, str) or not owner:
+            return paths
+        directory = self.root / ".mypr" / "artifacts" / owner
+        try:
+            children = list(directory.iterdir()) if directory.is_dir() else []
+        except OSError:
+            children = []
+        for child in children[:4096]:
+            if child.is_file() and not child.is_symlink():
+                path = self._relative_storage_path(str(child))
+                if path is not None:
+                    paths.add(path)
+        return paths
+
+    def _scan_paths(self, ident: str) -> set[str]:
+        metadata = self.root / ".mypr" / "scans" / f"{ident}.json"
+        paths: set[str] = set()
+        try:
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            for key in ("result_path", "summary_path", "artifact", "artifact_path", "config"):
+                path = self._relative_storage_path(payload.get(key))
+                if path is not None:
+                    paths.add(path)
+        if not paths:
+            prefix = f".mypr/scans/{ident}"
+            paths.update(
+                f"{prefix}{suffix}"
+                for suffix in (".jsonl", ".summary.json", ".xml", ".request.json")
+            )
+        return paths
+
+    def storage_gc_snapshot(self) -> dict[str, Any]:
+        active, protected, references, tombstones = set(), set(), {}, {}
+        for record in self.storage_records():
+            ident, kind = record.get("id"), record.get("kind")
+            if not isinstance(ident, str):
+                continue
+            if kind == "python":
+                history_id = _python_history_id(record)
+                digest = hashlib.sha256(str(history_id).encode()).hexdigest()
+                paths = [f".mypr/runs/task-{digest}.jsonl"]
+            elif kind == "execution":
+                paths = [f".mypr/runs/{ident}.jsonl"]
+            elif kind == "scan":
+                paths = sorted(self._scan_paths(ident))
+            else:
+                paths = [f".mypr/jobs/{ident}.jsonl"]
+            reference = record.get("result_ref")
+            if isinstance(reference, dict):
+                path = self._relative_storage_path(reference.get("path"))
+                if path is not None:
+                    paths.append(path)
+            paths.extend(self._artifact_paths(record))
+            live = record.get("state") in _ACTIVE_STATES
+            if live:
+                active.add(ident)
+                protected.update(paths)
+            for path in paths:
+                references.setdefault(path, []).append(ident)
+                result_path = (
+                    self._relative_storage_path(reference.get("path"))
+                    if isinstance(reference, dict)
+                    else None
+                )
+                is_result = result_path is not None and path == result_path
+                if record.get("result_evicted" if is_result else (
+                    "scan_output_evicted" if kind == "scan" else "output_evicted"
+                )):
+                    tombstones[path] = {"id": ident}
+        return {
+            "active_ids": active, "protected_paths": protected,
+            "references": references, "tombstones": tombstones,
+        }
+
+    def storage_gc_before_delete(self, candidates) -> list[str]:
+        snapshot = self.storage_gc_snapshot()
+        protected = set(snapshot["protected_paths"])
+        paths = [item["path"] for item in candidates if item["path"] not in protected]
+        return self.mark_storage_evicted(paths)
+
+    def mark_storage_evicted(self, paths: list[str]) -> list[str]:
+        """Preserve entity identity and deduplication while expiring owned data."""
+        self._ensure_open()
+        selected = set(paths)
+        marked: set[str] = set()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                for row in self._db.execute("SELECT id, data FROM entities").fetchall():
+                    record = _load(row["data"])
+                    if record.get("state") not in {"succeeded", "failed", "cancelled", "lost"}:
+                        continue
+                    kind = record.get("kind")
+                    ident = record.get("id")
+                    if kind == "python":
+                        key = _python_history_id(record)
+                        digest = hashlib.sha256(str(key).encode()).hexdigest()
+                        output_paths = {f".mypr/runs/task-{digest}.jsonl"}
+                    elif kind == "execution":
+                        output_paths = {f".mypr/runs/{ident}.jsonl"}
+                    elif kind == "scan":
+                        output_paths = self._scan_paths(ident)
+                    else:
+                        output_paths = {f".mypr/jobs/{ident}.jsonl"}
+                    updated = False
+                    if output_paths & selected:
+                        if kind == "scan":
+                            record.update(
+                                scan_output_evicted=True,
+                                output_evicted=True,
+                                output_evicted_at=time.time(),
+                            )
+                        else:
+                            record.update(output_evicted=True, output_evicted_at=time.time())
+                        record.pop("output", None)
+                        record.pop("events", None)
+                        updated = True
+                    reference = record.get("result_ref")
+                    result_path = (
+                        self._relative_storage_path(reference.get("path"))
+                        if isinstance(reference, dict)
+                        else None
+                    )
+                    if result_path in selected:
+                        record.update(result_evicted=True, result_evicted_at=time.time())
+                        updated = True
+                    artifact_paths = self._artifact_paths(record)
+                    if artifact_paths & selected:
+                        record.update(
+                            output_evicted=True,
+                            artifact_evicted=True,
+                            output_evicted_at=time.time(),
+                        )
+                        record.pop("output", None)
+                        record.pop("events", None)
+                        updated = True
+                    if updated:
+                        self._db.execute(
+                            "UPDATE entities SET data=? WHERE id=?", (_dump(record), row["id"])
+                        )
+                        marked.update(
+                            path
+                            for path in selected
+                            if path in output_paths or path == result_path or path in artifact_paths
+                        )
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return sorted(marked)
 
     def record(
         self,

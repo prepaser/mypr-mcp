@@ -14,6 +14,7 @@ import re
 import stat
 import tempfile
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from .filesystem import (
     _signature,
     _to_thread_uncancelled,
 )
+from .revisions import RevisionIndexOutcomeUnknown
 
 _FILE_HEADER = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$")
 _MOVE_HEADER = re.compile(r"^\*\*\* Move to: (.+)$")
@@ -207,6 +209,7 @@ async def apply_patch(
     expected_hashes: Mapping[str, str | None] | None = None,
     dry_run: bool = False,
     max_diff_bytes: int = 32_768,
+    history: bool = True,
 ) -> dict[str, Any]:
     """Validate and transactionally apply a multi-file agent patch.
 
@@ -215,6 +218,8 @@ async def apply_patch(
     """
     if type(dry_run) is not bool:
         raise TypeError("dry_run must be a boolean")
+    if type(history) is not bool:
+        raise TypeError("history must be a boolean")
     if (
         not isinstance(max_diff_bytes, int)
         or isinstance(max_diff_bytes, bool)
@@ -225,12 +230,22 @@ async def apply_patch(
     resolved = _resolve_changes(fs, changes)
     _check_conflicts(resolved)
     expected = _resolve_expected_hashes(fs, expected_hashes)
+    history_store = fs._history_store() if history and not dry_run else None
+    resources = sorted(
+        resource
+        for _, source, _, destination, _ in resolved
+        for path in (source, destination)
+        if path is not None
+        if (resource := history_store._resource_for_path(path)) is not None
+    ) if history_store is not None else []
     locks = [fs._lock(path) for path in sorted(_lock_paths(resolved, expected), key=str)]
-    acquired: list[Any] = []
-    try:
+    async with AsyncExitStack() as stack:
+        if history_store is not None:
+            for resource in resources:
+                await stack.enter_async_context(history_store.transaction(resource))
         for lock in locks:
             await lock.acquire()
-            acquired.append(lock)
+            stack.callback(lock.release)
         return await _to_thread_uncancelled(
             _apply_locked,
             fs,
@@ -238,10 +253,8 @@ async def apply_patch(
             expected,
             dry_run,
             max_diff_bytes,
+            history_store,
         )
-    finally:
-        for lock in reversed(acquired):
-            lock.release()
 
 
 def _resolve_changes(
@@ -322,6 +335,7 @@ def _apply_locked(
     expected_hashes: Mapping[Path, str | None],
     dry_run: bool,
     max_diff_bytes: int,
+    history_store: Any = None,
 ) -> dict[str, Any]:
     states: dict[Path, _State] = {}
     for _, source, source_display, destination, destination_display in resolved:
@@ -389,7 +403,12 @@ def _apply_locked(
             )
     if dry_run:
         return _result(plans, True, max_diff_bytes)
-    return _commit(plans, states, max_diff_bytes)
+    if history_store is not None:
+        history_store.prepare_changes_sync(plans)
+    result = _commit(plans, states, max_diff_bytes, history_store=history_store)
+    if history_store is not None:
+        result["history_recorded"] = True
+    return result
 
 
 def _resolve_expected_hashes(
@@ -596,7 +615,13 @@ def _result(plans: list[dict[str, Any]], dry_run: bool, limit: int) -> dict[str,
     }
 
 
-def _commit(plans: list[dict[str, Any]], states: dict[Path, _State], limit: int) -> dict[str, Any]:
+def _commit(
+    plans: list[dict[str, Any]],
+    states: dict[Path, _State],
+    limit: int,
+    *,
+    history_store: Any = None,
+) -> dict[str, Any]:
     temporaries: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
     created_dirs: list[Path] = []
@@ -681,6 +706,13 @@ def _commit(plans: list[dict[str, Any]], states: dict[Path, _State], limit: int)
                 _assert_unchanged(source_state, current_source)
                 source.unlink()
                 committed.append((source, source_state.data, source_state.info, None, None))
+        if history_store is not None:
+            try:
+                history_store.record_changes_sync(plans)
+            except RevisionIndexOutcomeUnknown:
+                raise
+            except BaseException as exc:
+                raise RuntimeError("history record failed; patch will be rolled back") from exc
         result = _result(plans, False, limit)
         completed = True
         return result

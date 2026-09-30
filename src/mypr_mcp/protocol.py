@@ -45,6 +45,15 @@ CAPABILITIES = [
     "git_history",
     "document_extract",
     "ocr",
+    "pages",
+    "storage",
+    "doctor",
+    "filesystem_history",
+    "text_replace",
+    "lsp_config",
+    "lsp_edits",
+    "task_results",
+    "execution_output_budget",
 ]
 LEGACY_INSTRUCTIONS = """This workspace uses the legacy 0.9.0 runtime.
 Use execute for Python and poll for submitted executions. Store client-local values in

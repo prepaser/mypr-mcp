@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.kernel_api import Skills
 from mypr_mcp.modules import ModuleManager
+from mypr_mcp.revisions import RevisionStore
 
 
 class FakeShell:
@@ -27,6 +29,52 @@ def module_manager(workspace: Path, fs: Filesystem | None = None) -> ModuleManag
 
 def sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_revision_storage_lock_does_not_leak_to_child_context(tmp_path: Path):
+    store = RevisionStore(tmp_path, Filesystem(tmp_path), "files")
+
+    async def acquire_from_child():
+        async with store.transaction("child.txt"):
+            return True
+
+    async with store.transaction("parent.txt"):
+        child = asyncio.create_task(acquire_from_child())
+        await asyncio.sleep(0.05)
+        assert not child.done()
+    assert await asyncio.wait_for(child, 1) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["modules", "skills"])
+async def test_legacy_revision_index_upgrades_and_prunes(kind: str, tmp_path: Path):
+    store = RevisionStore(tmp_path, Filesystem(tmp_path), kind)
+    resource = f"{kind}/demo.py"
+    values = [f"value = {index}\n" for index in range(3)]
+    for value in values:
+        await store.record(resource, [value])
+    index_path = tmp_path / store._index_path(resource)
+    legacy = json.loads(index_path.read_text(encoding="utf-8"))
+    legacy["version"] = 1
+    legacy.pop("next_sequence", None)
+    legacy.pop("pruned_before", None)
+    index_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    values.extend(f"value = {index}\n" for index in range(3, 55))
+    for value in values[3:]:
+        await store.record(resource, [value])
+    migrated = "value = migrated\n"
+    await store.record(resource, [migrated])
+    current = json.loads(index_path.read_text(encoding="utf-8"))
+    assert current["version"] == 2
+    assert current["next_sequence"] > current["revisions"][-1]["sequence"]
+    history = await store.history(resource, limit=100)
+    assert len(history["items"]) == 56
+    assert history["pruned_before"] == 0
+    assert (await store.read_revision(resource, hashlib.sha256(values[-1].encode()).hexdigest()))[
+        "recorded"
+    ]
 
 
 @pytest.mark.asyncio

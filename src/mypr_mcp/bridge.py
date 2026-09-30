@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .diagnostics import RPCError
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, wait_ticket
 from .restart_records import poll_restart
@@ -45,6 +46,8 @@ class ConnectionBridge:
             self._ready.clear()
         await self._ready.wait()
         if self._error is not None:
+            if isinstance(self._error, RPCError):
+                raise self._error
             raise RuntimeError(str(self._error)) from self._error
         if self._stopped or self.path is None:
             raise RuntimeError("Workspace manager connection is closed")
@@ -63,10 +66,12 @@ class ConnectionBridge:
         self._reported_generation = self.generation
         return {**result, "runtime": info}
 
-    async def _poll_restart(self, exec_id, cursor, wait_ms):
+    async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
         deadline = time.monotonic() + min(30000, max(0, wait_ms)) / 1000
         while True:
-            result = await asyncio.to_thread(poll_restart, self.workspace, exec_id, cursor)
+            result = await asyncio.to_thread(
+                poll_restart, self.workspace, exec_id, cursor, max_bytes=max_bytes
+            )
             if (
                 result is None
                 or result["state"] != "running"
@@ -110,7 +115,8 @@ class ConnectionBridge:
             or (self.attachment is not None and self.attachment.closed.is_set())
         ):
             recorded = await self._poll_restart(
-                fields["exec_id"], fields.get("cursor") or 0, fields.get("wait_ms", 0)
+                fields["exec_id"], fields.get("cursor") or 0, fields.get("wait_ms", 0),
+                fields.get("max_bytes"),
             )
             if recorded is not None:
                 return self._decorate(recorded)
@@ -130,7 +136,10 @@ class ConnectionBridge:
                 and origin.get("connection_id") == connection_id
                 and origin.get("request_id") == fields.get("request_id")
             ):
-                result = await asyncio.to_thread(poll_restart, self.workspace, origin["exec_id"])
+                result = await asyncio.to_thread(
+                    poll_restart, self.workspace, origin["exec_id"],
+                    max_bytes=fields.get("max_bytes"),
+                )
                 if result is not None:
                     return self._decorate(result)
             if op == "poll" and ticket:
@@ -139,6 +148,7 @@ class ConnectionBridge:
                     self.workspace,
                     fields["exec_id"],
                     fields.get("cursor") or 0,
+                    max_bytes=fields.get("max_bytes"),
                 )
                 if result is not None:
                     return self._decorate(result)

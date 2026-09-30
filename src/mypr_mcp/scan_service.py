@@ -22,6 +22,8 @@ from .services import Shells
 _RESULT_LIMIT = 16 * 1024 * 1024
 _DEFAULT_PAGE_ENTRIES = 100
 _DEFAULT_PAGE_BYTES = 32768
+_DEFAULT_MAX_PROBES = 1_000_000
+_DEFAULT_MAX_DURATION = 3600.0
 _TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
 
 
@@ -73,6 +75,9 @@ class ScanService:
         concurrency: int = 64,
         rate: float = 200,
         timeout: float = 1.0,  # noqa: ASYNC109
+        max_probes: int | None = _DEFAULT_MAX_PROBES,
+        max_duration: float | None = _DEFAULT_MAX_DURATION,
+        continue_after_output_limit: bool = False,
         args: list[str] | None = None,
         client_id: str | None = None,
         connection_id: str | None = None,
@@ -81,6 +86,12 @@ class ScanService:
         if mode not in {"tcp", "nmap"}:
             raise ValueError("mode must be 'tcp' or 'nmap'")
         target_list = self._validate_targets(targets)
+        self._validate_limits(max_probes, max_duration, continue_after_output_limit)
+        estimate = None
+        if mode == "tcp":
+            from .scan_worker import estimate_probes
+
+            estimate = estimate_probes(target_list, ports)
         request_id = secrets.token_hex(16)
         result_path = self.root / f"{request_id}.jsonl"
         artifact_path = self.root / f"{request_id}.xml"
@@ -92,6 +103,9 @@ class ScanService:
             "concurrency": concurrency,
             "rate": rate,
             "timeout": timeout,
+            "max_probes": max_probes,
+            "max_duration": max_duration,
+            "continue_after_output_limit": continue_after_output_limit,
             "result_path": str(result_path),
             "artifact_path": str(artifact_path),
             "summary_path": str(summary_path),
@@ -103,6 +117,8 @@ class ScanService:
                 "mode": mode,
                 "targets": target_list,
                 "args": self._validate_nmap_args(args),
+                "max_duration": max_duration,
+                "continue_after_output_limit": continue_after_output_limit,
                 "result_path": str(result_path),
                 "artifact_path": str(artifact_path),
                 "summary_path": str(summary_path),
@@ -142,7 +158,12 @@ class ScanService:
             "artifact": str(config["artifact_path"]) if mode == "nmap" else None,
             "result_count": 0,
             "result_bytes": 0,
+            "attempts": 0,
+            "estimate": estimate,
+            "max_probes": max_probes,
+            "max_duration": max_duration,
             "truncated": False,
+            "stop_reason": None,
             "warnings": [],
             "client_id": client_id,
             "connection_id": connection_id,
@@ -172,7 +193,14 @@ class ScanService:
         monitor = asyncio.create_task(self._monitor(record), name=f"mypr:scan:{ident}")
         self._monitors[ident] = monitor
         monitor.add_done_callback(lambda _: self._monitors.pop(ident, None))
-        return {"id": ident, "state": record["state"], "mode": mode}
+        return {
+            "id": ident,
+            "state": record["state"],
+            "mode": mode,
+            "estimate": estimate,
+            "max_probes": max_probes,
+            "max_duration": max_duration,
+        }
 
     @staticmethod
     async def _finish_cancelled_launch(launch: asyncio.Task[Any]) -> dict[str, Any]:
@@ -371,7 +399,9 @@ class ScanService:
             for key in (
                 "count",
                 "bytes",
+                "attempts",
                 "truncated",
+                "stop_reason",
                 "artifact_bytes",
                 "artifact_truncated",
                 "returncode",
@@ -396,6 +426,9 @@ class ScanService:
                 if isinstance(summary, dict):
                     for key in (
                         "truncated",
+                        "attempts",
+                        "stop_reason",
+                        "duration_seconds",
                         "artifact_bytes",
                         "artifact_truncated",
                         "returncode",
@@ -495,6 +528,24 @@ class ScanService:
                 or config[name] <= 0
             ):
                 raise ValueError(f"{name} must be positive")
+
+    @staticmethod
+    def _validate_limits(
+        max_probes: int | None, max_duration: float | None, continue_after_output_limit: bool
+    ) -> None:
+        if max_probes is not None and (
+            isinstance(max_probes, bool) or not isinstance(max_probes, int) or max_probes < 1
+        ):
+            raise ValueError("max_probes must be a positive integer or None")
+        if max_duration is not None and (
+            isinstance(max_duration, bool)
+            or not isinstance(max_duration, (int, float))
+            or not math.isfinite(float(max_duration))
+            or max_duration <= 0
+        ):
+            raise ValueError("max_duration must be positive and finite or None")
+        if type(continue_after_output_limit) is not bool:
+            raise TypeError("continue_after_output_limit must be a boolean")
 
     @staticmethod
     def _validate_nmap_args(args: list[str] | None) -> list[str]:

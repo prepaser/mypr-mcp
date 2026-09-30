@@ -327,6 +327,51 @@ async def test_client_event_ring_is_bounded_and_reads_only_its_page(browser_tool
 
 
 @pytest.mark.asyncio
+async def test_observation_filters_wait_and_respects_compact_budget(browser_tools):
+    tools, _ = browser_tools
+    context = await tools.context()
+    page = context.pages[0]
+    observation = await tools.observe(page)
+    for _ in range(1000):
+        page.emit("pageerror", "")
+    result = await observation.read(cursor=0, limit=1000)
+    assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) <= 32 * 1024
+
+    request = Request()
+    response = Response(request, {"content-length": "2"})
+    waiting = asyncio.create_task(
+        observation.read(types="response", url_contains="/data", status=200, wait_ms=500)
+    )
+    await asyncio.sleep(0)
+    page.emit("request", request)
+    page.emit("response", response)
+    filtered = await waiting
+    assert [event["type"] for event in filtered["events"]] == ["response"]
+
+
+@pytest.mark.asyncio
+async def test_observation_body_timeout_is_bounded(browser_tools):
+    tools, _ = browser_tools
+    context = await tools.context()
+    page = context.pages[0]
+    observation = await tools.observe(page)
+
+    class HangingResponse(Response):
+        async def body(self):
+            await asyncio.sleep(10)
+            return b"never"
+
+    request = Request()
+    page.emit("request", request)
+    page.emit("response", HangingResponse(request, {"content-length": "5"}))
+    event = (await observation.read())[
+        "events"
+    ][0]
+    result = await observation.request(event["request_id"], body=True, body_timeout=0.01)
+    assert "timed out" in result["response"]["body_error"]
+
+
+@pytest.mark.asyncio
 async def test_request_details_are_evicted_with_the_client_cap(browser_tools):
     tools, _ = browser_tools
     context = await tools.context()
@@ -415,6 +460,11 @@ async def test_snapshot_find_and_diff_are_paged_and_client_private(browser_tools
     assert first["has_more"]
     rest = await tools.find(snapshot["snapshot_id"], "alpha", cursor=first["next_cursor"], limit=2)
     assert [item["line"] for item in rest["matches"]] == [4]
+    page.snapshot_text = "alpha\nnoise"
+    trailing = await tools.snapshot(page)
+    first_trailing = await tools.find(trailing["snapshot_id"], "alpha", limit=1)
+    assert not first_trailing["has_more"]
+    assert first_trailing["next_cursor"] is None
     regex = await tools.find(snapshot["snapshot_id"], r"^alpha", regex=True)
     assert [item["line"] for item in regex["matches"]] == [1, 4]
     page.snapshot_text = "x ^alpha"

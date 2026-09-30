@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import codecs
 import difflib
 import hashlib
@@ -11,6 +12,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -89,18 +91,30 @@ class Filesystem:
         overwrite: bool = False,
         encoding: str = "utf-8",
         create_parents: bool = False,
+        history: bool = True,
     ) -> dict[str, Any]:
         """Atomically create or replace a text file using an optional CAS."""
         if not isinstance(text, str):
             raise TypeError("text must be a string")
-        if type(overwrite) is not bool or type(create_parents) is not bool:
-            raise TypeError("overwrite and create_parents must be booleans")
+        if (
+            type(overwrite) is not bool
+            or type(create_parents) is not bool
+            or type(history) is not bool
+        ):
+            raise TypeError("overwrite, create_parents, and history must be booleans")
         resolved, display = self._path(path)
         encoded = text.encode(encoding)
-        lock = self._lock(resolved)
-        await lock.acquire()
-        try:
-            return await _to_thread_uncancelled(
+        if history:
+            _validate_history_target(resolved, display)
+        resource = self._history_resource(resolved) if history else None
+        history_enabled = resource is not None
+        async with AsyncExitStack() as stack:
+            if resource is not None:
+                await stack.enter_async_context(self._history_store().transaction(resource))
+            lock = self._lock(resolved)
+            await lock.acquire()
+            stack.callback(lock.release)
+            result = await _to_thread_uncancelled(
                 _write_file,
                 resolved,
                 display,
@@ -108,9 +122,74 @@ class Filesystem:
                 expected_hash,
                 overwrite,
                 create_parents,
+                history_enabled,
             )
-        finally:
-            lock.release()
+            old = result.pop("_old", None)
+            if history_enabled:
+                await self._record_history(resolved, display, old, encoded)
+                result["history_recorded"] = self._history_resource(resolved) is not None
+            return result
+
+    async def read_bytes(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        start_byte: int = 0,
+        max_bytes: int = 32_768,
+    ) -> dict[str, Any]:
+        """Read a bounded byte page without decoding the source."""
+        if type(start_byte) is not int or start_byte < 0:
+            raise ValueError("start_byte must be a non-negative integer")
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        resolved, display = self._path(path)
+        return await _to_thread_uncancelled(_read_bytes, resolved, display, start_byte, max_bytes)
+
+    async def write_bytes(
+        self,
+        path: str | os.PathLike[str],
+        data: bytes,
+        *,
+        expected_hash: str | None = None,
+        overwrite: bool = False,
+        create_parents: bool = False,
+        history: bool = True,
+    ) -> dict[str, Any]:
+        """Atomically write raw bytes using an optional CAS."""
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
+        if (
+            type(overwrite) is not bool
+            or type(create_parents) is not bool
+            or type(history) is not bool
+        ):
+            raise TypeError("overwrite, create_parents, and history must be booleans")
+        resolved, display = self._path(path)
+        if history:
+            _validate_history_target(resolved, display)
+        resource = self._history_resource(resolved) if history else None
+        history_enabled = resource is not None
+        async with AsyncExitStack() as stack:
+            if resource is not None:
+                await stack.enter_async_context(self._history_store().transaction(resource))
+            lock = self._lock(resolved)
+            await lock.acquire()
+            stack.callback(lock.release)
+            result = await _to_thread_uncancelled(
+                _write_file,
+                resolved,
+                display,
+                data,
+                expected_hash,
+                overwrite,
+                create_parents,
+                history_enabled,
+            )
+            old = result.pop("_old", None)
+            if history_enabled:
+                await self._record_history(resolved, display, old, data)
+                result["history_recorded"] = self._history_resource(resolved) is not None
+            return result
 
     async def apply_patch(
         self,
@@ -119,6 +198,7 @@ class Filesystem:
         expected_hashes: Mapping[str, str | None] | None = None,
         dry_run: bool = False,
         max_diff_bytes: int = 32768,
+        history: bool = True,
     ) -> dict[str, Any]:
         from .patching import apply_patch
 
@@ -128,6 +208,7 @@ class Filesystem:
             expected_hashes=expected_hashes,
             dry_run=dry_run,
             max_diff_bytes=max_diff_bytes,
+            history=history,
         )
 
     async def rewrite_ast(
@@ -139,6 +220,7 @@ class Filesystem:
         lang: str,
         paths: str | list[str] | None = None,
         glob: str | list[str] | None = None,
+        history: bool = True,
     ) -> dict[str, Any]:
         from .ast_rewrite import rewrite_ast
 
@@ -150,12 +232,432 @@ class Filesystem:
             lang=lang,
             paths=paths,
             glob=glob,
+            history=history,
         )
 
     async def apply_rewrite(self, plan_id: str) -> dict[str, Any]:
         from .ast_rewrite import apply_rewrite
 
         return await apply_rewrite(self, plan_id)
+
+    async def replace(self, pattern: str, replacement: str, **options: Any) -> dict[str, Any]:
+        from .text_replace import replace
+
+        return await replace(self, pattern, replacement, **options)
+
+    async def apply_replace(self, plan_id: str) -> dict[str, Any]:
+        from .text_replace import apply_replace
+
+        return await apply_replace(self, plan_id)
+
+    async def apply_lsp_plan(self, plan: Any) -> dict[str, Any]:
+        """Apply a validated LSP WorkspaceEdit as one CAS transaction."""
+        from .patching import _commit, _plan, _read_state
+
+        operations = getattr(plan, "operations", None)
+        if not isinstance(operations, list) or not operations:
+            raise ValueError("LSP edit plan has no operations")
+        paths: set[Path] = set()
+        for operation in operations:
+            path = getattr(operation, "path", None)
+            source = getattr(operation, "source", None)
+            if not isinstance(path, Path) or (source is not None and not isinstance(source, Path)):
+                raise ValueError("LSP edit plan contains an invalid path")
+            resolved_path = path.resolve(strict=False)
+            if not _below(resolved_path, self.workspace) or resolved_path == self.workspace:
+                raise ValueError("LSP edit path must remain inside the workspace")
+            paths.add(resolved_path)
+            if source is not None:
+                resolved_source = source.resolve(strict=False)
+                if not _below(resolved_source, self.workspace) or resolved_source == self.workspace:
+                    raise ValueError("LSP edit source must remain inside the workspace")
+                paths.add(resolved_source)
+        locks = [self._lock(path) for path in sorted(paths, key=str)]
+        history_store = self._history_store()
+        resources = sorted(
+            resource
+            for path in paths
+            if (resource := self._history_resource(path)) is not None
+        )
+        async with AsyncExitStack() as stack:
+            for resource in resources:
+                await stack.enter_async_context(history_store.transaction(resource))
+            for lock in locks:
+                await lock.acquire()
+                stack.callback(lock.release)
+            states: dict[Path, Any] = {}
+            plans: list[dict[str, Any]] = []
+            for operation in operations:
+                path = operation.path.resolve(strict=False)
+                display = str(path.relative_to(self.workspace))
+                current = await _to_thread_uncancelled(_read_state, path, display)
+                expected = getattr(operation, "expected", None)
+                if expected is not None and _sha256(current.data or b"") != expected:
+                    raise ValueError(f"LSP edit plan is stale: {display}")
+                kind = operation.operation
+                if kind == "rename":
+                    source = operation.source.resolve(strict=False)
+                    source_display = str(source.relative_to(self.workspace))
+                    source_state = states.get(source)
+                    if source_state is None:
+                        source_state = await _to_thread_uncancelled(
+                            _read_state, source, source_display
+                        )
+                        states[source] = source_state
+                    if not source_state.exists or source_state.data != operation.source_old:
+                        raise ValueError(f"LSP edit plan is stale: {source_display}")
+                    if current.exists:
+                        raise FileExistsError(display)
+                    states[path] = current
+                    plans.append(
+                        _plan(
+                            "move",
+                            path,
+                            display,
+                            None,
+                            operation.new,
+                            current.info,
+                            stat.S_IMODE(source_state.info.st_mode),
+                            source=source,
+                            source_display=source_display,
+                            source_old=source_state.data,
+                            source_old_info=source_state.info,
+                        )
+                    )
+                elif kind == "create":
+                    if current.exists:
+                        raise FileExistsError(display)
+                    states[path] = current
+                    plans.append(_plan("add", path, display, None, operation.new, None, 0o600))
+                elif kind == "delete":
+                    if not current.exists:
+                        raise FileNotFoundError(display)
+                    states[path] = current
+                    plans.append(
+                        _plan("delete", path, display, current.data, None, current.info, None)
+                    )
+                elif kind == "update":
+                    if not current.exists:
+                        raise FileNotFoundError(display)
+                    states[path] = current
+                    plans.append(
+                        _plan(
+                            "update",
+                            path,
+                            display,
+                            current.data,
+                            operation.new,
+                            current.info,
+                            stat.S_IMODE(current.info.st_mode),
+                        )
+                    )
+                else:
+                    raise ValueError(f"unsupported LSP edit operation: {kind}")
+            history_store.prepare_changes_sync(plans)
+            result = await _to_thread_uncancelled(
+                _commit, plans, states, 32 * 1024, history_store=history_store
+            )
+            result["history_recorded"] = True
+            return result
+
+    async def history(
+        self, path: str | os.PathLike[str], *, limit: int = 20, cursor: int | None = None
+    ) -> dict[str, Any]:
+        resource = self._history_resource_for_input(path)
+        if resource is None:
+            raise ValueError("file history requires a regular workspace file path")
+        return await self._history_store().history(resource, limit=limit, cursor=cursor)
+
+    async def read_revision(
+        self,
+        path: str | os.PathLike[str],
+        revision: str,
+        *,
+        start_byte: int = 0,
+        max_bytes: int = 32_768,
+    ) -> dict[str, Any]:
+        resource = self._history_resource_for_input(path)
+        if resource is None:
+            raise ValueError("file history requires a workspace file path")
+        return await self._history_store().read_revision(
+            resource, revision, start_byte=start_byte, max_bytes=max_bytes
+        )
+
+    async def restore(
+        self,
+        path: str | os.PathLike[str],
+        revision: str,
+        *,
+        expected_hash: str | None = None,
+        history: bool = True,
+    ) -> dict[str, Any]:
+        resource = self._history_resource_for_input(path)
+        if resource is None:
+            raise ValueError("file history requires a workspace file path")
+        if type(history) is not bool:
+            raise TypeError("history must be a boolean")
+        store = self._history_store()
+        data = await store.restore_bytes(resource, revision)
+        if data is None:
+            resolved, display = self._path(path)
+            current = await _to_thread_uncancelled(_read_optional_bytes, resolved, display)
+            if current is None:
+                if expected_hash is not None:
+                    raise ValueError(f"Revision mismatch: expected {expected_hash}, got None")
+                return {
+                    "path": display,
+                    "restored": True,
+                    "absent": True,
+                    "changed": False,
+                    "history_recorded": False,
+                }
+            result = await self.delete(path, expected_hash=expected_hash, history=history)
+            result.update({"restored": True, "absent": True, "changed": True})
+            return result
+        return await self.write_bytes(
+            path,
+            data,
+            expected_hash=expected_hash,
+            overwrite=expected_hash is not None,
+            create_parents=True,
+            history=history,
+        )
+
+    async def delete(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        expected_hash: str | None = None,
+        history: bool = True,
+    ) -> dict[str, Any]:
+        if expected_hash is None:
+            raise ValueError("delete requires expected_hash")
+        resolved, display = self._path(path)
+        if history:
+            _validate_history_target(resolved, display)
+        resource = self._history_resource(resolved) if history else None
+        history_enabled = resource is not None
+        async with AsyncExitStack() as stack:
+            if resource is not None:
+                await stack.enter_async_context(self._history_store().transaction(resource))
+            lock = self._lock(resolved)
+            await lock.acquire()
+            stack.callback(lock.release)
+            old = await _to_thread_uncancelled(_read_optional_bytes, resolved, display)
+            _check_expected(old, expected_hash)
+            if old is None:
+                raise FileNotFoundError(display)
+            history_enabled = resource is not None
+            if history_enabled:
+                _validate_history_size(old, None, display)
+            await _to_thread_uncancelled(_unlink_expected, resolved, display, old)
+            if history_enabled:
+                await self._record_history(resolved, display, old, None)
+            return {
+                "path": display,
+                "deleted": True,
+                "old_revision": _sha256(old),
+                "history_recorded": history and self._history_resource(resolved) is not None,
+            }
+
+    async def move(
+        self,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        *,
+        expected_hash: str | None = None,
+        overwrite: bool = False,
+        history: bool = True,
+    ) -> dict[str, Any]:
+        if expected_hash is None:
+            raise ValueError("move requires expected_hash")
+        return await self._copy_or_move(
+            source, destination, expected_hash, overwrite, history, move=True
+        )
+
+    async def copy(
+        self,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        *,
+        expected_hash: str | None = None,
+        overwrite: bool = False,
+        history: bool = True,
+    ) -> dict[str, Any]:
+        return await self._copy_or_move(
+            source, destination, expected_hash, overwrite, history, move=False
+        )
+
+    async def _copy_or_move(
+        self,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        expected_hash: str | None,
+        overwrite: bool,
+        history: bool,
+        *,
+        move: bool,
+    ) -> dict[str, Any]:
+        if type(overwrite) is not bool or type(history) is not bool:
+            raise TypeError("overwrite and history must be booleans")
+        if overwrite:
+            raise ValueError("destination overwrite is not supported")
+        source_path, source_display = self._path(source)
+        destination_path, destination_display = self._path(destination)
+        _reject_symlink_input(self.workspace, source)
+        _reject_symlink_input(self.workspace, destination)
+        if source_path == destination_path:
+            raise ValueError("source and destination are identical")
+        if history:
+            _validate_history_target(source_path, source_display)
+            _validate_history_target(destination_path, destination_display)
+        resources = (
+            sorted(
+                {
+                    resource
+                    for path in (source_path, destination_path)
+                    if (resource := self._history_resource(path)) is not None
+                }
+            )
+            if history
+            else []
+        )
+        history_enabled = bool(resources)
+        locks = [self._lock(path) for path in sorted({source_path, destination_path}, key=str)]
+        async with AsyncExitStack() as stack:
+            for resource in resources:
+                await stack.enter_async_context(self._history_store().transaction(resource))
+            for lock in locks:
+                await lock.acquire()
+                stack.callback(lock.release)
+            old = await _to_thread_uncancelled(_read_optional_bytes, source_path, source_display)
+            _check_expected(old, expected_hash)
+            if old is None:
+                raise FileNotFoundError(source_display)
+            destination_old = await _to_thread_uncancelled(
+                _read_optional_bytes, destination_path, destination_display
+            )
+            if destination_old is not None and not overwrite:
+                raise FileExistsError(destination_display)
+            if history_enabled:
+                _validate_history_size(old, old, source_display)
+            if destination_path.parent != self.workspace and not destination_path.parent.exists():
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                await _to_thread_uncancelled(
+                    _copy_bytes,
+                    source_path,
+                    destination_path,
+                    old,
+                    destination_old,
+                    move,
+                )
+            except BaseException as exc:
+                try:
+                    await _to_thread_uncancelled(
+                        _restore_transition, destination_path, destination_old, old
+                    )
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        f"lifecycle operation failed and destination rollback was incomplete: "
+                        f"{rollback_error}"
+                    ) from exc
+                raise
+            if history_enabled:
+                source_resource = self._history_resource(source_path)
+                destination_resource = self._history_resource(destination_path)
+                transitions = []
+                if source_resource is not None:
+                    transitions.append((source_path, source_display, old, None if move else old))
+                if destination_resource is not None:
+                    transitions.append(
+                        (destination_path, destination_display, destination_old, old)
+                    )
+                try:
+                    for target, target_display, before, after in transitions:
+                        await self._record_history(target, target_display, before, after)
+                except BaseException as exc:
+                    recovery = []
+                    for target, _, before, after in reversed(transitions):
+                        try:
+                            await _to_thread_uncancelled(_restore_transition, target, before, after)
+                        except BaseException as rollback_error:
+                            recovery.append(f"{target}: {rollback_error}")
+                    if recovery:
+                        raise RuntimeError(
+                            "history write failed and lifecycle rollback was incomplete: "
+                            + "; ".join(recovery)
+                        ) from exc
+                    raise RuntimeError(
+                        "history write failed; lifecycle change was rolled back"
+                    ) from exc
+            return {
+                "source": source_display,
+                "path": destination_display,
+                "operation": "move" if move else "copy",
+                "old_revision": _sha256(old),
+                "revision": _sha256(old),
+                "size": len(old),
+                "history_recorded": history_enabled
+                and (self._history_resource(source_path) is not None
+                     or self._history_resource(destination_path) is not None),
+            }
+
+    def _history_store(self):
+        from .revisions import RevisionStore
+
+        return RevisionStore(self.workspace, self, "files")
+
+    def _history_resource_for_input(self, path: str | os.PathLike[str]) -> str | None:
+        resolved, display = self._path(path)
+        _validate_history_target(resolved, display)
+        return self._history_resource(resolved)
+
+    def _history_resource(self, path: Path) -> str | None:
+        try:
+            relative = path.resolve(strict=False).relative_to(self.workspace)
+        except ValueError:
+            return None
+        if not relative.parts:
+            return None
+        if relative.parts[0] == ".mypr":
+            editable = relative.parts[1:2] == ("skills",) or relative.parts[:3] == (
+                ".mypr",
+                "lib",
+                "ws_lib",
+            )
+            if not editable:
+                return None
+        return relative.as_posix()
+
+    async def _record_history(
+        self, path: Path, display: str, old: bytes | None, new: bytes | None
+    ) -> None:
+        resource = self._history_resource(path)
+        if resource is None or old == new:
+            return
+        from .revisions import _MAX_BLOB_BYTES
+
+        for value in (old, new):
+            if value is not None and len(value) > _MAX_BLOB_BYTES:
+                raise ValueError(
+                    f"history for {display} exceeds {_MAX_BLOB_BYTES} bytes; "
+                    "retry with history=False"
+                )
+        store = self._history_store()
+        try:
+            await store.record_bytes(resource, (old, new))
+        except BaseException as exc:
+            try:
+                await _to_thread_uncancelled(_restore_transition, path, old, new)
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    f"history write failed for {display}; rollback was incomplete: "
+                    f"{rollback_error}"
+                ) from exc
+            raise RuntimeError(
+                f"history write failed for {display}; file change was rolled back"
+            ) from exc
 
     async def image(
         self,
@@ -224,6 +726,7 @@ class Filesystem:
         dry_run: bool = False,
         encoding: str = "utf-8",
         max_diff_bytes: int = 32_768,
+        history: bool = True,
     ) -> dict[str, Any]:
         """Apply exact text replacements atomically and return a bounded diff."""
         if not isinstance(edits, list):
@@ -236,11 +739,20 @@ class Filesystem:
             or max_diff_bytes < 1
         ):
             raise ValueError("max_diff_bytes must be a positive integer")
+        if type(history) is not bool:
+            raise TypeError("history must be a boolean")
         resolved, display = self._path(path)
-        lock = self._lock(resolved)
-        await lock.acquire()
-        try:
-            return await _to_thread_uncancelled(
+        if history:
+            _validate_history_target(resolved, display)
+        resource = self._history_resource(resolved) if history else None
+        history_enabled = resource is not None
+        async with AsyncExitStack() as stack:
+            if resource is not None:
+                await stack.enter_async_context(self._history_store().transaction(resource))
+            lock = self._lock(resolved)
+            await lock.acquire()
+            stack.callback(lock.release)
+            result = await _to_thread_uncancelled(
                 _patch_file,
                 resolved,
                 display,
@@ -249,9 +761,14 @@ class Filesystem:
                 dry_run,
                 encoding,
                 max_diff_bytes,
+                history_enabled,
             )
-        finally:
-            lock.release()
+            old = result.pop("_old", None)
+            new = result.pop("_new", None)
+            if history_enabled and not dry_run:
+                await self._record_history(resolved, display, old, new)
+                result["history_recorded"] = self._history_resource(resolved) is not None
+            return result
 
     async def search(self, pattern=None, **options):
         return await self._search_query("rg", pattern, options)
@@ -506,6 +1023,43 @@ def _read_regular(path: Path, display: str) -> tuple[bytes, os.stat_result]:
             os.close(fd)
 
 
+def _read_optional_bytes(path: Path, display: str) -> bytes | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Path must not be a symlink: {display}")
+    _require_regular(info, display)
+    data, opened = _read_regular(path, display)
+    after = path.stat()
+    if _signature(info) != _signature(opened) or _signature(info) != _signature(after):
+        raise RuntimeError(f"File changed while reading: {display}")
+    return data
+
+
+def _read_bytes(path: Path, display: str, start_byte: int, max_bytes: int) -> dict[str, Any]:
+    before = path.stat()
+    _require_regular(before, display)
+    data, opened = _read_regular(path, display)
+    after = path.stat()
+    if _signature(before) != _signature(opened) or _signature(before) != _signature(after):
+        raise RuntimeError(f"File changed while reading: {display}")
+    if start_byte > len(data):
+        raise ValueError("start_byte is beyond the file")
+    end = min(start_byte + max_bytes, len(data))
+    chunk = data[start_byte:end]
+    return {
+        "path": display,
+        "data_base64": base64.b64encode(chunk).decode("ascii"),
+        "start_byte": start_byte,
+        "size": len(data),
+        "revision": _sha256(data),
+        "next_cursor": end if end < len(data) else None,
+        "truncated": end < len(data),
+    }
+
+
 def _check_expected(old: bytes | None, expected_hash: str | None) -> None:
     if expected_hash is not None and (old is None or _sha256(old) != expected_hash):
         actual = None if old is None else _sha256(old)
@@ -677,6 +1231,7 @@ def _write_file(
     expected_hash: str | None,
     overwrite: bool,
     create_parents: bool,
+    history: bool = False,
 ) -> dict[str, Any]:
     try:
         old_stat = path.stat()
@@ -690,12 +1245,16 @@ def _write_file(
     _check_expected(old, expected_hash)
     if old is not None and not (overwrite or expected_hash is not None):
         raise FileExistsError(f"File already exists: {display}")
+    if history:
+        _validate_history_size(old, data, display)
     if create_parents:
         path.parent.mkdir(parents=True, exist_ok=True)
     elif not path.parent.exists():
         raise FileNotFoundError(str(path.parent))
     info = _atomic_write(path, data, old, old_stat)
-    return _write_result(display, data, info, old is not None)
+    result = _write_result(display, data, info, old is not None)
+    result["_old"] = old
+    return result
 
 
 def _patch_file(
@@ -706,6 +1265,7 @@ def _patch_file(
     dry_run: bool,
     encoding: str,
     max_diff_bytes: int,
+    history: bool = False,
 ) -> dict[str, Any]:
     old_stat = path.stat()
     _require_regular(old_stat, display)
@@ -715,6 +1275,8 @@ def _patch_file(
     updated = _apply_edits(original, edits)
     old_hash = _sha256(old)
     new_bytes = updated.encode(encoding)
+    if history:
+        _validate_history_size(old, new_bytes, display)
     new_hash = _sha256(new_bytes)
     diff, diff_truncated = _bounded_diff(display, original, updated, max_diff_bytes)
     if not dry_run and new_bytes != old:
@@ -729,6 +1291,8 @@ def _patch_file(
         "size": len(new_bytes),
         "diff": diff,
         "diff_truncated": diff_truncated,
+        "_old": old,
+        "_new": new_bytes,
     }
 
 
@@ -841,6 +1405,78 @@ def _write_result(
         "size": len(data),
         "mode": stat.S_IMODE(info.st_mode),
     }
+
+
+def _validate_history_target(path: Path, display: str) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    if path.is_symlink():
+        raise ValueError(f"History does not support symlink paths: {display}")
+    if path.is_dir():
+            raise IsADirectoryError(display)
+
+
+def _reject_symlink_input(workspace: Path, value: str | os.PathLike[str]) -> None:
+    supplied = Path(value).expanduser()
+    candidate = supplied if supplied.is_absolute() else workspace / supplied
+    if candidate.is_symlink():
+        raise ValueError(f"Path must not be a symlink: {value}")
+
+
+def _validate_history_size(old: bytes | None, new: bytes | None, display: str) -> None:
+    from .revisions import _MAX_BLOB_BYTES
+
+    for data in (old, new):
+        if data is not None and len(data) > _MAX_BLOB_BYTES:
+            raise ValueError(
+                f"history for {display} exceeds {_MAX_BLOB_BYTES} bytes; retry with history=False"
+            )
+
+
+def _unlink_expected(path: Path, display: str, expected: bytes) -> None:
+    current = _read_optional_bytes(path, display)
+    if current != expected:
+        raise RuntimeError(f"File changed while deleting: {display}")
+    path.unlink()
+
+
+def _copy_bytes(
+    source: Path,
+    destination: Path,
+    data: bytes,
+    destination_old: bytes | None,
+    move: bool,
+) -> None:
+    source_mode = stat.S_IMODE(source.stat().st_mode)
+    destination_info = destination.stat() if destination.exists() else None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(destination, data, destination_old, destination_info)
+    if destination_info is None:
+        destination.chmod(source_mode)
+    if move:
+        current = _read_optional_bytes(destination, str(destination))
+        if current != data:
+            raise RuntimeError(f"Destination changed while moving: {destination}")
+        source.unlink()
+
+
+def _restore_transition(path: Path, old: bytes | None, new: bytes | None) -> None:
+    current = _read_optional_bytes(path, str(path))
+    if new is None:
+        if current is not None:
+            raise RuntimeError(f"File changed while rolling back: {path}")
+        if old is None:
+            return
+        _atomic_write(path, old, None, None)
+        return
+    if current != new:
+        raise RuntimeError(f"File changed while rolling back: {path}")
+    if old is None:
+        path.unlink(missing_ok=True)
+    else:
+        _atomic_write(path, old, new, path.stat())
 
 
 async def _to_thread_uncancelled(function, *args, **kwargs):

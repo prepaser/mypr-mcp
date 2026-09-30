@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -205,5 +206,70 @@ def test_empty_log_cursor_and_filtered_pages_survive_restart(tmp_path):
         last = history.logs(cursor=next_page["cursor"], client_id="a", limit=2)
         assert [event["id"] for event in last["events"]] == ["4"]
         assert history.logs(cursor=last["cursor"], client_id="a")["events"] == []
+    finally:
+        history.close()
+
+
+def test_storage_gc_normalizes_artifacts_and_scan_metadata(tmp_path):
+    root = tmp_path / ".mypr"
+    scan_dir = root / "scans"
+    scan_dir.mkdir(parents=True)
+    result = scan_dir / "request.jsonl"
+    summary = scan_dir / "request.summary.json"
+    artifact = scan_dir / "request.xml"
+    for path in (result, summary, artifact):
+        path.write_text("x", encoding="utf-8")
+    (scan_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "id": "job",
+                "result_path": str(result),
+                "summary_path": str(summary),
+                "artifact": str(artifact),
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact_dir = root / "artifacts" / "exec"
+    artifact_dir.mkdir(parents=True)
+    owned_artifact = artifact_dir / "image.png"
+    owned_artifact.write_bytes(b"png")
+    history = History(tmp_path)
+    try:
+        history.record(
+            "scan",
+            {"id": "job", "kind": "scan", "state": "succeeded", "client_id": "client"},
+        )
+        history.record(
+            "execution",
+            {
+                "id": "exec",
+                "exec_id": "exec",
+                "state": "succeeded",
+                "client_id": "client",
+                "code": "display('x')",
+                "messages": ["keep"],
+                "artifacts": [{"path": str(owned_artifact), "mime": "image/png"}],
+            },
+        )
+        snapshot = history.storage_gc_snapshot()
+        assert ".mypr/scans/request.jsonl" in snapshot["references"]
+        assert ".mypr/scans/request.xml" in snapshot["references"]
+        assert ".mypr/artifacts/exec/image.png" in snapshot["references"]
+
+        marked = history.storage_gc_before_delete(
+            [
+                {"path": ".mypr/scans/request.xml"},
+                {"path": ".mypr/artifacts/exec/image.png"},
+                {"path": ".mypr/scans/orphan.jsonl"},
+            ]
+        )
+        assert marked == [".mypr/artifacts/exec/image.png", ".mypr/scans/request.xml"]
+        assert history.get("job")["scan_output_evicted"]
+        updated = history.get("exec")
+        assert updated["output_evicted"]
+        assert updated["code"] == "display('x')"
+        assert updated["messages"] == ["keep"]
+        assert updated["client_id"] == "client"
     finally:
         history.close()

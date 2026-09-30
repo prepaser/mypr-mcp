@@ -7,6 +7,8 @@ import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from .diagnostics import RPCError
+
 MAX_MESSAGE = 32 * 1024 * 1024
 
 
@@ -35,9 +37,23 @@ async def rpc(path: Path | str, **request):
         data = await reader.readline()
         if not data:
             raise ConnectionError("Workspace manager disconnected")
-        response = json.loads(data)
-        if not response["ok"]:
-            raise RuntimeError(response["error"])
+        try:
+            response = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RPCError(
+                "Workspace manager returned invalid RPC data", code="protocol_error"
+            ) from exc
+        if not response.get("ok"):
+            info = response.get("error_info")
+            if isinstance(info, dict):
+                raise RPCError(
+                    str(response.get("error", info.get("message", "RPC request failed"))),
+                    code=str(info.get("code", "rpc_error")),
+                    operation=info.get("operation"),
+                    details=info.get("details") if isinstance(info.get("details"), dict) else None,
+                    error_type=info.get("type"),
+                )
+            raise RPCError(str(response.get("error", "Workspace manager request failed")))
         return response["result"]
     finally:
         writer.close()
@@ -147,9 +163,27 @@ async def attachment(
         data = await reader.readline()
         if not data:
             raise ConnectionError("Workspace manager disconnected during attach")
-        response = json.loads(data)
+        try:
+            response = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RPCError(
+                "Workspace manager returned invalid attach data", code="protocol_error"
+            ) from exc
         if not response.get("ok"):
-            raise RuntimeError(response.get("error", "Workspace manager attach failed"))
+            info = response.get("error_info")
+            if isinstance(info, dict):
+                raise RPCError(
+                    str(
+                        response.get(
+                            "error", info.get("message", "Workspace manager attach failed")
+                        )
+                    ),
+                    code=str(info.get("code", "rpc_error")),
+                    operation=info.get("operation"),
+                    details=info.get("details") if isinstance(info.get("details"), dict) else None,
+                    error_type=info.get("type"),
+                )
+            raise RPCError(str(response.get("error", "Workspace manager attach failed")))
         attached = Attachment(reader, writer)
         attached.status = response.get("result")
         attached._watcher = asyncio.create_task(attached._watch())

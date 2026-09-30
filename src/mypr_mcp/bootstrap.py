@@ -7,7 +7,9 @@ import importlib.metadata
 import json
 from pathlib import Path
 
-RUNTIME_PACKAGES = ("ipykernel", "pyyaml", "httpx2", "playwright", "h2", "socksio", "psutil")
+RUNTIME_PACKAGES = (
+    "ipykernel", "pyyaml", "httpx2", "playwright", "h2", "socksio", "psutil", "tomlkit"
+)
 _PROBE = """
 import importlib.metadata as m, json, sys
 found = {}

@@ -42,7 +42,10 @@ async def rewrite_ast(
     lang: str,
     paths: str | list[str] | None,
     glob: str | list[str] | None,
+    history: bool = True,
 ) -> dict[str, Any]:
+    if type(history) is not bool:
+        raise TypeError("history must be a boolean")
     _validate(pattern, rule, replacement, lang, paths, glob)
     if fs._shell is None:
         raise RuntimeError("AST rewrites require the workspace shell")
@@ -77,6 +80,7 @@ async def rewrite_ast(
                 raw = record.get("file")
                 if not isinstance(raw, str) or not raw or raw == "STDIN":
                     raise RuntimeError("ast-grep returned an invalid file path")
+                _reject_ast_symlink_alias(fs, raw)
                 path, display = fs._path(raw)
                 _reject_symlink_alias(fs, raw, path)
                 if path.is_relative_to(root.resolve()):
@@ -175,6 +179,7 @@ async def rewrite_ast(
                 "preview": preview,
                 "original_bytes": original_bytes,
                 "planned_bytes": planned_bytes,
+                "history": history,
             }
             plan_id = await _to_thread_uncancelled(store.create, payload)
             return {
@@ -220,6 +225,7 @@ async def apply_rewrite(fs: Any, plan_id: str) -> dict[str, Any]:
             or len(encoded) > 4 * ((_MAX_BYTES + 2) // 3)
         ):
             raise RuntimeError("invalid rewrite plan")
+        _reject_ast_symlink_alias(fs, raw_path)
         path, actual_display = fs._path(raw_path)
         _reject_symlink_alias(fs, raw_path, path)
         if path in {item[0] for item in resolved}:
@@ -266,13 +272,19 @@ async def apply_rewrite(fs: Any, plan_id: str) -> dict[str, Any]:
                     stat.S_IMODE(state.info.st_mode),
                 )
             )
-        result = await _to_thread_uncancelled(_commit, plans, states, _MAX_DIFF)
+        history_store = fs._history_store() if payload.get("history", True) else None
+        if history_store is not None:
+            history_store.prepare_changes_sync(plans)
+        result = await _to_thread_uncancelled(
+            _commit, plans, states, _MAX_DIFF, history_store=history_store
+        )
         result.update(
             {
                 "plan_id": plan_id,
                 "applied": True,
                 "original_bytes": payload.get("original_bytes"),
                 "planned_bytes": payload.get("planned_bytes"),
+                "history_recorded": history_store is not None,
             }
         )
         try:
@@ -409,6 +421,21 @@ def _reject_nul(value):
     elif isinstance(value, (list, tuple)):
         for child in value:
             _reject_nul(child)
+
+
+def _reject_ast_symlink_alias(fs: Any, supplied: str) -> None:
+    candidate = Path(supplied).expanduser()
+    current = Path(candidate.anchor) if candidate.is_absolute() else fs.workspace
+    parts = candidate.parts[1:] if candidate.is_absolute() else candidate.parts
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"symlink paths are not supported in AST rewrites: {supplied}")
 
 
 class _InputLimit(Exception):

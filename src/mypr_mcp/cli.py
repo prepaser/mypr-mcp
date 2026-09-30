@@ -21,9 +21,17 @@ from pydantic import Field
 
 from . import __version__
 from .bridge import ConnectionBridge
-from .diagnostics import safe_error
+from .config import ConfigError, load_workspace_config
+from .diagnostics import RPCError, safe_error
+from .doctor import doctor_workspace
 from .instructions import COMMON_INSTRUCTIONS
 from .instructions import INSTRUCTIONS as INSTRUCTIONS
+from .startup import (
+    clear_startup_failure,
+    read_startup_failure,
+    startup_error,
+    write_startup_failure,
+)
 from .transport import find_runtime, manager_running, rpc, socket_path
 
 STARTUP_TIMEOUT = 180
@@ -57,6 +65,26 @@ async def ensure(workspace, *, locked=False):
                 "Workspace already has a running manager, but its socket is unreachable. "
                 "Make the manager's runtime directory accessible to this client."
             )
+        try:
+            load_workspace_config(workspace)
+        except (ConfigError, OSError) as exc:
+            write_startup_failure(root, exc, operation="config_validate")
+            raise RPCError(
+                str(exc),
+                code=getattr(exc, "code", "invalid_workspace_config"),
+                operation="config_validate",
+                details={
+                    key: value
+                    for key, value in {
+                        "path": getattr(exc, "path", None),
+                        "line": getattr(exc, "line", None),
+                        "column": getattr(exc, "column", None),
+                    }.items()
+                    if value is not None
+                },
+                error_type=type(exc).__name__,
+            ) from exc
+        clear_startup_failure(root)
         log = (root / "manager.log").open("ab")
         try:
             launch = asyncio.create_task(
@@ -81,15 +109,30 @@ async def ensure(workspace, *, locked=False):
         deadline = time.monotonic() + STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                raise RuntimeError(f"Workspace manager failed; inspect {root / 'manager.log'}")
+                error = startup_error(root)
+                if error is None:
+                    error = RPCError(
+                        f"Workspace manager failed; inspect {root / 'manager.log'}",
+                        code="manager_start_failed",
+                        operation="manager_start",
+                    )
+                    write_startup_failure(root, error, operation="manager_start")
+                raise error
             try:
                 state = await rpc(path, op="status")
                 if state["healthy"]:
+                    clear_startup_failure(root)
                     return path
             except OSError, ConnectionError:
                 pass
             await asyncio.sleep(0.1)
-        raise TimeoutError(f"Workspace startup timed out; inspect {root / 'manager.log'}")
+        error = RPCError(
+            f"Workspace startup timed out; inspect {root / 'manager.log'}",
+            code="manager_start_timeout",
+            operation="manager_start",
+        )
+        write_startup_failure(root, error, operation="manager_start")
+        raise error
     except BaseException:
         if proc is not None:
             cleanup = asyncio.create_task(_stop_spawned(proc))
@@ -123,6 +166,49 @@ async def _stop_spawned(proc):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
         await asyncio.to_thread(proc.wait)
+
+
+async def run_manager(workspace):
+    """Run a manager and persist exceptions raised before it becomes healthy."""
+
+    from .runtime import Runtime
+
+    try:
+        runtime = Runtime(workspace)
+    except BaseException as exc:
+        write_startup_failure(Path(workspace) / ".mypr", exc, operation="manager_start")
+        raise
+    task = asyncio.create_task(runtime.run(), name="mypr-manager")
+    healthy = False
+    try:
+        while not task.done():
+            if runtime.healthy:
+                healthy = True
+                clear_startup_failure(runtime.root)
+                break
+            await asyncio.sleep(0.02)
+        await task
+        if runtime.healthy:
+            healthy = True
+            clear_startup_failure(runtime.root)
+    except BaseException as exc:
+        if not healthy:
+            write_startup_failure(
+                runtime.root,
+                exc,
+                operation="manager_start",
+                details={"health_error": runtime.health_error}
+                if runtime.health_error
+                else None,
+            )
+        raise
+    else:
+        if healthy:
+            clear_startup_failure(runtime.root)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 _IMAGE_RESPONSE_LIMIT = 2 * 1024 * 1024
@@ -387,6 +473,17 @@ async def serve(workspace):
     async def request(op, **fields):
         try:
             return await bridge.request(op, **fields)
+        except RPCError as exc:
+            info = {
+                "code": exc.code,
+                "type": exc.error_type or type(exc).__name__,
+                "message": str(exc),
+                **({"operation": exc.operation} if exc.operation else {}),
+                **({"details": exc.details} if exc.details else {}),
+            }
+            raise ToolError(
+                json.dumps({"error": str(exc), "error_info": info}, ensure_ascii=False)
+            ) from exc
         except RuntimeError as exc:
             raise ToolError(str(exc)) from exc
 
@@ -436,6 +533,13 @@ async def serve(workspace):
                 "Omit for a new execution. Reuse does not rebuild state after restart."
             ),
         ] = None,
+        max_bytes: Annotated[
+            int | None,
+            Field(
+                description="Optional response output budget in bytes (1024..1048576). "
+                "Omit to use the workspace default."
+            ),
+        ] = None,
     ) -> CallToolResult:
         """Read/edit files, search, run commands, and compose helpers in persistent Python.
 
@@ -454,6 +558,7 @@ async def serve(workspace):
             wait_ms=wait_ms,
             request_id=request_id,
             client_id=bound_client,
+            max_bytes=max_bytes,
         )
         return await tool_result(result)
 
@@ -477,6 +582,13 @@ async def serve(workspace):
                 "total request deadline."
             ),
         ] = 1000,
+        max_bytes: Annotated[
+            int | None,
+            Field(
+                description="Optional response output budget in bytes (1024..1048576). "
+                "Omit to use the workspace default."
+            ),
+        ] = None,
     ) -> CallToolResult:
         """Continue a submitted cell without executing it again; available before init.
 
@@ -489,6 +601,7 @@ async def serve(workspace):
             exec_id=exec_id,
             cursor=cursor,
             wait_ms=wait_ms,
+            max_bytes=max_bytes,
         )
         return await tool_result(result)
 
@@ -520,10 +633,30 @@ async def logs(workspace, limit: int, follow: bool) -> None:
         await asyncio.sleep(0.5)
 
 
+def _offline_status(workspace: Path) -> dict[str, Any]:
+    root = workspace / ".mypr"
+    record = read_startup_failure(root)
+    if record is None:
+        try:
+            load_workspace_config(workspace)
+        except (ConfigError, OSError) as exc:
+            write_startup_failure(root, exc, operation="config_validate")
+            record = read_startup_failure(root)
+    result: dict[str, Any] = {
+        "workspace": str(workspace.resolve()),
+        "healthy": False,
+        "manager_available": False,
+    }
+    if record is not None:
+        result["startup_error"] = record
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Persistent workspace Python over MCP")
     parser.add_argument(
-        "command", choices=["serve", "status", "logs", "reset", "restart", "stop", "_manager"]
+        "command",
+        choices=["serve", "status", "logs", "doctor", "reset", "restart", "stop", "_manager"],
     )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--limit", type=int, default=20)
@@ -536,15 +669,20 @@ def main():
         if args.command == "serve":
             asyncio.run(serve(workspace))
         elif args.command == "_manager":
-            from .runtime import Runtime
-
-            asyncio.run(Runtime(workspace).run())
+            asyncio.run(run_manager(workspace))
         else:
 
             async def admin():
+                if args.command == "doctor":
+                    return await doctor_workspace(workspace)
                 if args.command == "logs":
                     return await logs(workspace, args.limit, args.follow)
-                if args.command == "reset":
+                if args.command == "status":
+                    found = await find_runtime(workspace)
+                    if found is None:
+                        return await asyncio.to_thread(_offline_status, workspace)
+                    path, _ = found
+                elif args.command == "reset":
                     path = await ensure(workspace)
                 elif args.command == "restart":
                     from . import restart

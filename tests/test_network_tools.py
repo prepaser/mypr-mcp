@@ -35,6 +35,34 @@ async def test_resolve_and_connect_report_structured_results(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resolve_timeout_stops_the_guarded_worker(tmp_path, monkeypatch):
+    import mypr_mcp.network_tools as network_module
+
+    class StalledProcess:
+        pid = 999_999
+        returncode = None
+
+        async def communicate(self, _payload):
+            await asyncio.sleep(10)
+            return b"", b""
+
+        async def wait(self):
+            self.returncode = -15
+            return self.returncode
+
+    process = StalledProcess()
+
+    async def launch(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(network_module.asyncio, "create_subprocess_exec", launch)
+    monkeypatch.setattr(network_module.os, "killpg", lambda *_args: None)
+    with pytest.raises(TimeoutError, match="DNS resolution exceeded"):
+        await NetworkTools(tmp_path).resolve("localhost", timeout=0.01)
+    assert process.returncode == -15
+
+
+@pytest.mark.asyncio
 async def test_tls_rejects_unverified_context_when_verification_requested(tmp_path):
     tools = NetworkTools(tmp_path)
     context = ssl._create_unverified_context()
@@ -95,3 +123,11 @@ async def test_tls_verifies_and_pins_self_signed_certificate(tmp_path):
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_dns_deadline_includes_waiting_for_a_worker_slot(tmp_path, monkeypatch):
+    import mypr_mcp.network_tools as network
+
+    monkeypatch.setattr(network, "_DNS_WORKERS", asyncio.Semaphore(0))
+    with pytest.raises(TimeoutError, match="DNS resolution exceeded"):
+        await asyncio.wait_for(NetworkTools(tmp_path).resolve("localhost", timeout=0.01), 0.5)

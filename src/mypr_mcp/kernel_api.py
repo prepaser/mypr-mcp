@@ -22,7 +22,7 @@ from typing import Any
 from .api_help import workspace_help
 from .browser_tools import BrowserTools
 from .code_tools import CodeTools
-from .diagnostics import safe_error, safe_error_details
+from .diagnostics import RPCError, safe_error, safe_error_details
 from .filesystem import Filesystem
 from .http_tools import HTTPTools
 from .locks import WorkspaceLocks
@@ -73,10 +73,6 @@ def _reserved_generated_id(value: str) -> bool:
 
 class NotReady(RuntimeError):
     """Raised when a task result is requested before it has finished."""
-
-
-class RPCError(RuntimeError):
-    """An error returned by the workspace manager."""
 
 
 class ResultUnavailable(RPCError):
@@ -287,7 +283,16 @@ async def _rpc(op: str, **fields: Any) -> Any:
     except json.JSONDecodeError as exc:
         raise RPCError("invalid response from workspace manager") from exc
     if not response.get("ok", False):
-        raise RPCError(str(response.get("error", "workspace manager request failed")))
+        info = response.get("error_info")
+        if not isinstance(info, dict):
+            info = {}
+        raise RPCError(
+            str(response.get("error", "workspace manager request failed")),
+            code=info.get("code", "rpc_error"),
+            operation=info.get("operation", op),
+            details=info.get("details"),
+            error_type=info.get("type"),
+        )
     return response.get("result")
 
 
@@ -311,6 +316,9 @@ class TaskHandle:
         self._client = _client_context.get()
         self._exec_id = _exec_context.get()
         self._generation = os.environ.get("MYPR_GENERATION", "local")
+        self._persist_result = False
+        self._result_persisted: bool | None = None
+        self._result_warnings: list[dict[str, str]] = []
         self._task.add_done_callback(self._finished)
 
     def _finished(self, task: asyncio.Task[Any]) -> None:
@@ -341,6 +349,10 @@ class TaskHandle:
         }
         if self._finished_at is not None:
             result["finished_at"] = self._finished_at
+        if self._persist_result:
+            result["result_persisted"] = self._result_persisted
+            if self._result_warnings:
+                result["warnings"] = list(self._result_warnings)
         return result
 
     def output(self, cursor: int | None = None) -> str | dict[str, Any]:
@@ -632,12 +644,39 @@ class TaskHandle:
                 output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
             )
         else:
+            result_fields = {}
+            if self._persist_result:
+                from .task_results import encode_result
+
+                try:
+                    encoded = await asyncio.to_thread(encode_result, self._task.result())
+                except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+                    self._result_persisted = False
+                    self._result_warnings.append(
+                        {"code": "result_not_serializable", "text": safe_error(exc)}
+                    )
+                    result_fields["result_persisted"] = False
+                else:
+                    try:
+                        reference = await _rpc(
+                            "task_result_store", id=self.id, encoded=encoded
+                        )
+                    except Exception as exc:
+                        self._result_warnings.append(
+                            {"code": "result_persistence_unknown", "text": safe_error(exc)}
+                        )
+                    else:
+                        self._result_persisted = True
+                        result_fields.update(result_persisted=True, result_ref=reference)
+                if self._result_warnings:
+                    result_fields["result_warnings"] = list(self._result_warnings)
             await publish_terminal(
                 "succeeded",
                 finished=time.time(),
                 output=_bounded_history_output(self.output()),
                 output_delta="",
                 output_truncated=self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT,
+                **result_fields,
             )
 
     async def _wait(self) -> Any:
@@ -700,9 +739,14 @@ class TaskManager:
         *,
         task_id: str | None = None,
         visible: bool = True,
+        persist_result: bool = False,
     ) -> TaskHandle:
         if not inspect.isawaitable(awaitable):
             raise TypeError("tasks.start expects an awaitable")
+        if type(persist_result) is not bool or (persist_result and not visible):
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise ValueError("persist_result must be a boolean and requires a visible task")
         generation = os.environ.get("MYPR_GENERATION", "local")
         if task_id is None:
             self._counter += 1
@@ -742,6 +786,7 @@ class TaskManager:
                 self._explicit_ids.discard(ident)
             raise
         handle = TaskHandle(ident, task, buffer, awaitable, run_state)
+        handle._persist_result = persist_result
         if visible:
             self._track(handle, generated=generated)
 
@@ -819,6 +864,14 @@ class TaskManager:
             self._handles[task_id] = handle
             return handle
         if kind in {"python", "execution"}:
+            if record.get("result_persisted"):
+                try:
+                    record["saved_result"] = await _rpc(
+                        "task_result_get", id=task_id
+                    )
+                    record["saved_result_available"] = True
+                except RPCError as exc:
+                    record["result_warning"] = safe_error(exc)
             return HistoricalTask(record)
         raise ValueError(f"task {task_id!r} is not attachable")
 
@@ -849,6 +902,17 @@ class HistoricalTask(TaskHandle):
         self._history_id = record.get("history_id") or record.get("id")
         self._history_event_cursor = int(record.get("cursor", 0) or 0)
         self._history_has_more = bool(record.get("has_more"))
+        self._saved_result = record.get("saved_result")
+        self._saved_result_available = bool(record.get("saved_result_available"))
+        self._result_warning = record.get("result_warning")
+        self._warnings: list[dict[str, str]] = []
+        self._warnings_truncated = False
+        self._output_evicted = bool(
+            record.get("output_evicted") or record.get("scan_output_evicted")
+        )
+        self._merge_warnings(record.get("warnings", []), record.get("warnings_truncated"))
+        if self._output_evicted:
+            self._add_output_expired_warning()
         output = record.get("output", "")
         if isinstance(output, list):
             for event in output:
@@ -862,7 +926,39 @@ class HistoricalTask(TaskHandle):
             text = str(output)
             self._buffer.write(text)
             self._streams["stdout"].write(text)
-        self._buffer.truncated = bool(record.get("truncated") or record.get("output_truncated"))
+        self._buffer.truncated = bool(
+            record.get("truncated") or record.get("output_truncated") or self._output_evicted
+        )
+
+    def _merge_warnings(self, values: Any, truncated: Any = False) -> None:
+        if not isinstance(values, list):
+            self._warnings_truncated |= bool(values)
+            return
+        for value in values:
+            if not isinstance(value, Mapping):
+                self._warnings_truncated = True
+                continue
+            warning = {
+                "code": str(value.get("code", "warning"))[:128],
+                "text": str(value.get("text", ""))[:1024],
+            }
+            if warning not in self._warnings:
+                if len(self._warnings) < 4:
+                    self._warnings.append(warning)
+                else:
+                    self._warnings_truncated = True
+        self._warnings_truncated |= bool(truncated)
+
+    def _add_output_expired_warning(self) -> None:
+        warning = {
+            "code": "output_expired",
+            "text": "Retained task output has expired and is no longer available.",
+        }
+        if warning not in self._warnings:
+            if len(self._warnings) < 4:
+                self._warnings.append(warning)
+            else:
+                self._warnings_truncated = True
 
     async def _load_more(self, max_bytes: int = 32768) -> bool:
         async with self._history_lock:
@@ -876,6 +972,10 @@ class HistoricalTask(TaskHandle):
             )
             if not isinstance(result, Mapping):
                 raise RPCError("invalid persisted task output response")
+            self._merge_warnings(result.get("warnings", []), result.get("warnings_truncated"))
+            if result.get("output_evicted"):
+                self._output_evicted = True
+                self._add_output_expired_warning()
             events = result.get("output", [])
             if not isinstance(events, list):
                 raise RPCError("invalid persisted task output events")
@@ -925,6 +1025,12 @@ class HistoricalTask(TaskHandle):
             buffer = self._output_buffer_for(selected)
         result = await super().read(cursor, **kwargs)
         result["has_more"] = bool(result.get("has_more") or self._history_has_more)
+        if self._warnings:
+            result["warnings"] = list(self._warnings)
+        if self._warnings_truncated:
+            result["warnings_truncated"] = True
+        if self._output_evicted:
+            result["output_evicted"] = True
         return result
 
     async def expect(
@@ -981,9 +1087,16 @@ class HistoricalTask(TaskHandle):
             "connection_id": self._client.connection_id if self._client else None,
             "error": self._error,
             "read_only": True,
+            "result_persisted": self._saved_result_available,
+            "result_warning": self._result_warning,
+            **({"warnings": list(self._warnings)} if self._warnings else {}),
+            **({"warnings_truncated": True} if self._warnings_truncated else {}),
+            **({"output_evicted": True} if self._output_evicted else {}),
         }
 
     def result(self) -> Any:
+        if self._saved_result_available:
+            return self._saved_result
         raise ResultUnavailable(f"result for persisted Python task {self.id} is unavailable")
 
     async def cancel(self) -> bool:
@@ -1497,6 +1610,16 @@ class Messages:
         self._require_client()
         return await _rpc("message_ack", ids=list(ids))
 
+    async def clients(
+        self, *, prefix: str | None = None, connected: bool | None = None,
+        limit: int = 50, cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """List registered clients, including disconnected message recipients."""
+        self._require_client()
+        return await _rpc(
+            "message_clients", prefix=prefix, connected=connected, limit=limit, cursor=cursor
+        )
+
 
 class Packages:
     def __init__(self, tasks: TaskManager) -> None:
@@ -1637,7 +1760,15 @@ class Workspace:
         self.net = NetworkTools(self.workspace, self.tasks, _rpc)
         self.system = SystemTools(self.workspace)
         self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
-        self.code = CodeTools(self.workspace)
+        self.code = CodeTools(
+            self.workspace, self.fs,
+            config_rpc=self._code_config if os.environ.get("MYPR_SOCKET") else None,
+        )
+        from .pages import Pages
+        from .storage_api import StorageAPI
+
+        self.pages = Pages(self)
+        self.storage = StorageAPI(_rpc)
         self._closing = False
 
     async def _close_resources(self):
@@ -1666,6 +1797,9 @@ class Workspace:
         failures = [result for result in results if isinstance(result, Exception)]
         if failures:
             raise ExceptionGroup("Workspace resource cleanup failed", failures)
+
+    async def _code_config(self, method, definitions=None, **fields):
+        return await _rpc("code_config", method=method, definitions=definitions, **fields)
 
     async def _search(self, **args):
         return await _rpc("search", args=args)
@@ -1697,6 +1831,12 @@ class Workspace:
 
     async def performance(self) -> Any:
         return await _rpc("performance")
+
+    async def doctor(self) -> dict[str, Any]:
+        """Check local workspace readiness without starting or installing services."""
+        from .doctor import doctor_workspace
+
+        return await doctor_workspace(self.workspace, ws=self)
 
     async def reset(self, force: bool = False) -> Any:
         if _output_buffer.get() is not None:

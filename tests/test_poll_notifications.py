@@ -1,6 +1,7 @@
 import asyncio
 import time
 
+import pytest
 import pytest_asyncio
 
 from mypr_mcp.history import History
@@ -46,6 +47,25 @@ async def test_available_output_does_not_wait_for_a_running_cell(runtime):
     assert page["state"] == "running"
     assert page["cursor"] == 1
     assert page["output"][0]["text"] == "ready"
+
+
+async def test_explicit_output_budget_rejects_oversized_first_event_without_advancing(runtime):
+    runtime, record = runtime
+    record["state"] = "succeeded"
+    record["events"] = [{"type": "stream", "stream": "stdout", "text": "x" * 2000}]
+    with pytest.raises(ValueError, match="cursor unchanged"):
+        await runtime.poll(record["id"], max_bytes=1024)
+    page = await runtime.poll(record["id"], max_bytes=4096)
+    assert page["cursor"] == 1
+    assert page["output"][0]["text"] == "x" * 2000
+
+
+async def test_explicit_output_budget_has_a_bounded_range(runtime):
+    runtime, record = runtime
+    with pytest.raises(ValueError, match="1024 and 1048576"):
+        await runtime.poll(record["id"], max_bytes=1023)
+    with pytest.raises(ValueError, match="1024 and 1048576"):
+        await runtime.poll(record["id"], max_bytes=1048577)
 
 
 async def test_new_output_wakes_all_pollers_without_finishing_cell(runtime):
@@ -107,3 +127,22 @@ async def test_execute_wait_keeps_waiting_for_completion_after_initial_output(ru
     finally:
         waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def test_invalid_execute_budget_does_not_admit_work(tmp_path, monkeypatch):
+    runtime = Runtime(tmp_path)
+    runtime.healthy = True
+    runtime.clients["conn"] = {"client_id": "reader"}
+
+    async def no_admission(*args):
+        pytest.fail("invalid output budget must not submit code")
+
+    async def no_persistence(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(runtime, "admit_execution", no_admission)
+    monkeypatch.setattr(runtime, "io", no_persistence)
+    runtime.history = type("History", (), {"touch_client": lambda *args: None})()
+    with pytest.raises(ValueError, match="max_bytes"):
+        await runtime.dispatch({"op": "execute", "connection_id": "conn", "code": "run()",
+                                "max_bytes": 1})

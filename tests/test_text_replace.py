@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from mypr_mcp.filesystem import Filesystem
+from mypr_mcp.text_replace_worker import replace as worker_replace
+
+
+class Shell:
+    async def run(self, command, **kwargs):
+        result = await asyncio.to_thread(
+            subprocess.run,
+            command,
+            input=kwargs.get("input"),
+            cwd=kwargs.get("cwd"),
+            capture_output=True,
+            text=True,
+        )
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "state": "succeeded" if result.returncode == 0 else "failed",
+            "timed_out": False,
+            "truncated": False,
+            "warnings": [],
+        }
+
+
+@pytest.mark.asyncio
+async def test_replace_preview_and_apply_is_cas_checked(tmp_path: Path):
+    (tmp_path / "one.txt").write_text("old old\n")
+    (tmp_path / "two.txt").write_text("old\n")
+    fs = Filesystem(tmp_path, Shell())
+    preview = await fs.replace("old", "new", glob="*.txt", fixed=True)
+    assert preview["applicable"]
+    (tmp_path / "two.txt").write_text("changed\n")
+    with pytest.raises(ValueError, match="source changed"):
+        await fs.apply_replace(preview["plan_id"])
+
+
+@pytest.mark.asyncio
+async def test_replace_applies_all_matching_files(tmp_path: Path):
+    (tmp_path / "one.txt").write_text("old\n")
+    (tmp_path / "two.txt").write_text("old\n")
+    fs = Filesystem(tmp_path, Shell())
+    preview = await fs.replace("old", "new", glob="*.txt", fixed=True)
+    result = await fs.apply_replace(preview["plan_id"])
+    assert result["applied"]
+    assert (tmp_path / "one.txt").read_text() == "new\n"
+    assert (tmp_path / "two.txt").read_text() == "new\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_defaults_to_literal_and_honors_case_insensitive(tmp_path: Path):
+    (tmp_path / "value.txt").write_text("A.B a.b\n")
+    fs = Filesystem(tmp_path, Shell())
+    preview = await fs.replace("a.b", "x", glob="*.txt", ignore_case=True)
+    assert preview["changes"][0]["matches"] == 2
+    await fs.apply_replace(preview["plan_id"])
+    assert (tmp_path / "value.txt").read_text() == "x x\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_regex_uses_worker_matching_and_substitution(tmp_path: Path):
+    (tmp_path / "value.txt").write_text("item-12 item-34\n")
+    fs = Filesystem(tmp_path, Shell())
+    preview = await fs.replace(r"item-(\d+)", r"value-\1", glob="*.txt", fixed=False)
+    assert preview["changes"][0]["matches"] == 2
+    await fs.apply_replace(preview["plan_id"])
+    assert (tmp_path / "value.txt").read_text() == "value-12 value-34\n"
+
+
+def test_replace_worker_keeps_literal_replacement_text(tmp_path: Path):
+    (tmp_path / "value.txt").write_text("old\n")
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": ["value.txt"],
+            "pattern": "old",
+            "replacement": r"\1",
+            "fixed": True,
+            "ignore_case": False,
+        }
+    )
+    assert result["complete"]
+    assert base64.b64decode(result["operations"][0]["new"]) == b"\\1\n"
+
+
+def test_replace_worker_rejects_lexical_symlink_alias(tmp_path: Path):
+    (tmp_path / "target.txt").write_text("old\n")
+    (tmp_path / "link").symlink_to(tmp_path / "target.txt")
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": ["link/../target.txt"],
+            "pattern": "old",
+            "replacement": "new",
+            "fixed": True,
+            "ignore_case": False,
+        }
+    )
+    assert result == {"complete": False, "reason": "path_outside_workspace"}
