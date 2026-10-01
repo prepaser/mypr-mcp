@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.code_tools import CodeError, CodeTools
+from mypr_mcp.code_tools import CodeError, CodeTools, _Document, _LanguageServer
 
 FAKE_SERVER = r"""
 import json
@@ -174,6 +174,36 @@ async def test_lsp_framing_unicode_positions_and_document_changes(tmp_path):
         assert positions == [{"line": 0, "character": 3}] * 2 + [{"line": 1, "character": 3}]
     finally:
         await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_document_sync_waits_for_notification_commit(tmp_path):
+    path = tmp_path / "sample.py"
+    path.write_text("old\n", encoding="utf-8")
+    server = _LanguageServer(
+        tmp_path, "fake", ("fake",), frozenset({"python"}), timeout=1
+    )
+    document = _Document(path, path.as_uri(), "python", "old\n", 1)
+    server.documents[document.uri] = document
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def notify(_method, _params):
+        entered.set()
+        await release.wait()
+
+    server._notify = notify
+    path.write_text("new\n", encoding="utf-8")
+    task = asyncio.create_task(server._document(path))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert document.version == 2
+    assert document.text == "new\n"
 
 
 @pytest.mark.asyncio

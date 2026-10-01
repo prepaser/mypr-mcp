@@ -1,5 +1,9 @@
 import asyncio
+import json
 import math
+import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 
 import pytest
@@ -35,6 +39,28 @@ def test_json_result_limits_and_integrity(tmp_path):
     (tmp_path / reference["path"]).write_text('{"changed":true}')
     with pytest.raises(ValueError, match="size|hash"):
         load_result(tmp_path, reference)
+
+
+def test_fifo_result_is_rejected_without_waiting_for_a_writer(tmp_path):
+    reference = store_result(tmp_path, "task", "generation", encode_result({"ok": True}))
+    path = tmp_path / reference["path"]
+    path.unlink()
+    os.mkfifo(path)
+    code = (
+        "from pathlib import Path\n"
+        "import json\n"
+        "import sys\n"
+        "from mypr_mcp.task_results import load_result\n"
+        "load_result(Path(sys.argv[1]), json.loads(sys.argv[2]))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path), json.dumps(reference)],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert result.returncode != 0
+    assert "regular file" in result.stderr
 
 
 async def test_fast_task_result_survives_terminal_event_and_attach(tmp_path, monkeypatch):

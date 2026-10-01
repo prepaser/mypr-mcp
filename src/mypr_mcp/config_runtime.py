@@ -20,6 +20,8 @@ class RuntimeConfig:
         self.applied = store.get(snapshot=snapshot)
         self.applying = False
         self._lock = asyncio.Lock()
+        self.lsp_generation: str | None = None
+        self.lsp_sequence = 0
 
     async def dispatch(self, request):
         method = request.get("method")
@@ -91,8 +93,28 @@ class RuntimeConfig:
             if snapshot.values["limits"][key] != self.applied["limits"][key]
         ]
 
-    def record_lsp(self, definitions):
+    def reset_lsp_generation(self, generation):
+        if not isinstance(generation, str) or not generation:
+            raise ValueError("kernel generation must be a non-empty string")
+        self.lsp_generation = generation
+        self.lsp_sequence = 0
+
+    def record_lsp(self, definitions, *, sequence=None, generation=None):
+        if generation is None:
+            generation = self.lsp_generation or self.runtime.generation
+        if generation != self.runtime.generation:
+            return False
+        if sequence is not None:
+            if type(sequence) is not int or sequence < 0:
+                return False
+            if self.lsp_generation == generation and sequence <= self.lsp_sequence:
+                return False
+            self.lsp_generation = generation
+            self.lsp_sequence = sequence
+        elif self.lsp_generation is None:
+            self.lsp_generation = generation
         self.applied["lsp"]["servers"] = copy.deepcopy(definitions)
+        return True
 
     async def _record(self, method, **fields):
         if self.runtime.history is not None:
@@ -164,7 +186,13 @@ class RuntimeConfig:
                             applied.get("deferred") or "LSP configuration could not be applied"
                         )
                     else:
-                        self.applied["lsp"] = copy.deepcopy(values["lsp"])
+                        recorded = self.record_lsp(
+                            values["lsp"]["servers"],
+                            sequence=applied.get("sequence"),
+                            generation=applied.get("generation", generation),
+                        )
+                        if recorded:
+                            self.applied["lsp"] = copy.deepcopy(values["lsp"])
                         result["applied"]["lsp"] = applied
                 except Exception as exc:
                     result["errors"]["lsp"] = safe_error(exc)

@@ -110,6 +110,7 @@ class MessageStore:
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (sender, recipient, text, created, encoded_data, reply_to),
                 )
+                self._touch_activity(sender, created)
                 message = {
                     "id": int(cursor.lastrowid),
                     "from": sender,
@@ -155,6 +156,7 @@ class MessageStore:
             where += " AND reply_to = ?"
             params.append(reply_to)
         with self._lock:
+            self._touch_activity(recipient, time.time())
             rows = self._db.execute(
                 f"SELECT id, sender, recipient, text, created, data, reply_to FROM messages "
                 f"WHERE {where} ORDER BY id ASC LIMIT ?",
@@ -222,6 +224,7 @@ class MessageStore:
                 )
                 if foreign is not None:
                     raise ValueError(f"message {foreign['id']} is addressed to another client")
+                self._touch_activity(recipient, time.time())
                 acknowledged = time.time()
                 changed = 0
                 for start in range(0, len(values), 900):
@@ -305,6 +308,12 @@ class MessageStore:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("message store is closed")
+
+    def _touch_activity(self, client_id: str, timestamp: float) -> None:
+        self._db.execute(
+            "UPDATE client_ids SET last_seen = MAX(COALESCE(last_seen, 0), ?) WHERE id = ?",
+            (timestamp, client_id),
+        )
 
 
 def _validate_limit(value: int) -> int:

@@ -420,7 +420,7 @@ class RevisionStore:
         self._write_index_sync(resource, index)
 
     def _read_index_bytes_sync(self, resource: str) -> bytes | None:
-        path = self.workspace / self._index_path(resource)
+        path = self._metadata_path(self._index_path(resource))
         try:
             return path.read_bytes()
         except FileNotFoundError:
@@ -430,7 +430,7 @@ class RevisionStore:
         self, snapshots: dict[str, bytes | None], expected: dict[str, bytes]
     ) -> None:
         for resource in reversed(tuple(expected)):
-            path = self.workspace / self._index_path(resource)
+            path = self._metadata_path(self._index_path(resource))
             current = self._read_index_bytes_sync(resource)
             original = snapshots.get(resource)
             if current == original:
@@ -446,8 +446,9 @@ class RevisionStore:
 
     def _load_index_sync(self, resource: str) -> dict[str, Any]:
         path = self._index_path(resource)
+        metadata_path = self._metadata_path(path)
         try:
-            raw = Path(self.workspace / path).read_bytes()
+            raw = metadata_path.read_bytes()
         except FileNotFoundError:
             return _empty_index(self.kind, resource, self._version)
         if len(raw) > _MAX_INDEX_BYTES:
@@ -459,7 +460,7 @@ class RevisionStore:
         return _validate_index(index, self.kind, resource, len(raw))
 
     def _write_index_sync(self, resource: str, index: dict[str, Any]) -> None:
-        path = self.workspace / self._index_path(resource)
+        path = self._metadata_path(self._index_path(resource))
         _write_index_bytes_sync(path, _encode_index(index))
 
     def _store_blob_sync(self, data: bytes | None) -> None:
@@ -669,9 +670,9 @@ class RevisionStore:
     async def _load_index(
         self, resource: str, path: str
     ) -> tuple[dict[str, Any], str | None]:
-        self._safe_path(path)
+        metadata_path = self._metadata_path(path)
         try:
-            page = await self.fs.read(path, max_bytes=_MAX_INDEX_BYTES)
+            page = await self.fs.read(metadata_path, max_bytes=_MAX_INDEX_BYTES)
         except FileNotFoundError:
             return _empty_index(self.kind, resource, self._version), None
         if page.get("truncated"):
@@ -690,7 +691,23 @@ class RevisionStore:
 
     def _blob_path(self, revision: str) -> Path:
         _validate_hash(revision)
-        return self._safe_path(f".mypr/revisions/objects/{revision}")
+        return self._metadata_path(f".mypr/revisions/objects/{revision}")
+
+    def _metadata_path(self, relative: str) -> Path:
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("revision metadata path escapes workspace")
+        candidate = self.workspace.joinpath(path)
+        current = self.workspace
+        for part in path.parts:
+            current /= part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError("revision metadata path must not contain symlinks")
+        return candidate
 
     def _safe_path(self, relative: str) -> Path:
         candidate = (self.workspace / relative).resolve(strict=False)

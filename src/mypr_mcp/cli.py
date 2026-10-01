@@ -806,7 +806,16 @@ async def _reload_manager(record: dict[str, Any], *, force: bool) -> dict[str, A
 async def _reload_all(global_path: Path, *, force: bool) -> dict[str, Any]:
     from .runtime_registry import list_managers
 
-    records = list_managers(global_path)
+    try:
+        records = list_managers(global_path)
+    except (OSError, RuntimeError) as exc:
+        return {
+            "global_path": str(global_path),
+            "managers": [],
+            "ok": False,
+            "status": "error",
+            "error": f"manager registry unavailable: {exc}",
+        }
     semaphore = asyncio.Semaphore(4)
 
     async def run(record):

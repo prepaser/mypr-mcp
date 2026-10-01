@@ -17,7 +17,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 from .services import Shells
 
 _RESULT_LIMIT = 16 * 1024 * 1024
@@ -42,6 +42,7 @@ class ScanService:
         self.root.mkdir(parents=True, exist_ok=True)
         self._records: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._monitors: dict[str, asyncio.Task[None]] = {}
+        self._state_lock = asyncio.Lock()
         self._load_records()
         self._track = track
 
@@ -138,9 +139,16 @@ class ScanService:
         try:
             job = await asyncio.shield(launch)
         except asyncio.CancelledError:
-            job = await self._finish_cancelled_launch(launch)
-            with contextlib.suppress(Exception):
-                await self.shells.cancel(job["id"])
+            try:
+                job = await self._finish_cancelled_launch(launch)
+                with contextlib.suppress(BaseException):
+                    await wait_owned(
+                        asyncio.create_task(self.shells.cancel(job["id"])),
+                        propagate=False,
+                    )
+            finally:
+                with contextlib.suppress(OSError):
+                    config_path.unlink()
             raise
         except Exception:
             with contextlib.suppress(OSError):
@@ -325,12 +333,35 @@ class ScanService:
         if record.get("state") in _TERMINAL:
             return dict(record)
         shell_id = record.get("shell_id")
+        shell_result: dict[str, Any] = {}
+        cancelled = False
         if shell_id:
-            await self.shells.cancel(shell_id)
-        record["state"] = "cancelled"
-        record["finished"] = time.time()
-        self._write_record(record)
-        return dict(record)
+            shell_result, cancelled = await finish_owned(
+                asyncio.create_task(self.shells.cancel(shell_id))
+            )
+        async with self._state_lock:
+            if record.get("state") not in _TERMINAL:
+                state = shell_result.get("state")
+                if state not in _TERMINAL:
+                    state = "cancelled"
+                record["state"] = state
+                result = shell_result.get("result")
+                if isinstance(result, dict):
+                    record["returncode"] = result.get("returncode")
+                if shell_result.get("error"):
+                    record["error"] = shell_result["error"]
+                record["finished"] = shell_result.get("finished_at") or time.time()
+                self._write_record(record)
+                config = record.get("config")
+                if isinstance(config, str):
+                    with contextlib.suppress(OSError):
+                        await wait_owned(
+                            asyncio.to_thread(Path(config).unlink), propagate=False
+                        )
+            result = dict(record)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def close(self) -> None:
         active = [
@@ -393,8 +424,11 @@ class ScanService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            with contextlib.suppress(Exception):
-                await self.shells.cancel(record["shell_id"])
+            with contextlib.suppress(BaseException):
+                await wait_owned(
+                    asyncio.create_task(self.shells.cancel(record["shell_id"])),
+                    propagate=False,
+                )
             await self._finish(record, {"state": "failed", "error": str(exc), "result": None})
 
     def _consume_line(self, record: dict[str, Any], line: str) -> None:
@@ -451,8 +485,6 @@ class ScanService:
         state = str(page.get("state", "failed"))
         if state not in _TERMINAL:
             state = "failed"
-        if record.get("state") == "cancelled":
-            state = "cancelled"
         result = page.get("result") or {}
         returncode = record.get("returncode", result.get("returncode"))
         if state == "succeeded" and returncode not in (None, 0):
@@ -463,21 +495,24 @@ class ScanService:
         if result_bytes is not None:
             record["result_bytes"] = result_bytes
             record["result_count"] = result_count
-        record.update(
-            state=state,
-            finished=time.time(),
-            returncode=returncode,
-            error=record.get("error") or page.get("error"),
-            shell_truncated=bool(page.get("truncated")),
-        )
-        if page.get("warnings"):
-            for warning in page["warnings"]:
-                if warning not in record["warnings"] and len(record["warnings"]) < 4:
-                    record["warnings"].append(warning)
-        with contextlib.suppress(OSError):
-            await asyncio.to_thread(Path(record["config"]).unlink)
-        self._write_record(record)
-        self._cache(record)
+        async with self._state_lock:
+            if record.get("state") in _TERMINAL:
+                state = record["state"]
+            record.update(
+                state=state,
+                finished=time.time(),
+                returncode=returncode,
+                error=record.get("error") or page.get("error"),
+                shell_truncated=bool(page.get("truncated")),
+            )
+            if page.get("warnings"):
+                for warning in page["warnings"]:
+                    if warning not in record["warnings"] and len(record["warnings"]) < 4:
+                        record["warnings"].append(warning)
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(Path(record["config"]).unlink)
+            self._write_record(record)
+            self._cache(record)
 
     @staticmethod
     def _result_stats(path: Path) -> tuple[int | None, int]:

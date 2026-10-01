@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -170,6 +171,35 @@ def test_read_filters_and_reply_survive_ack(store: MessageStore):
     store.ack("bob", [first["id"]])
     reply = store.reply("bob", first["id"], "after ack")
     assert store.read("alice", reply_to=first["id"])["messages"] == [reply]
+
+
+def test_message_activity_updates_client_last_seen(tmp_path: Path, monkeypatch):
+    history = History(tmp_path)
+    for client in ("alice", "bob"):
+        history.reserve_client_id(client)
+    messages = MessageStore(tmp_path)
+    now = 2.0
+    monkeypatch.setattr("mypr_mcp.messages.time", SimpleNamespace(time=lambda: now))
+    try:
+        history.touch_client("alice", 1.0)
+        sent = messages.send("alice", "bob", "hello")
+        assert history.clients(prefix="alice")["clients"][0]["last_seen"] == 2.0
+
+        now = 3.0
+        history.touch_client("bob", 1.0)
+        messages.read("bob")
+        assert history.clients(prefix="bob")["clients"][0]["last_seen"] == 3.0
+
+        now = 4.0
+        messages.ack("bob", [sent["id"]])
+        assert history.clients(prefix="bob")["clients"][0]["last_seen"] == 4.0
+
+        now = 5.0
+        messages.reply("bob", sent["id"], "reply")
+        assert history.clients(prefix="bob")["clients"][0]["last_seen"] == 5.0
+    finally:
+        messages.close()
+        history.close()
 
 
 def test_existing_message_schema_is_migrated(tmp_path: Path):

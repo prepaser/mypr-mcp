@@ -268,6 +268,7 @@ class _LanguageServer:
         self._closed = False
         self._closing = False
         self._failure: str | None = None
+        self._write_uncertain = False
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -563,6 +564,8 @@ class _LanguageServer:
             or self.process.returncode is not None
         ):
             raise CodeError(self._failure or "language server is not running")
+        if self._failure:
+            raise CodeError(self._failure)
         try:
             body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         except (TypeError, ValueError) as exc:
@@ -570,15 +573,32 @@ class _LanguageServer:
         if len(body) > MAX_MESSAGE_BYTES:
             raise CodeError("LSP request exceeds the message size limit")
         frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        written = False
         try:
             async with asyncio.timeout(self.timeout):
                 async with self._write_lock:
                     self.process.stdin.write(frame)
+                    written = True
                     await self.process.stdin.drain()
+        except asyncio.CancelledError:
+            if written:
+                self._invalidate_uncertain_write()
+            raise
         except TimeoutError as exc:
+            if written:
+                self._invalidate_uncertain_write()
+                raise CodeError(
+                    "language server write timed out after sending a frame"
+                ) from exc
             raise CodeError("language server stopped accepting LSP messages") from exc
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise CodeError(self._failure or "language server closed its input") from exc
+
+    def _invalidate_uncertain_write(self) -> None:
+        self._write_uncertain = True
+        self._failure = self._failure or "language server input state is uncertain after a write"
+        self._fail_pending(CodeError(self._failure))
+        self._terminate_group(signal.SIGTERM)
 
     async def _notify(
         self,
@@ -592,6 +612,10 @@ class _LanguageServer:
         else:
             async with asyncio.timeout(timeout):
                 await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    async def _notify_committed(self, method: str, params: dict[str, Any]) -> bool:
+        _, cancelled = await finish_owned(self._notify(method, params))
+        return cancelled
 
     async def _request(
         self,
@@ -628,6 +652,8 @@ class _LanguageServer:
                 self._pending.pop(ident, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     def _path(self, value: str | os.PathLike[str]) -> Path:
         if not isinstance(value, (str, os.PathLike)):
@@ -672,29 +698,49 @@ class _LanguageServer:
         if current is None:
             current = _Document(path, uri, selected, text, 1)
             self.documents[uri] = current
-            await self._evict_documents(exclude=uri)
-            await self._notify(
-                "textDocument/didOpen",
-                {
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": selected,
-                        "version": current.version,
-                        "text": text,
-                    }
-                },
-            )
+            write_uncertain = self._write_uncertain
+            try:
+                await self._evict_documents(exclude=uri)
+                cancelled = await self._notify_committed(
+                    "textDocument/didOpen",
+                    {
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": selected,
+                            "version": current.version,
+                            "text": text,
+                        }
+                    },
+                )
+            except BaseException:
+                if (
+                    (write_uncertain or not self._write_uncertain)
+                    and self.documents.get(uri) is current
+                ):
+                    self.documents.pop(uri, None)
+                raise
+            if cancelled:
+                raise asyncio.CancelledError
         elif current.text != text or current.language != selected:
+            previous = current.text, current.language, current.version
+            write_uncertain = self._write_uncertain
             current.version += 1
             current.text = text
             current.language = selected
-            await self._notify(
-                "textDocument/didChange",
-                {
-                    "textDocument": {"uri": uri, "version": current.version},
-                    "contentChanges": [{"text": text}],
-                },
-            )
+            try:
+                cancelled = await self._notify_committed(
+                    "textDocument/didChange",
+                    {
+                        "textDocument": {"uri": uri, "version": current.version},
+                        "contentChanges": [{"text": text}],
+                    },
+                )
+            except BaseException:
+                if write_uncertain or not self._write_uncertain:
+                    current.text, current.language, current.version = previous
+                raise
+            if cancelled:
+                raise asyncio.CancelledError
         self.documents.move_to_end(uri)
         return current, generation
 
@@ -704,11 +750,28 @@ class _LanguageServer:
             if uri == exclude:
                 self.documents.move_to_end(uri)
                 uri, document = next(iter(self.documents.items()))
+            diagnostics = self.diagnostics_cache.pop(uri, None)
+            had_diagnostics = diagnostics is not None
+            event = self._diag_events.pop(uri, None)
+            generation = self._diag_generation.pop(uri, None)
             self.documents.pop(uri)
-            self.diagnostics_cache.pop(uri, None)
-            self._diag_events.pop(uri, None)
-            self._diag_generation.pop(uri, None)
-            await self._notify("textDocument/didClose", {"textDocument": {"uri": document.uri}})
+            write_uncertain = self._write_uncertain
+            try:
+                cancelled = await self._notify_committed(
+                    "textDocument/didClose", {"textDocument": {"uri": document.uri}}
+                )
+            except BaseException:
+                if write_uncertain or not self._write_uncertain:
+                    self.documents[uri] = document
+                    if had_diagnostics:
+                        self.diagnostics_cache[uri] = diagnostics
+                    if event is not None:
+                        self._diag_events[uri] = event
+                    if generation is not None:
+                        self._diag_generation[uri] = generation
+                raise
+            if cancelled:
+                raise asyncio.CancelledError
 
     def _require(self, capability: str) -> None:
         if not self.initialized:
@@ -1597,6 +1660,9 @@ class CodeTools:
             self._config_error = None
         self._servers: dict[str, _LanguageServer] = {}
         self._lock = asyncio.Lock()
+        self._config_report_lock = asyncio.Lock()
+        self._lsp_apply_sequence = 0
+        self._kernel_generation = os.environ.get("MYPR_GENERATION")
         self._plans = EditPlanStore(self.workspace)
         self._actions: OrderedDict[str, _StoredAction] = OrderedDict()
         self._workspace_diag_results: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -1790,21 +1856,31 @@ class CodeTools:
         definitions, revision = await self._save_definition(name, definition)
         self._definitions = definitions
         self._config_revision = revision
+        self._lsp_apply_sequence += 1
         self._config_error = None
 
     async def _report_applied_lsp(self) -> None:
         if self._config_rpc is None:
             return
-        try:
-            result = self._config_rpc(
-                "applied_lsp",
-                copy.deepcopy(self._definitions),
-                revision=self._config_revision,
-            )
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:
-            self._config_error = f"unable to report applied LSP configuration: {exc}"[:1024]
+        async with self._config_report_lock:
+            async with self._lock:
+                definitions = copy.deepcopy(self._definitions)
+                revision = self._config_revision
+                sequence = self._lsp_apply_sequence
+            try:
+                result = self._config_rpc(
+                    "applied_lsp",
+                    definitions,
+                    revision=revision,
+                    sequence=sequence,
+                    generation=self._kernel_generation,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                self._config_error = f"unable to report applied LSP configuration: {exc}"[:1024]
+            else:
+                self._config_error = None
 
     async def start(
         self,
@@ -2748,6 +2824,8 @@ class CodeTools:
                 "deferred": busy,
                 "applied": False,
                 "revision": self._config_revision,
+                "sequence": self._lsp_apply_sequence,
+                "generation": self._kernel_generation,
                 "servers": self.status()["servers"],
             }
         targets = [
@@ -2757,6 +2835,7 @@ class CodeTools:
         ]
         self._definitions = definitions
         self._config_revision = revision
+        self._lsp_apply_sequence += 1
         self._config_error = None
         await asyncio.gather(*(server.aclose() for _, server in targets))
         return {
@@ -2764,6 +2843,8 @@ class CodeTools:
             "deferred": [],
             "applied": True,
             "revision": revision,
+            "sequence": self._lsp_apply_sequence,
+            "generation": self._kernel_generation,
             "servers": self.status()["servers"],
         }
 
@@ -2792,6 +2873,8 @@ class CodeTools:
                 "reason": reason,
                 "applied": False,
                 "revision": self._config_revision,
+                "sequence": self._lsp_apply_sequence,
+                "generation": self._kernel_generation,
                 "servers": self.status()["servers"],
             }
         async with self._lock:

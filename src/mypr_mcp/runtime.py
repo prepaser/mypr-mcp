@@ -197,6 +197,7 @@ class Runtime:
         self.restarting = None
         self.healthy = False
         self.health_error = None
+        self.registry_error = None
         self.km = None
         self.kc = None
         self.worker = None
@@ -297,7 +298,7 @@ class Runtime:
             change.cancel()
             await wait_owned(asyncio.gather(stop, change, return_exceptions=True), propagate=False)
 
-    async def code_config(self, req):
+    async def code_config(self, req, *, generation=None):
         if self.mcp is None:
             raise RuntimeError("Workspace configuration is not ready")
         method = req.get("method")
@@ -318,8 +319,26 @@ class Runtime:
         if method == "applied_lsp":
             from .lsp_config import validate_servers
 
-            self.settings.record_lsp(validate_servers(req.get("definitions")))
-            return {"recorded": True}
+            generation = req.get("generation", generation)
+            sequence = req.get("sequence")
+            current_sequence = getattr(self.settings, "lsp_sequence", 0)
+            current_generation = getattr(self, "generation", None)
+            if generation != current_generation or type(sequence) is not int or sequence < 0:
+                return {
+                    "recorded": False,
+                    "generation": current_generation,
+                    "sequence": current_sequence,
+                }
+            recorded = self.settings.record_lsp(
+                validate_servers(req.get("definitions")),
+                sequence=sequence,
+                generation=generation,
+            )
+            return {
+                "recorded": recorded,
+                "generation": current_generation,
+                "sequence": getattr(self.settings, "lsp_sequence", sequence),
+            }
         raise ValueError("Unknown workspace configuration operation")
 
     def new_shells(self):
@@ -577,6 +596,7 @@ class Runtime:
 
     async def start_kernel(self):
         self.check_persistence()
+        self.settings.reset_lsp_generation(self.generation)
         env = dict(
             os.environ,
             MYPR_SOCKET=str(self.socket),
@@ -622,7 +642,13 @@ class Runtime:
             )
             if applied["applied"] is not True:
                 raise RuntimeError("Kernel startup configuration was deferred")
-            self.settings.record_lsp(self._kernel_snapshot.values["lsp"]["servers"])
+            recorded = self.settings.record_lsp(
+                self._kernel_snapshot.values["lsp"]["servers"],
+                sequence=applied.get("sequence"),
+                generation=applied.get("generation", self.generation),
+            )
+            if not recorded:
+                raise RuntimeError("Kernel startup returned an outdated LSP configuration")
             self.healthy = True
             self.health_error = None
             self.worker = asyncio.create_task(self.run_queue())
@@ -1494,6 +1520,8 @@ class Runtime:
                 }
                 if self.health_error:
                     result["health_error"] = self.health_error
+                if self.registry_error:
+                    result["registry_error"] = self.registry_error
                 return result
             connections = []
             for info in self.clients.values():
@@ -1526,6 +1554,7 @@ class Runtime:
                 "generation": self.generation,
                 "healthy": self.healthy,
                 "health_error": self.health_error,
+                "registry_error": self.registry_error,
                 "resetting": self.resetting,
                 "connections": connections,
                 "connection_count": len(connections),
@@ -1760,7 +1789,7 @@ class Runtime:
         requested_client, generation,
     ):
         if op == "code_config":
-            return await self.code_config(req)
+            return await self.code_config(req, generation=generation)
         if op == "storage_usage":
             return await self.storage_call("usage")
         if op == "storage_gc":
@@ -2327,10 +2356,16 @@ class Runtime:
                 await self.start_kernel()
                 from .runtime_registry import register
 
-                await asyncio.to_thread(
-                    register, self.workspace, self.socket, self.generation,
-                    self.config_store.global_path,
-                )
+                try:
+                    await asyncio.to_thread(
+                        register, self.workspace, self.socket, self.generation,
+                        self.config_store.global_path,
+                    )
+                except Exception as exc:
+                    self.registry_error = f"manager registry unavailable: {safe_error(exc)}"
+                    print(self.registry_error, file=sys.stderr)
+                else:
+                    self.registry_error = None
                 if current:
                     await self.append(
                         current, {"type": "result", "text": "Workspace reset completed"}
@@ -2789,10 +2824,16 @@ class Runtime:
                 await self.start_kernel()
                 from .runtime_registry import register
 
-                await asyncio.to_thread(
-                    register, self.workspace, self.socket, self.generation,
-                    self.config_store.global_path,
-                )
+                try:
+                    await asyncio.to_thread(
+                        register, self.workspace, self.socket, self.generation,
+                        self.config_store.global_path,
+                    )
+                except Exception as exc:
+                    self.registry_error = f"manager registry unavailable: {safe_error(exc)}"
+                    print(self.registry_error, file=sys.stderr)
+                else:
+                    self.registry_error = None
                 self.spawn(self.maintain_storage())
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     asyncio.get_running_loop().add_signal_handler(sig, self.stopping.set)

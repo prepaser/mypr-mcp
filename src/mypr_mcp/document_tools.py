@@ -166,7 +166,7 @@ class _ResultStore:
         ):
             raise ValueError("invalid document result cursor")
         path = self.root / f"{ident}.json"
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(path, flags)
         except FileNotFoundError as exc:
@@ -285,7 +285,7 @@ class _ResultStore:
         if cache != f"{ident}.resume":
             raise DocumentToolError("Stored OCR resume cache is invalid")
         path = self.root / cache
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(path, flags)
         except FileNotFoundError as exc:

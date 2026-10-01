@@ -98,6 +98,37 @@ async def test_corrupt_index_is_rejected_before_patch_changes_file(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_revision_index_symlink_is_rejected_before_target_update(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    store = RevisionStore(tmp_path, fs, "files")
+    resource = "sample.txt"
+    target = tmp_path / ".mypr" / "other-index.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "kind": "files",
+                "resource": resource,
+                "count": 0,
+                "revisions": [],
+                "next_sequence": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    index = tmp_path / store._index_path(resource)
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.symlink_to(target)
+
+    with pytest.raises(ValueError, match="must not contain symlinks"):
+        await store.record(resource, [b"old"])
+
+    assert json.loads(target.read_text(encoding="utf-8"))["count"] == 0
+    assert index.is_symlink()
+
+
+@pytest.mark.asyncio
 async def test_corrupt_existing_blob_is_rejected_before_target_write(tmp_path: Path):
     fs = Filesystem(tmp_path)
     store = RevisionStore(tmp_path, fs, "files")

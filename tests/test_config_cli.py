@@ -186,6 +186,20 @@ async def test_reload_all_reports_identity_and_capability_errors(tmp_path: Path,
 
 
 @pytest.mark.asyncio
+async def test_reload_all_reports_registry_read_failure(tmp_path: Path, monkeypatch):
+    def blocked(_path):
+        raise PermissionError("registry unavailable")
+
+    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers", blocked)
+
+    result = await cli._reload_all(tmp_path / "global.toml", force=False)
+
+    assert result["ok"] is False
+    assert result["status"] == "error"
+    assert "registry unavailable" in result["error"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reload_result", "status"),
     [

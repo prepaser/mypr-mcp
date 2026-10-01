@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from mypr_mcp.browser_observation import _safe_url
 from mypr_mcp.browser_tools import BrowserError, BrowserTools
 
 
@@ -231,6 +232,25 @@ async def test_observation_scopes_page_events_and_redacts_sensitive_data(browser
     assert not any(page.listeners.values())
     assert (await observation.read())["closed"]
     assert await observation.request(request_event["request_id"])
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@example.test/?access_token=secret&safe=yes#api%5Fkey=secret",
+        "https://user:password@example.test:invalid/?access_token=secret&safe=yes#api%5Fkey=secret",
+        "https://user:password@exa／mple.test/?access_token=secret&safe=yes",
+        "//user:password@example.test:invalid/?access_token=secret&safe=yes",
+    ],
+)
+def test_safe_url_masks_credentials_and_sensitive_values(url):
+    result = _safe_url(url)
+
+    assert "password" not in result
+    assert "secret" not in result
+    assert "[redacted]@" in result
+    assert "safe=yes" in result
+    assert result.endswith("#[redacted]") or "#" not in url
 
 
 @pytest.mark.asyncio

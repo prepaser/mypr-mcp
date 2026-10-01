@@ -11,7 +11,7 @@ import heapq
 import os
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from pathlib import Path
 from threading import Lock
@@ -722,6 +722,7 @@ class Filesystem:
             if destination_path.parent != self.workspace and not destination_path.parent.exists():
                 destination_path.parent.mkdir(parents=True, exist_ok=True)
             try:
+                copy_state = {"destination_committed": False}
                 await _to_thread_uncancelled(
                     _copy_bytes,
                     source_path,
@@ -730,8 +731,11 @@ class Filesystem:
                     destination_old,
                     _signature(source_info),
                     move,
+                    copy_state,
                 )
             except BaseException as exc:
+                if not copy_state["destination_committed"]:
+                    raise
                 try:
                     await _to_thread_uncancelled(
                         _restore_transition, destination_path, destination_old, old
@@ -1728,6 +1732,8 @@ def _atomic_write(
     data: bytes,
     old: bytes | None,
     old_stat: os.stat_result | None,
+    *,
+    on_commit: Callable[[], None] | None = None,
 ) -> os.stat_result:
     mode = stat.S_IMODE(old_stat.st_mode) if old_stat is not None else 0o600
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -1740,6 +1746,8 @@ def _atomic_write(
             os.fsync(stream.fileno())
         if old is None:
             os.link(temporary_path, path)
+            if on_commit is not None:
+                on_commit()
             temporary_path.unlink(missing_ok=True)
         else:
             try:
@@ -1751,6 +1759,8 @@ def _atomic_write(
             if not unchanged:
                 raise RuntimeError(f"File changed while updating: {path}")
             os.replace(temporary_path, path)
+            if on_commit is not None:
+                on_commit()
         return path.stat()
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -1813,11 +1823,22 @@ def _copy_bytes(
     destination_old: bytes | None,
     source_signature: tuple[int, int, int, int, int],
     move: bool,
+    state: dict[str, bool] | None = None,
 ) -> None:
     source_mode = stat.S_IMODE(source.stat().st_mode)
     destination_info = destination.stat() if destination.exists() else None
     destination.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(destination, data, destination_old, destination_info)
+    _atomic_write(
+        destination,
+        data,
+        destination_old,
+        destination_info,
+        on_commit=(
+            None
+            if state is None
+            else lambda: state.__setitem__("destination_committed", True)
+        ),
+    )
     if destination_info is None:
         destination.chmod(source_mode)
     if move:

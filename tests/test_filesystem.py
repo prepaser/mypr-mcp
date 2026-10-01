@@ -171,8 +171,8 @@ async def test_move_rechecks_source_before_unlinking(tmp_path: Path, monkeypatch
     fs = Filesystem(tmp_path)
     original_atomic_write = filesystem_module._atomic_write
 
-    def write_then_change(path, data, old, old_stat):
-        result = original_atomic_write(path, data, old, old_stat)
+    def write_then_change(path, data, old, old_stat, **kwargs):
+        result = original_atomic_write(path, data, old, old_stat, **kwargs)
         if path == destination:
             source.write_bytes(b"external change")
         return result
@@ -183,6 +183,75 @@ async def test_move_rechecks_source_before_unlinking(tmp_path: Path, monkeypatch
 
     assert source.read_bytes() == b"external change"
     assert not destination.exists()
+
+
+async def test_copy_failure_does_not_delete_competing_destination(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"same content")
+    original = filesystem_module._copy_bytes
+
+    def competing_creation(*args, **kwargs):
+        destination.write_bytes(source.read_bytes())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(filesystem_module, "_copy_bytes", competing_creation)
+    with pytest.raises(FileExistsError):
+        await Filesystem(tmp_path).copy("source.txt", "destination.txt", history=False)
+
+    assert destination.read_bytes() == b"same content"
+
+
+@pytest.mark.parametrize("operation", ["copy", "move"])
+@pytest.mark.parametrize("failure", ["cleanup", "stat"])
+async def test_copy_or_move_rolls_back_after_destination_commit_failure(
+    tmp_path: Path, monkeypatch, operation: str, failure: str
+):
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"source")
+    fs = Filesystem(tmp_path)
+
+    if failure == "cleanup":
+        original_unlink = Path.unlink
+        injected = False
+
+        def fail_cleanup(path, *args, **kwargs):
+            nonlocal injected
+            if not injected and path.parent == tmp_path and path.name.startswith(
+                ".destination.txt."
+            ):
+                injected = True
+                raise OSError("injected temporary cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    else:
+        original_stat = Path.stat
+        injected = False
+
+        def fail_stat(path, *args, **kwargs):
+            nonlocal injected
+            if not injected and path == destination and os.path.exists(path):
+                injected = True
+                raise OSError("injected destination stat failure")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fail_stat)
+
+    with pytest.raises(OSError, match="injected"):
+        if operation == "copy":
+            await fs.copy("source.txt", "destination.txt", history=False)
+        else:
+            await fs.move(
+                "source.txt",
+                "destination.txt",
+                expected_hash=digest("source"),
+                history=False,
+            )
+
+    assert not destination.exists()
+    assert source.read_bytes() == b"source"
 
 
 async def test_read_bytes_hashes_stream_and_captures_only_requested_range(

@@ -111,7 +111,8 @@ def _load_result(workspace: Path, reference: dict[str, Any]) -> Any:
         raise ValueError("invalid task result path")
     if len(path.stem) != 64 or any(char not in "0123456789abcdef" for char in path.stem):
         raise ValueError("invalid task result name")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("task result is not a regular file")

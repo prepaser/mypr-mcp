@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 
+import mypr_mcp.patching as patching
+from mypr_mcp.change_plans import ChangePlanStore
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.text_replace_worker import replace as worker_replace
 
@@ -42,6 +45,51 @@ async def test_replace_preview_and_apply_is_cas_checked(tmp_path: Path):
     (tmp_path / "two.txt").write_text("changed\n")
     with pytest.raises(ValueError, match="source changed"):
         await fs.apply_replace(preview["plan_id"])
+
+
+@pytest.mark.asyncio
+async def test_cancelled_apply_waits_for_commit_before_releasing_lock(tmp_path: Path, monkeypatch):
+    path = tmp_path / "one.txt"
+    path.write_text("old\n")
+    fs = Filesystem(tmp_path)
+    plan_id = ChangePlanStore(tmp_path, "replace").create(
+        {
+            "history": False,
+            "operations": [
+                {
+                    "input": "one.txt",
+                    "display": "one.txt",
+                    "old": b"old\n",
+                    "new": b"new\n",
+                    "matches": 1,
+                }
+            ],
+        }
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original = patching._assert_unchanged
+
+    def gated(expected, current):
+        nonlocal calls
+        calls += 1
+        result = original(expected, current)
+        if calls == 2:
+            entered.set()
+            release.wait(5)
+        return result
+
+    monkeypatch.setattr(patching, "_assert_unchanged", gated)
+    task = asyncio.create_task(fs.apply_replace(plan_id))
+    await asyncio.to_thread(entered.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert path.read_text() == "new\n"
 
 
 @pytest.mark.asyncio

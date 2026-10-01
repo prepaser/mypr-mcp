@@ -31,6 +31,10 @@ async def test_reload_from_python_preserves_state_and_global_inheritance(
             "assert (await ws.config.explain('limits.response_bytes'))['pending']",
             "await ws.config.set('lsp.servers.demo', "
             "{'command': ['local-lsp'], 'languages': ['python']})",
+            "await ws.code.reload()",
+            "explanation = await ws.config.explain('lsp.servers.demo')",
+            "assert explanation['applied']['command'] == ['local-lsp'], explanation",
+            "assert not explanation['pending'], explanation",
             "result = await ws.config.reload()",
             "assert result['errors'] == {} and result['deferred'] == {}, result",
             "assert ws.code._definitions['demo']['command'] == ['local-lsp']",

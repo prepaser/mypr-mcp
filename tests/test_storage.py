@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -16,6 +18,30 @@ def old(path: Path, text: str = "x") -> None:
     path.write_text(text, encoding="utf-8")
     timestamp = time.time() - 40 * 24 * 60 * 60
     os.utime(path, (timestamp, timestamp))
+
+
+def test_document_result_fifo_is_rejected_without_waiting_for_a_writer(tmp_path: Path):
+    from mypr_mcp.document_tools import _ResultStore
+
+    store = _ResultStore(tmp_path)
+    ident = store.create({"kind": "extract", "source": {"path": "x"}, "items": []})
+    path = store.root / f"{ident}.json"
+    path.unlink()
+    os.mkfifo(path)
+    code = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from mypr_mcp.document_tools import _ResultStore\n"
+        "_ResultStore(Path(sys.argv[1])).load(sys.argv[2])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path), ident],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert result.returncode != 0
+    assert "invalid stored document result" in result.stderr
 
 
 @pytest.mark.asyncio

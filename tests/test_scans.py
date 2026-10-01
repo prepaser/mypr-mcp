@@ -164,6 +164,77 @@ async def test_scan_tracking_failure_persists_terminal_record(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_scan_launch_cleans_request_and_survives_repeat_cancel(tmp_path: Path):
+    class FakeShells:
+        completed_records = 10
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release_start = asyncio.Event()
+            self.cancel_started = asyncio.Event()
+            self.release_cancel = asyncio.Event()
+            self.cancelled = []
+
+        async def start(self, *args, **kwargs):
+            self.started.set()
+            await self.release_start.wait()
+            return {"id": "a" * 32}
+
+        async def cancel(self, ident):
+            self.cancelled.append(ident)
+            self.cancel_started.set()
+            await self.release_cancel.wait()
+            return {"id": ident, "state": "cancelled"}
+
+    shells = FakeShells()
+    service = ScanService(tmp_path, shells)
+    operation = asyncio.create_task(service.start("tcp", targets="127.0.0.1", ports=[1]))
+    await shells.started.wait()
+    operation.cancel()
+    shells.release_start.set()
+    await shells.cancel_started.wait()
+    operation.cancel()
+    shells.release_cancel.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert shells.cancelled == ["a" * 32]
+    assert not list((tmp_path / ".mypr" / "scans").glob("*.request.json"))
+
+
+@pytest.mark.asyncio
+async def test_scan_cancel_preserves_terminal_shell_result(tmp_path: Path):
+    class FakeShells:
+        completed_records = 10
+
+        async def cancel(self, ident):
+            return {"id": ident, "state": "succeeded", "result": {"returncode": 0}}
+
+    service = ScanService(tmp_path, FakeShells())
+    ident = "a" * 32
+    config = tmp_path / ".mypr" / "scans" / f"{ident}.request.json"
+    config.write_text("{}", encoding="utf-8")
+    record = {
+        "id": ident,
+        "state": "running",
+        "shell_id": ident,
+        "config": str(config),
+        "warnings": [],
+    }
+    service._records[ident] = record
+    service._write_record(record)
+
+    result = await service.cancel(ident)
+
+    assert result["state"] == "succeeded"
+    assert result["returncode"] == 0
+    assert json.loads((tmp_path / ".mypr" / "scans" / f"{ident}.json").read_text())[
+        "state"
+    ] == "succeeded"
+    assert not config.exists()
+
+
+@pytest.mark.asyncio
 async def test_net_diagnostics_and_scan_task_facade(tmp_path: Path):
     shells = Shells(tmp_path)
     service = ScanService(tmp_path, shells)

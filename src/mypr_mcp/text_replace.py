@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES, ChangePlanError, ChangePlanStore
+from .filesystem import _to_thread_uncancelled
 from .patching import _commit, _plan, _read_state, _reject_symlink_alias, _State
 
 MAX_DIFF_BYTES = 32 * 1024
@@ -162,7 +163,8 @@ async def replace(
             max_files=max_files,
             max_input_output_bytes=max_bytes,
         )
-        plan_id = store.create(
+        plan_id = await _to_thread_uncancelled(
+            store.create,
             {
                 "pattern": pattern,
                 "replacement": replacement,
@@ -170,7 +172,7 @@ async def replace(
                 "ignore_case": ignore_case,
                 "history": history,
                 "operations": operations,
-            }
+            },
         )
         changes, diff, diff_truncated = _preview(operations)
         return {
@@ -190,7 +192,7 @@ async def replace(
 async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
     store = ChangePlanStore(fs.workspace, "replace")
     try:
-        payload = store.load(plan_id)
+        payload = await _to_thread_uncancelled(store.load, plan_id)
     except ChangePlanError:
         raise
     entries = payload.get("operations")
@@ -256,8 +258,8 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
             if current.data != state.data:
                 raise ChangePlanError(f"replacement source changed: {display}")
         if history_store is not None:
-            history_store.prepare_changes_sync(plans)
-        result = await asyncio.to_thread(
+            await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
+        result = await _to_thread_uncancelled(
             _commit, plans, {path: state for _, path, _, _, state in resolved}, MAX_DIFF_BYTES,
             history_store=history_store,
         )
@@ -269,7 +271,7 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
             }
         )
     try:
-        store.remove(plan_id)
+        await _to_thread_uncancelled(store.remove, plan_id)
     except OSError as exc:
         result["warnings"] = [f"replacement plan cleanup failed: {exc}"]
     return result

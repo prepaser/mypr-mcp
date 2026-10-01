@@ -12,7 +12,7 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 _MAX_EVENTS = 1000
 _MAX_BYTES = 4 * 1024 * 1024
@@ -24,6 +24,58 @@ _MAX_PAGES = 64
 _DEFAULT_PAGE_SIZE = 100
 _SENSITIVE_HEADER = re.compile(r"(?:auth|cookie|token|secret|api.?key|session|credential)", re.I)
 _EVENT_TYPES = frozenset({"console", "pageerror", "request", "response", "requestfailed"})
+
+
+def _safe_url_fallback(raw: str) -> str:
+    before_fragment, has_fragment, fragment = raw.partition("#")
+    try:
+        decoded_fragment = unquote_plus(fragment)
+    except (UnicodeError, ValueError):
+        decoded_fragment = fragment
+    if has_fragment and _SENSITIVE_HEADER.search(decoded_fragment):
+        fragment = "[redacted]"
+
+    before_query, has_query, query = before_fragment.partition("?")
+    if has_query:
+        fields = []
+        for field in query.split("&"):
+            key, has_value, _item = field.partition("=")
+            try:
+                decoded_key = unquote_plus(key)
+            except (UnicodeError, ValueError):
+                decoded_key = key
+            if _SENSITIVE_HEADER.search(decoded_key):
+                fields.append(f"{key}=[redacted]" if has_value else "[redacted]")
+            else:
+                fields.append(field)
+        query = "&".join(fields)
+
+    result = before_query
+    if has_query:
+        result += f"?{query}"
+    if has_fragment:
+        result += f"#{fragment}"
+
+    marker = result.find("://")
+    if marker >= 0:
+        authority_start = marker + 3
+    elif result.startswith("//"):
+        marker = 0
+        authority_start = 2
+    else:
+        marker = -1
+    if marker >= 0:
+        authority_end = len(result)
+        for delimiter in "/?#":
+            position = result.find(delimiter, authority_start)
+            if position >= 0:
+                authority_end = min(authority_end, position)
+        authority = result[authority_start:authority_end]
+        if "@" in authority:
+            host = authority.rsplit("@", 1)[1]
+            result = f"{result[:authority_start]}[redacted]@{host}{result[authority_end:]}"
+
+    return _text(result, 8192)
 
 
 def _safe_url(value: Any) -> str:
@@ -43,10 +95,14 @@ def _safe_url(value: Any) -> str:
                 for key, item in parse_qsl(parts.query, keep_blank_values=True)
             ]
         )
-        fragment = "[redacted]" if _SENSITIVE_HEADER.search(parts.fragment) else parts.fragment
+        fragment = (
+            "[redacted]"
+            if _SENSITIVE_HEADER.search(unquote_plus(parts.fragment))
+            else parts.fragment
+        )
         return _text(urlunsplit((parts.scheme, host, parts.path, query, fragment)), 8192)
-    except ValueError, UnicodeError:
-        return _text(raw, 8192)
+    except (ValueError, UnicodeError):
+        return _safe_url_fallback(raw)
 
 
 def _text(value: Any, limit: int = 16_384) -> str:

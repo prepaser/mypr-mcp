@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import heapq
 import json
 import os
 import stat
@@ -17,6 +18,10 @@ from .transport import workspace_id
 _MAX_RECORD_BYTES = 64 * 1024
 _MAX_RECORDS = 1024
 _GENERATION_LIMIT = 256
+
+
+class RegistryError(RuntimeError):
+    """The manager registry could not be read or updated."""
 
 
 def registry_dir() -> Path:
@@ -38,8 +43,10 @@ def _canonical_path(value: str | os.PathLike[str] | None) -> str | None:
 def _read_record(path: Path) -> dict[str, Any] | None:
     try:
         info = path.lstat()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise RegistryError(f"unable to inspect manager record {path}: {exc}") from exc
     if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size > _MAX_RECORD_BYTES:
         return None
     flags = (
@@ -58,7 +65,11 @@ def _read_record(path: Path) -> dict[str, Any] | None:
         if len(raw) > _MAX_RECORD_BYTES:
             return None
         value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RegistryError(f"unable to read manager record {path}: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
     finally:
         if fd >= 0:
@@ -165,26 +176,30 @@ def list_managers(
     directory = registry_dir()
     try:
         lock = _lock(directory, exclusive=False)
-    except OSError:
-        return []
+    except OSError as exc:
+        raise RegistryError(f"unable to access manager registry {directory}: {exc}") from exc
     try:
-        entries = sorted(directory.iterdir(), key=lambda path: path.name)[:_MAX_RECORDS]
-    except OSError:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
-        return []
-    try:
-        records = []
-        for path in entries:
-            if path.suffix != ".json":
-                continue
-            record = _read_record(path)
-            if record is not None and record.get("global_path") == selected:
-                records.append(record)
-        return records
+        def candidates():
+            for path in directory.iterdir():
+                if path.suffix != ".json":
+                    continue
+                record = _read_record(path)
+                if record is not None and record.get("global_path") == selected:
+                    yield path.name, record
+
+        return [
+            record
+            for _, record in heapq.nsmallest(
+                _MAX_RECORDS, candidates(), key=lambda item: item[0]
+            )
+        ]
+    except RegistryError:
+        raise
+    except OSError as exc:
+        raise RegistryError(f"unable to read manager registry {directory}: {exc}") from exc
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
 
 
-__all__ = ["list_managers", "register", "registry_dir", "unregister"]
+__all__ = ["RegistryError", "list_managers", "register", "registry_dir", "unregister"]
