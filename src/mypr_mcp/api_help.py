@@ -147,7 +147,7 @@ await ws.config.explain(path) reports desired and applied values, source, revisi
     ),
     "http": (
         "Make bounded asynchronous HTTP requests and downloads.",
-        """ws.http provides named persistent HTTPX2 (httpx2.AsyncClient) clients. Use await ws.http.get/post/... for bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and await ws.http.download(url, path) for atomic workspace downloads.
+        """ws.http provides named persistent HTTPX2 (httpx2.AsyncClient) clients. Use await ws.http.get/post/... for bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and await ws.http.download(url, path) for atomic workspace downloads. A completed download returns its Path even if temporary-file cleanup fails; ws.http.last_warnings reports warnings from the current logical client's most recently completed download.
 
 await ws.http.extract_html(html, url=..., selector=...) extracts readable content from existing HTML. await ws.http.read_html(url, ...) fetches through a named HTTP client before extraction. Both return bounded text and link results with source metadata. Pass include_structure=True when heading hierarchy and document metadata are needed. Parsing requires optional workspace packages trafilatura and cssselect; it does not execute JavaScript. Pass browser page.content() to extract a rendered document.
 
@@ -188,7 +188,7 @@ await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newe
     ),
     "packages": (
         "Install packages into the workspace Python environment.",
-        """await ws.packages.add("package") starts an installation and returns a task handle. Keep the handle in ws.local to inspect or await the installation. Package changes are serialized per workspace; requirements and the frozen manifest are replaced atomically after installation succeeds. A failed or cancelled job leaves the previous manifest intact. Reset is not required for unrelated imports, but already-imported modules may need a reset before an upgrade is visible.""",
+        """await ws.packages.add("package") starts an installation and returns a task handle. Keep the handle in ws.local to inspect or await the installation. Package changes are serialized per workspace; the frozen manifest is replaced atomically after installation succeeds. Failures before replacement leave the previous manifest intact. If the replacement cannot be confirmed durable, the job succeeds with a manifest_durability_unknown warning in its status and output. Installation can change the environment before a later freeze or manifest failure. Reset is not required for unrelated imports, but already-imported modules may need a reset before an upgrade is visible.""",
     ),
     "history": (
         "Find execution records and inspect event logs.",

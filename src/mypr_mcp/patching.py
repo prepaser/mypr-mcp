@@ -22,7 +22,10 @@ from typing import Any
 from .filesystem import (
     _check_expected,
     _diff_lines,
+    _history_blob_limit,
+    _history_size_error,
     _read_regular,
+    _ReadLimitExceeded,
     _require_regular,
     _signature,
     _to_thread_uncancelled,
@@ -341,10 +344,12 @@ def _apply_locked(
     for _, source, source_display, destination, destination_display in resolved:
         for path, display in ((source, source_display), (destination, destination_display)):
             if path is not None and path not in states:
-                states[path] = _read_state(path, display)
+                states[path] = _read_state(path, display, _history_limit(path, history_store))
     for path, wanted in expected_hashes.items():
         if path not in states:
-            states[path] = _read_state(path, str(path))
+            states[path] = _read_state(
+                path, str(path), _history_limit(path, history_store)
+            )
         if wanted is None:
             if states[path].exists:
                 raise ValueError(f"Revision mismatch: expected absent, got {states[path].revision}")
@@ -432,13 +437,26 @@ def _resolve_expected_hashes(
     return output
 
 
-def _read_state(path: Path, display: str) -> _State:
+def _history_limit(path: Path, history_store: Any) -> int | None:
+    if history_store is None or history_store._resource_for_path(path) is None:
+        return None
+    return _history_blob_limit()
+
+
+def _read_state(path: Path, display: str, max_bytes: int | None = None) -> _State:
     try:
         info = path.stat()
     except FileNotFoundError:
         return _State(path, display, False, None, None)
     _require_regular(info, display)
-    data, opened = _read_regular(path, display)
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise _history_size_error(display, max_bytes)
+    try:
+        data, opened = _read_regular(path, display, max_bytes=max_bytes)
+    except _ReadLimitExceeded as exc:
+        if max_bytes is not None:
+            raise _history_size_error(display, exc.limit) from exc
+        raise
     after = path.stat()
     if _signature(info) != _signature(opened) or _signature(info) != _signature(after):
         raise RuntimeError(f"File changed while reading: {display}")
@@ -674,11 +692,22 @@ def _commit(
                 stream.flush()
                 os.fsync(stream.fileno())
         for state in states.values():
-            _assert_unchanged(state, _read_state(state.path, state.display))
+            _assert_unchanged(
+                state,
+                _read_state(
+                    state.path,
+                    state.display,
+                    _history_limit(state.path, history_store),
+                ),
+            )
         for plan in active_plans:
             path = plan["path"]
             state = states.get(path)
-            current = _read_state(path, plan["display"])
+            current = _read_state(
+                path,
+                plan["display"],
+                _history_limit(path, history_store),
+            )
             if state is None:
                 state = _State(path, plan["display"], False, None, None)
             _assert_unchanged(state, current)
@@ -704,7 +733,11 @@ def _commit(
             if plan["source"] is not None:
                 source = plan["source"]
                 source_state = states[source]
-                current_source = _read_state(source, plan["source_display"] or str(source))
+                current_source = _read_state(
+                    source,
+                    plan["source_display"] or str(source),
+                    _history_limit(source, history_store),
+                )
                 _assert_unchanged(source_state, current_source)
                 source.unlink()
                 committed.append((source, source_state.data, source_state.info, None, None))
@@ -723,7 +756,11 @@ def _commit(
         recovery: list[str] = []
         for path, old, old_info, expected_new, expected_info in reversed(committed):
             try:
-                current = _read_state(path, str(path))
+                current = _read_state(
+                    path,
+                    str(path),
+                    _history_limit(path, history_store),
+                )
                 if expected_new is None and current.exists:
                     raise RuntimeError("path changed outside this patch")
                 if expected_new is not None and (

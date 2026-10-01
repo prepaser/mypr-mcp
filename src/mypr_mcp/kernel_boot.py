@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import importlib
 import os
@@ -98,6 +99,18 @@ def _kernel_class():
                         force=metadata.get("force", False),
                     )
                     result["config_result"] = config_result
+                    if config_result.get("applied") is True:
+                        code = self._mypr_workspace.code
+                        definitions = getattr(code, "_definitions", None)
+                        sequence = getattr(code, "_lsp_apply_sequence", None)
+                        if isinstance(definitions, dict) and type(sequence) is int:
+                            result["_mypr_applied_lsp"] = {
+                                "definitions": copy.deepcopy(definitions),
+                                "revision": getattr(code, "_config_revision", None),
+                                "sequence": sequence,
+                                "generation": getattr(code, "_kernel_generation", None)
+                                or metadata.get("generation"),
+                            }
                 except Exception as exc:
                     result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
                 self.session.send(stream, "execute_reply", result, parent, ident=ident)

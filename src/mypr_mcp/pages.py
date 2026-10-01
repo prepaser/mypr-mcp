@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any
@@ -52,6 +53,14 @@ class Pages:
         if type(max_pages) is not int or not 1 <= max_pages <= 10_000:
             raise ValueError("max_pages must be between 1 and 10000")
         call, name = self._resolve(method)
+        try:
+            positional = {
+                parameter.name: index
+                for index, parameter in enumerate(inspect.signature(call).parameters.values())
+                if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD and index < len(args)
+            }
+        except (TypeError, ValueError):
+            positional = {}
         options = dict(kwargs)
         search_method = self._search_method(method, name)
         if (
@@ -72,7 +81,11 @@ class Pages:
         seen: set[str] = set()
         revision: Any = _MISSING
         for page_number in range(1, max_pages + 1):
-            result = await call(*args, **options)
+            call_args, call_options = list(args), dict(options)
+            for key in ("cursor", "after", "start_line", "start_byte"):
+                if key in call_options and key in positional and args:
+                    call_args[positional[key]] = call_options.pop(key)
+            result = await call(*call_args, **call_options)
             if not isinstance(result, Mapping):
                 raise TypeError(
                     f"paged method returned {type(result).__name__}, expected a mapping"

@@ -199,6 +199,11 @@ async def test_kernel_config_reload_control_applies_outside_user_executor(monkey
     applied = []
 
     class Code:
+        _definitions = {"fake": _definition()}
+        _config_revision = "composite"
+        _lsp_apply_sequence = 1
+        _kernel_generation = "generation"
+
         async def apply_definitions(self, definitions, revision, *, force=False):
             applied.append((definitions, revision, force))
             return {"applied": True, "changed": []}
@@ -217,6 +222,7 @@ async def test_kernel_config_reload_control_applies_outside_user_executor(monkey
     await kernel_type.execute_request(kernel, "stream", "ident", parent)
     assert applied == [({"fake": _definition()}, "composite", False)]
     assert kernel.session.sent[0][2]["config_result"]["applied"] is True
+    assert kernel.session.sent[0][2]["_mypr_applied_lsp"]["sequence"] == 1
 
 
 @pytest.mark.asyncio

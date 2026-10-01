@@ -12,7 +12,7 @@ while page["next_cursor"]:
 page = await ws.git.blame("src/app.py", start_line=10, end_line=30)
 ```
 
-`await ws.git.commit_info(ref, include_files=True, include_patch=False)` returns one commit's parents, author and committer, subject, body, changed files, and insert/delete statistics. Patch text is opt-in and remains bounded by `max_bytes`. Merge statistics use the first parent as the comparison base and identify that choice in the result. The method is read-only and does not change the repository.
+`await ws.git.commit_info(ref, include_files=True, include_patch=False)` returns one commit's parents, author and committer, subject, body, changed files, and insert/delete statistics. Patch text is opt-in and remains bounded by `max_bytes`. Files, statistics, and patch text compare against the first parent, including merge commits. `commit.comparison_base` identifies that parent's hash; it is `None` for a root commit, whose files are compared against an empty tree. The method is read-only and does not change the repository.
 
 `log(ref="HEAD", *, path=None, author=None, since=None, until=None, cursor=None, max_entries=50, max_bytes=32768)` supports Git's author regular expression and date filter syntax. A path is workspace-relative (or an absolute path inside the repository) and matched literally. Each commit contains its hash, author, email, authored timestamp, and subject. The resolved commit hash is returned as `ref`.
 

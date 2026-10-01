@@ -1,10 +1,13 @@
 import json
+import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import pytest
 
+import mypr_mcp.journal as journal
 from mypr_mcp.journal import append_events, read_page
 
 
@@ -30,15 +33,15 @@ class CountedFile:
 
 def count_reads(monkeypatch, path):
     reads = []
-    original = Path.open
+    original = journal.open_regular
 
     def open_file(self, *args, **kwargs):
         file = original(self, *args, **kwargs)
-        if self == path and args and args[0] == "rb":
+        if self == path:
             return CountedFile(file, reads)
         return file
 
-    monkeypatch.setattr(Path, "open", open_file)
+    monkeypatch.setattr(journal, "open_regular", open_file)
     return reads
 
 
@@ -53,6 +56,28 @@ def test_pages_read_only_requested_region(monkeypatch, tmp_path):
     assert first + second == events[: len(first) + len(second)]
     assert 0 < sum(reads) < 3 * 32768
     assert path.stat().st_size > 1024 * 1024
+
+
+def test_fifo_is_rejected_without_waiting(tmp_path):
+    path = tmp_path / "events.jsonl"
+    os.mkfifo(path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from mypr_mcp.journal import read_page; "
+                "read_page(Path(__import__('sys').argv[1]), 0, 1024)"
+            ),
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert result.returncode != 0
+    assert "regular file" in result.stderr
 
 
 def test_legacy_index_is_built_once_and_supports_arbitrary_cursors(monkeypatch, tmp_path):

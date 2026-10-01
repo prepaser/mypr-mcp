@@ -12,6 +12,37 @@ from typing import Any
 import tomlkit
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_LANGUAGE_ID = re.compile(r"^[A-Za-z0-9_.+-]{1,64}$")
+
+MAX_COMMAND_ARGS = 64
+MAX_COMMAND_ARG_LENGTH = 4096
+MAX_LANGUAGE_IDS = 64
+
+
+def validate_configuration(
+    command: Any, languages: Any
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Validate and normalize the command and language IDs shared by all callers."""
+    if not isinstance(command, (list, tuple)) or not command:
+        raise ValueError("command must be a non-empty list of at most 64 strings")
+    if len(command) > MAX_COMMAND_ARGS:
+        raise ValueError("command must be a non-empty list of at most 64 strings")
+    if any(
+        not isinstance(arg, str) or not arg or "\x00" in arg or len(arg) > MAX_COMMAND_ARG_LENGTH
+        for arg in command
+    ):
+        raise ValueError(
+            "command arguments must be non-empty strings of at most 4096 characters"
+        )
+    if not isinstance(languages, (list, tuple)) or not languages:
+        raise ValueError("languages must be a non-empty list of language IDs")
+    if len(languages) > MAX_LANGUAGE_IDS:
+        raise ValueError("languages must be a non-empty list of at most 64 language IDs")
+    if any(not isinstance(value, str) or not _LANGUAGE_ID.fullmatch(value) for value in languages):
+        raise ValueError(
+            "language IDs must be 1-64 letters, numbers, dots, underscores, pluses, or dashes"
+        )
+    return tuple(command), tuple(dict.fromkeys(languages))
 
 
 def _revision(raw: bytes | None) -> str | None:
@@ -44,14 +75,10 @@ def validate_servers(value: Any) -> dict[str, dict[str, Any]]:
             )
         command = raw.get("command")
         languages = raw.get("languages")
-        if not isinstance(command, (list, tuple)) or not command or not all(
-            isinstance(item, str) and item and "\x00" not in item for item in command
-        ):
-            raise ValueError(f"LSP server {name!r} command must be a non-empty list of strings")
-        if not isinstance(languages, (list, tuple)) or not languages or not all(
-            isinstance(item, str) and item and "\x00" not in item for item in languages
-        ):
-            raise ValueError(f"LSP server {name!r} languages must be a non-empty list of strings")
+        try:
+            command_values, language_values = validate_configuration(command, languages)
+        except ValueError as exc:
+            raise ValueError(f"LSP server {name!r}: {exc}") from exc
         timeout = raw.get("timeout", 10.0)
         if (
             isinstance(timeout, bool)
@@ -60,8 +87,8 @@ def validate_servers(value: Any) -> dict[str, dict[str, Any]]:
         ):
             raise ValueError(f"LSP server {name!r} timeout must be between 1 and 60 seconds")
         result[name] = {
-            "command": list(command),
-            "languages": list(dict.fromkeys(languages)),
+            "command": list(command_values),
+            "languages": list(language_values),
             "timeout": float(timeout),
         }
     return result
@@ -114,4 +141,4 @@ class LSPConfig:
         return self.core.save_server(section, name, definition, expected_revision)
 
 
-__all__ = ["LSPConfig", "validate_servers"]
+__all__ = ["LSPConfig", "validate_configuration", "validate_servers"]

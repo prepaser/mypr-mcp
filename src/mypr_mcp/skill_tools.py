@@ -245,10 +245,7 @@ def _validate_skill(name: str, path: Path, text: str, root: Path) -> dict[str, A
         errors.append(front)
     else:
         metadata = front
-        if "name" in metadata and not isinstance(metadata["name"], str):
-            errors.append("front matter name must be a string")
-        if "description" in metadata and not isinstance(metadata["description"], str):
-            errors.append("front matter description must be a string")
+        errors.extend(_metadata_errors(metadata))
         if "name" not in metadata:
             warnings.append("front matter name is missing")
         if "description" not in metadata:
@@ -272,6 +269,14 @@ def _validate_skill_name(name: str) -> None:
     parts = name.split("/")
     if any(not part or part in {".", ".."} for part in parts):
         raise ValueError("skill name contains an invalid path component")
+
+
+def _metadata_errors(metadata: Mapping[str, Any]) -> list[str]:
+    return [
+        f"front matter {key} must be a string"
+        for key in ("name", "description")
+        if key in metadata and not isinstance(metadata[key], str)
+    ]
 
 
 def _front_matter(text: str) -> dict[str, Any] | str | None:

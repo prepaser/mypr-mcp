@@ -174,7 +174,7 @@ async def replace(
                 "operations": operations,
             },
         )
-        changes, diff, diff_truncated = _preview(operations)
+        changes, diff, diff_truncated = await _to_thread_uncancelled(_preview, operations)
         return {
             "plan_id": plan_id,
             "applicable": True,
@@ -260,7 +260,10 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
         if history_store is not None:
             await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
         result = await _to_thread_uncancelled(
-            _commit, plans, {path: state for _, path, _, _, state in resolved}, MAX_DIFF_BYTES,
+            _commit,
+            plans,
+            {path: state for _, path, _, _, state in resolved},
+            MAX_DIFF_BYTES,
             history_store=history_store,
         )
         result.update(
@@ -294,20 +297,19 @@ def _preview(operations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
                 "size": len(new),
             }
         )
-        for line in difflib.unified_diff(
-            old.decode("utf-8").splitlines(keepends=True),
-            new.decode("utf-8").splitlines(keepends=True),
-            fromfile=display,
-            tofile=display,
-        ):
-            encoded = line.encode("utf-8")
-            if total + len(encoded) > MAX_DIFF_BYTES:
-                truncated = True
-                break
-            chunks.append(line)
-            total += len(encoded)
-        if truncated:
-            break
+        if not truncated:
+            for line in difflib.unified_diff(
+                old.decode("utf-8").splitlines(keepends=True),
+                new.decode("utf-8").splitlines(keepends=True),
+                fromfile=display,
+                tofile=display,
+            ):
+                encoded = line.encode("utf-8")
+                if total + len(encoded) > MAX_DIFF_BYTES:
+                    truncated = True
+                    break
+                chunks.append(line)
+                total += len(encoded)
     return changes, "".join(chunks), truncated
 
 

@@ -87,6 +87,20 @@ async def test_check_runs_in_child_without_parent_side_effects(tmp_path: Path):
     assert "CHECK_CHILD_VALUE" not in globals()
 
 
+async def test_check_provides_import_metadata_for_candidate_source(tmp_path: Path):
+    modules = manager(tmp_path)
+    result = await modules.check(
+        "meta",
+        "from importlib.util import find_spec\n"
+        "assert find_spec(__name__) is __spec__\n"
+        "assert __loader__ is not None\n"
+        "assert __package__ == 'ws_lib'\n"
+        "assert __spec__.origin == __file__\n"
+        "assert '__path__' not in globals()\n",
+    )
+    assert result["valid"], result["stderr"]
+
+
 @pytest.mark.asyncio
 async def test_check_rejects_truncated_existing_source(tmp_path: Path):
     class TruncatedFilesystem(Filesystem):

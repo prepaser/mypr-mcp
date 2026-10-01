@@ -23,7 +23,7 @@ from urllib.parse import unquote, urlparse
 
 from .async_utils import finish_owned, wait_owned
 from .config import ConfigSnapshot, ConfigStore
-from .lsp_config import validate_servers
+from .lsp_config import validate_configuration, validate_servers
 from .lsp_edits import (
     EditError,
     EditPlanStore,
@@ -1682,25 +1682,8 @@ class CodeTools:
     def _configuration(
         command: list[str] | tuple[str, ...], languages: list[str] | tuple[str, ...]
     ) -> tuple[tuple[str, ...], frozenset[str]]:
-        if not isinstance(command, (list, tuple)) or not command or len(command) > 64:
-            raise ValueError("command must be a non-empty list of at most 64 strings")
-        if any(
-            not isinstance(arg, str) or not arg or "\x00" in arg or len(arg) > 4096
-            for arg in command
-        ):
-            raise ValueError(
-                "command arguments must be non-empty strings of at most 4096 characters"
-            )
-        if not isinstance(languages, (list, tuple)) or not languages or len(languages) > 64:
-            raise ValueError("languages must be a non-empty list of language IDs")
-        if any(
-            not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", value)
-            for value in languages
-        ):
-            raise ValueError(
-                "language IDs must be 1-64 letters, numbers, dots, underscores, pluses, or dashes"
-            )
-        return tuple(command), frozenset(languages)
+        command_values, language_values = validate_configuration(command, languages)
+        return command_values, frozenset(language_values)
 
     @staticmethod
     def _lsp_snapshot(

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .async_utils import finish_owned, wait_owned
+from .file_io import open_regular, read_bytes
 from .services import Shells
 
 _RESULT_LIMIT = 16 * 1024 * 1024
@@ -25,6 +26,7 @@ _DEFAULT_PAGE_ENTRIES = 100
 _DEFAULT_PAGE_BYTES = 32768
 _DEFAULT_MAX_PROBES = 1_000_000
 _DEFAULT_MAX_DURATION = 3600.0
+_PERSISTED_JSON_LIMIT = 1 * 1024 * 1024
 _TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
 
 
@@ -48,8 +50,10 @@ class ScanService:
 
     def _load_records(self) -> None:
         for path in self.root.glob("*.json"):
+            if path.name.endswith((".request.json", ".summary.json")):
+                continue
             try:
-                record = json.loads(path.read_text(encoding="utf-8"))
+                record = json.loads(read_bytes(path, max_bytes=_PERSISTED_JSON_LIMIT))
             except OSError, ValueError:
                 continue
             if not isinstance(record, dict) or record.get("id") != path.stem:
@@ -57,6 +61,26 @@ class ScanService:
             if record.get("state") not in _TERMINAL:
                 record.update(state="lost", error="scan manager restarted before completion")
                 self._write_record(record)
+                self._remove_request(record)
+        for path in self.root.glob("*.request.json"):
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+    def _remove_request(self, record: dict[str, Any]) -> None:
+        config = record.get("config")
+        if not isinstance(config, str):
+            return
+        request = Path(config)
+        try:
+            if request.parent.resolve(strict=False) != self.root.resolve(strict=False):
+                return
+        except (OSError, RuntimeError):
+            return
+        name = request.name.removesuffix(".request.json")
+        if len(name) != 32 or any(char not in "0123456789abcdef" for char in name):
+            return
+        with contextlib.suppress(OSError):
+            request.unlink()
 
     def _cache(self, record: dict[str, Any]) -> dict[str, Any]:
         ident = str(record["id"])
@@ -277,7 +301,7 @@ class ScanService:
         more_data = False
         if not path.is_file():
             return rows, offset, running
-        with path.open("rb") as stream:
+        with open_regular(path) as stream:
             if offset > os.fstat(stream.fileno()).st_size:
                 raise ValueError("scan cursor is beyond the retained results")
             stream.seek(offset)
@@ -385,7 +409,9 @@ class ScanService:
             self._records.move_to_end(scan_id)
             return current
         try:
-            record = json.loads((self.root / f"{scan_id}.json").read_text(encoding="utf-8"))
+            record = json.loads(
+                read_bytes(self.root / f"{scan_id}.json", max_bytes=_PERSISTED_JSON_LIMIT)
+            )
         except (OSError, ValueError) as exc:
             raise ValueError("invalid persisted scan") from exc
         if not isinstance(record, dict) or record.get("id") != scan_id:
@@ -466,7 +492,11 @@ class ScanService:
         summary_path = record.get("summary_path")
         if summary_path:
             try:
-                summary = json.loads(await asyncio.to_thread(Path(summary_path).read_text))
+                summary = json.loads(
+                    await asyncio.to_thread(
+                        read_bytes, Path(summary_path), max_bytes=_PERSISTED_JSON_LIMIT
+                    )
+                )
                 if isinstance(summary, dict):
                     for key in (
                         "truncated",
@@ -517,7 +547,7 @@ class ScanService:
     @staticmethod
     def _result_stats(path: Path) -> tuple[int | None, int]:
         try:
-            with path.open("rb") as stream:
+            with open_regular(path) as stream:
                 return path.stat().st_size, sum(1 for line in stream if line.strip())
         except OSError:
             return None, 0

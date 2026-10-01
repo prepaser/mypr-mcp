@@ -1,8 +1,10 @@
 import asyncio
+import sys
 
 import pytest
 
 import mypr_mcp.kernel_api as api
+import mypr_mcp.services as services
 from mypr_mcp.services import Shells
 
 
@@ -50,6 +52,40 @@ async def test_shell_read_pages_large_event(tmp_path):
         assert output == "abcdef"
     finally:
         await service.close()
+
+
+async def test_package_warning_survives_output_limit_and_cache_eviction(tmp_path):
+    service = Shells(tmp_path, output_limit=1024, completed_records=0, cache_bytes=0)
+    try:
+        code = (
+            "import json; print('x' * 2000); "
+            "print(json.dumps({'phase': 'warning', 'code': 'late', 'text': 'late warning'}))"
+        )
+        job = await service.start([sys.executable, "-c", code], kind="package")
+        await service.wait(job["id"])
+        result = await service.read(job["id"])
+        assert result["truncated"]
+        assert result["warnings"] == [{"code": "late", "text": "late warning"}]
+    finally:
+        await service.close()
+
+
+def test_package_warning_decoder_discards_overlong_partial_lines(tmp_path):
+    service = Shells(tmp_path)
+    job = services._Job("a" * 32, None, 0, 1024, kind="package")
+    buffer, discarding = service._consume_package_output(job, "", "x" * 4096, False)
+    buffer, discarding = service._consume_package_output(job, buffer, "x", discarding)
+    assert not buffer
+    assert discarding
+    buffer, discarding = service._consume_package_output(
+        job,
+        buffer,
+        '{"phase":"warning","code":"tail","text":"must be ignored"}\n',
+        discarding,
+    )
+    assert not buffer
+    assert not discarding
+    assert job.warnings == []
 
 
 @pytest.mark.parametrize("job_id", ["/" * 32, "z" * 32, "../" + "a" * 29])

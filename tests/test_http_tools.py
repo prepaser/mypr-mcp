@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -179,6 +180,53 @@ async def test_download_refuses_existing_target(tools: HTTPTools, http_server: s
     with pytest.raises(FileExistsError):
         await tools.download(f"{http_server}/large", target)
     assert target.read_bytes() == b"old"
+    await tools.aclose()
+
+
+async def test_download_reports_cleanup_failure_after_target_commit(
+    tools: HTTPTools, http_server: str, tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "result.bin"
+    original_unlink = os.unlink
+
+    def fail_temporary(path):
+        if str(path).startswith(str(tmp_path / ".result.bin.")):
+            raise OSError("temporary cleanup failed")
+        return original_unlink(path)
+
+    monkeypatch.setattr("mypr_mcp.http_tools.os.unlink", fail_temporary)
+    result = await tools.download(f"{http_server}/large", target)
+    assert result == target
+    assert target.read_bytes() == b"x" * 64
+    assert tools.last_warnings == [
+        {"code": "download_cleanup_failed", "text": "temporary cleanup failed"}
+    ]
+    await tools.aclose()
+
+
+async def test_download_warnings_are_scoped_to_overlapping_clients(
+    tools: HTTPTools, http_server: str, tmp_path: Path, monkeypatch
+):
+    original_unlink = os.unlink
+
+    def fail_first_temporary(path):
+        if str(path).startswith(str(tmp_path / ".first.bin.")):
+            raise OSError("first cleanup failed")
+        return original_unlink(path)
+
+    monkeypatch.setattr("mypr_mcp.http_tools.os.unlink", fail_first_temporary)
+    first = asyncio.create_task(tools.download(f"{http_server}/slow", "first.bin"))
+    await asyncio.sleep(0)
+    tools._test_identity["id"] = "second"
+    second = asyncio.create_task(tools.download(f"{http_server}/slow", "second.bin"))
+    await asyncio.gather(first, second)
+
+    tools._test_identity["id"] = "first"
+    assert tools.last_warnings == [
+        {"code": "download_cleanup_failed", "text": "first cleanup failed"}
+    ]
+    tools._test_identity["id"] = "second"
+    assert tools.last_warnings == []
     await tools.aclose()
 
 

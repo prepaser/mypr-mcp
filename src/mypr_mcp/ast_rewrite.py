@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from .file_io import PersistedFileError, read_bytes
 from .filesystem import _diff_lines, _require_regular, _sha256, _to_thread_uncancelled
 from .patching import _commit, _plan, _reject_symlink_alias, _signature, _State
 from .search_backends import _inline_rule, _verify_sg
@@ -145,15 +146,24 @@ async def rewrite_ast(
                 first_match = next(matches, None)
                 if first_match is None:
                     return _incomplete_result("file_changed_during_scan")
-                changed = _apply_matches(
-                    state.data, itertools.chain((first_match,), matches), display
-                )
+                try:
+                    changed = await _to_thread_uncancelled(
+                        _apply_matches,
+                        state.data,
+                        itertools.chain((first_match,), matches),
+                        display,
+                        max_bytes=_MAX_BYTES - planned_bytes,
+                    )
+                except _OutputLimit:
+                    return _incomplete_result("byte_limit")
                 if changed != state.data:
                     planned_bytes += len(changed)
                     if planned_bytes > _MAX_BYTES:
                         return _incomplete_result("byte_limit")
                     inputs.append((path, display, state.data, state.info, changed))
-            preview = _preview(inputs, original_bytes, planned_bytes)
+            preview = await _to_thread_uncancelled(
+                _preview, inputs, original_bytes, planned_bytes
+            )
             if not inputs:
                 return {
                     **preview,
@@ -446,6 +456,10 @@ class _InputLimit(Exception):
     pass
 
 
+class _OutputLimit(Exception):
+    pass
+
+
 def _read_bounded_state(path: Path, display: str, limit: int) -> _State:
     try:
         before = path.stat()
@@ -481,11 +495,18 @@ def _read_bounded_state(path: Path, display: str, limit: int) -> _State:
             os.close(fd)
 
 
-def _apply_matches(data: bytes, records: Iterable[Mapping[str, Any]], display: str) -> bytes:
+def _apply_matches(
+    data: bytes,
+    records: Iterable[Mapping[str, Any]],
+    display: str,
+    *,
+    max_bytes: int = _MAX_BYTES,
+) -> bytes:
     output = bytearray()
     cursor = 0
     previous_start = -1
     found = False
+    newline_tracker = _NewlineTracker(data)
     for record in records:
         offsets = record.get("replacementOffsets")
         replacement = record.get("replacement")
@@ -501,50 +522,83 @@ def _apply_matches(data: bytes, records: Iterable[Mapping[str, Any]], display: s
             raise RuntimeError(f"ast-grep returned out-of-range rewrite offsets for {display}")
         if start < cursor or start == previous_start:
             raise ValueError(f"overlapping AST matches in {display}")
-        try:
-            data[:start].decode("utf-8")
-            data[start:end].decode("utf-8")
-            data[end:].decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise RuntimeError(f"ast-grep returned invalid UTF-8 offsets for {display}") from exc
-        replacement = _normalize_newlines(replacement, data, start)
-        output.extend(data[cursor:start])
-        output.extend(replacement.encode("utf-8"))
+        if not _is_utf8_boundary(data, start) or not _is_utf8_boundary(data, end):
+            raise RuntimeError(f"ast-grep returned invalid UTF-8 offsets for {display}")
+        ending = (
+            newline_tracker.style(start)
+            if "\n" in replacement or "\r" in replacement
+            else None
+        )
+        replacement = _normalize_newlines(replacement, ending)
+        _extend_bounded(output, data[cursor:start], max_bytes)
+        _extend_bounded(output, replacement.encode("utf-8"), max_bytes)
         cursor = end
         previous_start = start
         found = True
     if not found:
         return data
-    output.extend(data[cursor:])
+    _extend_bounded(output, data[cursor:], max_bytes)
     return bytes(output)
 
 
-def _normalize_newlines(replacement: str, data: bytes, offset: int) -> str:
+def _is_utf8_boundary(data: bytes, offset: int) -> bool:
+    return offset == 0 or offset == len(data) or not 0x80 <= data[offset] <= 0xBF
+
+
+def _extend_bounded(output: bytearray, value: bytes, max_bytes: int) -> None:
+    if len(output) + len(value) > max_bytes:
+        raise _OutputLimit
+    output.extend(value)
+
+
+class _NewlineTracker:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.scanned = 0
+        self.last: str | None = None
+        self.first_after: str | None = None
+        self.first_after_known = False
+
+    def style(self, offset: int) -> str:
+        if self.scanned < offset:
+            cr = self.data.rfind(b"\r", self.scanned, offset)
+            lf = self.data.rfind(b"\n", self.scanned, offset)
+            position = max(cr, lf)
+            if position >= 0:
+                if self.data[position : position + 2] == b"\r\n" or (
+                    self.data[position : position + 1] == b"\n"
+                    and position > 0
+                    and self.data[position - 1 : position] == b"\r"
+                ):
+                    self.last = "\r\n"
+                else:
+                    self.last = self.data[position : position + 1].decode("ascii")
+            self.scanned = offset
+        if self.last is not None:
+            return self.last
+        if not self.first_after_known:
+            cr = self.data.find(b"\r", offset)
+            lf = self.data.find(b"\n", offset)
+            positions = [position for position in (cr, lf) if position >= 0]
+            if not positions:
+                self.first_after = "\n"
+            else:
+                position = min(positions)
+                self.first_after = (
+                    "\r\n"
+                    if self.data[position : position + 2] == b"\r\n"
+                    else self.data[position : position + 1].decode("ascii")
+                )
+            self.first_after_known = True
+        return self.first_after
+
+
+def _normalize_newlines(replacement: str, ending: str | None) -> str:
     if "\n" not in replacement and "\r" not in replacement:
         return replacement
-    ending = _nearby_newline(data, offset)
+    if ending is None:
+        ending = "\n"
     return re.sub(r"\r\n|\r|\n", lambda _: ending, replacement)
-
-
-def _nearby_newline(data: bytes, offset: int) -> str:
-    before = max(data.rfind(b"\n", 0, offset), data.rfind(b"\r", 0, offset))
-    after_candidates = [
-        value
-        for value in (data.find(b"\n", offset), data.find(b"\r", offset))
-        if value >= 0
-    ]
-    if before >= 0:
-        if data[before : before + 2] == b"\r\n" or (
-            data[before : before + 1] == b"\n" and before > 0 and data[before - 1 : before] == b"\r"
-        ):
-            return "\r\n"
-        return data[before : before + 1].decode("ascii")
-    if after_candidates:
-        position = min(after_candidates)
-        if data[position : position + 2] == b"\r\n":
-            return "\r\n"
-        return data[position : position + 1].decode("ascii")
-    return "\n"
 
 
 def _preview(inputs, original_bytes, planned_bytes):
@@ -700,12 +754,19 @@ class _PlanStore:
     def load(self, ident: str) -> dict[str, Any]:
         target = self.root / f"{ident}.json"
         try:
-            if time.time() - target.stat().st_mtime > _PLAN_TTL:
+            metadata = target.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("invalid rewrite plan file")
+            if time.time() - metadata.st_mtime > _PLAN_TTL:
                 target.unlink(missing_ok=True)
                 raise ValueError("rewrite plan has expired")
-            if target.stat().st_size > _STORE_BYTES:
-                raise RuntimeError("invalid rewrite plan size")
-            payload = json.loads(target.read_text(encoding="ascii"))
+            try:
+                raw = read_bytes(target, max_bytes=_STORE_BYTES)
+            except ValueError as exc:
+                raise RuntimeError("invalid rewrite plan size") from exc
+            except PersistedFileError as exc:
+                raise RuntimeError("invalid rewrite plan file") from exc
+            payload = json.loads(raw.decode("ascii"))
         except FileNotFoundError as exc:
             raise ValueError("rewrite plan has expired or does not exist") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):

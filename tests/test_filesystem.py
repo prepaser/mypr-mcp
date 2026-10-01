@@ -135,6 +135,47 @@ async def test_non_regular_files_fail_before_blocking(tmp_path: Path):
         await fs.patch("pipe", [{"old": "x", "new": "y"}])
 
 
+@pytest.mark.parametrize("operation", ["write", "patch", "delete", "copy"])
+async def test_history_mutations_reject_oversized_existing_files_before_read(
+    tmp_path: Path, monkeypatch, operation: str
+):
+    import mypr_mcp.revisions as revisions
+
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"123456789")
+    monkeypatch.setattr(revisions, "_MAX_BLOB_BYTES", 8)
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("history size must be checked before reading the file")
+
+    monkeypatch.setattr(filesystem_module, "_read_regular", unexpected_read)
+    fs = Filesystem(tmp_path)
+    expected = digest("123456789")
+    with pytest.raises(ValueError, match="history .* exceeds 8 bytes"):
+        if operation == "write":
+            await fs.write("source.txt", "replacement", overwrite=True)
+        elif operation == "patch":
+            await fs.patch("source.txt", [{"old": "1", "new": "2"}])
+        elif operation == "delete":
+            await fs.delete("source.txt", expected_hash=expected)
+        else:
+            await fs.copy("source.txt", "copy.txt")
+    assert source.read_bytes() == b"123456789"
+    assert not (tmp_path / "copy.txt").exists()
+
+
+async def test_history_false_keeps_unbounded_mutation_behavior(tmp_path: Path, monkeypatch):
+    import mypr_mcp.revisions as revisions
+
+    monkeypatch.setattr(revisions, "_MAX_BLOB_BYTES", 8)
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"123456789")
+    fs = Filesystem(tmp_path)
+    result = await fs.write("source.txt", "replacement", overwrite=True, history=False)
+    assert result["overwritten"]
+    assert source.read_text() == "replacement"
+
+
 async def test_cancelled_write_waits_for_worker_before_unlocking(tmp_path: Path, monkeypatch):
     fs = Filesystem(tmp_path)
     await fs.write("file.txt", "old")

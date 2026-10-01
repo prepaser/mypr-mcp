@@ -27,7 +27,7 @@ Install ast-grep in the workstation environment to use this API. No Python packa
 
 ## Text replacements
 
-`ws.fs.replace(pattern, replacement, paths=None, glob=None, fixed=True, ignore_case=False, hidden=False, no_ignore=False, max_files=100, max_bytes=16777216, timeout=30, history=True)` creates a multi-file preview for ordinary text files. Literal matching is the default; pass `fixed=False` for Python regular-expression matching and `ignore_case=True` when needed. The search must complete before a plan can be applied. `max_files`, `max_bytes`, and `timeout` bound the preview, and `history=True` records the old and new bytes when it is applied.
+`ws.fs.replace(pattern, replacement, paths=None, glob=None, fixed=True, ignore_case=False, hidden=False, no_ignore=False, max_files=100, max_bytes=16777216, timeout=30, history=True)` creates a multi-file preview for ordinary text files. Literal matching is the default; pass `fixed=False` for Python regular-expression matching and `ignore_case=True` when needed. The search must complete before a plan can be applied. `max_files`, `max_bytes`, and `timeout` bound the preview, and `history=True` records the old and new bytes when it is applied. File reads and substitution output are checked against the remaining byte budget before a full oversized result is allocated. A truncated diff still retains metadata for every changed file in `changes`.
 
 ```python
 preview = await ws.fs.replace(

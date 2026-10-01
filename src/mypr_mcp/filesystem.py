@@ -25,6 +25,13 @@ _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
 _PATH_LOCKS_GUARD = Lock()
 
 
+class _ReadLimitExceeded(ValueError):
+    def __init__(self, path: Path, limit: int) -> None:
+        super().__init__(f"file exceeds {limit} bytes: {path}")
+        self.path = path
+        self.limit = limit
+
+
 class Filesystem:
     """Filesystem operations rooted at a workspace.
 
@@ -569,7 +576,11 @@ class Filesystem:
         data = await store.restore_bytes(resource, revision)
         if data is None:
             resolved, display = self._path(path)
-            current = await _to_thread_uncancelled(_read_optional_bytes, resolved, display)
+            current = await _to_thread_uncancelled(
+                _read_history_optional_bytes if history else _read_optional_bytes,
+                resolved,
+                display,
+            )
             if current is None:
                 if expected_hash is not None:
                     raise ValueError(f"Revision mismatch: expected {expected_hash}, got None")
@@ -612,14 +623,24 @@ class Filesystem:
             lock = self._lock(resolved)
             await lock.acquire()
             stack.callback(lock.release)
-            old = await _to_thread_uncancelled(_read_optional_bytes, resolved, display)
+            old = await _to_thread_uncancelled(
+                _read_history_optional_bytes if history_enabled else _read_optional_bytes,
+                resolved,
+                display,
+            )
             _check_expected(old, expected_hash)
             if old is None:
                 raise FileNotFoundError(display)
             history_enabled = resource is not None
             if history_enabled:
                 _validate_history_size(old, None, display)
-            await _to_thread_uncancelled(_unlink_expected, resolved, display, old)
+            await _to_thread_uncancelled(
+                _unlink_expected,
+                resolved,
+                display,
+                old,
+                _history_blob_limit() if history_enabled else None,
+            )
             if history_enabled:
                 await self._record_history(resolved, display, old, None)
             return {
@@ -700,7 +721,16 @@ class Filesystem:
                 await lock.acquire()
                 stack.callback(lock.release)
             source_info = source_path.stat() if source_path.exists() else None
-            old = await _to_thread_uncancelled(_read_optional_bytes, source_path, source_display)
+            source_resource = self._history_resource(source_path) if history else None
+            destination_resource = self._history_resource(destination_path) if history else None
+            read_limit = _history_blob_limit() if history_enabled else None
+            if source_info is not None and read_limit is not None:
+                _validate_history_stat_size(source_info, source_display)
+            old = await _to_thread_uncancelled(
+                _read_history_optional_bytes if read_limit is not None else _read_optional_bytes,
+                source_path,
+                source_display,
+            )
             _check_expected(old, expected_hash)
             if old is None:
                 raise FileNotFoundError(source_display)
@@ -712,8 +742,14 @@ class Filesystem:
                 raise RuntimeError(f"File changed while reading: {source_display}") from exc
             if _signature(source_info) != _signature(source_after_read):
                 raise RuntimeError(f"File changed while reading: {source_display}")
+            if destination_resource is not None:
+                _validate_history_path_size(destination_path, destination_display)
             destination_old = await _to_thread_uncancelled(
-                _read_optional_bytes, destination_path, destination_display
+                _read_history_optional_bytes
+                if destination_resource is not None
+                else _read_optional_bytes,
+                destination_path,
+                destination_display,
             )
             if destination_old is not None and not overwrite:
                 raise FileExistsError(destination_display)
@@ -732,13 +768,18 @@ class Filesystem:
                     _signature(source_info),
                     move,
                     copy_state,
+                    read_limit,
                 )
             except BaseException as exc:
                 if not copy_state["destination_committed"]:
                     raise
                 try:
                     await _to_thread_uncancelled(
-                        _restore_transition, destination_path, destination_old, old
+                        _restore_transition,
+                        destination_path,
+                        destination_old,
+                        old,
+                        read_limit,
                     )
                 except BaseException as rollback_error:
                     raise RuntimeError(
@@ -747,8 +788,6 @@ class Filesystem:
                     ) from exc
                 raise
             if history_enabled:
-                source_resource = self._history_resource(source_path)
-                destination_resource = self._history_resource(destination_path)
                 transitions = []
                 if source_resource is not None:
                     transitions.append((source_path, source_display, old, None if move else old))
@@ -763,7 +802,13 @@ class Filesystem:
                     recovery = []
                     for target, _, before, after in reversed(transitions):
                         try:
-                            await _to_thread_uncancelled(_restore_transition, target, before, after)
+                            await _to_thread_uncancelled(
+                                _restore_transition,
+                                target,
+                                before,
+                                after,
+                                read_limit,
+                            )
                         except BaseException as rollback_error:
                             recovery.append(f"{target}: {rollback_error}")
                     if recovery:
@@ -819,20 +864,19 @@ class Filesystem:
         resource = self._history_resource(path)
         if resource is None or old == new:
             return
-        from .revisions import _MAX_BLOB_BYTES
-
-        for value in (old, new):
-            if value is not None and len(value) > _MAX_BLOB_BYTES:
-                raise ValueError(
-                    f"history for {display} exceeds {_MAX_BLOB_BYTES} bytes; "
-                    "retry with history=False"
-                )
+        _validate_history_size(old, new, display)
         store = self._history_store()
         try:
             await store.record_bytes(resource, (old, new))
         except BaseException as exc:
             try:
-                await _to_thread_uncancelled(_restore_transition, path, old, new)
+                await _to_thread_uncancelled(
+                    _restore_transition,
+                    path,
+                    old,
+                    new,
+                    _history_blob_limit(),
+                )
             except BaseException as rollback_error:
                 raise RuntimeError(
                     f"history write failed for {display}; rollback was incomplete: "
@@ -1357,20 +1401,29 @@ def _require_regular(info: os.stat_result, display: str) -> None:
         raise ValueError(f"Path must be a regular file: {display}")
 
 
-def _read_regular(path: Path, display: str) -> tuple[bytes, os.stat_result]:
+def _read_regular(
+    path: Path, display: str, *, max_bytes: int | None = None
+) -> tuple[bytes, os.stat_result]:
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
         _require_regular(info, display)
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise _ReadLimitExceeded(path, max_bytes)
         with os.fdopen(fd, "rb") as stream:
             fd = -1
-            return stream.read(), info
+            data = stream.read(-1 if max_bytes is None else max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise _ReadLimitExceeded(path, max_bytes)
+        return data, info
     finally:
         if fd >= 0:
             os.close(fd)
 
 
-def _read_optional_bytes(path: Path, display: str) -> bytes | None:
+def _read_optional_bytes(
+    path: Path, display: str, *, max_bytes: int | None = None
+) -> bytes | None:
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -1378,11 +1431,20 @@ def _read_optional_bytes(path: Path, display: str) -> bytes | None:
     if stat.S_ISLNK(info.st_mode):
         raise ValueError(f"Path must not be a symlink: {display}")
     _require_regular(info, display)
-    data, opened = _read_regular(path, display)
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise _ReadLimitExceeded(path, max_bytes)
+    data, opened = _read_regular(path, display, max_bytes=max_bytes)
     after = path.stat()
     if _signature(info) != _signature(opened) or _signature(info) != _signature(after):
         raise RuntimeError(f"File changed while reading: {display}")
     return data
+
+
+def _read_history_optional_bytes(path: Path, display: str) -> bytes | None:
+    try:
+        return _read_optional_bytes(path, display, max_bytes=_history_blob_limit())
+    except _ReadLimitExceeded as exc:
+        raise _history_size_error(display, exc.limit) from exc
 
 
 def _read_bytes(path: Path, display: str, start_byte: int, max_bytes: int) -> dict[str, Any]:
@@ -1607,7 +1669,16 @@ def _write_file(
         old_stat = None
     if old_stat is not None:
         _require_regular(old_stat, display)
-        old, old_stat = _read_regular(path, display)
+        if history:
+            _validate_history_stat_size(old_stat, display)
+        try:
+            old, old_stat = _read_regular(
+                path,
+                display,
+                max_bytes=_history_blob_limit() if history else None,
+            )
+        except _ReadLimitExceeded as exc:
+            raise _history_size_error(display, exc.limit) from exc
     else:
         old = None
     _check_expected(old, expected_hash)
@@ -1619,7 +1690,13 @@ def _write_file(
         path.parent.mkdir(parents=True, exist_ok=True)
     elif not path.parent.exists():
         raise FileNotFoundError(str(path.parent))
-    info = _atomic_write(path, data, old, old_stat)
+    info = _atomic_write(
+        path,
+        data,
+        old,
+        old_stat,
+        max_bytes=_history_blob_limit() if history else None,
+    )
     result = _write_result(display, data, info, old is not None)
     result["_old"] = old
     return result
@@ -1637,7 +1714,16 @@ def _patch_file(
 ) -> dict[str, Any]:
     old_stat = path.stat()
     _require_regular(old_stat, display)
-    old, old_stat = _read_regular(path, display)
+    if history:
+        _validate_history_stat_size(old_stat, display)
+    try:
+        old, old_stat = _read_regular(
+            path,
+            display,
+            max_bytes=_history_blob_limit() if history else None,
+        )
+    except _ReadLimitExceeded as exc:
+        raise _history_size_error(display, exc.limit) from exc
     _check_expected(old, expected_hash)
     original = old.decode(encoding)
     updated = _apply_edits(original, edits)
@@ -1648,7 +1734,13 @@ def _patch_file(
     new_hash = _sha256(new_bytes)
     diff, diff_truncated = _bounded_diff(display, original, updated, max_diff_bytes)
     if not dry_run and new_bytes != old:
-        _atomic_write(path, new_bytes, old, old_stat)
+        _atomic_write(
+            path,
+            new_bytes,
+            old,
+            old_stat,
+            max_bytes=_history_blob_limit() if history else None,
+        )
     return {
         "path": display,
         "changed": new_bytes != old,
@@ -1734,6 +1826,7 @@ def _atomic_write(
     old_stat: os.stat_result | None,
     *,
     on_commit: Callable[[], None] | None = None,
+    max_bytes: int | None = None,
 ) -> os.stat_result:
     mode = stat.S_IMODE(old_stat.st_mode) if old_stat is not None else 0o600
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -1752,7 +1845,12 @@ def _atomic_write(
         else:
             try:
                 current = path.stat()
-                current_data, current = _read_regular(path, str(path))
+                try:
+                    current_data, current = _read_regular(
+                        path, str(path), max_bytes=max_bytes
+                    )
+                except _ReadLimitExceeded as exc:
+                    raise _history_size_error(str(path), exc.limit) from exc
                 unchanged = _signature(current) == _signature(old_stat) and current_data == old
             except FileNotFoundError:
                 unchanged = False
@@ -1800,17 +1898,51 @@ def _reject_symlink_input(workspace: Path, value: str | os.PathLike[str]) -> Non
 
 
 def _validate_history_size(old: bytes | None, new: bytes | None, display: str) -> None:
-    from .revisions import _MAX_BLOB_BYTES
+    limit = _history_blob_limit()
 
     for data in (old, new):
-        if data is not None and len(data) > _MAX_BLOB_BYTES:
-            raise ValueError(
-                f"history for {display} exceeds {_MAX_BLOB_BYTES} bytes; retry with history=False"
-            )
+        if data is not None and len(data) > limit:
+            raise _history_size_error(display, limit)
 
 
-def _unlink_expected(path: Path, display: str, expected: bytes) -> None:
-    current = _read_optional_bytes(path, display)
+def _history_blob_limit() -> int:
+    from .revisions import _MAX_BLOB_BYTES
+
+    return _MAX_BLOB_BYTES
+
+
+def _history_size_error(display: str, limit: int | None = None) -> ValueError:
+    limit = _history_blob_limit() if limit is None else limit
+    return ValueError(
+        f"history for {display} exceeds {limit} bytes; retry with history=False"
+    )
+
+
+def _validate_history_stat_size(info: os.stat_result, display: str) -> None:
+    limit = _history_blob_limit()
+    _require_regular(info, display)
+    if info.st_size > limit:
+        raise _history_size_error(display, limit)
+
+
+def _validate_history_path_size(path: Path, display: str) -> os.stat_result | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    _validate_history_stat_size(info, display)
+    return info
+
+
+def _unlink_expected(
+    path: Path, display: str, expected: bytes, max_bytes: int | None = None
+) -> None:
+    try:
+        current = _read_optional_bytes(path, display, max_bytes=max_bytes)
+    except _ReadLimitExceeded as exc:
+        if max_bytes is not None:
+            raise _history_size_error(display, exc.limit) from exc
+        raise
     if current != expected:
         raise RuntimeError(f"File changed while deleting: {display}")
     path.unlink()
@@ -1824,6 +1956,7 @@ def _copy_bytes(
     source_signature: tuple[int, int, int, int, int],
     move: bool,
     state: dict[str, bool] | None = None,
+    max_bytes: int | None = None,
 ) -> None:
     source_mode = stat.S_IMODE(source.stat().st_mode)
     destination_info = destination.stat() if destination.exists() else None
@@ -1838,14 +1971,25 @@ def _copy_bytes(
             if state is None
             else lambda: state.__setitem__("destination_committed", True)
         ),
+        max_bytes=max_bytes,
     )
     if destination_info is None:
         destination.chmod(source_mode)
     if move:
-        current = _read_optional_bytes(destination, str(destination))
+        try:
+            current = _read_optional_bytes(destination, str(destination), max_bytes=max_bytes)
+        except _ReadLimitExceeded as exc:
+            if max_bytes is not None:
+                raise _history_size_error(str(destination), exc.limit) from exc
+            raise
         if current != data:
             raise RuntimeError(f"Destination changed while moving: {destination}")
-        current = _read_optional_bytes(source, str(source))
+        try:
+            current = _read_optional_bytes(source, str(source), max_bytes=max_bytes)
+        except _ReadLimitExceeded as exc:
+            if max_bytes is not None:
+                raise _history_size_error(str(source), exc.limit) from exc
+            raise
         try:
             source_info = source.stat()
         except FileNotFoundError as exc:
@@ -1855,21 +1999,31 @@ def _copy_bytes(
         source.unlink()
 
 
-def _restore_transition(path: Path, old: bytes | None, new: bytes | None) -> None:
-    current = _read_optional_bytes(path, str(path))
+def _restore_transition(
+    path: Path,
+    old: bytes | None,
+    new: bytes | None,
+    max_bytes: int | None = None,
+) -> None:
+    try:
+        current = _read_optional_bytes(path, str(path), max_bytes=max_bytes)
+    except _ReadLimitExceeded as exc:
+        if max_bytes is not None:
+            raise _history_size_error(str(path), exc.limit) from exc
+        raise
     if new is None:
         if current is not None:
             raise RuntimeError(f"File changed while rolling back: {path}")
         if old is None:
             return
-        _atomic_write(path, old, None, None)
+        _atomic_write(path, old, None, None, max_bytes=max_bytes)
         return
     if current != new:
         raise RuntimeError(f"File changed while rolling back: {path}")
     if old is None:
         path.unlink(missing_ok=True)
     else:
-        _atomic_write(path, old, new, path.stat())
+        _atomic_write(path, old, new, path.stat(), max_bytes=max_bytes)
 
 
 async def _to_thread_uncancelled(function, *args, **kwargs):

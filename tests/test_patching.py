@@ -129,6 +129,32 @@ async def test_failed_hunk_and_stale_hash_are_preflight_atomic(tmp_path: Path):
         )
 
 
+async def test_history_patch_rejects_oversized_source_before_read(tmp_path: Path, monkeypatch):
+    import mypr_mcp.filesystem as filesystem_module
+    import mypr_mcp.revisions as revisions
+
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"123456789")
+    monkeypatch.setattr(revisions, "_MAX_BLOB_BYTES", 8)
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("history size must be checked before reading the file")
+
+    monkeypatch.setattr(filesystem_module, "_read_regular", unexpected_read)
+    fs = Filesystem(tmp_path)
+    with pytest.raises(ValueError, match="history .* exceeds 8 bytes"):
+        await apply_patch(
+            fs,
+            patch_body(
+                "*** Update File: source.txt",
+                "@@ -1,1 +1,1 @@",
+                "-123456789",
+                "+replacement",
+            ),
+        )
+    assert source.read_bytes() == b"123456789"
+
+
 async def test_commit_failure_rolls_back_previous_files(tmp_path: Path, monkeypatch):
     (tmp_path / "one.txt").write_text("one\n")
     (tmp_path / "two.txt").write_text("two\n")

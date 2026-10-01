@@ -80,6 +80,54 @@ async def test_tcp_scan_stops_at_probe_limit(tmp_path: Path):
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_tcp_scan_deadline_unblocks_producer_and_consumers(tmp_path: Path, monkeypatch):
+    async def slow_probe(*args, **kwargs):
+        await asyncio.sleep(30)
+        return {"host": args[0], "port": args[1], "state": "closed"}
+
+    monkeypatch.setattr(scan_worker, "_probe", slow_probe)
+    result_path = tmp_path / "results.jsonl"
+    summary_path = tmp_path / "summary.json"
+    config = {
+        "mode": "tcp",
+        "targets": ["127.0.0.1"],
+        "ports": [1, 2, 3, 4, 5],
+        "concurrency": 1,
+        "rate": 10000,
+        "timeout": 1,
+        "max_duration": 0.01,
+        "result_path": str(result_path),
+        "summary_path": str(summary_path),
+    }
+
+    assert await asyncio.wait_for(scan_worker.run(config), 1) == 0
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["stop_reason"] == "time_limit"
+
+
+@pytest.mark.asyncio
+async def test_tcp_scan_output_limit_unblocks_producer(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(scan_worker._Results, "append", lambda self, row: False)
+    result_path = tmp_path / "results.jsonl"
+    summary_path = tmp_path / "summary.json"
+    config = {
+        "mode": "tcp",
+        "targets": ["127.0.0.1"],
+        "ports": list(range(1, 20)),
+        "concurrency": 1,
+        "rate": 10000,
+        "timeout": 1,
+        "max_duration": 1,
+        "result_path": str(result_path),
+        "summary_path": str(summary_path),
+    }
+
+    assert await asyncio.wait_for(scan_worker.run(config), 1) == 0
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["stop_reason"] == "result_size_limit"
+
+
 def test_estimate_probes_matches_ipaddress_hosts_for_ipv6():
     assert scan_worker.estimate_probes(["2001:db8::/126"], [443]) == 3
     assert scan_worker.estimate_probes(["2001:db8::/127"], [443]) == 2
@@ -128,6 +176,73 @@ async def test_scan_attach_after_service_restart(tmp_path: Path):
     finally:
         if not shells._closed:
             await shells.close()
+
+
+def test_scan_restart_marks_lost_and_removes_request(tmp_path: Path):
+    root = tmp_path / ".mypr" / "scans"
+    root.mkdir(parents=True)
+    ident = "a" * 32
+    request_id = "b" * 32
+    config = root / f"{request_id}.request.json"
+    config.write_text("{}", encoding="utf-8")
+    record = {"id": ident, "state": "running", "config": str(config)}
+    (root / f"{ident}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    ScanService(tmp_path, Shells(tmp_path))
+
+    restored = json.loads((root / f"{ident}.json").read_text(encoding="utf-8"))
+    assert restored["state"] == "lost"
+    assert not config.exists()
+
+
+@pytest.mark.asyncio
+async def test_scan_restart_cleans_fifo_request_without_blocking(tmp_path: Path):
+    root = tmp_path / ".mypr" / "scans"
+    root.mkdir(parents=True)
+    config = root / f"{'a' * 32}.request.json"
+    os.mkfifo(config)
+    shells = Shells(tmp_path)
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(ScanService, tmp_path, shells), 1)
+        assert not config.exists()
+    finally:
+        await shells.close()
+
+
+def test_scan_restart_removes_request_symlink_without_following_it(tmp_path: Path):
+    root = tmp_path / ".mypr" / "scans"
+    root.mkdir(parents=True)
+    target = tmp_path / "outside.json"
+    target.write_text("{}", encoding="utf-8")
+    config = root / f"{'a' * 32}.request.json"
+    config.symlink_to(target)
+
+    ScanService(tmp_path, Shells(tmp_path))
+
+    assert target.exists()
+    assert not config.exists()
+
+
+def test_scan_restart_removes_unreferenced_request(tmp_path: Path):
+    root = tmp_path / ".mypr" / "scans"
+    root.mkdir(parents=True)
+    config = root / f"{'a' * 32}.request.json"
+    config.write_text("{}", encoding="utf-8")
+
+    ScanService(tmp_path, Shells(tmp_path))
+
+    assert not config.exists()
+
+
+@pytest.mark.asyncio
+async def test_scan_result_stats_rejects_fifo_without_blocking(tmp_path: Path):
+    path = tmp_path / "results.jsonl"
+    os.mkfifo(path)
+
+    stats = await asyncio.wait_for(asyncio.to_thread(ScanService._result_stats, path), 1)
+
+    assert stats == (None, 0)
 
 
 @pytest.mark.asyncio

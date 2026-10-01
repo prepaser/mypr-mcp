@@ -22,7 +22,9 @@ _DEFAULT_BODY_TIMEOUT = 5.0
 _MAX_REQUESTS = 256
 _MAX_PAGES = 64
 _DEFAULT_PAGE_SIZE = 100
-_SENSITIVE_HEADER = re.compile(r"(?:auth|cookie|token|secret|api.?key|session|credential)", re.I)
+_SENSITIVE_HEADER = re.compile(
+    r"(?:auth|cookie|token|secret|api.?key|session|credential|password|passwd|pwd|^pass$)", re.I
+)
 _EVENT_TYPES = frozenset({"console", "pageerror", "request", "response", "requestfailed"})
 
 

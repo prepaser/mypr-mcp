@@ -7,6 +7,8 @@ import struct
 import tempfile
 from pathlib import Path
 
+from .file_io import open_regular
+
 _HEADER = struct.Struct("<8sQQQQ")
 _OFFSET = struct.Struct("<Q")
 _MAGIC = b"MYPRIDX1"
@@ -34,7 +36,7 @@ def _count(index, stat):
 
 def _cached_index(sidecar, stat):
     try:
-        index = sidecar.open("rb")
+        index = open_regular(sidecar)
     except FileNotFoundError:
         index = None
     if index is not None:
@@ -50,7 +52,7 @@ def _open_index(path):
     cached = _cached_index(sidecar, path.stat())
     if cached is not None:
         return cached
-    with path.open("rb") as source:
+    with open_regular(path) as source:
         fcntl.flock(source.fileno(), fcntl.LOCK_EX)
         stat = os.fstat(source.fileno())
         cached = _cached_index(sidecar, stat)
@@ -75,7 +77,7 @@ def _build_index(path, sidecar, source, stat):
             if _identity(path.stat()) != _identity(stat):
                 raise RuntimeError("Output journal changed while indexing")
         temporary.replace(sidecar)
-        return sidecar.open("rb"), count
+        return open_regular(sidecar), count
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -88,7 +90,9 @@ def append_events(path: Path, events: list[dict]) -> None:
         path.touch()
     index, _ = _open_index(path)
     index.close()
-    with path.open("ab") as journal, path.with_suffix(".idx").open("r+b") as index:
+    with open_regular(path, "ab") as journal, open_regular(
+        path.with_suffix(".idx"), "r+b"
+    ) as index:
         index.seek(0, os.SEEK_END)
         for event in events:
             journal.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
@@ -132,7 +136,7 @@ def read_page(path: Path, cursor: int, budget: int, initial_size: int = 0):
         index.seek(_HEADER.size + cursor * _OFFSET.size)
         offset = _OFFSET.unpack(index.read(_OFFSET.size))[0]
     output, size = [], initial_size
-    with path.open("rb") as source:
+    with open_regular(path) as source:
         source.seek(offset)
         for position in range(cursor, count):
             event = decode_event(source.readline(), position + 1)

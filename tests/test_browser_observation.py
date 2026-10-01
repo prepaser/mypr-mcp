@@ -253,6 +253,14 @@ def test_safe_url_masks_credentials_and_sensitive_values(url):
     assert result.endswith("#[redacted]") or "#" not in url
 
 
+@pytest.mark.parametrize("host", ["example.test", "example.test:invalid", "exa／mple.test"])
+def test_safe_url_masks_password_query_keys_including_fallback(host):
+    url = f"https://{host}/?%70assword=FIRSTSECRET&PWD=SECONDSECRET&pass=THIRDSECRET&safe=yes"
+    result = _safe_url(url)
+    assert "SECRET" not in result
+    assert "safe=yes" in result
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("headers", "body", "read_body"),

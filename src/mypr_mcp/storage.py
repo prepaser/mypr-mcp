@@ -23,6 +23,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+from .file_io import open_regular, read_bytes
 from .storage_lock import StorageLock
 
 DEFAULT_AGE_DAYS = 30
@@ -593,7 +594,7 @@ class Storage:
         digest = hashlib.sha256()
         read = 0
         try:
-            with path.open("rb") as stream:
+            with open_regular(path) as stream:
                 while read < _MAX_HASH_BYTES and (
                     chunk := stream.read(min(1024 * 1024, _MAX_HASH_BYTES - read))
                 ):
@@ -912,7 +913,13 @@ class Storage:
         for directory, _, filenames in os.walk(root, followlinks=False):
             for name in filenames:
                 path = Path(directory) / name
-                if path.suffix == ".json" and not path.is_symlink():
+                if path.suffix != ".json":
+                    continue
+                try:
+                    info = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                     paths.append(path)
         return paths
 
@@ -1103,10 +1110,8 @@ class Storage:
     @staticmethod
     def _read_json(path: Path, *, max_bytes: int = _MAX_JSON_BYTES) -> Any:
         try:
-            if path.stat().st_size > max_bytes:
-                return None
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            return json.loads(read_bytes(path, max_bytes=max_bytes).decode("utf-8"))
+        except (OSError, UnicodeError, ValueError):
             return None
 
     def _referenced_paths(self, value: Any) -> set[Path]:

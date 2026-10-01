@@ -167,33 +167,35 @@ def _process_alive(pid: Any, expected_starttime: Any) -> bool:
     return True
 
 
+def _ticket_active(workspace: Path, ticket: dict[str, Any]) -> bool:
+    if ticket["state"] in TERMINAL_STATES:
+        return False
+    try:
+        age = max(0.0, time.time() - float(ticket.get("updated_at", ticket["created_at"])))
+    except KeyError, TypeError, ValueError:
+        return False
+    pid = ticket.get("coordinator_pid")
+    if pid is None and age <= COORDINATOR_START_GRACE:
+        return True
+    if age > TICKET_STALE_SECONDS:
+        return False
+    return _process_alive(pid, ticket.get("coordinator_starttime"))
+
+
 def active_ticket(workspace: Path) -> dict[str, Any] | None:
     """Return an active ticket, ignoring terminal or stale coordinator records."""
 
     workspace = Path(workspace)
     ticket = read_ticket(workspace)
-    if ticket is None or ticket["state"] in TERMINAL_STATES:
-        return None
-    try:
-        age = max(0.0, time.time() - float(ticket.get("updated_at", ticket["created_at"])))
-    except KeyError, TypeError, ValueError:
-        return None
-    pid = ticket.get("coordinator_pid")
-    if pid is None and age <= COORDINATOR_START_GRACE:
-        return ticket
-    if age > TICKET_STALE_SECONDS:
-        return None
-    if _process_alive(pid, ticket.get("coordinator_starttime")):
-        return ticket
-    return None
+    return ticket if ticket is not None and _ticket_active(workspace, ticket) else None
 
 
-async def recover_ticket(workspace: Path) -> dict[str, Any] | None:
+async def recover_ticket(workspace: Path, ident: str | None = None) -> dict[str, Any] | None:
     """Finalize an abandoned coordinator ticket so callers can recover safely."""
 
     workspace = Path(workspace)
-    ticket = read_ticket(workspace)
-    if ticket is None or ticket["state"] in TERMINAL_STATES or active_ticket(workspace) is not None:
+    ticket = read_ticket(workspace, ident)
+    if ticket is None or ticket["state"] in TERMINAL_STATES or _ticket_active(workspace, ticket):
         return ticket
     ticket["state"] = "failed"
     ticket["error"] = "Restart coordinator is no longer running"
@@ -202,7 +204,11 @@ async def recover_ticket(workspace: Path) -> dict[str, Any] | None:
     except Exception as exc:
         ticket["error"] += f"; origin finalization failed: {exc}"
     finally:
-        _write_ticket(workspace, ticket)
+        current = read_ticket(workspace)
+        if current is not None and current["id"] == ticket["id"]:
+            _write_ticket(workspace, ticket)
+        else:
+            _atomic_write(_ticket_path(workspace, ticket["id"]), ticket)
     return ticket
 
 
@@ -223,8 +229,8 @@ async def wait_ticket(workspace: Path, ident: str, timeout: float = 240.0) -> di
         ticket = read_ticket(workspace, ident)
         if ticket is not None and ticket["state"] in TERMINAL_STATES:
             return ticket
-        if ticket is not None and active_ticket(workspace) is None:
-            await recover_ticket(workspace)
+        if ticket is not None and not _ticket_active(workspace, ticket):
+            await recover_ticket(workspace, ident)
             continue
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Restart {ident} did not finish within {timeout:g} seconds")

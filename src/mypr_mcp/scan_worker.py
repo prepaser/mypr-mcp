@@ -214,21 +214,63 @@ async def _tcp(config: dict[str, Any], results: _Results) -> int:
             return True
 
     async def produce() -> None:
+        async def put(item: tuple[str, int] | None) -> bool:
+            put_task = asyncio.create_task(queue.put(item))
+            stop_task = asyncio.create_task(stop.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (put_task, stop_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if put_task in done:
+                    return True
+                put_task.cancel()
+                await asyncio.gather(put_task, return_exceptions=True)
+                return False
+            finally:
+                if not put_task.done():
+                    put_task.cancel()
+                await asyncio.gather(put_task, return_exceptions=True)
+                if not stop_task.done():
+                    stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+
         for host in targets:
             for port in ports:
                 if stop.is_set():
                     return
-                await queue.put((host, port))
+                if not await put((host, port)):
+                    return
             if stop.is_set():
                 return
         for _ in range(workers):
             if stop.is_set():
                 return
-            await queue.put(None)
+            if not await put(None):
+                return
 
     async def consume() -> None:
+        async def get() -> tuple[str, int] | None:
+            get_task = asyncio.create_task(queue.get())
+            stop_task = asyncio.create_task(stop.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (get_task, stop_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if get_task in done:
+                    return get_task.result()
+                get_task.cancel()
+                await asyncio.gather(get_task, return_exceptions=True)
+                return None
+            finally:
+                if not get_task.done():
+                    get_task.cancel()
+                await asyncio.gather(get_task, return_exceptions=True)
+                if not stop_task.done():
+                    stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+
         while True:
-            pair = await queue.get()
+            pair = await get()
             if pair is None:
                 return
             if not await reserve():

@@ -52,6 +52,10 @@ async def ensure(workspace, *, locked=False):
                     break
                 except BlockingIOError:
                     await asyncio.sleep(0.05)
+        # Recover abandoned restart state before reusing or starting a manager.
+        from .restart import recover_ticket
+
+        await recover_ticket(workspace)
         found = await find_runtime(workspace)
         if found is not None:
             path, state = found

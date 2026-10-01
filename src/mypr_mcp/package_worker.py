@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,14 @@ from pathlib import Path
 from typing import Any
 
 _MAX_FREEZE_BYTES = 16 * 1024 * 1024
+
+
+class _ManifestCommitError(OSError):
+    """The manifest was replaced, but its directory durability is unknown."""
+
+    def __init__(self, cause: OSError):
+        super().__init__("manifest was replaced but directory durability is unknown")
+        self.__cause__ = cause
 
 
 def _emit(phase: str, **fields: Any) -> None:
@@ -44,11 +54,14 @@ def _atomic_write(path: Path, data: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            raise _ManifestCommitError(exc) from exc
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -77,7 +90,7 @@ def install_packages(
     lock_path = root_path / "packages.lock"
     manifest = root_path / "requirements.txt"
     root_path.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a") as lock:
+    with _open_lock(lock_path) as lock:
         try:
             _lock(lock, lock_timeout)
         except TimeoutError:
@@ -98,11 +111,51 @@ def install_packages(
             )
             if len(freeze) > _MAX_FREEZE_BYTES:
                 raise RuntimeError("package freeze exceeds manifest size limit")
-            _atomic_write(manifest, freeze)
-            _emit("saved", manifest=str(manifest), bytes=len(freeze))
-            return {"manifest": str(manifest), "bytes": len(freeze), "specs": specs}
+            try:
+                _atomic_write(manifest, freeze)
+            except _ManifestCommitError as exc:
+                warning = {
+                    "code": "manifest_durability_unknown",
+                    "text": str(exc),
+                }
+                _emit("warning", **warning)
+                _emit(
+                    "saved",
+                    manifest=str(manifest),
+                    bytes=len(freeze),
+                    durability="unknown",
+                )
+                return {
+                    "manifest": str(manifest),
+                    "bytes": len(freeze),
+                    "specs": specs,
+                    "durability": "unknown",
+                    "warnings": [warning],
+                }
+            _emit("saved", manifest=str(manifest), bytes=len(freeze), durability="confirmed")
+            return {
+                "manifest": str(manifest),
+                "bytes": len(freeze),
+                "specs": specs,
+                "durability": "confirmed",
+            }
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _open_lock(path: Path):
+    """Open a regular lock file without blocking on a replaced FIFO."""
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, f"package lock is not a regular file: {path}")
+        return os.fdopen(descriptor, "a+")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _lock(stream, timeout: float) -> None:

@@ -94,6 +94,15 @@ def test_startup_record_is_json(tmp_path: Path):
     json.loads((root / "startup-error.json").read_text())
 
 
+def test_startup_record_bounds_escaped_errors_without_breaking_json(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    path = write_startup_failure(root, RuntimeError("\x00" * 4096))
+    assert path.stat().st_size <= 16 * 1024
+    record = read_startup_failure(root)
+    assert record["error"].startswith("RuntimeError:")
+    assert record["error_info"]["truncated"]
+
+
 def test_cli_status_reports_invalid_config_without_starting_manager(tmp_path: Path):
     root = tmp_path / ".mypr"
     root.mkdir()

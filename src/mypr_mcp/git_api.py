@@ -325,6 +325,9 @@ class Git:
         metadata = self._parse_commit_metadata(
             metadata_result["stdout"], truncated=bool(metadata_result.get("truncated"))
         )
+        parent = metadata["first_parent"]
+        metadata["comparison_base"] = parent
+        comparison = [parent, commit] if parent is not None else [commit]
         records: list[dict[str, Any]] = []
         warnings = list(metadata_result.get("warnings", []))
         scan_truncated = bool(metadata_result.get("truncated"))
@@ -339,7 +342,7 @@ class Git:
                     "-r",
                     "--find-renames",
                     "--find-copies",
-                    commit,
+                    *comparison,
                 ],
                 max_bytes=_MAX_HISTORY_SCAN_BYTES,
             )
@@ -353,7 +356,7 @@ class Git:
                     "-r",
                     "--find-renames",
                     "--find-copies",
-                    commit,
+                    *comparison,
                 ],
                 max_bytes=_MAX_HISTORY_SCAN_BYTES,
             )
@@ -364,15 +367,14 @@ class Git:
         if include_patch:
             patch_result = await self._run(
                 [
-                    "show",
-                    "--format=",
+                    *(["diff"] if parent is not None else ["show", "--format="]),
                     "--binary",
                     "--full-index",
                     "--no-ext-diff",
                     "--no-textconv",
                     "--no-color",
                     "--end-of-options",
-                    commit,
+                    *comparison,
                 ],
                 max_bytes=_MAX_COMMIT_SCAN_BYTES,
             )
@@ -557,22 +559,22 @@ class Git:
                 "deletions": int(deletions) if deletions.isdigit() else None,
                 "path": path,
             }
-            if index < len(fields) and "\t" not in fields[index]:
-                item["old_path"] = path
-                item["path"] = fields[index]
-                index += 1
+            if not path:
+                if index + 1 >= len(fields):
+                    break
+                item["old_path"], item["path"] = fields[index:index + 2]
+                index += 2
             output.append(item)
         return output
 
     @classmethod
     def _merge_file_records(cls, names: str, stats: str) -> list[dict[str, Any]]:
         name_items = cls._parse_name_status(names)
-        stat_items = cls._parse_numstat(stats)
+        stat_items = {item["path"]: item for item in cls._parse_numstat(stats)}
         output = []
-        for index, item in enumerate(name_items):
+        for item in name_items:
             merged = dict(item)
-            if index < len(stat_items):
-                stat = stat_items[index]
+            if (stat := stat_items.get(item["path"])) is not None:
                 merged["additions"] = stat["additions"]
                 merged["deletions"] = stat["deletions"]
             else:

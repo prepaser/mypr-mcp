@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
 DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 DEFAULT_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_TIMEOUT = 30.0
+_MAX_WARNINGS = 4
+_MAX_WARNING_TEXT = 256
+_MAX_WARNING_CLIENTS = 32
 
 
 class BodyTooLarge(RuntimeError):
@@ -67,6 +71,31 @@ class HTTPTools:
         self._closed = False
         self._shutdown_task: asyncio.Task[None] | None = None
         self._html = None
+        self._download_warnings: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
+
+    @property
+    def last_warnings(self) -> list[dict[str, str]]:
+        """Return bounded warnings from the current client's most recent download."""
+
+        warnings = self._download_warnings.get(_client_id(self._identity), ())
+        return [dict(warning) for warning in warnings]
+
+    @staticmethod
+    def _warning(
+        warnings: list[dict[str, str]], code: str, error: BaseException | str
+    ) -> None:
+        if len(warnings) >= _MAX_WARNINGS:
+            return
+        text = error if isinstance(error, str) else str(error).strip()
+        warnings.append(
+            {"code": code[:128], "text": (text or error.__class__.__name__)[:_MAX_WARNING_TEXT]}
+        )
+
+    def _record_download_warnings(self, client_id: str, warnings: list[dict[str, str]]) -> None:
+        self._download_warnings[client_id] = [dict(warning) for warning in warnings]
+        self._download_warnings.move_to_end(client_id)
+        while len(self._download_warnings) > _MAX_WARNING_CLIENTS:
+            self._download_warnings.popitem(last=False)
 
     async def extract_html(
         self,
@@ -281,6 +310,8 @@ class HTTPTools:
         """Stream a response into an atomically committed workspace file."""
 
         _check_limit(max_bytes)
+        warning_client_id = _client_id(self._identity)
+        warnings: list[dict[str, str]] = []
         target = self._path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         if not overwrite and (target.exists() or target.is_symlink()):
@@ -305,10 +336,16 @@ class HTTPTools:
                     await _run_blocking(os.fsync, handle.fileno())
             if overwrite:
                 os.replace(temporary, target)
+                temporary = None
             else:
                 os.link(temporary, target)
-                os.unlink(temporary)
-            temporary = None
+                committed_temporary = temporary
+                temporary = None
+                try:
+                    os.unlink(committed_temporary)
+                except OSError as exc:
+                    self._warning(warnings, "download_cleanup_failed", exc)
+            self._record_download_warnings(warning_client_id, warnings)
             return target
         finally:
             if temporary is not None:

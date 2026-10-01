@@ -11,6 +11,22 @@ from .history import History
 from .journal import read_page
 
 
+def restart_id_for_execution(workspace, exec_id):
+    if (
+        not isinstance(exec_id, str)
+        or len(exec_id) != 32
+        or any(char not in "0123456789abcdef" for char in exec_id)
+    ):
+        return None
+    path = Path(workspace) / ".mypr" / "runs" / f"{exec_id}.json"
+    try:
+        record = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    ident = record.get("restart_id")
+    return ident if isinstance(ident, str) else None
+
+
 def finalize_origin(workspace, ticket):
     origin = ticket.get("origin") or {}
     ident = origin.get("exec_id")

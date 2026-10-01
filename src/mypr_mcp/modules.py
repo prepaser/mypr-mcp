@@ -19,6 +19,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from .file_io import open_regular
 from .persistence import await_completion
 from .revisions import RevisionStore
 
@@ -51,17 +52,21 @@ class ModuleManager:
                 continue
             name = ".".join(relative.with_suffix("").parts)
             try:
-                data = path.read_bytes()
+                digest, size = hashlib.sha256(), 0
+                with open_regular(path) as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                        size += len(chunk)
             except (OSError, UnicodeError) as exc:
                 found.append({"name": name, "path": self._display(path), "error": str(exc)})
                 continue
-            revision = hashlib.sha256(data).hexdigest()
+            revision = digest.hexdigest()
             found.append(
                 {
                     "name": name,
                     "path": self._display(path),
                     "revision": revision,
-                    "size": len(data),
+                    "size": size,
                 }
             )
         return found
@@ -469,14 +474,14 @@ def _diff(path: str, old: str, new: str, limit: int) -> tuple[str, bool]:
 
 
 _CHECK_SCRIPT = r"""
-import base64, json, pathlib, sys, types
+import base64, importlib.machinery, importlib.util, json, sys
 payload = json.loads(base64.b64decode(sys.stdin.read()))
 sys.path.insert(0, payload["lib"])
 name = payload["name"]
-module = types.ModuleType(name)
+loader = importlib.machinery.SourceFileLoader(name, payload["path"])
+spec = importlib.util.spec_from_loader(name, loader, origin=payload["path"])
+module = importlib.util.module_from_spec(spec)
 module.__file__ = payload["path"]
-module.__package__ = name.rpartition(".")[0]
-module.__path__ = []
 sys.modules[name] = module
 exec(compile(payload["source"], payload["path"], "exec"), module.__dict__)
 if payload["test_code"] is not None:

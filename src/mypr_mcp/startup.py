@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .diagnostics import RPCError, error_info, safe_error, safe_text
+from .file_io import read_bytes
 
 _NAME = "startup-error.json"
 _MAX_BYTES = 16 * 1024
@@ -46,6 +47,9 @@ def write_startup_failure(
         payload["error_info"].pop("details", None)
         payload["error_info"]["truncated"] = True
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    while len(encoded) > _MAX_BYTES:
+        payload["error"] = payload["error"][:len(payload["error"]) // 2]
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -54,7 +58,7 @@ def write_startup_failure(
                 mode="wb", dir=target.parent, prefix=f".{target.name}.", delete=False
             ) as stream:
                 temporary = Path(stream.name)
-                stream.write(encoded[:_MAX_BYTES])
+                stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
@@ -69,15 +73,8 @@ def write_startup_failure(
 def read_startup_failure(root: str | os.PathLike[str]) -> dict[str, Any] | None:
     target = _path(root)
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(target, flags)
-        try:
-            data = os.read(fd, _MAX_BYTES + 1)
-        finally:
-            os.close(fd)
-    except OSError:
-        return None
-    if len(data) > _MAX_BYTES:
+        data = read_bytes(target, max_bytes=_MAX_BYTES, follow_symlinks=False)
+    except (OSError, ValueError):
         return None
     try:
         value = json.loads(data)

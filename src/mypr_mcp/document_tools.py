@@ -21,6 +21,7 @@ from threading import RLock
 from typing import Any
 
 from .async_utils import wait_owned
+from .file_io import open_regular
 from .storage_lock import StorageLock
 
 _WORKER = Path(__file__).with_name("document_worker.py")
@@ -588,7 +589,9 @@ def _page(
 
 
 def _file_revision(path: Path, limit: int) -> str:
-    with path.open("rb") as stream:
+    with open_regular(path) as stream:
+        if os.fstat(stream.fileno()).st_size > limit:
+            raise ValueError("File exceeds max_input_bytes")
         digest = hashlib.sha256()
         size = 0
         while chunk := stream.read(1024 * 1024):

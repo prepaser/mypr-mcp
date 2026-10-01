@@ -77,6 +77,28 @@ async def test_iter_adapts_mcp_camel_case_cursor():
     assert result[-1]["items"] == ["next"]
 
 
+@pytest.mark.parametrize("resume", [False, True])
+async def test_iter_advances_positional_message_cursor(resume):
+    class Messages:
+        async def read(self, limit=20, after=None):
+            assert limit == 1
+            value = after + 1
+            return {"messages": [value], "next_cursor": value if value < 3 else None}
+
+    pages = Pages(type("W", (), {"messages": Messages()})())
+    result = []
+    if resume:
+        with pytest.raises(PageLimitReached) as raised:
+            async for page in pages.iter("messages.read", 1, 1, max_pages=1):
+                result.extend(page["messages"])
+        iterator = pages.iter(raised.value.method, 1, 1, **raised.value.next_kwargs)
+    else:
+        iterator = pages.iter("messages.read", 1, 1)
+    async for page in iterator:
+        result.extend(page["messages"])
+    assert result == [2, 3]
+
+
 @pytest.mark.asyncio
 async def test_iter_reports_limit_with_resumable_context():
     class Source:

@@ -108,12 +108,34 @@ class RuntimeConfig:
             if type(sequence) is not int or sequence < 0:
                 return False
             if self.lsp_generation == generation and sequence <= self.lsp_sequence:
+                if (
+                    sequence == self.lsp_sequence
+                    and self.applied["lsp"].get("servers") == definitions
+                ):
+                    return True
                 return False
             self.lsp_generation = generation
             self.lsp_sequence = sequence
         elif self.lsp_generation is None:
             self.lsp_generation = generation
         self.applied["lsp"]["servers"] = copy.deepcopy(definitions)
+        return True
+
+    def reconcile_late_lsp(self, snapshot):
+        if not isinstance(snapshot, dict):
+            return False
+        generation = snapshot.get("generation")
+        if generation != self.runtime.generation:
+            return False
+        sequence = snapshot.get("sequence")
+        if type(sequence) is not int or sequence < 0:
+            return False
+        definitions = snapshot.get("definitions")
+        if not isinstance(definitions, dict):
+            return False
+        if not self.record_lsp(definitions, sequence=sequence, generation=generation):
+            return False
+        self.runtime.config = copy.deepcopy(self.applied)
         return True
 
     async def _record(self, method, **fields):

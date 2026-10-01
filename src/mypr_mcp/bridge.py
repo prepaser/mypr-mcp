@@ -12,8 +12,8 @@ from typing import Any
 from .async_utils import wait_owned
 from .diagnostics import RPCError
 from .protocol import check_compatibility, runtime_info, target_installation
-from .restart import active_ticket, read_ticket, wait_ticket
-from .restart_records import poll_restart
+from .restart import active_ticket, read_ticket, recover_ticket, wait_ticket
+from .restart_records import poll_restart, restart_id_for_execution
 from .transport import HANDSHAKE_TIMEOUT, attachment, find_runtime, rpc
 
 
@@ -69,6 +69,7 @@ class ConnectionBridge:
         return {**result, "runtime": info}
 
     async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
+        await self._recover_restart(exec_id)
         deadline = time.monotonic() + min(30000, max(0, wait_ms)) / 1000
         while True:
             result = await asyncio.to_thread(
@@ -82,6 +83,11 @@ class ConnectionBridge:
             ):
                 return result
             await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+    async def _recover_restart(self, exec_id):
+        ident = await asyncio.to_thread(restart_id_for_execution, self.workspace, exec_id)
+        if ident is not None:
+            await recover_ticket(self.workspace, ident)
 
     async def request(self, op: str, **fields: Any):
         started = time.perf_counter()
@@ -138,6 +144,7 @@ class ConnectionBridge:
                 and origin.get("connection_id") == connection_id
                 and origin.get("request_id") == fields.get("request_id")
             ):
+                await self._recover_restart(origin["exec_id"])
                 result = await asyncio.to_thread(
                     poll_restart, self.workspace, origin["exec_id"],
                     max_bytes=fields.get("max_bytes"),
@@ -145,6 +152,7 @@ class ConnectionBridge:
                 if result is not None:
                     return self._decorate(result)
             if op == "poll" and ticket:
+                await self._recover_restart(fields["exec_id"])
                 result = await asyncio.to_thread(
                     poll_restart,
                     self.workspace,

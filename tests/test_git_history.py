@@ -250,3 +250,37 @@ async def test_log_follow_requires_path_and_preserves_path_history(tmp_path: Pat
         await api.log(follow=True)
     result = await api.log(path="renamed.txt", follow=True)
     assert [item["commit"] for item in result["commits"]] == [second, first]
+
+
+async def test_merge_commit_info_compares_files_stats_and_patch_to_first_parent(tmp_path: Path):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "base.txt").write_text("base\n")
+    _commit(tmp_path, "base", "Ada", "2020-06-01T12:00:00+0000")
+    _git(tmp_path, "checkout", "-qb", "side")
+    (tmp_path / "side.txt").write_text("side\n")
+    _commit(tmp_path, "side", "Ada", "2021-06-01T12:00:00+0000")
+    _git(tmp_path, "checkout", "-q", "main")
+    (tmp_path / "main.txt").write_text("main\n")
+    parent = _commit(tmp_path, "main", "Ada", "2022-06-01T12:00:00+0000")
+    _git(tmp_path, "merge", "--no-ff", "-qm", "merge", "side")
+    result = await Git(tmp_path, ShellRunner()).commit_info(include_patch=True)
+    assert result["commit"]["comparison_base"] == parent
+    assert result["files"] == [{"status": "A", "path": "side.txt", "additions": 1, "deletions": 0}]
+    assert "+side\n" in result["patch"]
+    assert "main.txt" not in result["patch"]
+
+
+async def test_commit_info_rename_statistics_preserve_tabbed_paths(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    old = tmp_path / "a\told\tname.txt"
+    old.write_text("unchanged\n")
+    (tmp_path / "z.txt").write_text("one\n")
+    _commit(tmp_path, "initial", "Ada", "2020-06-01T12:00:00+0000")
+    old.rename(tmp_path / "b\tnew\tname.txt")
+    (tmp_path / "z.txt").write_text("one\ntwo\nthree\n")
+    _commit(tmp_path, "rename and update", "Ada", "2021-06-01T12:00:00+0000")
+    result = await Git(tmp_path, ShellRunner()).commit_info()
+    files = {item["path"]: item for item in result["files"]}
+    assert files["b\tnew\tname.txt"]["old_path"] == "a\told\tname.txt"
+    assert files["b\tnew\tname.txt"]["additions"] == 0
+    assert files["z.txt"]["additions"] == 2

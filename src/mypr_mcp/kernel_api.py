@@ -25,13 +25,14 @@ from .browser_tools import BrowserTools
 from .code_tools import CodeTools
 from .config_api import ConfigAPI
 from .diagnostics import RPCError, safe_error, safe_error_details
+from .file_io import read_bytes
 from .filesystem import Filesystem
 from .http_tools import HTTPTools
 from .locks import WorkspaceLocks
 from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
-from .skill_tools import SkillsWriting
+from .skill_tools import SkillsWriting, _front_matter, _metadata_errors
 from .system_tools import SystemTools
 from .terminal import validate_size as _terminal_size
 from .workspace_tools import Git
@@ -1741,31 +1742,14 @@ class Skills(SkillsWriting):
 
     @staticmethod
     def _metadata(path: Path) -> dict[str, Any]:
-        text = path.read_text(encoding="utf-8")
-        metadata: dict[str, Any] = {}
-        if text.startswith("---"):
-            _, _, rest = text.partition("\n")
-            front, marker, _ = rest.partition("\n---")
-            if marker:
-                try:
-                    import yaml
-                except ImportError:
-                    for line in front.splitlines():
-                        if ":" in line:
-                            key, value = line.split(":", 1)
-                            metadata[key.strip()] = value.strip().strip("'\"")
-                else:
-                    try:
-                        parsed = yaml.safe_load(front)
-                    except yaml.YAMLError as exc:
-                        detail = str(exc).strip() or exc.__class__.__name__
-                        metadata["error"] = f"Invalid YAML front matter: {detail}"
-                    except (TypeError, ValueError) as exc:
-                        detail = str(exc).strip() or exc.__class__.__name__
-                        metadata["error"] = f"Invalid skill metadata: {detail}"
-                    else:
-                        if isinstance(parsed, Mapping):
-                            metadata.update(parsed)
+        text = read_bytes(path, max_bytes=16 * 1024 * 1024).decode("utf-8")
+        front = _front_matter(text)
+        if isinstance(front, str):
+            return {"error": front}
+        metadata = front or {}
+        errors = _metadata_errors(metadata)
+        if errors:
+            metadata["error"] = "; ".join(errors)
         return metadata
 
     def list(self) -> list[dict[str, Any]]:
@@ -1780,7 +1764,7 @@ class Skills(SkillsWriting):
                 continue
             try:
                 item = self._metadata(resolved)
-            except (OSError, UnicodeError) as exc:
+            except (OSError, UnicodeError, ValueError) as exc:
                 detail = str(exc).strip() or exc.__class__.__name__
                 item = {"error": f"Unable to read skill: {detail}"}
             if "name" in item and item["name"] != name:
@@ -1791,7 +1775,7 @@ class Skills(SkillsWriting):
         return found
 
     def read(self, name: str) -> str:
-        return self._path(name).read_text(encoding="utf-8")
+        return read_bytes(self._path(name)).decode("utf-8")
 
 
 class History:

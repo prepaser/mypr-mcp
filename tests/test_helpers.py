@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -145,6 +146,53 @@ def test_package_worker_accepts_freeze_at_exact_limit(tmp_path: Path):
     result = install_packages(sys.executable, root, ["new"], uv=str(uv))
     assert result["bytes"] == 16 * 1024 * 1024
     assert manifest.stat().st_size == 16 * 1024 * 1024
+
+
+def test_package_worker_rejects_replaced_fifo_lock_without_blocking(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    root.mkdir()
+    lock = root / "packages.lock"
+    os.mkfifo(lock)
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n")
+    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(OSError, match="not a regular file"):
+        install_packages(sys.executable, root, ["new"], uv=str(uv), lock_timeout=0.01)
+
+
+def test_package_worker_reports_manifest_commit_with_unknown_durability(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / ".mypr"
+    root.mkdir()
+    manifest = root / "requirements.txt"
+    manifest.write_text("old==1\n")
+    uv = tmp_path / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --color ]; then printf 'new==2\\n'; fi\n"
+    )
+    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_directory_fsync(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("directory sync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr("mypr_mcp.package_worker.os.fsync", fail_directory_fsync)
+    result = install_packages(sys.executable, root, ["new"], uv=str(uv))
+    assert result["durability"] == "unknown"
+    assert result["warnings"] == [
+        {
+            "code": "manifest_durability_unknown",
+            "text": "manifest was replaced but directory durability is unknown",
+        }
+    ]
+    assert manifest.read_text() == "new==2\n"
 
 
 def test_page_limit_error_keeps_resume_cursor_without_original_query_options():

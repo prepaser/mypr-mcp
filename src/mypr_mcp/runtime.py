@@ -838,18 +838,32 @@ class Runtime:
         while True:
             reply = await self.kc.get_shell_msg()
             ident = reply.get("parent_header", {}).get("msg_id")
+            content = reply.get("content", {})
+            snapshot = (
+                content.get("_mypr_applied_lsp")
+                if isinstance(content, dict)
+                else None
+            )
+            if snapshot is not None:
+                with contextlib.suppress(Exception):
+                    self.settings.reconcile_late_lsp(snapshot)
             accepted = self.submit_waiters.get(ident)
             if accepted is not None and not accepted.done():
                 accepted.set_result(None)
             waiter = self.control_waiters.get(ident)
             if waiter is not None:
                 if not waiter.done():
-                    waiter.set_result(reply.get("content", {}))
+                    waiter.set_result(content)
+                continue
+            content = reply.get("content", {})
+            snapshot = content.get("_mypr_applied_lsp")
+            if snapshot is not None:
+                with contextlib.suppress(Exception):
+                    self.settings.reconcile_late_lsp(snapshot)
                 continue
             rec = self.by_msg.get(ident)
             if rec is None or rec["generation"] != self.generation:
                 continue
-            content = reply.get("content", {})
             if content.get("status") == "error":
                 await self.finish(rec, "failed", content.get("evalue", "Cell submission failed"))
 
@@ -1104,6 +1118,16 @@ class Runtime:
             raise ValueError("Invalid execution ID")
         rec = self.execs.get(ident)
         cold = rec is None
+        if cold:
+            path = self.root / "runs" / f"{ident}.json"
+            try:
+                rec = await self.io(_load_execution, path)
+            except FileNotFoundError as exc:
+                raise ValueError("Unknown execution") from exc
+        if rec.get("restart_id"):
+            from .restart import recover_ticket
+
+            await recover_ticket(self.workspace, rec["restart_id"])
         if cold or rec.get("restart_id"):
             restarted = await self.io(
                 poll_restart, self.workspace, ident, cursor, max_bytes=max_bytes
@@ -1142,12 +1166,6 @@ class Runtime:
                         or len(bounded) < len(restarted.get("output", [])),
                     }
                 return {**restarted, "generation": self.generation}
-        if cold:
-            path = self.root / "runs" / f"{ident}.json"
-            try:
-                rec = await self.io(_load_execution, path)
-            except FileNotFoundError as exc:
-                raise ValueError("Unknown execution") from exc
 
         async def page():
             error = rec.get("error")
@@ -1992,7 +2010,12 @@ class Runtime:
                 "--python", str(self.py), "--root", str(self.root),
                 "--spec-json", json.dumps(specs),
             ]
-            job = await self.shells.start(command, str(self.workspace), dict(os.environ))
+            job = await self.shells.start(
+                command,
+                str(self.workspace),
+                dict(os.environ),
+                kind="package",
+            )
             self.track_shell(
                 job["id"], client, connection_id, req.get("exec_id"), kind="package", specs=specs
             )
@@ -2299,14 +2322,14 @@ class Runtime:
                 except TimeoutError:
                     if active_ticket(self.workspace) is not None:
                         continue
-                    ticket = await recover_ticket(self.workspace)
+                    ticket = await recover_ticket(self.workspace, ident)
                     if ticket is None or ticket.get("state") != "failed":
                         raise
                 except Exception:
                     if active_ticket(self.workspace) is not None:
                         await asyncio.sleep(0.1)
                         continue
-                    ticket = await recover_ticket(self.workspace)
+                    ticket = await recover_ticket(self.workspace, ident)
                     if ticket is None or ticket.get("state") != "failed":
                         raise
             if ticket["state"] == "failed" and not self.stopping.is_set():

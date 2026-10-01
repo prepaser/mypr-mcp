@@ -30,6 +30,7 @@ from mcp.types import PaginatedRequestParams
 
 from .async_utils import finish_owned, wait_owned
 from .config import ConfigSnapshot, ConfigStore, MCPConfig, validate_name, validate_servers
+from .file_io import open_regular, read_bytes
 from .journal import decode_event, read_page
 from .lsp_config import validate_servers as validate_lsp_servers
 from .terminal import close as close_terminal
@@ -39,6 +40,7 @@ from .terminal import resize as resize_terminal
 _MAX_SHELL_WARNINGS = 4
 _MAX_SHELL_WARNING_TEXT = 256
 _MAX_UNSAVED_COMPLETED = 1
+_MAX_PACKAGE_WARNING_LINE = 4096
 
 
 def _wake_future(future: asyncio.Future[None]) -> None:
@@ -52,6 +54,7 @@ class _Job:
     process: asyncio.subprocess.Process
     group_id: int
     output_limit: int
+    kind: str = "shell"
     state: str = "running"
     output: list[dict[str, str]] = field(default_factory=list)
     output_bytes: int = 0
@@ -175,11 +178,21 @@ class Shells:
         cols: int = 80,
         *,
         inherit_env: bool = True,
+        kind: str = "shell",
     ) -> dict[str, str]:
         await self._begin_start()
         try:
             return await self._start(
-                command, cwd, env, input, stdin, pty, rows, cols, inherit_env=inherit_env
+                command,
+                cwd,
+                env,
+                input,
+                stdin,
+                pty,
+                rows,
+                cols,
+                inherit_env=inherit_env,
+                kind=kind,
             )
         finally:
             await wait_owned(self._end_start(), propagate=False)
@@ -196,6 +209,7 @@ class Shells:
         cols: int = 80,
         *,
         inherit_env: bool = True,
+        kind: str = "shell",
     ) -> dict[str, str]:
         if self._closed:
             raise RuntimeError("shell service is closed")
@@ -267,7 +281,7 @@ class Shells:
             ):
                 raise asyncio.CancelledError from exc
             job_id = uuid.uuid4().hex
-            job = self._new_job(job_id, _NoProcess(), 0)
+            job = self._new_job(job_id, _NoProcess(), 0, kind=kind)
             self._jobs[job_id] = job
             self._finish_job(job, returncode=-1, error=exc)
             return {"id": job_id}
@@ -275,7 +289,7 @@ class Shells:
             close_terminal(slave_fd)
 
         job_id = uuid.uuid4().hex
-        job = self._new_job(job_id, process, process.pid)
+        job = self._new_job(job_id, process, process.pid, kind=kind)
         self._jobs[job_id] = job
         if pty:
             assert master_fd is not None
@@ -418,7 +432,7 @@ class Shells:
                 raise ValueError("invalid shell job ID")
             metadata_path = self.jobs_root / f"{job_id}.json"
             try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata = json.loads(read_bytes(metadata_path, max_bytes=1024 * 1024))
             except FileNotFoundError:
                 raise ValueError("unknown job") from None
             page, next_index, next_offset, has_more = await asyncio.to_thread(
@@ -593,7 +607,7 @@ class Shells:
         metadata_path = self.jobs_root / f"{job_id}.json"
         journal_path = self.jobs_root / f"{job_id}.jsonl"
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = json.loads(read_bytes(metadata_path, max_bytes=1024 * 1024))
         except FileNotFoundError:
             return {
                 "id": job_id,
@@ -769,12 +783,14 @@ class Shells:
         *,
         state: str = "running",
         error: str | None = None,
+        kind: str = "shell",
     ) -> _Job:
         return _Job(
             job_id,
             process,
             group_id,
             self.output_limit,
+            kind=kind,
             state=state,
             error=error,
             journal=self.jobs_root / f"{job_id}.jsonl",
@@ -811,7 +827,7 @@ class Shells:
     @staticmethod
     def _read_journal(path: Path) -> list[dict[str, str]]:
         try:
-            file = path.open("rb")
+            file = open_regular(path)
         except FileNotFoundError:
             return []
         output = []
@@ -912,6 +928,13 @@ class Shells:
 
     async def _drain(self, job: _Job, stream: Any, name: str) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        package_decoder = (
+            codecs.getincrementaldecoder("utf-8")("replace")
+            if job.kind == "package" and name == "stdout"
+            else None
+        )
+        package_buffer = ""
+        package_discarding = False
         while True:
             try:
                 chunk = await stream.read(64 * 1024)
@@ -920,6 +943,13 @@ class Shells:
                 return
             if not chunk:
                 break
+            if package_decoder is not None:
+                package_buffer, package_discarding = self._consume_package_output(
+                    job,
+                    package_buffer,
+                    package_decoder.decode(chunk),
+                    package_discarding,
+                )
             if job.output_bytes >= job.output_limit:
                 job.truncated = True
                 continue
@@ -936,12 +966,50 @@ class Shells:
             if len(keep) < len(chunk):
                 job.truncated = True
         text = decoder.decode(b"", final=True)
+        if package_decoder is not None:
+            package_buffer, package_discarding = self._consume_package_output(
+                job,
+                package_buffer,
+                package_decoder.decode(b"", final=True),
+                package_discarding,
+            )
         if text and job.output_bytes < job.output_limit:
             event = {"stream": name, "text": text}
             job.output.append(event)
             job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
             self._persist_output(job, event)
             job.changed.set()
+
+    @classmethod
+    def _consume_package_output(
+        cls, job: _Job, buffer: str, text: str, discarding: bool
+    ) -> tuple[str, bool]:
+        """Extract complete, bounded worker warning lines from package stdout."""
+
+        if not text:
+            return buffer, discarding
+        pending = text if discarding else buffer + text
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            if not discarding and len(line) <= _MAX_PACKAGE_WARNING_LINE:
+                cls._package_warning(job, line)
+            discarding = False
+        if len(pending) > _MAX_PACKAGE_WARNING_LINE:
+            return "", True
+        return pending, discarding
+
+    @classmethod
+    def _package_warning(cls, job: _Job, line: str) -> None:
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(event, dict) or event.get("phase") != "warning":
+            return
+        code = event.get("code")
+        text = event.get("text")
+        if isinstance(code, str) and isinstance(text, str):
+            cls._add_warning(job, code, text)
 
     async def _settle_readers(self, job: _Job, *, cancel: bool = False) -> None:
         if cancel:

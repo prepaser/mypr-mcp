@@ -41,6 +41,16 @@ def test_malformed_skill_recovers_after_edit(tmp_path: Path):
     assert "error" not in item
 
 
+@pytest.mark.parametrize("front", ["- one", "scalar", "description: [one]", "name: 1"])
+async def test_list_and_validate_report_invalid_metadata_types(tmp_path: Path, front: str):
+    write_skill(tmp_path / ".mypr" / "skills", "invalid", f"---\n{front}\n---\n")
+    skills = Skills(tmp_path)
+    listed = skills.list()[0]
+    checked = await skills.validate("invalid")
+    assert not checked["valid"]
+    assert listed["error"] == "; ".join(checked["errors"])
+
+
 def test_list_applies_read_path_policy_to_symlinks(tmp_path: Path):
     root = tmp_path / ".mypr" / "skills"
     inside = write_skill(root, "inside", "# Inside\n")

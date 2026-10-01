@@ -14,6 +14,14 @@ MAX_FILES = 100
 MAX_BYTES = 16 * 1024 * 1024
 
 
+class _ByteLimit(Exception):
+    pass
+
+
+class _FileChanged(Exception):
+    pass
+
+
 def main() -> int:
     try:
         request = json.loads(base64.b64decode(sys.stdin.buffer.read(), validate=True))
@@ -70,31 +78,37 @@ def replace(request: dict) -> dict:
         if path == root or ".mypr" in path.relative_to(root).parts:
             continue
         try:
-            info = path.lstat()
+            data = _read_bounded(path, max_bytes - scanned_bytes - output_bytes)
         except FileNotFoundError:
             return {"complete": False, "reason": "file_changed_during_scan"}
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            continue
-        data = path.read_bytes()
-        scanned_bytes += len(data)
-        if scanned_bytes + output_bytes > max_bytes:
+        except _ByteLimit:
             return {"complete": False, "reason": "byte_limit"}
+        except _FileChanged:
+            return {"complete": False, "reason": "file_changed_during_scan"}
+        if data is None:
+            continue
+        scanned_bytes += len(data)
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        updated, count = expression.subn(
-            (lambda _match: replacement) if fixed else replacement,
-            text,
-        )
-        if count == 0 or updated == text:
+        try:
+            new, count, changed = _substitute_bounded(
+                text,
+                expression,
+                replacement,
+                fixed,
+                max_bytes - scanned_bytes - output_bytes,
+            )
+        except (IndexError, re.error, ValueError):
+            return {"complete": False, "reason": "invalid_replacement"}
+        if count == 0 or not changed:
             continue
-        new = updated.encode("utf-8")
         if len(operations) >= max_files:
             return {"complete": False, "reason": "file_limit"}
-        output_bytes += len(new)
-        if scanned_bytes + output_bytes > max_bytes:
+        if new is None:
             return {"complete": False, "reason": "byte_limit"}
+        output_bytes += len(new)
         operations.append(
             {
                 "path": raw,
@@ -104,6 +118,138 @@ def replace(request: dict) -> dict:
             }
         )
     return {"complete": True, "operations": operations}
+
+
+def _read_bounded(path: Path, limit: int) -> bytes | None:
+    """Read one regular file without exceeding the remaining input budget."""
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None
+    if info.st_size > limit:
+        raise _ByteLimit
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            return None
+        if opened.st_size > limit:
+            raise _ByteLimit
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            data = stream.read(limit + 1)
+            after = os.fstat(stream.fileno())
+        if len(data) > limit:
+            raise _ByteLimit
+        if _signature(info) != _signature(opened) or _signature(info) != _signature(after):
+            raise _FileChanged
+        return data
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _substitute_bounded(
+    text: str,
+    expression: re.Pattern[str],
+    replacement: str,
+    fixed: bool,
+    output_limit: int,
+) -> tuple[bytes | None, int, bool]:
+    """Apply substitutions in two passes, bounding the materialized result."""
+    template = None if fixed else _parse_template(replacement, expression)
+    cursor = 0
+    output_size = 0
+    count = 0
+    changed = False
+    for match in expression.finditer(text):
+        source = text[cursor : match.start()]
+        replacement_size, replacement_equal = _replacement_info(
+            match,
+            template,
+            replacement,
+            text[match.start() : match.end()],
+        )
+        output_size += len(source.encode("utf-8")) + replacement_size
+        changed |= not replacement_equal
+        count += 1
+        cursor = match.end()
+        if changed and output_size > output_limit:
+            return None, count, True
+    tail = text[cursor:]
+    output_size += len(tail.encode("utf-8"))
+    if count == 0 or not changed:
+        return None, count, False
+    if output_size > output_limit:
+        return None, count, True
+
+    result = bytearray(output_size)
+    position = 0
+    cursor = 0
+    for match in expression.finditer(text):
+        source = text[cursor : match.start()].encode("utf-8")
+        result[position : position + len(source)] = source
+        position += len(source)
+        position = _write_replacement(result, position, match, template, replacement)
+        cursor = match.end()
+    tail = text[cursor:].encode("utf-8")
+    result[position:] = tail
+    return bytes(result), count, True
+
+
+def _replacement_parts(
+    match: re.Match[str], template: list[str | int] | None, replacement: str
+):
+    if template is None:
+        yield replacement
+        return
+    for part in template:
+        yield (match.group(part) or "") if isinstance(part, int) else part
+
+
+def _replacement_info(
+    match: re.Match[str],
+    template: list[str | int] | None,
+    replacement: str,
+    matched: str,
+) -> tuple[int, bool]:
+    size = 0
+    offset = 0
+    equal = True
+    for part in _replacement_parts(match, template, replacement):
+        size += len(part.encode("utf-8"))
+        if equal and not matched.startswith(part, offset):
+            equal = False
+        offset += len(part)
+    return size, equal and offset == len(matched)
+
+
+def _write_replacement(
+    output: bytearray,
+    position: int,
+    match: re.Match[str],
+    template: list[str | int] | None,
+    replacement: str,
+) -> int:
+    for part in _replacement_parts(match, template, replacement):
+        encoded = part.encode("utf-8")
+        output[position : position + len(encoded)] = encoded
+        position += len(encoded)
+    return position
+
+
+def _parse_template(replacement: str, expression: re.Pattern[str]) -> list[str | int]:
+    parser = getattr(re, "_parser", None)
+    parse_template = getattr(parser, "parse_template", None)
+    if parse_template is None:
+        raise re.error("replacement templates are unavailable")
+    return parse_template(replacement, expression)
 
 
 def _lexical_path(root: Path, value: str) -> Path:

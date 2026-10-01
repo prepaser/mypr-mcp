@@ -20,6 +20,7 @@ from typing import Any
 from weakref import WeakValueDictionary
 
 from .async_utils import wait_owned
+from .file_io import open_regular, read_bytes
 from .storage_lock import StorageLock
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -422,7 +423,7 @@ class RevisionStore:
     def _read_index_bytes_sync(self, resource: str) -> bytes | None:
         path = self._metadata_path(self._index_path(resource))
         try:
-            return path.read_bytes()
+            return read_bytes(path, max_bytes=_MAX_INDEX_BYTES)
         except FileNotFoundError:
             return None
 
@@ -448,11 +449,11 @@ class RevisionStore:
         path = self._index_path(resource)
         metadata_path = self._metadata_path(path)
         try:
-            raw = metadata_path.read_bytes()
+            raw = read_bytes(metadata_path, max_bytes=_MAX_INDEX_BYTES)
         except FileNotFoundError:
             return _empty_index(self.kind, resource, self._version)
-        if len(raw) > _MAX_INDEX_BYTES:
-            raise ValueError("revision index exceeds its size limit")
+        except ValueError as exc:
+            raise ValueError("revision index exceeds its size limit") from exc
         try:
             index = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -782,7 +783,7 @@ def _unlink_if_revision(path: Path, expected_revision: str) -> tuple[str, str]:
         return "already_absent", "target is already absent"
     if not stat.S_ISREG(current.st_mode):
         raise RuntimeError("target is no longer a regular file")
-    with path.open("rb") as stream:
+    with open_regular(path) as stream:
         current_revision = hashlib.sha256(stream.read(_MAX_BLOB_BYTES + 1)).hexdigest()
     if current_revision != expected_revision:
         return "changed", f"target changed concurrently to revision {current_revision}"
@@ -800,7 +801,7 @@ def _unlink_if_revision(path: Path, expected_revision: str) -> tuple[str, str]:
             displaced = backup.lstat()
             if not stat.S_ISREG(displaced.st_mode):
                 raise RuntimeError("displaced target is no longer a regular file")
-            with backup.open("rb") as stream:
+            with open_regular(backup) as stream:
                 revision = hashlib.sha256(stream.read(_MAX_BLOB_BYTES + 1)).hexdigest()
             if revision == expected_revision:
                 backup.unlink()

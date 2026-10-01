@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import mypr_mcp.config_runtime as config_runtime
 from mypr_mcp.runtime import Runtime
 from mypr_mcp.services import MCPBridge
 
@@ -173,3 +174,72 @@ async def test_kernel_control_uses_a_snapshot_without_manager_rpc(configured_run
     assert result["applied"] is True
     assert observed[0]["config"]["lsp"]["revision"] == snapshot.revision
     assert runtime.control_waiters == {}
+
+
+async def test_late_lsp_control_reply_reconciles_after_waiter_timeout(
+    configured_runtime, monkeypatch
+):
+    runtime = configured_runtime
+    runtime.healthy = True
+    runtime.config_store.set("lsp.servers.demo", {
+        "command": ["demo-lsp"], "languages": ["python"],
+    })
+    original_timeout = asyncio.timeout
+
+    def short_timeout(_seconds):
+        return original_timeout(0.001)
+
+    monkeypatch.setattr(config_runtime.asyncio, "timeout", short_timeout)
+    message = {"header": {"msg_id": "late-config"}}
+    runtime.kc = SimpleNamespace(
+        session=SimpleNamespace(msg=lambda *args, **kwargs: message),
+        shell_channel=SimpleNamespace(send=lambda _message: None),
+    )
+    with pytest.raises(TimeoutError):
+        await runtime.settings._apply_lsp(runtime.config_store.load(), runtime.generation, False)
+    runtime.config_store.set("lsp.servers.demo", {
+        "command": ["new-lsp"], "languages": ["python"],
+    })
+    result = runtime.settings.reconcile_late_lsp(
+        {
+            "definitions": {
+                "demo": {"command": ["demo-lsp"], "languages": ["python"]},
+            },
+            "sequence": 1,
+            "generation": runtime.generation,
+        }
+    )
+    assert result is True
+    assert runtime.settings.applied["lsp"]["servers"]["demo"]["command"] == ["demo-lsp"]
+
+
+async def test_late_lsp_reply_uses_kernel_snapshot_without_pending_metadata(configured_runtime):
+    runtime = configured_runtime
+    waiter = asyncio.get_running_loop().create_future()
+    runtime.control_waiters["late-config"] = waiter
+    reply = {
+        "parent_header": {"msg_id": "late-config"},
+        "content": {
+            "_mypr_applied_lsp": {
+                "definitions": {
+                    "demo": {"command": ["demo-lsp"], "languages": ["python"]},
+                },
+                "revision": "old",
+                "sequence": 4,
+                "generation": runtime.generation,
+            },
+        },
+    }
+
+    async def receive():
+        await asyncio.sleep(0.01)
+        return reply
+
+    runtime.kc = SimpleNamespace(get_shell_msg=receive)
+    reader = asyncio.create_task(runtime.read_replies())
+    await asyncio.sleep(0.02)
+    reader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+    assert waiter.result()["_mypr_applied_lsp"]["sequence"] == 4
+    assert runtime.settings.applied["lsp"]["servers"]["demo"]["command"] == ["demo-lsp"]

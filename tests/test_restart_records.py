@@ -31,7 +31,7 @@ def test_origin_result_is_durable_and_finalization_is_idempotent(tmp_path, monke
         "state": "starting",
         "new_generation": None,
     }
-    monkeypatch.setattr(restart, "read_ticket", lambda workspace, key: ticket)
+    monkeypatch.setattr(restart, "read_ticket", lambda workspace, key=None: ticket)
     assert poll_restart(tmp_path, ident)["state"] == "running"
     ticket.update(
         state=state,
@@ -82,7 +82,7 @@ async def test_historical_restart_poll_reports_current_manager_generation(tmp_pa
         "origin": {"exec_id": ident},
         "new_generation": "previous",
     }
-    monkeypatch.setattr(restart, "read_ticket", lambda workspace, key: ticket)
+    monkeypatch.setattr(restart, "read_ticket", lambda workspace, key=None: ticket)
     result = await runtime.poll(ident)
     assert result["generation"] == "current"
     assert result["execution_generation"] == "old"
@@ -122,3 +122,74 @@ async def test_disconnected_bridge_restart_poll_keeps_budget_and_expiry(tmp_path
         assert expired["cursor"] == page["cursor"]
     finally:
         history.close()
+
+
+async def test_abandoned_restart_is_recovered_before_polling_origin(tmp_path):
+    from mypr_mcp import restart
+    from mypr_mcp.restart_records import poll_restart
+    from mypr_mcp.transport import workspace_id
+
+    ident = "1" * 32
+    ticket_id = "2" * 32
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    record = {
+        "id": ident,
+        "generation": "old",
+        "state": "restarting",
+        "restart_id": ticket_id,
+        "client_id": "client",
+        "connection_id": "connection",
+        "created": 1,
+    }
+    (root / f"{ident}.json").write_text(json.dumps(record))
+    ticket = {
+        "id": ticket_id,
+        "state": "starting",
+        "workspace_id": workspace_id(tmp_path),
+        "target": {"python": "/usr/bin/python", "package_root": "/tmp", "version": "1"},
+        "coordinator_pid": 999999,
+        "coordinator_starttime": None,
+        "created_at": 1,
+        "updated_at": 1,
+        "origin": {"exec_id": ident},
+    }
+    restart._write_ticket(tmp_path, ticket)
+    recovered = await restart.recover_ticket(tmp_path)
+    assert recovered["state"] == "failed"
+    assert poll_restart(tmp_path, ident)["state"] == "failed"
+
+
+async def test_bridge_poll_recovers_archived_ticket_without_clobbering_current(tmp_path):
+    from mypr_mcp import restart
+    from mypr_mcp.bridge import ConnectionBridge
+    from mypr_mcp.transport import workspace_id
+
+    ident = "3" * 32
+    abandoned_id = "4" * 32
+    current_id = "5" * 32
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    (root / f"{ident}.json").write_text(
+        json.dumps({"id": ident, "generation": "old", "state": "restarting",
+                    "restart_id": abandoned_id})
+    )
+    base = {
+        "workspace_id": workspace_id(tmp_path),
+        "target": {"python": "/usr/bin/python", "package_root": "/tmp", "version": "1"},
+        "coordinator_pid": 999999,
+        "coordinator_starttime": None,
+        "created_at": 1,
+        "updated_at": 1,
+    }
+    restart._write_ticket(tmp_path, {
+        **base, "id": abandoned_id, "state": "starting", "origin": {"exec_id": ident},
+    })
+    restart._write_ticket(tmp_path, {
+        **base, "id": current_id, "state": "succeeded", "origin": None,
+    })
+    bridge = ConnectionBridge(tmp_path)
+    result = await bridge._poll_restart(ident, 0, 0)
+    assert result["state"] == "failed"
+    assert restart.read_ticket(tmp_path)["id"] == current_id
+    assert restart.read_ticket(tmp_path, abandoned_id)["state"] == "failed"

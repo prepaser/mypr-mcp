@@ -154,3 +154,108 @@ def test_replace_worker_rejects_lexical_symlink_alias(tmp_path: Path):
         }
     )
     assert result == {"complete": False, "reason": "path_outside_workspace"}
+
+
+def test_replace_worker_bounds_source_reads(tmp_path: Path, monkeypatch):
+    source = tmp_path / "large.txt"
+    source.write_bytes(b"x" * 64)
+
+    def unexpected_read(*_args, **_kwargs):
+        raise AssertionError("worker must use its bounded reader")
+
+    monkeypatch.setattr(Path, "read_bytes", unexpected_read)
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": [source.name],
+            "pattern": "x",
+            "replacement": "y",
+            "fixed": True,
+            "ignore_case": False,
+            "max_files": 100,
+            "max_bytes": 16,
+        }
+    )
+    assert result == {"complete": False, "reason": "byte_limit"}
+
+
+def test_replace_worker_bounds_expanded_replacement(tmp_path: Path):
+    source = tmp_path / "value.txt"
+    source.write_bytes(b"x" * 64)
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": [source.name],
+            "pattern": "x",
+            "replacement": "12345678",
+            "fixed": True,
+            "ignore_case": False,
+            "max_files": 100,
+            "max_bytes": 100,
+        }
+    )
+    assert result == {"complete": False, "reason": "byte_limit"}
+
+
+def test_replace_worker_keeps_noop_matches_when_output_budget_is_zero(tmp_path: Path):
+    source = tmp_path / "value.txt"
+    source.write_bytes(b"x" * 64)
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": [source.name],
+            "pattern": "x",
+            "replacement": "x",
+            "fixed": True,
+            "ignore_case": False,
+            "max_files": 100,
+            "max_bytes": 64,
+        }
+    )
+    assert result == {"complete": True, "operations": []}
+
+
+def test_replace_worker_bounds_repeated_capture_expansion(tmp_path: Path):
+    source = tmp_path / "value.txt"
+    source.write_bytes(b"a" * 64)
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": [source.name],
+            "pattern": "(a+)",
+            "replacement": r"\1" * 64,
+            "fixed": False,
+            "ignore_case": False,
+            "max_files": 100,
+            "max_bytes": 100,
+        }
+    )
+    assert result == {"complete": False, "reason": "byte_limit"}
+
+
+def test_replace_worker_validates_regex_replacement_without_matches(tmp_path: Path):
+    source = tmp_path / "value.txt"
+    source.write_text("nothing to replace")
+    result = worker_replace(
+        {
+            "root": str(tmp_path),
+            "paths": [source.name],
+            "pattern": "missing",
+            "replacement": r"\1",
+            "fixed": False,
+            "ignore_case": False,
+            "max_files": 100,
+            "max_bytes": 100,
+        }
+    )
+    assert result == {"complete": False, "reason": "invalid_replacement"}
+
+
+@pytest.mark.asyncio
+async def test_replace_preview_keeps_metadata_after_diff_truncation(tmp_path: Path):
+    (tmp_path / "one.txt").write_text("old\n" * 6_000)
+    (tmp_path / "two.txt").write_text("old\n" * 6_000)
+    fs = Filesystem(tmp_path, Shell())
+    preview = await fs.replace("old", "new", paths=["one.txt", "two.txt"], history=False)
+    assert preview["diff_truncated"]
+    assert {change["path"] for change in preview["changes"]} == {"one.txt", "two.txt"}

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.ast_rewrite import _apply_matches, _PlanStore
+from mypr_mcp.ast_rewrite import _apply_matches, _NewlineTracker, _OutputLimit, _PlanStore
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.patching import _sha256
 
@@ -154,6 +154,67 @@ def test_overlapping_ast_replacements_are_rejected():
 
     with pytest.raises(ValueError, match="overlapping"):
         _apply_matches(b"abcdef", records, "sample.py")
+
+
+def test_ast_rewrite_offsets_must_use_utf8_boundaries():
+    records = [
+        {"replacementOffsets": {"start": 1, "end": 2}, "replacement": "x"},
+    ]
+
+    with pytest.raises(RuntimeError, match="UTF-8 offsets"):
+        _apply_matches("é".encode(), records, "sample.py")
+
+
+def test_ast_rewrite_output_limit_is_enforced_during_construction():
+    records = [
+        {"replacementOffsets": {"start": 0, "end": 3}, "replacement": "x" * 8},
+    ]
+
+    with pytest.raises(_OutputLimit):
+        _apply_matches(b"foo", records, "sample.py", max_bytes=3)
+
+
+def test_newline_tracker_scans_each_match_gap_once():
+    class CountingBytes(bytes):
+        def __new__(cls, value):
+            result = super().__new__(cls, value)
+            result.find_calls = 0
+            result.rfind_calls = 0
+            return result
+
+        def find(self, *args):
+            self.find_calls += 1
+            return super().find(*args)
+
+        def rfind(self, *args):
+            self.rfind_calls += 1
+            return super().rfind(*args)
+
+    data = CountingBytes(b"line\n" * 512 + b"tail")
+    tracker = _NewlineTracker(data)
+    offsets = list(range(0, len(data) + 1, 17))
+    assert all(tracker.style(offset) == "\n" for offset in offsets)
+    assert data.find_calls <= 2
+    assert data.rfind_calls == 2 * (len(offsets) - 1)
+
+    no_newlines = CountingBytes(b"x" * 4096)
+    tracker = _NewlineTracker(no_newlines)
+    assert all(tracker.style(offset) == "\n" for offset in offsets)
+    assert no_newlines.find_calls == 2
+    assert no_newlines.rfind_calls == 2 * (len(offsets) - 1)
+    mixed = _NewlineTracker(b"a\rb\nc\r\nd")
+    assert [mixed.style(offset) for offset in (0, 2, 4, 6, 7, 8)] == [
+        "\r", "\r", "\n", "\r\n", "\r\n", "\r\n",
+    ]
+
+
+def test_plan_store_rejects_fifo_without_waiting_for_a_writer(tmp_path: Path):
+    store = _PlanStore(tmp_path / "rewrites")
+    ident = "0" * 32
+    os.mkfifo(store.root / f"{ident}.json")
+
+    with pytest.raises(RuntimeError, match="invalid rewrite plan file"):
+        store.load(ident)
 
 
 async def test_empty_path_and_glob_lists_are_rejected(tmp_path: Path):
