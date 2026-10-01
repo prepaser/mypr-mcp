@@ -30,8 +30,13 @@ def socket_path(workspace: Path) -> Path:
     return root / f"{key}.sock"
 
 
-async def rpc(path: Path | str, **request):
-    reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_MESSAGE)
+async def rpc(_socket_path: Path | str | None = None, **request):
+    if _socket_path is None:
+        try:
+            _socket_path = request.pop("path")
+        except KeyError as exc:
+            raise TypeError("rpc() requires a socket path") from exc
+    reader, writer = await asyncio.open_unix_connection(str(_socket_path), limit=MAX_MESSAGE)
     try:
         writer.write(json.dumps(request).encode() + b"\n")
         await writer.drain()

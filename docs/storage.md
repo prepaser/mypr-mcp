@@ -9,7 +9,7 @@ usage = await ws.storage.usage()
 usage["total_bytes"], usage["categories"]
 ```
 
-The policy is configured in `.mypr/config.toml`:
+The policy is configured in the layered `storage` section. Workspace values in `.mypr/config.toml` override global defaults. Use `ws.config.set()` to persist a value and `ws.config.reload()` to apply it; the next storage-maintenance pass uses the updated policy:
 
 ```toml
 [storage]

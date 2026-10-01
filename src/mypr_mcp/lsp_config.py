@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import fcntl
+import copy
 import hashlib
 import os
 import re
-import tempfile
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import tomlkit
@@ -70,10 +68,17 @@ def validate_servers(value: Any) -> dict[str, dict[str, Any]]:
 
 
 class LSPConfig:
-    """Read and atomically update only the ``lsp`` TOML section."""
+    """Compatibility facade over the layered configuration store."""
 
-    def __init__(self, workspace: str | os.PathLike[str]) -> None:
-        self.path = Path(workspace).expanduser().resolve() / ".mypr" / "config.toml"
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str],
+        global_path: str | os.PathLike[str] | None = None,
+    ) -> None:
+        from .config import ConfigStore
+
+        self.core = ConfigStore(workspace, global_path)
+        self.path = self.core.workspace_path
 
     def _raw(self) -> bytes | None:
         try:
@@ -90,64 +95,23 @@ class LSPConfig:
             raise ValueError("lsp must be a table")
         return doc, validate_servers(lsp.get("servers", {}))
 
-    def load(self) -> tuple[dict[str, dict[str, Any]], str | None]:
-        raw = self._raw()
-        _, servers = self._parse(raw)
-        return servers, _revision(raw)
+    def load(self) -> tuple[dict[str, dict[str, Any]], str]:
+        snapshot = self.core.load()
+        return copy.deepcopy(snapshot.values["lsp"]["servers"]), snapshot.revision
 
     def save(
         self, servers: Mapping[str, Mapping[str, Any]], expected_revision: str | None
     ) -> str:
-        value = validate_servers(servers)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            raw = self._raw()
-            if _revision(raw) != expected_revision:
-                raise RuntimeError("LSP configuration changed on disk; call ws.code.reload() first")
-            doc, _ = self._parse(raw)
-            lsp = doc.get("lsp")
-            if lsp is None:
-                lsp = tomlkit.table()
-                doc["lsp"] = lsp
-            elif not isinstance(lsp, Mapping):
-                raise ValueError("lsp must be a table")
-            table = lsp.get("servers")
-            if table is None:
-                table = tomlkit.table()
-                lsp["servers"] = table
-            elif not isinstance(table, Mapping):
-                raise ValueError("lsp.servers must be a table")
-            for name in list(table):
-                if name not in value:
-                    del table[name]
-            for name, config in value.items():
-                entry = table.get(name)
-                if entry is None:
-                    entry = tomlkit.table()
-                    table[name] = entry
-                entry["command"] = list(config["command"])
-                entry["languages"] = list(config["languages"])
-                entry["timeout"] = config["timeout"]
-            data = tomlkit.dumps(doc).encode("utf-8")
-            temporary: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    dir=self.path.parent, prefix=".config-", delete=False
-                ) as stream:
-                    temporary = Path(stream.name)
-                    stream.write(data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if self.path.exists():
-                    temporary.chmod(self.path.stat().st_mode & 0o777)
-                if _revision(self._raw()) != expected_revision:
-                    raise RuntimeError("LSP configuration changed during save; reload and retry")
-                os.replace(temporary, self.path)
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-        return _revision(data) or ""
+        return self.core.save_servers("lsp", servers, expected_revision).revision
+
+    def save_server(
+        self,
+        section: str,
+        name: str,
+        definition: Mapping[str, Any] | None,
+        expected_revision: str | None = None,
+    ):
+        return self.core.save_server(section, name, definition, expected_revision)
 
 
 __all__ = ["LSPConfig", "validate_servers"]

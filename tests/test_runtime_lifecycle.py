@@ -37,7 +37,7 @@ async def test_shutdown_closes_kernel_started_by_in_progress_reset(tmp_path, mon
     monkeypatch.setattr(runtime, "lose_python_tasks", noop)
     monkeypatch.setattr(runtime, "close_shells", noop)
     monkeypatch.setattr(runtime, "new_shells", lambda: object())
-    monkeypatch.setattr(runtime_module, "MCPBridge", lambda _: Bridge())
+    monkeypatch.setattr(runtime_module, "MCPBridge", lambda _, **kwargs: Bridge())
     monkeypatch.setattr(runtime_module, "ScanService", lambda *args: object())
     runtime.mcp = Bridge()
 

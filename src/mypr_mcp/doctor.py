@@ -14,7 +14,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError, load_workspace_config
+from .config import ConfigError, ConfigStore
 from .startup import read_startup_failure
 
 _PYTHON_PACKAGES = {
@@ -229,7 +229,11 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result: dict[str, Any] = {
         "workspace": str(path),
         "mypr": {"path": str(root), "exists": await asyncio.to_thread(root.is_dir)},
-        "config": {"path": str(root / "config.toml"), "valid": True},
+        "config": {
+            "path": str(root / "config.toml"),
+            "valid": True,
+            "paths": {"workspace": str(root / "config.toml")},
+        },
         "python": {},
         "binaries": {},
         "search": {},
@@ -242,10 +246,22 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     startup_failure = await asyncio.to_thread(read_startup_failure, root)
     if startup_failure is not None:
         result["startup_error"] = startup_failure
+    config_store = ConfigStore(path)
+    result["config"]["paths"]["global"] = str(config_store.global_path)
     try:
-        snapshot = load_workspace_config(path)
+        snapshot = config_store.load()
         result["config"].update(
-            valid=True, revision=snapshot.revision, sections=sorted(snapshot.values)
+            valid=True,
+            revision=snapshot.revision,
+            sections=sorted(snapshot.values),
+            revisions=dict(snapshot.revisions),
+            sources={
+                scope: {
+                    "path": str(snapshot.paths[scope]),
+                    "revision": snapshot.revisions.get(scope),
+                }
+                for scope in ("global", "workspace")
+            },
         )
     except (OSError, ConfigError) as exc:
         result["config"].update(valid=False, error=f"{type(exc).__name__}: {exc}"[:512])

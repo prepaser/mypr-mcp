@@ -24,7 +24,8 @@ from . import __version__
 from .async_utils import wait_owned
 from .bootstrap import ensure_runtime
 from .browser_service import BrowserService
-from .config import load_workspace_config
+from .config import ConfigStore
+from .config_runtime import RuntimeConfig
 from .diagnostics import error_info, error_response, safe_error
 from .git_api import Git
 from .history import History
@@ -206,10 +207,15 @@ class Runtime:
         self.control_waiters = {}
         self.submit_waiters = {}
         self.monitor = None
-        self.config = load_workspace_config(self.workspace).values
-        self.storage_policy = self.config.get("storage", {})
+        self.config_store = ConfigStore(self.workspace)
+        snapshot = self.config_store.load()
+        self._kernel_snapshot = snapshot
+        self.config = snapshot.values
+        self.settings = RuntimeConfig(self, self.config_store, snapshot)
+        self.storage_policy = self.settings.applied["storage"].copy()
         self.storage = None
         self.storage_maintenance = {"running": False, "last_run": None, "last_error": None}
+        self._storage_wake = asyncio.Event()
         limits = self.config.get("limits", {})
         self.output_limit = int(limits.get("output_bytes", 16 * 1024 * 1024))
         self.response_limit = int(limits.get("response_bytes", 32768))
@@ -242,8 +248,19 @@ class Runtime:
         return await await_completion(task)
 
     async def maintain_storage(self):
+        first = True
         while not self.stopping.is_set():
-            if self.healthy and not self.resetting and not self.restarting:
+            if not first:
+                changed = await self._wait_storage_interval()
+                if self.stopping.is_set():
+                    return
+                if changed:
+                    continue
+            first = False
+            if (
+                self.storage_policy["enabled"] and self.healthy
+                and not self.resetting and not self.restarting
+            ):
                 self.storage_maintenance["running"] = True
                 try:
                     result = await self.storage_call(
@@ -262,12 +279,23 @@ class Runtime:
                     )
                 finally:
                     self.storage_maintenance["running"] = False
-            try:
-                await asyncio.wait_for(
-                    self.stopping.wait(), self.storage_policy["gc_interval_seconds"]
-                )
-            except TimeoutError:
-                pass
+
+    async def _wait_storage_interval(self):
+        stop = asyncio.create_task(self.stopping.wait())
+        change = asyncio.create_task(self._storage_wake.wait())
+        try:
+            done, _ = await asyncio.wait(
+                [stop, change], timeout=self.storage_policy["gc_interval_seconds"],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            changed = change in done
+            if changed:
+                self._storage_wake.clear()
+            return changed
+        finally:
+            stop.cancel()
+            change.cancel()
+            await wait_owned(asyncio.gather(stop, change, return_exceptions=True), propagate=False)
 
     async def code_config(self, req):
         if self.mcp is None:
@@ -276,10 +304,22 @@ class Runtime:
         if method == "get_lsp":
             return await self.mcp.get_lsp()
         if method == "set_lsp":
+            if self.settings.applying:
+                raise RuntimeError("Configuration reload is in progress; retry after it completes")
+            named = (
+                {"name": req["name"], "definition": req.get("definition")}
+                if "name" in req else {}
+            )
             return await self.mcp.save_lsp(
                 req.get("definitions"),
                 req.get("expected_servers"),
+                **named,
             )
+        if method == "applied_lsp":
+            from .lsp_config import validate_servers
+
+            self.settings.record_lsp(validate_servers(req.get("definitions")))
+            return {"recorded": True}
         raise ValueError("Unknown workspace configuration operation")
 
     def new_shells(self):
@@ -297,6 +337,9 @@ class Runtime:
         self.completed_bytes -= self.completed.pop(key, 0)
         self.completed[key] = size
         self.completed_bytes += size
+        self._trim_completed()
+
+    def _trim_completed(self):
         while (
             len(self.completed) > self.completed_records
             or self.completed_bytes > self.cache_bytes - self.cache_bytes // 2
@@ -389,10 +432,10 @@ class Runtime:
                 if entries:
                     file.write("\n")
                 file.write("\n".join(missing) + "\n")
-        config = self.root / "config.toml"
-        if not config.exists():
-            config.write_text("[mcp.servers]\n")
-        self.mcp = MCPBridge(self.workspace)
+        self.mcp = MCPBridge(
+            self.workspace, global_path=self.config_store.global_path,
+            snapshot=self._kernel_snapshot,
+        )
         py = self.root / "venv/bin/python"
         if not py.exists():
             await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
@@ -542,6 +585,7 @@ class Runtime:
             MYPR_PARENT_PID=str(os.getpid()),
             MYPR_OUTPUT_LIMIT=str(self.output_limit),
             MYPR_COMPLETED_TASKS=str(self.completed_tasks),
+            MYPR_GLOBAL_CONFIG=str(self.config_store.global_path),
             PYTHONDONTWRITEBYTECODE="1",
             IPYTHONDIR=str(self.root / "ipython"),
             JUPYTER_RUNTIME_DIR=str(self.root / "jupyter"),
@@ -569,12 +613,18 @@ class Runtime:
             kc.start_channels()
             await kc.wait_for_ready(timeout=60)
             self.check_persistence()
-            self.healthy = True
-            self.health_error = None
             self.by_msg = {}
             self.active = {}
             self.iopub = asyncio.create_task(self.read_output())
             self.replies = asyncio.create_task(self.read_replies())
+            applied = await self.settings._apply_lsp(
+                self._kernel_snapshot, self.generation, False, starting=True,
+            )
+            if applied["applied"] is not True:
+                raise RuntimeError("Kernel startup configuration was deferred")
+            self.settings.record_lsp(self._kernel_snapshot.values["lsp"]["servers"])
+            self.healthy = True
+            self.health_error = None
             self.worker = asyncio.create_task(self.run_queue())
             self.monitor = asyncio.create_task(self.watch_kernel())
             for name in ("iopub", "replies", "worker", "monitor"):
@@ -1304,6 +1354,8 @@ class Runtime:
         generation = req.pop("generation", None)
         if generation and generation != self.generation:
             raise RuntimeError("Expired kernel generation")
+        if op == "config":
+            return await self.settings.dispatch(req)
         context = dict(client=client, connection_id=connection_id, connection=connection,
                        requested_client=requested_client, generation=generation)
         if op == "browser_server":
@@ -1376,6 +1428,12 @@ class Runtime:
         raise ValueError(f"Unknown operation: {op}")
 
     def _check_dispatch_admission(self, op):
+        settings = getattr(self, "settings", None)
+        if (
+            settings is not None and settings.applying
+            and op in {"reset", "stop", "restart", "restart_prepare"}
+        ):
+            raise RuntimeError("Configuration reload is in progress; retry after it completes")
         if getattr(self, "resetting", False) and op in LIFECYCLE_START_OPS:
             raise RuntimeError("Workspace restart/reset already in progress")
         if self.restarting and op in {
@@ -1463,6 +1521,7 @@ class Runtime:
                 "pid": os.getpid(),
                 "workspace_id": self.workspace_id,
                 "workspace": str(self.workspace),
+                "global_path": str(self.config_store.global_path),
                 "workspace_available": self.workspace_available(),
                 "generation": self.generation,
                 "healthy": self.healthy,
@@ -2009,6 +2068,7 @@ class Runtime:
         if op == "reset":
             from_kernel = req.get("from_kernel", False)
             async with self._admission_lock:
+                self._check_dispatch_admission(op)
                 current = self.execs.get(req.get("exec_id")) if from_kernel else None
                 if from_kernel and (
                     current is None
@@ -2049,6 +2109,7 @@ class Runtime:
                         await asyncio.wait_for(origin["idle"].wait(), 3)
             async with self._admission_lock:
                 planned = restart_id is not None and restart_id == self.restarting
+                self._check_dispatch_admission(op)
                 if restart_id is not None and not planned:
                     raise RuntimeError("Restart reservation does not match")
                 if req.get("manager_pid", os.getpid()) != os.getpid():
@@ -2180,6 +2241,8 @@ class Runtime:
 
     async def _reserve_restart_locked(self, ident, current, force):
         async with self._admission_lock:
+            if self.settings.applying:
+                raise RuntimeError("Configuration reload is in progress; retry after it completes")
             if self.resetting or self.stopping.is_set():
                 raise RuntimeError("Workspace restart/reset already in progress")
             if self.restarting and self.restarting != ident:
@@ -2252,12 +2315,22 @@ class Runtime:
                 await self.lose_python_tasks("Workspace reset", state="cancelled")
                 await self.close_shells()
                 await self.mcp.close()
-                self.mcp = MCPBridge(self.workspace)
+                self._kernel_snapshot = await wait_owned(asyncio.to_thread(self.config_store.load))
+                self.mcp = MCPBridge(
+                    self.workspace, global_path=self.config_store.global_path,
+                    snapshot=self._kernel_snapshot,
+                )
                 self.shells = self.new_shells()
                 self.scans = ScanService(self.workspace, self.shells, self.track_shell)
                 self.queue = asyncio.Queue()
                 self.generation = uuid.uuid4().hex
                 await self.start_kernel()
+                from .runtime_registry import register
+
+                await asyncio.to_thread(
+                    register, self.workspace, self.socket, self.generation,
+                    self.config_store.global_path,
+                )
                 if current:
                     await self.append(
                         current, {"type": "result", "text": "Workspace reset completed"}
@@ -2714,8 +2787,13 @@ class Runtime:
             )
             try:
                 await self.start_kernel()
-                if self.storage_policy["enabled"]:
-                    self.spawn(self.maintain_storage())
+                from .runtime_registry import register
+
+                await asyncio.to_thread(
+                    register, self.workspace, self.socket, self.generation,
+                    self.config_store.global_path,
+                )
+                self.spawn(self.maintain_storage())
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     asyncio.get_running_loop().add_signal_handler(sig, self.stopping.set)
                 await self.stopping.wait()
@@ -2729,6 +2807,12 @@ class Runtime:
                 await server.wait_closed()
                 await self.drain_background()
         finally:
+            from .runtime_registry import unregister
+
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    unregister, self.workspace, self.generation, identity=self.workspace_id,
+                )
             for writer in list(self.attachments.values()):
                 writer.close()
             self.socket.unlink(missing_ok=True)

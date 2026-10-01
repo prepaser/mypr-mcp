@@ -22,7 +22,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .async_utils import finish_owned, wait_owned
-from .lsp_config import LSPConfig, validate_servers
+from .config import ConfigSnapshot, ConfigStore
+from .lsp_config import validate_servers
 from .lsp_edits import (
     EditError,
     EditPlanStore,
@@ -1586,9 +1587,9 @@ class CodeTools:
             fs = Filesystem(self.workspace)
         self.fs = fs
         self._config_rpc = config_rpc
-        self._config = LSPConfig(self.workspace)
+        self._config = ConfigStore(self.workspace)
         try:
-            self._definitions, self._config_revision = self._config.load()
+            self._definitions, self._config_revision = self._lsp_snapshot(self._config.load())
         except (OSError, UnicodeError, ValueError) as exc:
             self._definitions, self._config_revision = {}, None
             self._config_error = str(exc)
@@ -1635,6 +1636,61 @@ class CodeTools:
             )
         return tuple(command), frozenset(languages)
 
+    @staticmethod
+    def _lsp_snapshot(
+        value: ConfigSnapshot | dict[str, Any],
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
+        if isinstance(value, ConfigSnapshot):
+            lsp = value.values.get("lsp") if isinstance(value.values, dict) else None
+            definitions = lsp.get("servers") if isinstance(lsp, dict) else None
+            revision = value.revision
+        elif isinstance(value, dict):
+            definitions = value.get("servers")
+            revision = value.get("revision")
+        else:
+            raise CodeError("LSP configuration returned an invalid snapshot")
+        if not isinstance(definitions, dict):
+            raise CodeError("LSP configuration returned invalid servers")
+        if revision is not None and not isinstance(revision, str):
+            raise CodeError("LSP configuration returned an invalid revision")
+        return validate_servers(definitions), revision
+
+    async def _load_lsp_snapshot(self) -> tuple[dict[str, dict[str, Any]], str | None]:
+        if self._config_rpc is not None:
+            loaded = self._config_rpc("get_lsp")
+            if inspect.isawaitable(loaded):
+                loaded = await loaded
+            return self._lsp_snapshot(loaded)
+        return self._lsp_snapshot(self._config.load())
+
+    async def _save_definition(
+        self, name: str, definition: dict[str, Any] | None
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
+        candidate = dict(self._definitions)
+        if definition is None:
+            candidate.pop(name, None)
+        else:
+            candidate[name] = copy.deepcopy(definition)
+        if self._config_rpc is not None:
+            result = self._config_rpc(
+                "set_lsp",
+                candidate,
+                name=name,
+                definition=copy.deepcopy(definition),
+                expected_revision=self._config_revision,
+                expected_servers=self._definitions,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return self._lsp_snapshot(result)
+        result = self._config.save_server(
+            section="lsp",
+            name=name,
+            definition=copy.deepcopy(definition),
+            expected_revision=self._config_revision,
+        )
+        return self._lsp_snapshot(result)
+
     async def configure(
         self,
         name: str,
@@ -1657,6 +1713,10 @@ class CodeTools:
             raise ValueError("timeout must be between 1 and 60 seconds")
         if self._closed:
             raise CodeError("code tools are closed")
+        report_applied = False
+        operation_cancelled = False
+        reused = False
+        result: dict[str, Any]
         async with self._lock:
             if self._closed:
                 raise CodeError("code tools are closed")
@@ -1669,76 +1729,82 @@ class CodeTools:
             ):
                 if existing.command == command_value and existing.languages == language_values:
                     async with existing._operation_lock:
-                        cancelled = False
                         if persist:
-                            _, cancelled = await finish_owned(
-                                self._persist_definition(  # noqa: ASYNC109
-                                    name, command_value, language_values, timeout
+                            _, operation_cancelled = await finish_owned(
+                                self._persist_definition(
+                                    name,
+                                    {
+                                        "command": list(command_value),
+                                        "languages": sorted(language_values),
+                                        "timeout": float(timeout),
+                                    },
                                 )
                             )
+                            report_applied = True
                         existing.timeout = float(timeout)
-                    if cancelled:
-                        raise asyncio.CancelledError
                     result = existing.status()
-                    return result
-            if existing is None and len(self._servers) >= MAX_SERVERS:
-                raise CodeError(f"at most {MAX_SERVERS} language servers may be configured")
-            replacement = _LanguageServer(
-                self.workspace, name, command_value, language_values, float(timeout)
-            )
-            await replacement.start()
-            result = replacement.status()
-            persist_cancelled = False
-            if persist:
-                try:
-                    _, persist_cancelled = await finish_owned(
-                        self._persist_definition(  # noqa: ASYNC109
-                            name, command_value, language_values, timeout
+                    reused = True
+            if not reused:
+                if existing is None and len(self._servers) >= MAX_SERVERS:
+                    raise CodeError(f"at most {MAX_SERVERS} language servers may be configured")
+                replacement = _LanguageServer(
+                    self.workspace, name, command_value, language_values, float(timeout)
+                )
+                await replacement.start()
+                result = replacement.status()
+                persist_cancelled = False
+                if persist:
+                    try:
+                        _, persist_cancelled = await finish_owned(
+                            self._persist_definition(
+                                name,
+                                {
+                                    "command": list(command_value),
+                                    "languages": sorted(language_values),
+                                    "timeout": float(timeout),
+                                },
+                            )
                         )
-                    )
-                except BaseException:
-                    with suppress(BaseException):
-                        await replacement.aclose()
-                    raise
-            self._servers[name] = replacement
-            close_cancelled = False
-            if existing is not None:
-                _, close_cancelled = await finish_owned(existing.aclose())
-            if persist_cancelled or close_cancelled:
-                raise asyncio.CancelledError
-            return result
+                        report_applied = True
+                    except BaseException:
+                        with suppress(BaseException):
+                            await replacement.aclose()
+                        raise
+                self._servers[name] = replacement
+                close_cancelled = False
+                if existing is not None:
+                    close_cancelled = (await finish_owned(existing.aclose()))[1]
+                operation_cancelled = persist_cancelled or close_cancelled
+        if report_applied:
+            _, report_cancelled = await finish_owned(self._report_applied_lsp())
+            operation_cancelled = operation_cancelled or report_cancelled
+        if operation_cancelled:
+            raise asyncio.CancelledError
+        return result
 
-    async def _persist_definition(  # noqa: ASYNC109
-        self,
-        name: str,
-        command: tuple[str, ...],
-        languages: frozenset[str],
-        timeout: float,  # noqa: ASYNC109
+    async def _persist_definition(
+        self, name: str, definition: dict[str, Any] | None
     ) -> None:
-        definitions = dict(self._definitions)
-        definitions[name] = {
-            "command": list(command),
-            "languages": sorted(languages),
-            "timeout": float(timeout),
-        }
-        validate_servers(definitions)
-        if self._config_rpc is not None:
+        if definition is not None:
+            definition = validate_servers({name: definition})[name]
+        definitions, revision = await self._save_definition(name, definition)
+        self._definitions = definitions
+        self._config_revision = revision
+        self._config_error = None
+
+    async def _report_applied_lsp(self) -> None:
+        if self._config_rpc is None:
+            return
+        try:
             result = self._config_rpc(
-                "set_lsp",
-                definitions,
-                expected_revision=self._config_revision,
-                expected_servers=self._definitions,
+                "applied_lsp",
+                copy.deepcopy(self._definitions),
+                revision=self._config_revision,
             )
             if inspect.isawaitable(result):
-                result = await result
-            if isinstance(result, dict):
-                result = result.get("revision")
-            if not isinstance(result, str) or not result:
-                raise CodeError("LSP configuration callback returned no revision")
-            self._config_revision = result
-        else:
-            self._config_revision = self._config.save(definitions, self._config_revision)
-        self._definitions = definitions
+                await result
+        except Exception as exc:
+            self._config_error = f"unable to report applied LSP configuration: {exc}"[:1024]
 
     async def start(
         self,
@@ -2655,75 +2721,121 @@ class CodeTools:
                 servers.append(self.status(key))
         return {"servers": servers, "config_error": self._config_error}
 
-    async def reload(self) -> dict[str, Any]:
+    async def _apply_definitions_locked(
+        self,
+        definitions: dict[str, dict[str, Any]],
+        revision: str | None,
+        *,
+        force: bool,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise CodeError("code tools are closed")
+        changed = {
+            name
+            for name in set(self._definitions) | set(definitions)
+            if self._definitions.get(name) != definitions.get(name)
+        }
+        busy = sorted(
+            name
+            for name in changed
+            if name in self._servers
+            and getattr(self._servers[name], "_operation_lock", None) is not None
+            and self._servers[name]._operation_lock.locked()
+        )
+        if busy and not force:
+            return {
+                "changed": sorted(changed),
+                "deferred": busy,
+                "applied": False,
+                "revision": self._config_revision,
+                "servers": self.status()["servers"],
+            }
+        targets = [
+            (name, self._servers.pop(name))
+            for name in changed
+            if name in self._servers
+        ]
+        self._definitions = definitions
+        self._config_revision = revision
+        self._config_error = None
+        await asyncio.gather(*(server.aclose() for _, server in targets))
+        return {
+            "changed": sorted(changed),
+            "deferred": [],
+            "applied": True,
+            "revision": revision,
+            "servers": self.status()["servers"],
+        }
+
+    async def apply_definitions(
+        self,
+        definitions: dict[str, Any],
+        revision: str | None,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Apply an already loaded LSP snapshot without contacting the manager."""
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
+        definitions = validate_servers(definitions)
+        if revision is not None and not isinstance(revision, str):
+            raise CodeError("LSP configuration returned an invalid revision")
+        if self._lock.locked():
+            reason = "LSP configuration is busy"
+            return {
+                "changed": sorted(
+                    name
+                    for name in set(self._definitions) | set(definitions)
+                    if self._definitions.get(name) != definitions.get(name)
+                ),
+                "deferred": [reason],
+                "reason": reason,
+                "applied": False,
+                "revision": self._config_revision,
+                "servers": self.status()["servers"],
+            }
+        async with self._lock:
+            return await self._apply_definitions_locked(definitions, revision, force=force)
+
+    async def reload(self, *, force: bool = False) -> dict[str, Any]:
         """Reload saved definitions without starting stopped language servers."""
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
+        report_applied = False
         async with self._lock:
             if self._closed:
                 raise CodeError("code tools are closed")
-            if self._config_rpc is not None:
-                loaded = self._config_rpc("get_lsp")
-                if inspect.isawaitable(loaded):
-                    loaded = await loaded
-                if not isinstance(loaded, dict):
-                    raise CodeError("LSP configuration callback returned an invalid snapshot")
-                definitions = validate_servers(loaded.get("servers", {}))
-                revision = loaded.get("revision")
-                if revision is not None and not isinstance(revision, str):
-                    raise CodeError("LSP configuration callback returned an invalid revision")
-            else:
-                definitions, revision = self._config.load()
-            changed = {
-                name
-                for name in set(self._definitions) | set(definitions)
-                if self._definitions.get(name) != definitions.get(name)
-            }
-            targets = [
-                (name, self._servers.pop(name))
-                for name in changed
-                if name in self._servers
-            ]
-            self._definitions = definitions
-            self._config_revision = revision
-            self._config_error = None
-            await asyncio.gather(*(server.aclose() for _, server in targets))
-        return {"changed": sorted(changed), "servers": self.status()["servers"]}
+            definitions, revision = await self._load_lsp_snapshot()
+            result = await self._apply_definitions_locked(definitions, revision, force=force)
+            report_applied = bool(result.get("applied")) and self._config_rpc is not None
+        if report_applied:
+            _, report_cancelled = await finish_owned(self._report_applied_lsp())
+            if report_cancelled:
+                raise asyncio.CancelledError
+        return result
 
     async def remove(self, name: str, *, persist: bool = True) -> dict[str, Any]:
         """Stop and optionally remove a saved language-server definition."""
         key = self._name(name)
         if type(persist) is not bool:
             raise TypeError("persist must be a boolean")
+        report_applied = False
         async with self._lock:
             server = self._servers.get(key)
             exists = key in self._definitions or server is not None
             if persist and key in self._definitions:
-                definitions = dict(self._definitions)
-                definitions.pop(key)
-                if self._config_rpc is not None:
-                    result = self._config_rpc(
-                        "set_lsp",
-                        definitions,
-                        expected_revision=self._config_revision,
-                        expected_servers=self._definitions,
-                    )
-                    if inspect.isawaitable(result):
-                        result = await result
-                    if isinstance(result, dict):
-                        result = result.get("revision")
-                    if not isinstance(result, str) or not result:
-                        raise CodeError("LSP configuration callback returned no revision")
-                    self._config_revision = result
-                else:
-                    self._config_revision = self._config.save(
-                        definitions, self._config_revision
-                    )
-                self._definitions = definitions
+                await self._persist_definition(key, None)
+                report_applied = self._config_rpc is not None
             if server is not None:
                 self._servers.pop(key, None)
                 await server.aclose()
             removed = exists if persist else server is not None
         if not exists:
             raise CodeError(f"language server {key!r} is not configured")
+        if report_applied:
+            _, report_cancelled = await finish_owned(self._report_applied_lsp())
+            if report_cancelled:
+                raise asyncio.CancelledError
         return {
             "name": key,
             "removed": removed,

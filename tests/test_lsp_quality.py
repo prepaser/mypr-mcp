@@ -131,8 +131,10 @@ async def test_reload_serializes_config_snapshot_with_configure(tmp_path):
             started.set()
             await release.wait()
             return {"servers": old_definition, "revision": "old"}
+        if method == "applied_lsp":
+            return None
         assert method == "set_lsp"
-        return {"revision": "new"}
+        return {"servers": definitions, "revision": "new"}
 
     code = CodeTools(tmp_path, config_rpc=config_rpc)
     server = _running_server(command)
@@ -224,10 +226,12 @@ async def test_reused_lsp_cancel_after_persist_commits_runtime_timeout(tmp_path)
     committed = asyncio.Event()
     release = asyncio.Event()
 
-    async def config_rpc(_method, _definitions, **_options):
+    async def config_rpc(method, _definitions, **_options):
         committed.set()
         await release.wait()
-        return {"revision": "new"}
+        if method == "applied_lsp":
+            return None
+        return {"servers": _definitions, "revision": "new"}
 
     code = CodeTools(tmp_path, config_rpc=config_rpc)
     server = _running_server(command)
@@ -285,11 +289,13 @@ async def test_replacement_lsp_cancel_after_persist_publishes_and_closes_old(
     old_command = ("old-lsp",)
     new_command = ("new-lsp",)
 
-    async def config_rpc(_method, definitions, **_options):
+    async def config_rpc(method, definitions, **_options):
         assert definitions["fake"]["command"] == list(new_command)
         committed.set()
         await release.wait()
-        return {"revision": "new"}
+        if method == "applied_lsp":
+            return None
+        return {"servers": definitions, "revision": "new"}
 
     code = CodeTools(tmp_path, config_rpc=config_rpc)
     old = _running_server(old_command)

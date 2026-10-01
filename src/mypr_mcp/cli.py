@@ -22,7 +22,7 @@ from pydantic import Field
 from . import __version__
 from .async_utils import wait_owned
 from .bridge import ConnectionBridge
-from .config import ConfigError, load_workspace_config
+from .config import ConfigError, ConfigStore
 from .diagnostics import RPCError, safe_error
 from .doctor import doctor_workspace
 from .instructions import COMMON_INSTRUCTIONS
@@ -67,7 +67,7 @@ async def ensure(workspace, *, locked=False):
                 "Make the manager's runtime directory accessible to this client."
             )
         try:
-            load_workspace_config(workspace)
+            ConfigStore(workspace).load()
         except (ConfigError, OSError) as exc:
             write_startup_failure(root, exc, operation="config_validate")
             raise RPCError(
@@ -635,7 +635,7 @@ def _offline_status(workspace: Path) -> dict[str, Any]:
     record = read_startup_failure(root)
     if record is None:
         try:
-            load_workspace_config(workspace)
+            ConfigStore(workspace).load()
         except (ConfigError, OSError) as exc:
             write_startup_failure(root, exc, operation="config_validate")
             record = read_startup_failure(root)
@@ -649,16 +649,211 @@ def _offline_status(workspace: Path) -> dict[str, Any]:
     return result
 
 
+def _global_config_path() -> Path:
+    from .config import global_config_path
+
+    return global_config_path()
+
+
+def _config_store(workspace: Path, *, global_scope: bool):
+    return ConfigStore(None if global_scope else workspace, global_path=_global_config_path())
+
+
+def _json_value(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"config value must be valid JSON: {exc.msg}") from exc
+
+
+def _json_default(value):
+    if hasattr(value, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        return asdict(value)
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"not JSON serializable: {type(value).__name__}")
+
+
+def _print_json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, default=_json_default))
+
+
+async def _config_explain_rpc(socket: Path, path: str) -> Any:
+    return await rpc(socket, op="config", method="explain", path=path)
+
+
+async def _config_command(workspace: Path, action: str, path: str | None, value: str | None,
+                          *, global_scope: bool, all_managers: bool, force: bool) -> Any:
+    if action not in {"get", "set", "unset", "explain", "reload"}:
+        raise ValueError("config requires get, set, unset, explain, or reload")
+    if all_managers and action != "reload":
+        raise ValueError("--all is only valid with config reload")
+    if action == "reload":
+        if global_scope:
+            raise ValueError("--global selects a file; use config reload --all to reload managers")
+        if all_managers:
+            return await _reload_all(_global_config_path(), force=force)
+        found = await find_runtime(workspace)
+        if found is None:
+            raise RuntimeError("No reachable workspace manager")
+        socket, _ = found
+        return await rpc(socket, op="config", method="reload", force=force)
+    scope = "global" if global_scope else "effective"
+    store = _config_store(workspace, global_scope=global_scope)
+    if action == "get":
+        return store.get(path, scope=scope)
+    if action == "set":
+        if path is None or value is None:
+            raise ValueError("config set requires PATH and JSON_VALUE")
+        write_scope = "global" if global_scope else "workspace"
+        snapshot = store.set(path, _json_value(value), scope=write_scope)
+        return {"saved": True, "revision": snapshot.revision}
+    if action == "unset":
+        if path is None:
+            raise ValueError("config unset requires PATH")
+        write_scope = "global" if global_scope else "workspace"
+        snapshot = store.unset(path, scope=write_scope)
+        return {"saved": True, "revision": snapshot.revision}
+    if path is None:
+        raise ValueError("config explain requires PATH")
+    disk = store.explain(path)
+    if global_scope:
+        return disk
+    try:
+        found = await find_runtime(workspace)
+    except (OSError, ConnectionError, TimeoutError, RuntimeError) as exc:
+        found = None
+        disk["active_error"] = str(exc)
+    if found is not None:
+        socket, _ = found
+        try:
+            active = await _config_explain_rpc(socket, path)
+        except (OSError, ConnectionError, TimeoutError, RuntimeError) as exc:
+            disk["active_error"] = str(exc)
+        else:
+            disk["active"] = active
+    return disk
+
+
+def _registry_mismatch(record: dict[str, Any], state: dict[str, Any]) -> str | None:
+    for key in ("workspace_id", "pid", "generation"):
+        if state.get(key) != record.get(key):
+            return f"manager identity mismatch: {key}"
+    if state.get("healthy") is not True:
+        return "manager is not healthy"
+    capabilities = state.get("capabilities")
+    if not isinstance(capabilities, list) or "config" not in capabilities:
+        return "manager does not support config reload"
+    if state.get("global_path") != record.get("global_path"):
+        return "manager profile mismatch"
+    return None
+
+
+async def _reload_manager(record: dict[str, Any], *, force: bool) -> dict[str, Any]:
+    result = {
+        "workspace": record.get("workspace"),
+        "socket": record.get("socket"),
+        "generation": record.get("generation"),
+    }
+    try:
+        socket = Path(record["socket"])
+        async with asyncio.timeout(30):
+            state = await rpc(socket, op="status")
+            mismatch = (
+                "manager returned invalid status"
+                if not isinstance(state, dict)
+                else _registry_mismatch(record, state)
+            )
+            if mismatch is not None:
+                result.update(ok=False, status="unsupported", error=mismatch)
+                return result
+            reload_result = await rpc(
+                socket, op="config", method="reload", force=force,
+                generation=record["generation"],
+            )
+            if not isinstance(reload_result, dict):
+                result.update(
+                    ok=False,
+                    status="error",
+                    error="manager returned an invalid config reload result",
+                )
+                return result
+            result["result"] = reload_result
+            for key in ("applied", "deferred", "errors", "restart_required", "revision"):
+                if key in reload_result:
+                    result[key] = reload_result[key]
+            if reload_result.get("errors"):
+                result.update(
+                    ok=False,
+                    status="error",
+                    error="configuration reload reported errors",
+                )
+            elif reload_result.get("deferred") or reload_result.get("restart_required"):
+                result.update(
+                    ok=False,
+                    status="partial",
+                    error="configuration reload has deferred changes",
+                )
+            else:
+                result.update(ok=True, status="reloaded")
+    except (OSError, ConnectionError, TimeoutError, RuntimeError, KeyError, TypeError) as exc:
+        result.update(ok=False, status="error", error=str(exc))
+    return result
+
+
+async def _reload_all(global_path: Path, *, force: bool) -> dict[str, Any]:
+    from .runtime_registry import list_managers
+
+    records = list_managers(global_path)
+    semaphore = asyncio.Semaphore(4)
+
+    async def run(record):
+        async with semaphore:
+            return await _reload_manager(record, force=force)
+
+    results = await asyncio.gather(*(run(record) for record in records))
+    return {
+        "global_path": str(global_path),
+        "managers": results,
+        "ok": all(item.get("ok") is True for item in results),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Persistent workspace Python over MCP")
     parser.add_argument(
         "command",
-        choices=["serve", "status", "logs", "doctor", "reset", "restart", "stop", "_manager"],
+        choices=[
+            "serve",
+            "status",
+            "logs",
+            "doctor",
+            "reset",
+            "restart",
+            "stop",
+            "config",
+            "_manager",
+        ],
     )
+    parser.add_argument("config_action", nargs="?")
+    parser.add_argument("config_path", nargs="?")
+    parser.add_argument("config_value", nargs="?")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--global", dest="global_scope", action="store_true")
+    parser.add_argument("--all", dest="all_managers", action="store_true")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
+    if args.command != "config" and (
+        args.config_action is not None
+        or args.config_path is not None
+        or args.config_value is not None
+        or args.global_scope
+        or args.all_managers
+    ):
+        parser.error("config arguments require the config command")
     workspace = Path.cwd()
     if args.limit < 1:
         parser.error("--limit must be greater than zero")
@@ -667,6 +862,24 @@ def main():
             asyncio.run(serve(workspace))
         elif args.command == "_manager":
             asyncio.run(run_manager(workspace))
+        elif args.command == "config":
+            result = asyncio.run(
+                _config_command(
+                    workspace,
+                    args.config_action,
+                    args.config_path,
+                    args.config_value,
+                    global_scope=args.global_scope,
+                    all_managers=args.all_managers,
+                    force=args.force,
+                )
+            )
+            _print_json(result)
+            if args.config_action == "reload" and (
+                (args.all_managers and not result.get("ok", False))
+                or result.get("errors") or result.get("deferred") or result.get("restart_required")
+            ):
+                raise SystemExit(1)
         else:
 
             async def admin():
@@ -714,7 +927,7 @@ def main():
             result = asyncio.run(admin())
             if result is not None:
                 print(json.dumps(result, indent=2))
-    except (RuntimeError, OSError, TimeoutError) as exc:
+    except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from None
     except KeyboardInterrupt:

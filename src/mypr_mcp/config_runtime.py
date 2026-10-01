@@ -1,0 +1,220 @@
+"""Apply configuration snapshots without replacing the workspace kernel."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+
+from .async_utils import wait_owned
+from .config import ConfigStore, parse_path
+from .diagnostics import safe_error
+
+HOT_LIMITS = ("response_bytes", "completed_records", "cache_bytes")
+STARTUP_LIMITS = ("output_bytes", "completed_tasks")
+
+
+class RuntimeConfig:
+    def __init__(self, runtime, store, snapshot):
+        self.runtime = runtime
+        self.store = store
+        self.applied = store.get(snapshot=snapshot)
+        self.applying = False
+        self._lock = asyncio.Lock()
+
+    async def dispatch(self, request):
+        method = request.get("method")
+        if method == "reload":
+            return await wait_owned(self.reload(request.get("force", False)))
+        scope = request.get("scope", "effective" if method == "get" else "workspace")
+        store = (
+            ConfigStore(None, global_path=self.store.global_path)
+            if scope == "global" and method in {"get", "set", "unset"} else self.store
+        )
+        snapshot = await wait_owned(asyncio.to_thread(store.load))
+        path = request.get("path")
+        if method == "get":
+            return store.get(path, scope, snapshot)
+        if method == "explain":
+            result = self.store.explain(path, snapshot)
+            desired = self.store.get(path, snapshot=snapshot)
+            applied = self._applied_value(path)
+            parts = parse_path(path)
+            result.update(
+                desired=desired, applied=applied, pending=desired != applied,
+                restart_required=any(
+                    tuple(field.split("."))[:len(parts)] == parts
+                    for field in self.restart_required(snapshot)
+                ),
+            )
+            return result
+        if method not in {"set", "unset"}:
+            raise ValueError("Unknown configuration operation")
+        async with self._lock:
+            self._check_mutation()
+            arguments = [path]
+            if method == "set":
+                arguments.append(request["value"])
+            saved = await wait_owned(asyncio.to_thread(
+                getattr(store, method), *arguments, scope=scope,
+                expected_revision=snapshot.revision,
+            ))
+            await self._record(method, scope=scope, path=path, revision=saved.revision)
+        return {"saved": True, "revision": saved.revision}
+
+    def _check_mutation(self):
+        if self.applying:
+            raise RuntimeError("Configuration reload is in progress; retry after it completes")
+        runtime = self.runtime
+        if runtime.stopping.is_set() or runtime.resetting or runtime.restarting:
+            raise RuntimeError("Workspace lifecycle change is in progress")
+        if not runtime.workspace_available():
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
+
+    def _applied_value(self, path):
+        values = copy.deepcopy(self.applied)
+        if self.runtime.mcp is not None:
+            values["mcp"]["servers"] = copy.deepcopy(self.runtime.mcp.config)
+        for key in HOT_LIMITS:
+            attribute = "response_limit" if key == "response_bytes" else key
+            values["limits"][key] = getattr(self.runtime, attribute)
+        values["storage"] = copy.deepcopy(self.runtime.storage_policy)
+        value = values
+        for part in parse_path(path):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
+        return copy.deepcopy(value)
+
+    def restart_required(self, snapshot):
+        return [
+            f"limits.{key}" for key in STARTUP_LIMITS
+            if snapshot.values["limits"][key] != self.applied["limits"][key]
+        ]
+
+    def record_lsp(self, definitions):
+        self.applied["lsp"]["servers"] = copy.deepcopy(definitions)
+
+    async def _record(self, method, **fields):
+        if self.runtime.history is not None:
+            await self.runtime.io(
+                self.runtime.history.append, "config", method, fields, critical=True,
+            )
+
+    async def reload(self, force=False):
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
+        runtime = self.runtime
+        async with self._lock:
+            self._check_mutation()
+            async with runtime._admission_lock:
+                self._check_mutation()
+                self.applying = True
+                generation = runtime.generation
+                bridge = runtime.mcp
+                if bridge is not None:
+                    bridge._config_applying = True
+        try:
+            if bridge is None:
+                raise RuntimeError("Workspace configuration is not ready")
+            async with bridge._mutation_lock:
+                snapshot = await wait_owned(asyncio.to_thread(self.store.load))
+            values = self.store.get(snapshot=snapshot)
+            result = {
+                "revision": snapshot.revision, "applied": {}, "deferred": {},
+                "errors": {}, "restart_required": self.restart_required(snapshot),
+            }
+            async with runtime._admission_lock:
+                if (
+                    generation != runtime.generation or runtime.resetting
+                    or runtime.stopping.is_set()
+                ):
+                    raise RuntimeError("Workspace changed during configuration reload")
+                limits = values["limits"]
+                changed = []
+                for key in HOT_LIMITS:
+                    attribute = "response_limit" if key == "response_bytes" else key
+                    if getattr(runtime, attribute) != limits[key]:
+                        changed.append(f"limits.{key}")
+                    setattr(runtime, attribute, limits[key])
+                    self.applied["limits"][key] = limits[key]
+                runtime._trim_completed()
+                runtime.shells.set_retention(runtime.completed_records, runtime.cache_bytes // 2)
+                result["applied"]["manager"] = changed
+                changed_storage = values["storage"] != runtime.storage_policy
+                runtime.storage_policy = copy.deepcopy(values["storage"])
+                self.applied["storage"] = copy.deepcopy(runtime.storage_policy)
+                if changed_storage:
+                    runtime._storage_wake.set()
+                result["applied"]["storage"] = changed_storage
+            try:
+                result["applied"]["mcp"] = await bridge.apply_snapshot(snapshot, force=force)
+                self.applied["mcp"] = copy.deepcopy(values["mcp"])
+            except RuntimeError as exc:
+                category = "deferred" if "active requests" in str(exc) else "errors"
+                result[category]["mcp"] = safe_error(exc)
+            except Exception as exc:
+                result["errors"]["mcp"] = safe_error(exc)
+            if not runtime.healthy:
+                result["deferred"]["lsp"] = "Kernel is unavailable"
+            else:
+                try:
+                    applied = await self._apply_lsp(snapshot, generation, force)
+                    if not applied["applied"]:
+                        result["deferred"]["lsp"] = (
+                            applied.get("deferred") or "LSP configuration could not be applied"
+                        )
+                    else:
+                        self.applied["lsp"] = copy.deepcopy(values["lsp"])
+                        result["applied"]["lsp"] = applied
+                except Exception as exc:
+                    result["errors"]["lsp"] = safe_error(exc)
+            runtime.config = copy.deepcopy(self.applied)
+            await self._record("reload", **result)
+            return result
+        finally:
+            if bridge is not None:
+                bridge._config_applying = False
+            self.applying = False
+
+    async def _apply_lsp(self, snapshot, generation, force, *, starting=False):
+        runtime = self.runtime
+        if (
+            generation != runtime.generation or runtime.stopping.is_set()
+            or (runtime.resetting and not starting)
+        ):
+            raise RuntimeError("Workspace changed during configuration reload")
+        message = runtime.kc.session.msg(
+            "execute_request",
+            {
+                "code": "", "silent": True, "store_history": False,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
+            },
+            metadata={
+                "mypr_control": "config_reload", "generation": generation,
+                "config": {"lsp": {
+                    "servers": snapshot.values["lsp"]["servers"],
+                    "revision": snapshot.revision,
+                }},
+                "force": force,
+            },
+        )
+        ident = message["header"]["msg_id"]
+        waiter = asyncio.get_running_loop().create_future()
+        runtime.control_waiters[ident] = waiter
+        try:
+            runtime.kc.shell_channel.send(message)
+            async with asyncio.timeout(10):
+                reply = await waiter
+            if reply.get("status") != "ok":
+                raise RuntimeError(reply.get("evalue", "Kernel configuration reload failed"))
+            if (
+                generation != runtime.generation or runtime.stopping.is_set()
+                or (runtime.resetting and not starting)
+            ):
+                raise RuntimeError("Workspace changed during configuration reload")
+            result = reply.get("config_result")
+            if not isinstance(result, dict) or type(result.get("applied")) is not bool:
+                raise RuntimeError("Kernel returned an invalid configuration result")
+            return result
+        finally:
+            runtime.control_waiters.pop(ident, None)

@@ -29,6 +29,7 @@ async def test_history_dispatch_isolated_from_request_context():
 @pytest.mark.asyncio
 async def test_code_config_uses_bridge_lsp_cas_api():
     runtime = Runtime.__new__(Runtime)
+    runtime.settings = SimpleNamespace(applying=False)
     calls = []
 
     async def get_lsp():

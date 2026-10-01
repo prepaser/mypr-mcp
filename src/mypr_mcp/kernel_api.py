@@ -23,6 +23,7 @@ from .api_help import workspace_help
 from .async_utils import wait_owned
 from .browser_tools import BrowserTools
 from .code_tools import CodeTools
+from .config_api import ConfigAPI
 from .diagnostics import RPCError, safe_error, safe_error_details
 from .filesystem import Filesystem
 from .http_tools import HTTPTools
@@ -1839,6 +1840,7 @@ class Workspace:
         self.fs = Filesystem(self.workspace, self.shell, self._search)
         self.docs = Documents(self.fs)
         self.mcp = MCP()
+        self.config = ConfigAPI(_rpc)
         self.messages = Messages()
         self.packages = Packages(self.tasks)
         self.skills = Skills(self.workspace, self.fs)
@@ -1903,7 +1905,10 @@ class Workspace:
             raise ExceptionGroup("Workspace resource cleanup failed", failures)
 
     async def _code_config(self, method, definitions=None, **fields):
-        return await _rpc("code_config", method=method, definitions=definitions, **fields)
+        payload = {"method": method, **fields}
+        if definitions is not None:
+            payload["definitions"] = definitions
+        return await _rpc("code_config", **payload)
 
     async def _search(self, **args):
         return await _rpc("search", args=args)

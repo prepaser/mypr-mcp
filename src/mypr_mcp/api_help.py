@@ -137,6 +137,14 @@ await ws.mcp.list_resources("server") and await ws.mcp.read_resource("server", u
 
 These operations preserve Python state. A busy connection requires force=True to interrupt its calls. Initial connection and protocol initialization have a 30-second deadline, including lazy first use; startup failure reaches queued calls, and a later call can retry after cleanup. This is not a timeout on initialized tool calls.""",
     ),
+    "config": (
+        "Inspect and persist global and workspace configuration.",
+        """await ws.config.get() reads the desired effective configuration. Use scope="global" or scope="workspace" to inspect one raw layer, or pass a dotted TOML path such as "mcp.servers.reports" or a quoted key path such as 'mcp.servers."reports".env_from'. Known sections include mcp, lsp, limits, and storage.
+
+await ws.config.set(path, value, scope="workspace") and await ws.config.unset(path, scope="workspace") persist one layer without applying the change. The global scope is also writable when the manager permits it. Server entries are replaced as complete values; an explicit enabled=false workspace entry disables an inherited global server, while unset reveals the global value again.
+
+await ws.config.explain(path) reports desired and applied values, source, revisions, pending state, and whether a restart is required. await ws.config.reload(force=False) explicitly applies persisted changes and reports applied, deferred, errors, revision, and restart_required fields. Settings are never implicitly applied by set or unset.""",
+    ),
     "http": (
         "Make bounded asynchronous HTTP requests and downloads.",
         """ws.http provides named persistent HTTPX2 (httpx2.AsyncClient) clients. Use await ws.http.get/post/... for bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and await ws.http.download(url, path) for atomic workspace downloads.
@@ -259,6 +267,11 @@ _METHOD_NOTES = {
     "storage.gc": "Returns a dry-run cleanup plan by default; call storage.gc_apply(plan_id) to apply the exact plan.",
     "storage.gc_apply": "Applies a previously generated cleanup plan after validating its workspace identity and protected references.",
     "storage.usage": "Reports category file counts and byte totals from a metadata-only scan without hashing or reading file contents.",
+    "config.get": "Reads effective, global, or workspace configuration. A dotted TOML path narrows the returned value.",
+    "config.set": "Persists one global or workspace value without applying it; call config.reload() explicitly.",
+    "config.unset": "Removes one value from a writable configuration layer without applying the change.",
+    "config.explain": "Reports desired/applied values, source, revisions, pending state, and restart requirements for a path.",
+    "config.reload": "Explicitly applies persisted configuration and reports applied, deferred, failed, and restart-required changes.",
     "doctor": "Returns readiness checks for runtime, packages, tools, LSP, browser, OCR, MCP configuration, and storage without installing or changing anything.",
 }
 _WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "doctor", "reset", "restart"}

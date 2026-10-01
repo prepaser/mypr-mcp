@@ -22,14 +22,30 @@ from mypr_mcp.transport import socket_path
 @pytest.fixture(scope="session", autouse=True)
 def test_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     runtime = tmp_path_factory.mktemp("xdg-runtime")
+    config = tmp_path_factory.mktemp("xdg-config")
+    state = tmp_path_factory.mktemp("xdg-state")
+    config_previous = os.environ.get("XDG_CONFIG_HOME")
+    state_previous = os.environ.get("XDG_STATE_HOME")
+    global_previous = os.environ.pop("MYPR_GLOBAL_CONFIG", None)
     previous = os.environ.get("XDG_RUNTIME_DIR")
     cache_previous = os.environ.get("UV_CACHE_DIR")
     os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+    os.environ["XDG_CONFIG_HOME"] = str(config)
+    os.environ["XDG_STATE_HOME"] = str(state)
     os.environ["UV_CACHE_DIR"] = "/tmp/mypr-uv-cache"
     Path(os.environ["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
     try:
         yield
     finally:
+        for key, previous_value in (
+            ("XDG_CONFIG_HOME", config_previous),
+            ("XDG_STATE_HOME", state_previous),
+            ("MYPR_GLOBAL_CONFIG", global_previous),
+        ):
+            if previous_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous_value
         if previous is None:
             os.environ.pop("XDG_RUNTIME_DIR", None)
         else:

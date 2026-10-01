@@ -29,8 +29,9 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
 from .async_utils import finish_owned, wait_owned
-from .config import MCPConfig, validate_name, validate_servers
+from .config import ConfigSnapshot, ConfigStore, MCPConfig, validate_name, validate_servers
 from .journal import decode_event, read_page
+from .lsp_config import validate_servers as validate_lsp_servers
 from .terminal import close as close_terminal
 from .terminal import eof_byte
 from .terminal import resize as resize_terminal
@@ -870,6 +871,15 @@ class Shells:
             memory -= job.memory_bytes
             self._jobs.pop(job.id, None)
 
+    def set_retention(self, completed_records: int, cache_bytes: int) -> None:
+        if type(completed_records) is not int or completed_records < 0:
+            raise ValueError("completed_records must be a non-negative integer")
+        if type(cache_bytes) is not int or cache_bytes < 0:
+            raise ValueError("cache_bytes must be a non-negative integer")
+        self.completed_records = completed_records
+        self.cache_bytes = cache_bytes
+        self._prune_completed()
+
     @staticmethod
     def _warning_text(error: BaseException) -> str:
         text = str(error).strip() or error.__class__.__name__
@@ -1341,16 +1351,20 @@ class _MCPConnection:
 class MCPBridge:
     """Lazy client connections to configured MCP servers."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, global_path=None, snapshot=None):
         self.workspace = Path(workspace).resolve()
-        self.store = MCPConfig(self.workspace)
-        self.config, self._revision = self.store.load()
+        self._store = ConfigStore(self.workspace, global_path=global_path)
+        self.config_store = self._store
+        self.store = MCPConfig(self.workspace, global_path=global_path)
+        self._snapshot = snapshot if snapshot is not None else self._load_snapshot()
+        self.config, self._revision = self._snapshot_config(self._snapshot)
         self.config = _copy_configs(self.config)
         self._connections: dict[str, _MCPConnection] = {}
         self._lock = asyncio.Lock()
         self._mutation_lock = asyncio.Lock()
         self._changing: set[str] = set()
         self._closed = False
+        self._config_applying = False
 
     async def dispatch(self, method: str, args: dict[str, Any] | None = None) -> Any:
         if self._closed:
@@ -1399,7 +1413,7 @@ class MCPBridge:
 
         async with self._mutation_lock:
             self._ensure_open()
-            snapshot = await wait_owned(asyncio.to_thread(self.store.load_all))
+            snapshot = await wait_owned(asyncio.to_thread(self._load_snapshot))
             return {
                 "servers": copy.deepcopy(snapshot.values["lsp"]["servers"]),
                 "revision": snapshot.revision,
@@ -1409,24 +1423,59 @@ class MCPBridge:
         self,
         definitions: dict[str, Any],
         expected_servers: dict[str, Any],
-    ) -> dict[str, str]:
+        *,
+        name: str | None = None,
+        definition: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Save LSP definitions with a revision and definition compare-and-swap."""
 
+        self._ensure_mutation_allowed()
         async with self._mutation_lock:
             self._ensure_open()
-            snapshot = await wait_owned(asyncio.to_thread(self.store.load_all))
+            self._ensure_mutation_allowed()
+            snapshot = await wait_owned(asyncio.to_thread(self._load_snapshot))
+            if snapshot.values["mcp"]["servers"] != self.config:
+                raise RuntimeError("MCP configuration changed on disk; call ws.mcp.reload() first")
             current = snapshot.values["lsp"]["servers"]
-            if snapshot.revision != self._revision:
-                raise RuntimeError("Workspace configuration changed on disk; reload before saving")
             if current != expected_servers:
                 raise RuntimeError("LSP configuration changed; call ws.code.reload() before saving")
+            if name is not None:
+                validate_name(name)
+                candidate = copy.deepcopy(expected_servers)
+                if definition is None:
+                    if name not in candidate:
+                        raise ValueError(f"unknown LSP server: {name!r}")
+                    candidate.pop(name, None)
+                else:
+                    definition = validate_lsp_servers({name: definition})[name]
+                    candidate[name] = copy.deepcopy(definition)
+                if definitions != candidate:
+                    raise RuntimeError(
+                        "LSP candidate does not match name and definition; reload before saving"
+                    )
+                saved = await wait_owned(
+                    asyncio.to_thread(
+                        self._store.save_server, "lsp", name, definition, snapshot.revision
+                    )
+                )
+                self._snapshot = saved
+                self._revision = saved.revision
+                return {
+                    "servers": copy.deepcopy(saved.values["lsp"]["servers"]),
+                    "revision": saved.revision,
+                }
             revision, cancelled = await finish_owned(
                 asyncio.to_thread(self.store.save_lsp, definitions, snapshot.revision)
             )
-            self._revision = revision
             if cancelled:
                 raise asyncio.CancelledError
-            return {"revision": revision}
+            current_snapshot = await wait_owned(asyncio.to_thread(self._load_snapshot))
+            self._snapshot = current_snapshot
+            self._revision = current_snapshot.revision
+            return {
+                "servers": copy.deepcopy(current_snapshot.values["lsp"]["servers"]),
+                "revision": current_snapshot.revision,
+            }
 
     async def configure(
         self, server: str, config: dict[str, Any], force: bool = False
@@ -1434,16 +1483,16 @@ class MCPBridge:
         validate_name(server)
         self._validate_force(force)
         config = validate_servers({server: config})[server]
+        self._ensure_mutation_allowed()
         async with self._mutation_lock:
             self._ensure_open()
+            self._ensure_mutation_allowed()
             old = self.config.get(server)
             action = "added" if old is None else "unchanged" if old == config else "updated"
             if action == "unchanged":
-                _, revision = self.store.load()
-                if revision != self._revision:
-                    raise RuntimeError(
-                        "MCP configuration changed on disk; call ws.mcp.reload() first"
-                    )
+                self._check_config_current()
+                snapshot = await wait_owned(asyncio.to_thread(self._save_server, server, config))
+                self._commit_snapshot(snapshot, set())
                 connected = self._connections.get(server)
                 return {
                     "server": server,
@@ -1452,10 +1501,8 @@ class MCPBridge:
                 }
             try:
                 connection = await self._block_affected({server}, force)
-                servers = _copy_configs(self.config)
-                servers[server] = copy.deepcopy(config)
-                revision = self.store.save(servers, self._revision)
-                self._commit_config(servers, revision, {server})
+                snapshot = await wait_owned(asyncio.to_thread(self._save_server, server, config))
+                self._commit_snapshot(snapshot, {server})
                 await self._close_connections_resilient(connection, force)
                 return {"server": server, "action": action, "connected": False}
             finally:
@@ -1465,16 +1512,16 @@ class MCPBridge:
     async def remove(self, server: str, force: bool = False) -> dict[str, Any]:
         self._check_server_name(server)
         self._validate_force(force)
+        self._ensure_mutation_allowed()
         async with self._mutation_lock:
             self._ensure_open()
+            self._ensure_mutation_allowed()
             if server not in self.config:
                 raise ValueError(f"unknown MCP server: {server!r}")
             try:
                 connection = await self._block_affected({server}, force)
-                servers = _copy_configs(self.config)
-                del servers[server]
-                revision = self.store.save(servers, self._revision)
-                self._commit_config(servers, revision, {server})
+                snapshot = await wait_owned(asyncio.to_thread(self._save_server, server, None))
+                self._commit_snapshot(snapshot, {server})
                 await self._close_connections_resilient(connection, force)
                 return {
                     "server": server,
@@ -1489,8 +1536,10 @@ class MCPBridge:
     async def restart(self, server: str, force: bool = False) -> dict[str, Any]:
         self._check_server_name(server)
         self._validate_force(force)
+        self._ensure_mutation_allowed()
         async with self._mutation_lock:
             self._ensure_open()
+            self._ensure_mutation_allowed()
             if server not in self.config:
                 raise ValueError(f"unknown MCP server: {server!r}")
             try:
@@ -1524,11 +1573,18 @@ class MCPBridge:
             finally:
                 await self._clear_changing({server})
 
-    async def reload(self, force: bool = False) -> dict[str, list[str]]:
+    async def reload(self, force: bool = False, *, snapshot=None) -> dict[str, list[str]]:
         self._validate_force(force)
+        self._ensure_mutation_allowed()
         async with self._mutation_lock:
             self._ensure_open()
-            servers, revision = self.store.load()
+            self._ensure_mutation_allowed()
+            candidate = (
+                snapshot
+                if snapshot is not None
+                else await wait_owned(asyncio.to_thread(self._load_snapshot))
+            )
+            servers, revision = self._snapshot_config(candidate)
             servers = _copy_configs(servers)
             current = self.config
             added = sorted(set(servers) - set(current))
@@ -1539,7 +1595,35 @@ class MCPBridge:
             changed = set(added) | set(removed) | set(updated)
             try:
                 connections = await self._block_affected(changed, force)
-                self._commit_config(servers, revision, set(removed) | set(updated))
+                self._commit_config(
+                    servers, revision, set(removed) | set(updated), snapshot=candidate
+                )
+                await self._close_connections_resilient(connections, force)
+                return {"added": added, "updated": updated, "removed": removed}
+            finally:
+                await self._clear_changing(changed)
+
+    async def apply_snapshot(self, snapshot, force: bool = False) -> dict[str, list[str]]:
+        """Apply an already loaded layered configuration without disk I/O."""
+
+        self._validate_force(force)
+        async with self._mutation_lock:
+            self._ensure_open()
+            candidate = snapshot
+            servers, revision = self._snapshot_config(candidate)
+            servers = _copy_configs(servers)
+            current = self.config
+            added = sorted(set(servers) - set(current))
+            removed = sorted(set(current) - set(servers))
+            updated = sorted(
+                name for name in set(servers) & set(current) if servers[name] != current[name]
+            )
+            changed = set(added) | set(removed) | set(updated)
+            try:
+                connections = await self._block_affected(changed, force)
+                self._commit_config(
+                    servers, revision, set(removed) | set(updated), snapshot=candidate
+                )
                 await self._close_connections_resilient(connections, force)
                 return {"added": added, "updated": updated, "removed": removed}
             finally:
@@ -1599,12 +1683,38 @@ class MCPBridge:
             self._changing.difference_update(names)
 
     def _commit_config(
-        self, servers: dict[str, dict[str, Any]], revision: str | None, removed: set[str]
+        self, servers: dict[str, dict[str, Any]], revision: str | None, removed: set[str],
+        *, snapshot=None,
     ) -> None:
         self.config = servers
         self._revision = revision
+        if snapshot is not None:
+            self._snapshot = snapshot
         for name in removed:
             self._connections.pop(name, None)
+
+    def _commit_snapshot(self, snapshot, removed: set[str]) -> None:
+        servers, revision = self._snapshot_config(snapshot)
+        self._commit_config(_copy_configs(servers), revision, removed, snapshot=snapshot)
+
+    def _ensure_mutation_allowed(self) -> None:
+        if self._config_applying:
+            raise RuntimeError("Workspace configuration reload is in progress")
+
+    def _load_snapshot(self):
+        return self._store.load()
+
+    @staticmethod
+    def _snapshot_config(snapshot: ConfigSnapshot) -> tuple[dict[str, dict[str, Any]], str | None]:
+        return _copy_configs(snapshot.values["mcp"]["servers"]), snapshot.revision
+
+    def _check_config_current(self) -> None:
+        snapshot = self._load_snapshot()
+        if snapshot.revision != self._revision:
+            raise RuntimeError("MCP configuration changed on disk; call ws.mcp.reload() first")
+
+    def _save_server(self, server: str, definition: dict[str, Any] | None):
+        return self._store.save_server("mcp", server, definition, self._revision)
 
     async def _close_connections_resilient(
         self, connections: dict[str, _MCPConnection], force: bool

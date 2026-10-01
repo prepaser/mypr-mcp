@@ -1,0 +1,53 @@
+# Configuration reference: docs/config.md
+# Copy to your global config.toml or .mypr/config.toml.
+# Uncomment a table header and only the settings you want to override.
+# Commented values do not pin defaults or override inherited settings.
+
+# Optional configuration format version, unrelated to the package version.
+# version = 1
+
+# Built-in defaults. All sizes are bytes.
+# [limits]
+# output_bytes = 16777216
+# response_bytes = 32768
+# completed_tasks = 128
+# completed_records = 128
+# cache_bytes = 33554432
+
+# [storage]
+# enabled = true
+# revision_keep = 50
+# retention_days = 30
+# max_bytes = 1073741824
+# gc_interval_seconds = 300
+
+# MCP stdio example. Replace the command before enabling this entry.
+# [mcp.servers.reports]
+# command = "reports-mcp"
+# args = []
+# cwd = "."
+
+# Values name environment variables in the manager, not literal secrets.
+# [mcp.servers.reports.env_from]
+# REPORTS_TOKEN = "REPORTS_TOKEN"
+
+# MCP HTTP example. Use url instead of command, args, cwd, or env_from.
+# [mcp.servers.remote]
+# url = "https://example.com/mcp"
+
+# REMOTE_AUTHORIZATION must include any required scheme, such as "Bearer ".
+# [mcp.servers.remote.headers_from]
+# Authorization = "REMOTE_AUTHORIZATION"
+
+# LSP example. Install the executable before using the server.
+# [lsp.servers.python]
+# command = ["pylsp"]
+# languages = ["python"]
+# timeout = 10.0
+
+# Disable an inherited server with an entry containing only enabled = false.
+# [mcp.servers.inherited]
+# enabled = false
+
+# [lsp.servers.inherited]
+# enabled = false

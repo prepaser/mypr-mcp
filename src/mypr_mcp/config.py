@@ -2,10 +2,13 @@ import copy
 import fcntl
 import hashlib
 import os
+import stat
 import tempfile
-from collections.abc import MutableMapping
-from dataclasses import dataclass
+from collections.abc import Mapping, MutableMapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import tomlkit
@@ -14,6 +17,9 @@ from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
 MAX_RESPONSE_BYTES = 1024 * 1024
+MANAGED_SECTIONS = frozenset({"limits", "storage", "mcp", "lsp"})
+_SERVER_SECTIONS = frozenset({"mcp", "lsp"})
+_MAX_CONFIG_BYTES = 16 * 1024 * 1024
 
 
 class ConfigError(ValueError):
@@ -47,6 +53,9 @@ class ConfigSnapshot:
 
     values: dict
     revision: str | None
+    layers: dict = field(default_factory=dict)
+    revisions: dict = field(default_factory=dict)
+    paths: dict = field(default_factory=dict)
 
 
 DEFAULT_LIMITS = {
@@ -65,8 +74,17 @@ DEFAULT_STORAGE = {
 }
 
 
+def global_config_path() -> Path:
+    override = os.environ.get("MYPR_GLOBAL_CONFIG")
+    if override:
+        return Path(override).expanduser().resolve()
+    root = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".config"
+    return (base / "mypr" / "config.toml").resolve()
+
+
 def validate_name(name):
-    if not isinstance(name, str) or not name.strip() or len(name) > 128:
+    if not isinstance(name, str) or not name.strip() or len(name) > 128 or "\x00" in name:
         raise ConfigError("MCP server name must contain 1..128 characters", path="mcp.servers")
 
 
@@ -91,7 +109,7 @@ def validate_servers(servers):
             )
         if http:
             url = config["url"]
-            if not isinstance(url, str):
+            if not isinstance(url, str) or "\x00" in url:
                 raise ConfigError("must be an HTTP(S) URL", path=f"mcp.servers.{name}.url")
             try:
                 parts = urlsplit(url)
@@ -106,11 +124,14 @@ def validate_servers(servers):
         else:
             command = config["command"]
             if not (
-                (isinstance(command, str) and command.strip())
+                (isinstance(command, str) and command.strip() and "\x00" not in command)
                 or (
                     isinstance(command, list)
                     and command
-                    and all(isinstance(item, str) and item for item in command)
+                    and all(
+                        isinstance(item, str) and item and "\x00" not in item
+                        for item in command
+                    )
                 )
             ):
                 raise ConfigError(
@@ -119,16 +140,27 @@ def validate_servers(servers):
                 )
             if "args" in config and not (
                 isinstance(config["args"], list)
-                and all(isinstance(item, str) for item in config["args"])
+                and all(
+                    isinstance(item, str) and "\x00" not in item for item in config["args"]
+                )
             ):
                 raise ConfigError("must be a list of strings", path=f"mcp.servers.{name}.args")
-            if "cwd" in config and not (isinstance(config["cwd"], str) and config["cwd"]):
+            if "cwd" in config and not (
+                isinstance(config["cwd"], str)
+                and config["cwd"]
+                and "\x00" not in config["cwd"]
+            ):
                 raise ConfigError("must be a non-empty string", path=f"mcp.servers.{name}.cwd")
         field = "headers_from" if http else "env_from"
         if field in config:
             mapping = config[field]
             if not isinstance(mapping, dict) or not all(
-                isinstance(key, str) and key and isinstance(value, str) and value
+                isinstance(key, str)
+                and key
+                and "\x00" not in key
+                and isinstance(value, str)
+                and value
+                and "\x00" not in value
                 for key, value in mapping.items()
             ):
                 raise ConfigError(
@@ -227,6 +259,158 @@ def validate_config(values):
     return result
 
 
+def _validate_server_layer(section: str, value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise _field_error(f"{section}.servers", "must be a table")
+    active = {}
+    for name, definition in value.items():
+        if isinstance(definition, Mapping) and "enabled" in definition:
+            if definition != {"enabled": False}:
+                raise _field_error(
+                    f"{section}.servers.{name}",
+                    "enabled=false is only valid as a server tombstone",
+                )
+            try:
+                if section == "mcp":
+                    validate_name(name)
+                else:
+                    _validate_lsp_servers(
+                        {name: {"command": ["x"], "languages": ["x"]}}
+                    )
+            except (TypeError, ValueError) as exc:
+                raise _field_error(f"{section}.servers", str(exc)) from exc
+            continue
+        active[name] = definition
+    try:
+        (validate_servers if section == "mcp" else _validate_lsp_servers)(active)
+    except (TypeError, ValueError) as exc:
+        raise _field_error(f"{section}.servers", str(exc)) from exc
+
+
+def _validate_layer(values: Any, path: Path) -> dict:
+    if not isinstance(values, Mapping):
+        raise ConfigError("configuration must be a table", path=str(path))
+    result = copy.deepcopy(dict(values))
+    if "version" in result:
+        version = result["version"]
+        if type(version) is not int or version < 1 or version > CONFIG_VERSION:
+            raise _field_error("version", f"must be an integer between 1 and {CONFIG_VERSION}")
+    limits = result.get("limits")
+    if limits is not None:
+        if not isinstance(limits, Mapping):
+            raise _field_error("limits", "must be a table")
+        for key, value in limits.items():
+            if key in DEFAULT_LIMITS:
+                minimum = 1024 if key in {"output_bytes", "response_bytes", "cache_bytes"} else 1
+                maximum = MAX_RESPONSE_BYTES if key == "response_bytes" else None
+                _positive(value, f"limits.{key}", minimum=minimum, maximum=maximum)
+    storage = result.get("storage")
+    if storage is not None:
+        if not isinstance(storage, Mapping):
+            raise _field_error("storage", "must be a table")
+        for key, value in storage.items():
+            if key == "enabled":
+                if type(value) is not bool:
+                    raise _field_error("storage.enabled", "must be a boolean")
+            elif key in DEFAULT_STORAGE:
+                _positive(value, f"storage.{key}")
+    for section in _SERVER_SECTIONS:
+        table = result.get(section)
+        if table is None:
+            continue
+        if not isinstance(table, Mapping):
+            raise _field_error(section, "must be a table")
+        servers = table.get("servers")
+        if servers is not None:
+            _validate_server_layer(section, servers)
+    return result
+
+
+def _merge_servers(global_value: Any, workspace_value: Any) -> dict:
+    result: dict[str, Any] = {}
+    for source in (global_value, workspace_value):
+        if source is None:
+            continue
+        if not isinstance(source, Mapping):
+            raise ConfigError("servers must be a table")
+        for name, definition in source.items():
+            if isinstance(definition, Mapping) and definition.get("enabled") is False:
+                result.pop(name, None)
+            else:
+                result[name] = copy.deepcopy(definition)
+    return result
+
+
+def _merge_layers(global_value: Mapping, workspace_value: Mapping) -> dict:
+    def merge(left: Any, right: Any) -> Any:
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return copy.deepcopy(right if right is not None else left)
+        merged = copy.deepcopy(dict(left))
+        for key, value in right.items():
+            if key in merged and isinstance(merged[key], Mapping) and isinstance(value, Mapping):
+                merged[key] = merge(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+
+    merged = merge(global_value, workspace_value)
+    for section in _SERVER_SECTIONS:
+        global_section = global_value.get(section, {})
+        workspace_section = workspace_value.get(section, {})
+        if not isinstance(global_section, Mapping) and not isinstance(workspace_section, Mapping):
+            continue
+        section_value = merged.get(section, {})
+        if not isinstance(section_value, Mapping):
+            section_value = {}
+        section_value = copy.deepcopy(dict(section_value))
+        if (
+            isinstance(global_section, Mapping)
+            and "servers" in global_section
+        ) or (
+            isinstance(workspace_section, Mapping)
+            and "servers" in workspace_section
+        ):
+            section_value["servers"] = _merge_servers(
+                global_section.get("servers") if isinstance(global_section, Mapping) else None,
+                workspace_section.get("servers")
+                if isinstance(workspace_section, Mapping)
+                else None,
+            )
+        merged[section] = section_value
+    return merged
+
+
+def parse_path(path: str) -> tuple[str, ...]:
+    """Parse a TOML dotted key, including quoted keys containing dots."""
+
+    if not isinstance(path, str) or not path or len(path) > 512 or any(
+        ord(char) < 0x20 for char in path
+    ):
+        raise ConfigError("must be a TOML dotted key", path="path")
+    try:
+        parsed = tomlkit.parse(f"{path} = 0\n").unwrap()
+    except Exception as exc:
+        raise ConfigError(f"must be a TOML dotted key: {exc}", path="path") from exc
+    parts: list[str] = []
+    current: Any = parsed
+    while isinstance(current, dict) and len(current) == 1:
+        key, value = next(iter(current.items()))
+        if not isinstance(key, str) or not key or len(key) > 128:
+            raise ConfigError("must contain non-empty key parts", path="path")
+        parts.append(key)
+        if isinstance(value, dict):
+            current = value
+        elif value == 0:
+            break
+        else:
+            raise ConfigError("must be a TOML dotted key", path="path")
+    if not parts or len(parts) > 16 or not isinstance(current, dict) or len(current) != 1:
+        raise ConfigError("must be a TOML dotted key", path="path")
+    if parts[0] not in MANAGED_SECTIONS:
+        raise ConfigError("only managed configuration sections are supported", path=path)
+    return tuple(parts)
+
+
 def parse_config(raw: bytes | str | None) -> dict:
     """Parse and validate a workspace config, retaining unrelated TOML sections."""
 
@@ -264,27 +448,548 @@ def load_workspace_config(workspace: str | os.PathLike[str]) -> ConfigSnapshot:
 load_config = load_workspace_config
 
 
-def _update_table(table, values):
-    for key in list(table):
-        if key not in values:
-            del table[key]
-    for key, value in values.items():
-        if isinstance(value, dict) and isinstance(table.get(key), MutableMapping):
-            _update_table(table[key], value)
-        elif table.get(key) != value:
-            table[key] = value
+def _composite_revision(revisions: Mapping[str, str | None]) -> str:
+    return ";".join(
+        f"{name}={revisions.get(name) or '-'}" for name in ("global", "workspace")
+    )
+
+
+def _lookup(values: Any, parts: tuple[str, ...]) -> tuple[bool, Any]:
+    current = values
+    for part in parts:
+        if not isinstance(current, Mapping) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for section in ("limits", "storage", "mcp", "lsp"):
+        value = values.get(section)
+        if not isinstance(value, Mapping):
+            continue
+        if section == "limits":
+            result[section] = {
+                key: copy.deepcopy(value[key]) for key in DEFAULT_LIMITS if key in value
+            }
+        elif section == "storage":
+            result[section] = {
+                key: copy.deepcopy(value[key]) for key in DEFAULT_STORAGE if key in value
+            }
+        elif section in _SERVER_SECTIONS:
+            result[section] = {"servers": copy.deepcopy(value.get("servers", {}))}
+    return result
+
+
+def _validate_public_path(parts: tuple[str, ...]) -> None:
+    section = parts[0]
+    if len(parts) == 1 and section in MANAGED_SECTIONS:
+        return
+    if section in {"limits", "storage"}:
+        allowed = DEFAULT_LIMITS if section == "limits" else DEFAULT_STORAGE
+        if len(parts) > 2 or (len(parts) == 2 and parts[1] not in allowed):
+            raise ConfigError("unknown managed configuration field", path=".".join(parts))
+        return
+    if section in _SERVER_SECTIONS and len(parts) >= 2 and parts[1] == "servers":
+        return
+    raise ConfigError("unknown managed configuration field", path=".".join(parts))
+
+
+def _server_tombstone(value: Any) -> bool:
+    return isinstance(value, Mapping) and value == {"enabled": False}
+
+
+def _quote_key(value: str) -> str:
+    if value and all(char.isascii() and (char.isalnum() or char in "_-") for char in value):
+        return value
+    if any(ord(char) < 0x20 for char in value):
+        raise ConfigError("server name contains a control character", path="mcp.servers")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _document_from_raw(raw: bytes | None) -> Any:
+    if raw is None or raw == b"":
+        return tomlkit.document()
+    return tomlkit.parse(raw.decode("utf-8"))
+
+
+def _parse_layer(raw: bytes | None, path: Path) -> dict:
+    if raw is None or raw == b"":
+        return {}
+    try:
+        parsed = tomlkit.parse(raw.decode("utf-8")).unwrap()
+    except (UnicodeDecodeError, tomlkit.exceptions.ParseError) as exc:
+        raise ConfigError(
+            f"invalid TOML: {exc}",
+            path=str(path),
+            line=getattr(exc, "line", None),
+            column=getattr(exc, "col", None),
+        ) from exc
+    return _validate_layer(parsed, path)
+
+
+def _set_document(document: Any, parts: tuple[str, ...], value: Any) -> None:
+    current = document
+    for part in parts[:-1]:
+        child = current.get(part)
+        if child is None:
+            child = tomlkit.table()
+            current[part] = child
+        elif not isinstance(child, MutableMapping):
+            raise ConfigError("must be a table", path=".".join(parts))
+        current = child
+    current[parts[-1]] = copy.deepcopy(value)
+
+
+def _unset_document(document: Any, parts: tuple[str, ...]) -> bool:
+    current = document
+    for part in parts[:-1]:
+        current = current.get(part)
+        if not isinstance(current, MutableMapping):
+            return False
+    if parts[-1] not in current:
+        return False
+    del current[parts[-1]]
+    return True
+
+
+class ConfigStore:
+    """Coordinate the global and workspace TOML configuration layers."""
+
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str] | None = None,
+        global_path: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self.workspace = (
+            Path(workspace).expanduser().resolve() if workspace is not None else None
+        )
+        self.workspace_path = self.workspace / ".mypr" / "config.toml" if self.workspace else None
+        self.global_path = (
+            Path(global_path).expanduser().resolve()
+            if global_path is not None
+            else global_config_path()
+        )
+        if self.global_path == self.workspace_path:
+            raise ValueError("global and workspace configuration paths must differ")
+
+    @property
+    def paths(self) -> dict[str, Path]:
+        return {"global": self.global_path, "workspace": self.workspace_path}
+
+    def load(self) -> ConfigSnapshot:
+        with self._profile_lock(exclusive=False, create=False) as locked:
+            if locked:
+                with self._locks(create=False):
+                    return self._snapshot(
+                        self._read(self.global_path), self._read(self.workspace_path)
+                    )
+            for _ in range(3):
+                with self._locks(create=False):
+                    first = self._read(self.global_path), self._read(self.workspace_path)
+                with self._locks(create=False):
+                    second = self._read(self.global_path), self._read(self.workspace_path)
+                if first == second:
+                    return self._snapshot(*first)
+            raise RuntimeError("configuration changed while being read; retry")
+
+    def get(
+        self,
+        path: str | None = None,
+        scope: str = "effective",
+        snapshot: ConfigSnapshot | None = None,
+    ) -> Any:
+        snapshot = snapshot or self.load()
+        if scope not in {"effective", "global", "workspace"}:
+            raise ConfigError("must be effective, global, or workspace", path="scope")
+        values = snapshot.values if scope == "effective" else snapshot.layers.get(scope, {})
+        if path is None:
+            return _public_values(values)
+        parts = parse_path(path)
+        _validate_public_path(parts)
+        values = _public_values(values)
+        found, value = _lookup(values, parts)
+        return copy.deepcopy(value) if found else None
+
+    def explain(self, path: str, snapshot: ConfigSnapshot | None = None) -> dict[str, Any]:
+        snapshot = snapshot or self.load()
+        parts = parse_path(path)
+        _validate_public_path(parts)
+        public_values = _public_values(snapshot.values)
+        public_layers = {
+            scope: _public_values(snapshot.layers.get(scope, {}))
+            for scope in ("global", "workspace")
+        }
+        found, value = _lookup(public_values, parts)
+        if parts[0] in _SERVER_SECTIONS and len(parts) >= 3:
+            for scope in ("workspace", "global"):
+                server_found, definition = _lookup(
+                    snapshot.layers.get(scope, {}), parts[:3]
+                )
+                if not server_found:
+                    continue
+                if _server_tombstone(definition):
+                    return {
+                        "value": None,
+                        "source": scope,
+                        "revisions": copy.deepcopy(snapshot.revisions),
+                    }
+                return {
+                    "value": copy.deepcopy(value) if found else None,
+                    "source": scope,
+                    "revisions": copy.deepcopy(snapshot.revisions),
+                }
+        source = "default"
+        if found:
+            for scope in ("workspace", "global"):
+                layer_found, layer_value = _lookup(public_layers[scope], parts)
+                if layer_found:
+                    source = scope
+                    if parts[0] in _SERVER_SECTIONS and len(parts) >= 3:
+                        if _server_tombstone(layer_value):
+                            value = None
+                        else:
+                            value = layer_value
+                    break
+        else:
+            for scope in ("workspace", "global"):
+                layer_found, layer_value = _lookup(public_layers[scope], parts)
+                if layer_found:
+                    source = scope
+                    value = None if _server_tombstone(layer_value) else layer_value
+                    break
+        return {
+            "value": copy.deepcopy(value) if found or source != "default" else None,
+            "source": source,
+            "revisions": copy.deepcopy(snapshot.revisions),
+        }
+
+    def set(
+        self,
+        path: str,
+        value: Any,
+        scope: str = "workspace",
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        parts = parse_path(path)
+        _validate_public_path(parts)
+        if value is None:
+            raise ConfigError("use unset() to remove a value", path=path)
+        if parts[0] in _SERVER_SECTIONS and len(parts) >= 3 and len(parts) != 3:
+            raise ConfigError("server definitions must be replaced as a whole", path=path)
+        return self._mutate(
+            path,
+            scope,
+            expected_revision,
+            lambda doc, _layers: _set_document(doc, parts, value),
+        )
+
+    def unset(
+        self,
+        path: str,
+        scope: str = "workspace",
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        parts = parse_path(path)
+        _validate_public_path(parts)
+        if parts[0] in _SERVER_SECTIONS and len(parts) >= 3 and len(parts) != 3:
+            raise ConfigError("server definitions must be removed as a whole", path=path)
+
+        return self._mutate(
+            path,
+            scope,
+            expected_revision,
+            lambda document, _layers: _unset_document(document, parts),
+        )
+
+    def save_server(
+        self,
+        section: str,
+        name: str,
+        definition: Mapping[str, Any] | None,
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        if section not in _SERVER_SECTIONS or not isinstance(name, str) or not name:
+            raise ConfigError("invalid server target", path=f"{section}.servers")
+        path = f"{section}.servers.{_quote_key(name)}"
+        if definition is None:
+            parts = parse_path(path)
+
+            def remove(document: Any, layers: dict[str, dict]) -> bool:
+                if self.workspace_path is None:
+                    return _unset_document(document, parts)
+                global_servers = layers["global"].get(section, {}).get("servers", {})
+                inherited = (
+                    global_servers.get(name) if isinstance(global_servers, Mapping) else None
+                )
+                if inherited is not None and not _server_tombstone(inherited):
+                    _set_document(document, parts, {"enabled": False})
+                    return True
+                return _unset_document(document, parts)
+
+            return self._mutate(
+                path,
+                "global" if self.workspace_path is None else "workspace",
+                expected_revision,
+                remove,
+            )
+        if not isinstance(definition, Mapping):
+            raise ConfigError("server definition must be a table", path=path)
+        return self.set(
+            path,
+            dict(definition),
+            scope="global" if self.workspace_path is None else "workspace",
+            expected_revision=expected_revision,
+        )
+
+    def save_servers(
+        self,
+        section: str,
+        definitions: Mapping[str, Mapping[str, Any]],
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        if section not in _SERVER_SECTIONS or not isinstance(definitions, Mapping):
+            raise ConfigError("invalid server definitions", path=f"{section}.servers")
+        validator = validate_servers if section == "mcp" else _validate_lsp_servers
+        desired = validator(definitions)
+        path_parts = (section, "servers")
+
+        def change(document: Any, layers: dict[str, dict]) -> None:
+            global_servers = layers["global"].get(section, {}).get("servers", {})
+            workspace_servers = layers["workspace"].get(section, {}).get("servers", {})
+            if not isinstance(global_servers, Mapping):
+                global_servers = {}
+            if not isinstance(workspace_servers, Mapping):
+                workspace_servers = {}
+            if self.workspace_path is None:
+                names = set(desired) | set(global_servers)
+                for name in sorted(names):
+                    if name in desired:
+                        _set_document(document, (*path_parts, name), desired[name])
+                    else:
+                        _unset_document(document, (*path_parts, name))
+                return
+            names = set(desired) | set(global_servers) | set(workspace_servers)
+            for name in sorted(names):
+                wanted = desired.get(name)
+                inherited = global_servers.get(name)
+                if wanted is None:
+                    if name in global_servers and not _server_tombstone(inherited):
+                        if not _server_tombstone(workspace_servers.get(name)):
+                            _set_document(document, (*path_parts, name), {"enabled": False})
+                    else:
+                        _unset_document(document, (*path_parts, name))
+                elif name in workspace_servers and not _server_tombstone(workspace_servers[name]):
+                    workspace_effective = validator({name: workspace_servers[name]})[name]
+                    if workspace_effective == wanted:
+                        continue
+                    _set_document(document, (*path_parts, name), wanted)
+                elif inherited is not None and not _server_tombstone(inherited):
+                    inherited_effective = validator({name: inherited})[name]
+                    if inherited_effective == wanted:
+                        _unset_document(document, (*path_parts, name))
+                    else:
+                        _set_document(document, (*path_parts, name), wanted)
+                elif inherited == wanted:
+                    _unset_document(document, (*path_parts, name))
+                else:
+                    _set_document(document, (*path_parts, name), wanted)
+
+        return self._mutate(
+            f"{section}.servers",
+            "global" if self.workspace_path is None else "workspace",
+            expected_revision,
+            change,
+        )
+
+    def _snapshot(self, global_raw: bytes | None, workspace_raw: bytes | None) -> ConfigSnapshot:
+        global_values = _parse_layer(global_raw, self.global_path)
+        workspace_values = (
+            _parse_layer(workspace_raw, self.workspace_path)
+            if self.workspace_path is not None
+            else {}
+        )
+        merged = _merge_layers(global_values, workspace_values)
+        values = validate_config(merged)
+        revisions = {"global": _revision(global_raw), "workspace": _revision(workspace_raw)}
+        return ConfigSnapshot(
+            values,
+            _composite_revision(revisions),
+            {"global": global_values, "workspace": workspace_values},
+            revisions,
+            self.paths,
+        )
+
+    def _mutate(
+        self,
+        path: str,
+        scope: str,
+        expected_revision: str | None,
+        change: Any,
+    ) -> ConfigSnapshot:
+        if scope not in {"global", "workspace"}:
+            raise ConfigError("writes require global or workspace scope", path="scope")
+        if scope == "workspace" and self.workspace_path is None:
+            raise ConfigError("workspace scope is unavailable in global-only mode", path="scope")
+        target = self.global_path if scope == "global" else self.workspace_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with self._profile_lock(exclusive=True, create=True):
+            with self._locks(create=True, target=target):
+                original_global = self._read(self.global_path)
+                original_workspace = self._read(self.workspace_path)
+                current = self._snapshot(original_global, original_workspace)
+                if expected_revision is not None and current.revision != expected_revision:
+                    raise RuntimeError("configuration changed on disk; reload before saving")
+                layers = current.layers
+                document = _document_from_raw(
+                    original_global if scope == "global" else original_workspace
+                )
+                try:
+                    changed = change(document, layers)
+                    if changed is False:
+                        return current
+                    data = tomlkit.dumps(document).encode("utf-8")
+                    if len(data) > _MAX_CONFIG_BYTES:
+                        raise ConfigError("configuration file exceeds the size limit", path=path)
+                    _parse_layer(data, target)
+                    updated_global = data if scope == "global" else original_global
+                    updated_workspace = data if scope == "workspace" else original_workspace
+                    updated = self._snapshot(updated_global, updated_workspace)
+                except (tomlkit.exceptions.TOMLKitError, UnicodeEncodeError) as exc:
+                    raise ConfigError(f"invalid configuration: {exc}", path=path) from exc
+                if (
+                    self._read(self.global_path) != original_global
+                    or (
+                        self.workspace_path is not None
+                        and self._read(self.workspace_path) != original_workspace
+                    )
+                ):
+                    raise RuntimeError("configuration changed during save; reload before retrying")
+                if data != (original_global if scope == "global" else original_workspace):
+                    self._write(target, data)
+                return updated
+
+    def _profile_lock_path(self) -> Path:
+        state_home = os.environ.get("XDG_STATE_HOME")
+        base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+        name = hashlib.sha256(str(self.global_path).encode("utf-8")).hexdigest()
+        return base / "mypr" / "config-locks" / f"{name}.lock"
+
+    @contextmanager
+    def _profile_lock(self, *, exclusive: bool, create: bool):
+        path = self._profile_lock_path()
+        if create:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stream = path.open("a")
+        else:
+            try:
+                stream = path.open("r")
+            except FileNotFoundError:
+                yield False
+                return
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield True
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+            stream.close()
+
+    @contextmanager
+    def _locks(self, *, create: bool, target: Path | None = None):
+        paths = sorted(
+            (path for path in (self.global_path, self.workspace_path) if path is not None),
+            key=str,
+        )
+        locks = []
+        try:
+            for path in paths:
+                target_lock = create and path == target
+                if target_lock:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                lock_path = path.with_suffix(".lock")
+                if target_lock:
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    stream = lock_path.open("a")
+                    mode = fcntl.LOCK_EX
+                else:
+                    try:
+                        stream = lock_path.open("r")
+                    except FileNotFoundError:
+                        continue
+                    mode = fcntl.LOCK_SH
+                fcntl.flock(stream, mode)
+                locks.append(stream)
+            yield
+        finally:
+            for stream in reversed(locks):
+                fcntl.flock(stream, fcntl.LOCK_UN)
+                stream.close()
+
+    @staticmethod
+    def _read(path: Path | None) -> bytes | None:
+        if path is None:
+            return None
+        try:
+            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_CONFIG_BYTES:
+                raise ConfigError(
+                    "configuration file is not a bounded regular file", path=str(path)
+                )
+            chunks = []
+            remaining = _MAX_CONFIG_BYTES + 1
+            while remaining:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            if len(data) > _MAX_CONFIG_BYTES:
+                raise ConfigError("configuration file exceeds the size limit", path=str(path))
+            return data
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _write(path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=f".{path.name}.", delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if path.exists():
+                temporary.chmod(path.stat().st_mode & 0o777)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 class MCPConfig:
-    def __init__(self, workspace):
-        self.workspace = Path(workspace).resolve()
-        self.path = self.workspace / ".mypr" / "config.toml"
+    """Compatibility facade over the global/workspace configuration store."""
 
-    def _raw(self):
-        try:
-            return self.path.read_bytes()
-        except FileNotFoundError:
-            return None
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str],
+        global_path: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.core = ConfigStore(self.workspace, global_path)
+        self.path = self.core.workspace_path
+
+    def _raw(self) -> bytes | None:
+        return ConfigStore._read(self.path)
 
     @staticmethod
     def _parse(raw):
@@ -297,13 +1002,10 @@ class MCPConfig:
         return doc, servers
 
     def load(self):
-        raw = self._raw()
-        _, servers = self._parse(raw)
-        return servers, _revision(raw)
+        snapshot = self.core.load()
+        return copy.deepcopy(snapshot.values["mcp"]["servers"]), snapshot.revision
 
     def load_document(self):
-        """Return the parsed document and its on-disk revision for coordinated writes."""
-
         raw = self._raw()
         try:
             document = tomlkit.parse(raw.decode("utf-8")) if raw is not None else tomlkit.document()
@@ -312,89 +1014,27 @@ class MCPConfig:
         return document, _revision(raw)
 
     def load_all(self) -> ConfigSnapshot:
-        return load_workspace_config(self.workspace)
+        return self.core.load()
 
     @property
-    def revision(self) -> str | None:
-        return _revision(self._raw())
+    def revision(self) -> str:
+        return self.core.load().revision
 
     def save_section(self, section: str, values: dict, expected_revision: str | None) -> str:
-        """Atomically update one top-level table while retaining comments and siblings."""
-
-        if not isinstance(section, str) or not section or "." in section:
-            raise ConfigError("must be a top-level table name", path="section")
-        if not isinstance(values, dict):
-            raise ConfigError("must be a table", path=section)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            raw = self._raw()
-            current = _revision(raw)
-            if current != expected_revision:
-                raise RuntimeError("MCP configuration changed on disk; reload before saving")
-            document, _ = self.load_document()
-            table = document.get(section)
-            if table is None:
-                table = tomlkit.table()
-                document[section] = table
-            if not isinstance(table, MutableMapping):
-                raise ConfigError("must be a table", path=section)
-            _update_table(table, values)
-            data = tomlkit.dumps(document).encode("utf-8")
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    dir=self.path.parent, prefix=f".{self.path.name}.", delete=False
-                ) as stream:
-                    temporary = Path(stream.name)
-                    stream.write(data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if self.path.exists():
-                    temporary.chmod(self.path.stat().st_mode & 0o777)
-                if _revision(self._raw()) != expected_revision:
-                    raise RuntimeError("MCP configuration changed during save; reload and retry")
-                os.replace(temporary, self.path)
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-        return _revision(data)
+        snapshot = self.core.set(section, values, expected_revision=expected_revision)
+        return snapshot.revision
 
     def save_lsp(self, servers: dict, expected_revision: str | None) -> str:
-        values = _validate_lsp({"servers": servers})
-        return self.save_section("lsp", values, expected_revision)
+        return self.core.save_servers("lsp", servers, expected_revision).revision
 
     def save(self, servers, expected_revision):
-        servers = validate_servers(servers)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            raw = self._raw()
-            if _revision(raw) != expected_revision:
-                raise RuntimeError("MCP configuration changed on disk; call ws.mcp.reload() first")
-            doc, _ = self._parse(raw)
-            if "mcp" not in doc:
-                doc["mcp"] = tomlkit.table()
-            if "servers" not in doc["mcp"]:
-                doc["mcp"]["servers"] = tomlkit.table()
-            _update_table(doc["mcp"]["servers"], servers)
-            data = tomlkit.dumps(doc).encode()
-            target = self.path.resolve()
-            temp = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    dir=target.parent, prefix=".config-", delete=False
-                ) as file:
-                    temp = Path(file.name)
-                    file.write(data)
-                    file.flush()
-                    os.fsync(file.fileno())
-                if target.exists():
-                    temp.chmod(target.stat().st_mode & 0o777)
-                if _revision(self._raw()) != expected_revision:
-                    raise RuntimeError("MCP configuration changed during save; reload and retry")
-                os.replace(temp, target)
-            finally:
-                if temp is not None:
-                    temp.unlink(missing_ok=True)
-        return _revision(data)
+        return self.core.save_servers("mcp", servers, expected_revision).revision
+
+    def save_server(
+        self,
+        section: str,
+        name: str,
+        definition: Mapping[str, object] | None,
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        return self.core.save_server(section, name, definition, expected_revision)

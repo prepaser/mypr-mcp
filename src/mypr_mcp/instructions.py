@@ -2,15 +2,15 @@
 # ruff: noqa: E501
 
 COMMON_INSTRUCTIONS = """mypr is a persistent Python layer for this workspace, with file reading/editing, code and document search, shell commands, and reusable tools. Prefer mypr for supported work in this workspace, following user and host instructions; use other tools when mypr is unavailable or lacks the needed capability.
-Call init before execute. Follow the running manager's instructions and capabilities returned by init; they may differ from this MCP client's installation. Compose workspace operations in Python, keep working data there, and return concise results. Use poll to finish reading submitted cells rather than submitting them again. Confirm the outcome before repeating a state-changing operation whose completion is uncertain.
+Call init before execute. Follow the running manager's instructions and capabilities returned by init; they may differ from this MCP client's installation. Compose workspace operations in Python, keep working data there, and return concise results. Use poll to finish reading submitted cells rather than submitting them again. Confirm the outcome before repeating a state-changing operation whose completion is uncertain. Use ws.config to inspect or persist global and workspace settings; call ws.config.reload() explicitly when persisted changes should be applied.
 """
 
 INSTRUCTIONS = """Use execute for workspace work through Python and poll for submitted cell output. Prefer the built-in file, search, shell, and other helpers for supported tasks, subject to user and host instructions.
 
 Getting started
 - init() assigns an adjective-animal client ID; init(client_id="...") creates or resumes a logical client. This connection keeps that ID, so execute does not need it. Repeated init returns the same ID; switching IDs or sharing one across live connections is rejected. Poll is available before init.
-- For API details, run print(ws.help()) for topics, print(ws.help("fs")) for guidance, or print(ws.help("shell.run")) for a method's live signature and defaults. Use await ws.doctor() to check optional tools and packages before starting a workflow. Help comes from this running kernel; use its API and reported capabilities.
-- Files and search: ws.fs; commands and background work: ws.shell/ws.tasks; Git: ws.git. Help also covers system, messages, locks, mcp, http, browser, net, skills, modules, packages, history, and lifecycle.
+- For API details, run print(ws.help()) for topics, print(ws.help("fs")) for guidance, or print(ws.help("shell.run")) for a method's live signature and defaults. Use await ws.doctor() to check optional tools and packages before starting a workflow. Help comes from this running kernel; use its API and reported capabilities. Use ws.help("config") for layered configuration and explicit reload behavior.
+- Files and search: ws.fs; commands and background work: ws.shell/ws.tasks; Git: ws.git. Help also covers system, messages, locks, mcp, config, http, browser, net, skills, modules, packages, history, and lifecycle.
 
 Read and search before editing:
     ws.local["page"] = await ws.fs.read("src/app.py", end_line=80)

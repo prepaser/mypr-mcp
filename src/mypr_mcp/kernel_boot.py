@@ -72,6 +72,36 @@ def _kernel_class():
                     result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
                 self.session.send(stream, "execute_reply", result, parent, ident=ident)
                 return
+            if isinstance(metadata, dict) and metadata.get("mypr_control") == "config_reload":
+                result = {
+                    "status": "ok",
+                    "execution_count": 0,
+                    "user_expressions": {},
+                    "payload": [],
+                }
+                try:
+                    if metadata.get("generation") != os.environ.get("MYPR_GENERATION"):
+                        raise RuntimeError("Expired config reload generation")
+                    config = metadata.get("config")
+                    lsp = config.get("lsp") if isinstance(config, dict) else None
+                    if not isinstance(lsp, dict):
+                        raise ValueError("Config reload metadata has no lsp section")
+                    servers = lsp.get("servers")
+                    revision = lsp.get("revision")
+                    if not isinstance(servers, dict):
+                        raise ValueError("Config reload metadata has invalid LSP servers")
+                    if revision is not None and not isinstance(revision, str):
+                        raise ValueError("Config reload metadata has invalid revision")
+                    config_result = await self._mypr_workspace.code.apply_definitions(
+                        servers,
+                        revision,
+                        force=metadata.get("force", False),
+                    )
+                    result["config_result"] = config_result
+                except Exception as exc:
+                    result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
+                self.session.send(stream, "execute_reply", result, parent, ident=ident)
+                return
             request = metadata.get("mypr") if isinstance(metadata, dict) else None
             content = (parent or {}).get("content", {})
             executor = getattr(self, "_mypr_cells", None)

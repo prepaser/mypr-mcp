@@ -58,7 +58,7 @@ This creates a user-wide entry. Add the timeout and `required` settings above to
 
 Restart the Codex client after changing its configuration. Check registration with `codex mcp get mypr` or `codex mcp list`, then use `/mcp` in the Codex CLI to inspect the live connection. After connecting, the agent must call `init` once to bind the connection to a logical client identity before it can run Python code.
 
-Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers called from Python belong in the workspace's `.mypr/config.toml`, or can be registered dynamically with `await ws.mcp.configure(...)`.
+Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers called from Python can be set as global defaults in `~/.config/mypr/config.toml`, overridden in the workspace's `.mypr/config.toml`, or registered dynamically with `await ws.mcp.configure(...)`. Start with [config.example.toml](config.example.toml); the [configuration reference](docs/config.md) covers every field, its default and allowed values, and how to apply changes.
 
 ## Workspace runtime
 
@@ -142,6 +142,7 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | `ws.docs` | Read PDFs and Office documents, render pages, and explicitly run OCR |
 | `ws.shell`, `ws.tasks` | Start and inspect background work |
 | `ws.mcp` | Call and reconfigure external MCP servers |
+| `ws.config` | Inspect and persist global and workspace configuration |
 | `ws.messages` | Send and receive persistent client messages |
 | `ws.skills`, `ws.modules` | Validate, save, and reuse workspace capabilities |
 | `ws.git` | Read structured Git status, diffs, history, blame, and committed files |
@@ -417,7 +418,7 @@ Task IDs are shared across the kernel; omit `task_id` to generate one. An explic
 
 ### MCP services
 
-External MCP servers are configured in `.mypr/config.toml`:
+External MCP servers use global defaults with workspace overrides. The workspace layer is stored in `.mypr/config.toml`; the global layer is selected by `MYPR_GLOBAL_CONFIG` or the user's XDG configuration directory. Use `ws.config` to inspect layers and apply persisted changes explicitly. A workspace override replaces a server entry as a whole; `enabled = false` disables an inherited server and `ws.config.unset()` reveals the global entry again. See [layered configuration](docs/config.md).
 
 ```toml
 [mcp.servers.reports]
@@ -471,7 +472,7 @@ await ws.mcp.configure("reports", {
 await ws.mcp.list_tools("reports")
 ```
 
-`configure` persists a complete replacement of that server's configuration to `.mypr/config.toml`. To change selected fields, read the active configuration first:
+`configure` persists a complete workspace replacement of that server's configuration. To change selected fields, read the active configuration first:
 
 ```python
 ws.local["server_config"] = await ws.mcp.get_config("reports")
@@ -489,7 +490,7 @@ Initial connection and protocol initialization have a 30-second deadline, includ
 
 Changes affecting active or queued calls are rejected by default. Use `force=True` on these management methods to close the affected connections and fail their pending calls. Other servers remain usable. Closing a connection does not undo completed external side effects.
 
-Configuration is validated before changes are applied. Writes are atomic and preserve unrelated TOML sections and comments. If the file changed since the last load, `configure` and `remove` ask for `reload()` rather than overwriting those edits. `reload()` applies only added, changed, or removed MCP entries; unchanged connections stay open. A valid configuration does not guarantee that its server can start or authenticate: connection failures are reported when connecting. Management changes and their outcomes are recorded in workspace history. Once accepted, a management operation completes even if its caller disconnects or stops waiting; inspect configuration and history to confirm the outcome.
+Configuration is validated before changes are applied. Writes are atomic and preserve unrelated TOML sections and comments. If the file changed since the last load, `configure` and `remove` ask for `reload()` rather than overwriting those edits. `ws.config.set()` and `unset()` persist without applying; call `ws.config.reload()` explicitly. Reload applies only added, changed, or removed MCP entries; unchanged connections stay open. A valid configuration does not guarantee that its server can start or authenticate: connection failures are reported when connecting. Management changes and their outcomes are recorded in workspace history. Once accepted, a management operation completes even if its caller disconnects or stops waiting; inspect configuration and history to confirm the outcome.
 
 ### Client-local state and history
 
@@ -633,7 +634,7 @@ The installation uses `uv pip` and writes the resulting freeze to `.mypr/require
 
 `await ws.doctor()` checks whether the workspace is ready for the requested workflow: Python packages, search backends, configured LSP servers, browser engine, OCR language data, MCP configuration, runtime workers, and storage. Checks are reported as ready, missing, invalid, or unknown with a bounded reason. Doctor does not install packages or modify configuration. The same check is available before a manager starts with `uvx mypr-mcp doctor`.
 
-`await ws.storage.usage()` reports managed disk use by category through a metadata-only scan; it does not hash or read file contents. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Configure the policy in `.mypr/config.toml`:
+`await ws.storage.usage()` reports managed disk use by category through a metadata-only scan; it does not hash or read file contents. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Set the policy as global defaults or workspace overrides, then apply it with `await ws.config.reload()`:
 
 ```toml
 [storage]
@@ -720,7 +721,7 @@ Inline PNG/JPEG images share a 2 MiB source-byte budget per response; base64 enc
 
 ### Completed-work retention
 
-Configure retention in `.mypr/config.toml`; changes apply on manager restart:
+Configure retention as global defaults or workspace overrides. `completed_records` and `cache_bytes` apply through `await ws.config.reload()`; `completed_tasks` requires a manager and kernel restart:
 
 ```toml
 [limits]
