@@ -286,6 +286,7 @@ async def test_shell_start_rpc_preserves_environment_mode(rpc_fields, expected_i
     manager = Runtime.__new__(Runtime)
     manager.restarting = False
     manager.stopping = asyncio.Event()
+    manager._admission_lock = asyncio.Lock()
     manager.clients = {}
     manager.workspace = "/workspace"
     manager.shells = ShellService()

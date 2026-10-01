@@ -284,12 +284,33 @@ class Filesystem:
 
     async def _apply_lsp_plan(self, plan: Any) -> dict[str, Any]:
         """Apply a validated LSP WorkspaceEdit as one CAS transaction."""
-        from .patching import _commit, _plan, _read_state
+        from .patching import _commit, _plan, _read_state, _State
 
         operations = getattr(plan, "operations", None)
         if not isinstance(operations, list) or not operations:
             raise ValueError("LSP edit plan has no operations")
         paths: set[Path] = set()
+        touched_paths: set[Path] = set()
+        resolved_operations = []
+        raw_preconditions = getattr(plan, "preconditions", None)
+        if raw_preconditions is None:
+            preconditions: dict[Path, str | None] = {}
+        elif isinstance(raw_preconditions, Mapping):
+            preconditions = {}
+            for raw_path, expected in raw_preconditions.items():
+                if not isinstance(raw_path, Path):
+                    raise ValueError("LSP edit precondition contains an invalid path")
+                if expected is not None and not isinstance(expected, str):
+                    raise ValueError("LSP edit precondition contains an invalid revision")
+                path = raw_path.resolve(strict=False)
+                if not _below(path, self.workspace) or path == self.workspace:
+                    raise ValueError("LSP edit precondition must remain inside the workspace")
+                if path in preconditions:
+                    raise ValueError(f"duplicate LSP edit precondition: {path}")
+                preconditions[path] = expected
+                paths.add(path)
+        else:
+            raise ValueError("LSP edit preconditions must be a mapping")
         for operation in operations:
             path = getattr(operation, "path", None)
             source = getattr(operation, "source", None)
@@ -298,12 +319,17 @@ class Filesystem:
             resolved_path = path.resolve(strict=False)
             if not _below(resolved_path, self.workspace) or resolved_path == self.workspace:
                 raise ValueError("LSP edit path must remain inside the workspace")
-            paths.add(resolved_path)
+            resolved_source = None
             if source is not None:
                 resolved_source = source.resolve(strict=False)
                 if not _below(resolved_source, self.workspace) or resolved_source == self.workspace:
                     raise ValueError("LSP edit source must remain inside the workspace")
                 paths.add(resolved_source)
+                touched_paths.add(resolved_source)
+            paths.add(resolved_path)
+            touched_paths.add(resolved_path)
+            resolved_operations.append((operation, resolved_path, resolved_source))
+
         locks = [self._lock(path) for path in sorted(paths, key=str)]
         history_store = self._history_store()
         resources = sorted(
@@ -317,77 +343,188 @@ class Filesystem:
             for lock in locks:
                 await lock.acquire()
                 stack.callback(lock.release)
-            states: dict[Path, Any] = {}
-            plans: list[dict[str, Any]] = []
-            for operation in operations:
-                path = operation.path.resolve(strict=False)
-                display = str(path.relative_to(self.workspace))
-                current = await _to_thread_uncancelled(_read_state, path, display)
-                expected = getattr(operation, "expected", None)
-                if expected is not None and _sha256(current.data or b"") != expected:
-                    raise ValueError(f"LSP edit plan is stale: {display}")
+
+            initial: dict[Path, _State] = {}
+            for path in sorted(paths, key=str):
+                initial[path] = await _to_thread_uncancelled(
+                    _read_state, path, str(path.relative_to(self.workspace))
+                )
+            for path, expected in preconditions.items():
+                state = initial[path]
+                actual = _sha256(state.data) if state.exists else None
+                if actual != expected:
+                    raise ValueError(
+                        f"LSP edit plan precondition is stale: {path.relative_to(self.workspace)}"
+                    )
+            virtual = {
+                path: _State(state.path, state.display, state.exists, state.data, state.info)
+                for path, state in initial.items()
+            }
+
+            def check_expected(path: Path, expected: str | None, data: bytes | None) -> None:
+                if expected is not None and _sha256(data or b"") != expected:
+                    raise ValueError(f"LSP edit plan is stale: {path.relative_to(self.workspace)}")
+
+            def check_data(path: Path, expected: bytes | None, actual: _State) -> None:
+                if actual.data != expected or actual.exists != (expected is not None):
+                    raise ValueError(f"LSP edit plan is stale: {path.relative_to(self.workspace)}")
+
+            def mode(state: _State) -> int:
+                return stat.S_IMODE(state.info.st_mode) if state.info is not None else 0o600
+
+            for operation, path, source in resolved_operations:
                 kind = operation.operation
-                if kind == "rename":
-                    source = operation.source.resolve(strict=False)
-                    source_display = str(source.relative_to(self.workspace))
-                    source_state = states.get(source)
-                    if source_state is None:
-                        source_state = await _to_thread_uncancelled(
-                            _read_state, source, source_display
-                        )
-                        states[source] = source_state
-                    if not source_state.exists or source_state.data != operation.source_old:
-                        raise ValueError(f"LSP edit plan is stale: {source_display}")
+                current = virtual[path]
+                expected = getattr(operation, "expected", None)
+                if kind == "create":
+                    check_expected(path, expected, current.data)
                     if current.exists:
-                        raise FileExistsError(display)
-                    states[path] = current
-                    plans.append(
-                        _plan(
-                            "move",
-                            path,
-                            display,
-                            None,
-                            operation.new,
-                            current.info,
-                            stat.S_IMODE(source_state.info.st_mode),
-                            source=source,
-                            source_display=source_display,
-                            source_old=source_state.data,
-                            source_old_info=source_state.info,
-                        )
-                    )
-                elif kind == "create":
-                    if current.exists:
-                        raise FileExistsError(display)
-                    states[path] = current
-                    plans.append(_plan("add", path, display, None, operation.new, None, 0o600))
+                        raise FileExistsError(str(path.relative_to(self.workspace)))
+                    new = operation.new
+                    if not isinstance(new, bytes):
+                        raise ValueError("LSP create operation contains invalid bytes")
+                    virtual[path] = _State(path, current.display, True, new, None)
                 elif kind == "delete":
-                    if not current.exists:
-                        raise FileNotFoundError(display)
-                    states[path] = current
-                    plans.append(
-                        _plan("delete", path, display, current.data, None, current.info, None)
-                    )
+                    old = operation.old
+                    check_expected(path, expected, current.data)
+                    check_data(path, old, current)
+                    virtual[path] = _State(path, current.display, False, None, None)
                 elif kind == "update":
-                    if not current.exists:
-                        raise FileNotFoundError(display)
-                    states[path] = current
-                    plans.append(
-                        _plan(
-                            "update",
-                            path,
-                            display,
-                            current.data,
-                            operation.new,
-                            current.info,
-                            stat.S_IMODE(current.info.st_mode),
-                        )
+                    old = operation.old
+                    check_expected(path, expected, current.data)
+                    check_data(path, old, current)
+                    new = operation.new
+                    if not isinstance(new, bytes):
+                        raise ValueError("LSP update operation contains invalid bytes")
+                    virtual[path] = _State(path, current.display, True, new, current.info)
+                elif kind == "rename":
+                    if source is None:
+                        raise ValueError("LSP rename operation has no source")
+                    source_state = virtual[source]
+                    destination_state = virtual[path]
+                    check_expected(source, getattr(operation, "expected", None), source_state.data)
+                    check_data(source, getattr(operation, "source_old", None), source_state)
+                    if not source_state.exists:
+                        raise FileNotFoundError(str(source.relative_to(self.workspace)))
+                    if destination_state.exists:
+                        raise FileExistsError(str(path.relative_to(self.workspace)))
+                    new = operation.new
+                    if not isinstance(new, bytes):
+                        raise ValueError("LSP rename operation contains invalid bytes")
+                    virtual[source] = _State(
+                        source,
+                        source_state.display,
+                        False,
+                        None,
+                        None,
+                    )
+                    virtual[path] = _State(
+                        path,
+                        destination_state.display,
+                        True,
+                        new,
+                        source_state.info,
                     )
                 else:
                     raise ValueError(f"unsupported LSP edit operation: {kind}")
+
+            plans: list[dict[str, Any]] = []
+            if (
+                len(resolved_operations) == 1
+                and resolved_operations[0][0].operation == "rename"
+            ):
+                operation, path, source = resolved_operations[0]
+                assert source is not None
+                source_state = initial[source]
+                destination_state = initial[path]
+                plans.append(
+                    _plan(
+                        "move",
+                        path,
+                        str(path.relative_to(self.workspace)),
+                        None,
+                        operation.new,
+                        destination_state.info,
+                        stat.S_IMODE(source_state.info.st_mode),
+                        source=source,
+                        source_display=str(source.relative_to(self.workspace)),
+                        source_old=source_state.data,
+                        source_old_info=source_state.info,
+                    )
+                )
+            else:
+                for path in sorted(touched_paths, key=str):
+                    old_state = initial[path]
+                    new_state = virtual[path]
+                    mode_changed = (
+                        old_state.exists
+                        and new_state.exists
+                        and mode(old_state) != mode(new_state)
+                    )
+                    if (
+                        old_state.exists == new_state.exists
+                        and old_state.data == new_state.data
+                        and not mode_changed
+                    ):
+                        if (
+                            len(resolved_operations) == 1
+                            and resolved_operations[0][0].operation == "update"
+                            and old_state.exists
+                        ):
+                            display = str(path.relative_to(self.workspace))
+                            plans.append(
+                                _plan(
+                                    "update",
+                                    path,
+                                    display,
+                                    old_state.data,
+                                    new_state.data,
+                                    old_state.info,
+                                    stat.S_IMODE(old_state.info.st_mode),
+                                )
+                            )
+                        continue
+                    display = str(path.relative_to(self.workspace))
+                    if not old_state.exists:
+                        plans.append(
+                            _plan(
+                                "add",
+                                path,
+                                display,
+                                None,
+                                new_state.data,
+                                None,
+                                mode(new_state),
+                            )
+                        )
+                    elif not new_state.exists:
+                        plans.append(
+                            _plan(
+                                "delete",
+                                path,
+                                display,
+                                old_state.data,
+                                None,
+                                old_state.info,
+                                None,
+                            )
+                        )
+                    else:
+                        plans.append(
+                            _plan(
+                                "update",
+                                path,
+                                display,
+                                old_state.data,
+                                new_state.data,
+                                old_state.info,
+                                mode(new_state),
+                            )
+                        )
+
             await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
             result = await _to_thread_uncancelled(
-                _commit, plans, states, 32 * 1024, history_store=history_store
+                _commit, plans, initial, 32 * 1024, history_store=history_store
             )
             result["history_recorded"] = True
             return result

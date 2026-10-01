@@ -22,11 +22,14 @@ def _emit(phase: str, **fields: Any) -> None:
 
 
 def _validate_specs(specs: list[str]) -> list[str]:
-    if not specs:
+    if not isinstance(specs, list) or not specs:
         raise ValueError("at least one package requirement is required")
-    if any(not isinstance(spec, str) or not spec.strip() or spec.startswith("-") for spec in specs):
+    if any(not isinstance(spec, str) for spec in specs):
+        raise ValueError("package requirements must be strings")
+    values = [spec.strip() for spec in specs]
+    if any(not spec or spec.startswith("-") for spec in values):
         raise ValueError("package requirements must be non-empty and cannot be options")
-    return [spec.strip() for spec in specs]
+    return values
 
 
 def _atomic_write(path: Path, data: bytes) -> None:

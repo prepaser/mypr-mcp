@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import sys
 import time
 from collections import OrderedDict
@@ -43,6 +44,7 @@ MAX_HOVER_CHARS = 64 * 1024
 MAX_STDERR_BYTES = 16 * 1024
 MAX_ACTIONS = 1024
 ACTION_TTL = 3600.0
+MAX_EDIT_TARGETS = 100
 MAX_SYMBOL_DEPTH = 32
 MAX_SYMBOL_TEXT = 1024
 MAX_HIERARCHY_ITEMS = 64
@@ -92,6 +94,8 @@ class _StoredAction:
     document_uri: str
     document_text: str
     created: float
+    target_snapshots: dict[Path, str | None]
+    target_documents: dict[Path, tuple[int, str]]
 
 
 def _position(text: str, line: Any, character: Any, encoding: str) -> dict[str, int]:
@@ -189,6 +193,10 @@ def _source_lines(text: str) -> list[str]:
 
 def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _file_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
 def _clean_diagnostic(value: Any) -> dict[str, Any] | None:
@@ -1871,11 +1879,51 @@ class CodeTools:
 
     async def _read_edit_bytes(self, path: Path) -> bytes | None:
         def read() -> bytes | None:
-            if not path.exists():
+            try:
+                before = path.lstat()
+            except FileNotFoundError:
                 return None
-            if path.is_symlink() or not path.is_file():
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
                 raise EditError(f"LSP edit target is not a regular file: {path}")
-            return path.read_bytes()
+            if before.st_size > MAX_DOCUMENT_BYTES:
+                raise ValueError(f"document exceeds {MAX_DOCUMENT_BYTES} bytes")
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                fd = os.open(path, flags)
+            except FileNotFoundError:
+                return None
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise EditError(f"LSP edit target is not a regular file: {path}")
+                if opened.st_size > MAX_DOCUMENT_BYTES:
+                    raise ValueError(f"document exceeds {MAX_DOCUMENT_BYTES} bytes")
+                with os.fdopen(fd, "rb") as stream:
+                    fd = -1
+                    data = stream.read(MAX_DOCUMENT_BYTES + 1)
+                    after = os.fstat(stream.fileno())
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            if len(data) > MAX_DOCUMENT_BYTES:
+                raise ValueError(f"document exceeds {MAX_DOCUMENT_BYTES} bytes")
+            try:
+                current = path.lstat()
+            except FileNotFoundError as exc:
+                raise EditError(f"file changed while reading: {path}") from exc
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or _file_signature(before) != _file_signature(opened)
+                or _file_signature(opened) != _file_signature(after)
+                or _file_signature(after) != _file_signature(current)
+            ):
+                raise EditError(f"file changed while reading: {path}")
+            return data
 
         return await asyncio.to_thread(read)
 
@@ -1891,7 +1939,8 @@ class CodeTools:
         *,
         title: str,
         unsupported_reason: str | None = None,
-        document_preconditions: dict[Path, bytes] | None = None,
+        document_preconditions: dict[Path, str | None] | None = None,
+        document_snapshots: dict[Path, tuple[int, str]] | None = None,
     ) -> Any:
         if edit is None:
             raise EditError("language server returned no workspace edit")
@@ -1905,7 +1954,7 @@ class CodeTools:
             if path not in states:
                 states[path] = await self._read_edit_bytes(path)
                 expected = (document_preconditions or {}).get(path)
-                if expected is not None and states[path] != expected:
+                if path in (document_preconditions or {}) and sha256(states[path]) != expected:
                     raise EditError(f"LSP document changed since the request: {path}")
             return states[path]
 
@@ -1932,8 +1981,14 @@ class CodeTools:
             new = new_text.encode("utf-8")
             original = current
             states[path] = new
-            for operation in operations:
-                if operation.path == path and operation.operation in {"create", "update", "rename"}:
+            for operation in reversed(operations):
+                if operation.operation == "rename" and operation.source == path:
+                    break
+                if operation.path != path:
+                    continue
+                if operation.operation == "delete":
+                    break
+                if operation.operation in {"create", "update", "rename"}:
                     operation.new = new
                     return
             operations.append(
@@ -2010,12 +2065,14 @@ class CodeTools:
             title,
             unsupported_reason,
             server.name,
+            preconditions=document_preconditions,
+            documents=document_snapshots,
         )
         return plan
 
     async def _validate_document_snapshot(
         self, server: _LanguageServer, uri: str, version: int, text: str
-    ) -> dict[Path, bytes]:
+    ) -> dict[Path, str | None]:
         document = server.documents.get(uri)
         if (
             document is None
@@ -2031,7 +2088,105 @@ class CodeTools:
         current = await self._read_edit_bytes(document.path)
         if current != expected:
             raise EditError(f"LSP document changed since the request: {document.path}")
-        return {document.path: expected}
+        return {document.path: sha256(expected)}
+
+    def _edit_target_paths(self, edit: Any) -> set[Path]:
+        if not isinstance(edit, dict):
+            return set()
+        paths: set[Path] = set()
+
+        def add(uri: Any) -> None:
+            if uri is None:
+                return
+            path = self._edit_uri_path(uri)
+            if path not in paths and len(paths) >= MAX_EDIT_TARGETS:
+                raise EditError(f"LSP edit references more than {MAX_EDIT_TARGETS} files")
+            paths.add(path)
+
+        changes = edit.get("changes")
+        if isinstance(changes, dict):
+            for uri in changes:
+                add(uri)
+        document_changes = edit.get("documentChanges")
+        if isinstance(document_changes, list):
+            for change in document_changes:
+                if not isinstance(change, dict):
+                    continue
+                kind = change.get("kind")
+                if kind == "rename":
+                    add(change.get("oldUri"))
+                    add(change.get("newUri"))
+                elif kind in {"create", "delete"}:
+                    add(change.get("uri"))
+                else:
+                    text_document = change.get("textDocument")
+                    if isinstance(text_document, dict):
+                        add(text_document.get("uri"))
+        return paths
+
+    async def _capture_edit_targets(
+        self,
+        server: _LanguageServer,
+        edit: Any,
+        *,
+        snapshot_cache: dict[Path, str | None] | None = None,
+        document_cache: dict[Path, tuple[int, str]] | None = None,
+    ) -> tuple[dict[Path, str | None], dict[Path, tuple[int, str]]]:
+        snapshots = snapshot_cache if snapshot_cache is not None else {}
+        documents = document_cache if document_cache is not None else {}
+        open_documents = {document.path: document for document in server.documents.values()}
+        paths = self._edit_target_paths(edit)
+        for path in paths:
+            document = open_documents.get(path)
+            if document is not None:
+                try:
+                    data = document.text.encode("utf-8")
+                except UnicodeEncodeError as exc:
+                    raise EditError("LSP document text is not valid UTF-8") from exc
+                if len(data) > MAX_DOCUMENT_BYTES:
+                    raise ValueError(f"document exceeds {MAX_DOCUMENT_BYTES} bytes")
+                revision = sha256(data)
+                if path in snapshots and snapshots[path] != revision:
+                    raise EditError(f"LSP document changed since the request: {path}")
+                snapshots[path] = revision
+                current = (document.version, revision)
+                if path in documents and documents[path] != current:
+                    raise EditError(f"LSP document changed since the request: {path}")
+                documents[path] = current
+            elif path not in snapshots:
+                snapshots[path] = sha256(await self._read_edit_bytes(path))
+        return (
+            {path: snapshots[path] for path in paths},
+            {
+                path: documents[path]
+                for path in paths
+                if path in open_documents and path in documents
+            },
+        )
+
+    @staticmethod
+    def _validate_target_documents(
+        server: _LanguageServer, documents: dict[Path, tuple[int, str]]
+    ) -> None:
+        current = {
+            document.path: document for document in getattr(server, "documents", {}).values()
+        }
+        for path, (version, revision) in documents.items():
+            document = current.get(path)
+            if (
+                document is None
+                or document.version != version
+                or sha256(document.text.encode("utf-8")) != revision
+            ):
+                raise EditError(f"LSP document changed since the request: {path}")
+
+    async def _validate_target_snapshots(
+        self, snapshots: dict[Path, str | None]
+    ) -> None:
+        for path, expected in snapshots.items():
+            current = sha256(await self._read_edit_bytes(path))
+            if current != expected:
+                raise EditError(f"LSP document changed since the request: {path}")
 
     def _prune_actions(self) -> None:
         now = time.monotonic()
@@ -2061,14 +2216,24 @@ class CodeTools:
         version = document.version
         text = document.text
         async with server._operation_lock:
-            preconditions = await self._validate_document_snapshot(
+            await self._validate_document_snapshot(
                 server, document.uri, version, text
             )
+            captured, captured_documents = await self._capture_edit_targets(server, edit)
+            preconditions = dict(captured)
+            preconditions.update(
+                await self._validate_document_snapshot(server, document.uri, version, text)
+            )
+            target_documents = dict(captured_documents)
+            target_documents[document.path] = (version, preconditions[document.path])
+            self._validate_target_documents(server, target_documents)
+            await self._validate_target_snapshots(preconditions)
             plan = await self._workspace_edit_plan(
                 server,
                 edit,
                 title=f"Rename to {new_name}",
                 document_preconditions=preconditions,
+                document_snapshots=target_documents,
             )
         result = plan.result()
         result.update(
@@ -2104,53 +2269,96 @@ class CodeTools:
             language=language,
             only=only,
         )
+        document_version = document.version
+        document_uri = document.uri
+        document_text = document.text
+        try:
+            origin_revision = sha256(document_text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise EditError("LSP document text is not valid UTF-8") from exc
         result: dict[str, Any] = {
             "path": str(document.path),
-            "document_version": document.version,
+            "document_version": document_version,
             "actions": [],
             "truncated": len(raw_actions) > MAX_RESULTS,
         }
-        for raw in raw_actions[:MAX_RESULTS]:
-            if not isinstance(raw, dict):
-                result["truncated"] = True
-                continue
-            title = raw.get("title")
-            if not isinstance(title, str):
-                title = str(raw.get("command", ""))
-            action_id = secrets.token_urlsafe(18)
-            self._actions[action_id] = _StoredAction(
-                server.name,
-                copy.deepcopy(raw),
-                server.generation,
-                document.version,
-                document.uri,
-                document.text,
-                time.monotonic(),
-            )
-            command = raw.get("command")
-            if isinstance(command, dict):
-                has_command = isinstance(command.get("command"), str)
-            else:
-                has_command = isinstance(command, str)
-            edit_value = raw.get("edit")
-            item = {
-                "action_id": action_id,
-                "title": title[:1024],
-                "kind": raw.get("kind") if isinstance(raw.get("kind"), str) else None,
-                "has_edit": isinstance(edit_value, dict),
-                "has_command": has_command,
-                "supported": isinstance(edit_value, dict) and not has_command,
-            }
-            if isinstance(raw.get("disabled"), dict):
-                item["disabled"] = str(raw["disabled"].get("reason", ""))[:1024]
-            elif isinstance(raw.get("disabled"), str):
-                item["disabled"] = raw["disabled"][:1024]
-            result["actions"].append(item)
-            if _json_size(result) > max_bytes:
-                result["actions"].pop()
-                result["truncated"] = True
-                break
-        self._prune_actions()
+        created_ids: list[str] = []
+        try:
+            async with server._operation_lock:
+                current = server.documents.get(document_uri)
+                if (
+                    current is not document
+                    or current.version != document_version
+                    or current.text != document_text
+                ):
+                    raise EditError("LSP document changed since the request")
+                shared_snapshots: dict[Path, str | None] = {
+                    document.path: origin_revision
+                }
+                shared_documents: dict[Path, tuple[int, str]] = {
+                    document.path: (document_version, origin_revision)
+                }
+                for raw in raw_actions[:MAX_RESULTS]:
+                    if not isinstance(raw, dict):
+                        result["truncated"] = True
+                        continue
+                    title = raw.get("title")
+                    if not isinstance(title, str):
+                        title = str(raw.get("command", ""))
+                    action_id = secrets.token_urlsafe(18)
+                    target_snapshots: dict[Path, str | None] = {}
+                    target_documents: dict[Path, tuple[int, str]] = {}
+                    if isinstance(raw.get("edit"), dict):
+                        target_snapshots, target_documents = await self._capture_edit_targets(
+                            server,
+                            raw["edit"],
+                            snapshot_cache=shared_snapshots,
+                            document_cache=shared_documents,
+                        )
+                    target_snapshots[document.path] = origin_revision
+                    target_documents[document.path] = (document_version, origin_revision)
+                    self._actions[action_id] = _StoredAction(
+                        server.name,
+                        copy.deepcopy(raw),
+                        server.generation,
+                        document_version,
+                        document_uri,
+                        document_text,
+                        time.monotonic(),
+                        target_snapshots,
+                        target_documents,
+                    )
+                    created_ids.append(action_id)
+                    command = raw.get("command")
+                    if isinstance(command, dict):
+                        has_command = isinstance(command.get("command"), str)
+                    else:
+                        has_command = isinstance(command, str)
+                    edit_value = raw.get("edit")
+                    item = {
+                        "action_id": action_id,
+                        "title": title[:1024],
+                        "kind": raw.get("kind") if isinstance(raw.get("kind"), str) else None,
+                        "has_edit": isinstance(edit_value, dict),
+                        "has_command": has_command,
+                        "supported": isinstance(edit_value, dict) and not has_command,
+                    }
+                    if isinstance(raw.get("disabled"), dict):
+                        item["disabled"] = str(raw["disabled"].get("reason", ""))[:1024]
+                    elif isinstance(raw.get("disabled"), str):
+                        item["disabled"] = raw["disabled"][:1024]
+                    result["actions"].append(item)
+                    if _json_size(result) > max_bytes:
+                        result["actions"].pop()
+                        self._actions.pop(action_id, None)
+                        result["truncated"] = True
+                        break
+        except BaseException:
+            for action_id in created_ids:
+                self._actions.pop(action_id, None)
+            raise
+        finally:
+            self._prune_actions()
         return result
 
     async def prepare_action(self, action_id: str) -> dict[str, Any]:
@@ -2169,18 +2377,25 @@ class CodeTools:
         if server.generation != generation:
             raise EditError("code action belongs to an older language-server generation")
         async with server._operation_lock:
-            preconditions = await self._validate_document_snapshot(
-                server, stored.document_uri, version, stored.document_text
+            self._validate_target_documents(server, stored.target_documents)
+            preconditions = dict(stored.target_snapshots)
+            preconditions.update(
+                await self._validate_document_snapshot(
+                    server, stored.document_uri, version, stored.document_text
+                )
             )
+            await self._validate_target_snapshots(preconditions)
             command = action.get("command")
             has_command = isinstance(command, str) or (
                 isinstance(command, dict) and isinstance(command.get("command"), str)
             )
+            resolved = False
             if "edit" not in action and not has_command:
                 provider = server.capabilities.get("codeActionProvider")
                 if not isinstance(provider, dict) or provider.get("resolveProvider") is not True:
                     raise EditError("code action requires unsupported codeAction/resolve")
                 action = await server.resolve_code_action(action)
+                resolved = True
                 command = action.get("command")
                 has_command = isinstance(command, str) or (
                     isinstance(command, dict) and isinstance(command.get("command"), str)
@@ -2194,12 +2409,28 @@ class CodeTools:
                 edit = {"changes": {}}
             else:
                 edit = action["edit"]
+            target_documents = dict(stored.target_documents)
+            if resolved and isinstance(action.get("edit"), dict):
+                captured, captured_documents = await self._capture_edit_targets(server, edit)
+                for path, revision in captured.items():
+                    preconditions.setdefault(path, revision)
+                for path, snapshot in captured_documents.items():
+                    target_documents.setdefault(path, snapshot)
+            origin = await self._validate_document_snapshot(
+                server, stored.document_uri, version, stored.document_text
+            )
+            preconditions.update(origin)
+            origin_path = next(iter(origin))
+            target_documents[origin_path] = (version, origin[origin_path])
+            self._validate_target_documents(server, target_documents)
+            await self._validate_target_snapshots(preconditions)
             plan = await self._workspace_edit_plan(
                 server,
                 edit,
                 title=str(action.get("title", "Code action"))[:1024],
                 unsupported_reason=unsupported,
                 document_preconditions=preconditions,
+                document_snapshots=target_documents,
             )
         result = plan.result()
         result.update({"action_id": action_id, "document_version": version})
@@ -2216,6 +2447,8 @@ class CodeTools:
         if plan.unsupported_reason is not None:
             raise EditError(plan.unsupported_reason)
         async with server._operation_lock:
+            self._validate_target_documents(server, plan.documents)
+            await self._validate_target_snapshots(plan.preconditions)
             virtual: dict[Path, bytes | None] = {}
             for operation in plan.operations:
                 if operation.operation == "rename":

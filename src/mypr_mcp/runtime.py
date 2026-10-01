@@ -44,6 +44,7 @@ from .transport import MAX_MESSAGE, socket_path, workspace_id
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
 MCP_MUTATIONS = {"configure", "remove", "restart", "reload"}
+LIFECYCLE_START_OPS = {"shell_start", "packages_add", "scan_start", "browser_server"}
 TIMING_OPS = {
     "init",
     "status",
@@ -1305,6 +1306,65 @@ class Runtime:
             raise RuntimeError("Expired kernel generation")
         context = dict(client=client, connection_id=connection_id, connection=connection,
                        requested_client=requested_client, generation=generation)
+        if op == "browser_server":
+            async with self._admission_lock:
+                self._check_dispatch_admission(op)
+                if generation and generation != self.generation:
+                    raise RuntimeError("Expired kernel generation")
+                admission_generation = self.generation
+                if (
+                    self.stopping.is_set()
+                    or self.resetting
+                    or not self.healthy
+                    or not self.workspace_available()
+                ):
+                    raise RuntimeError("Workspace is not accepting browser requests")
+                async with self._resource_lock:
+                    if (
+                        admission_generation != self.generation
+                        or self.stopping.is_set()
+                        or self.resetting
+                        or not self.healthy
+                        or not self.workspace_available()
+                    ):
+                        raise RuntimeError("Workspace is not accepting browser requests")
+                    if self.browser is None:
+                        self.browser = BrowserService(
+                            self.workspace,
+                            self.py,
+                            kernel_pid=self.km.provisioner.pid,
+                            generation=self.generation,
+                            shells=self.shells,
+                        )
+                    browser_service = self.browser
+            def track_install(ident, **fields):
+                self.track_shell(ident, client, connection_id, req.get("exec_id"), **fields)
+
+            result = await browser_service.ensure(
+                req.get("browser", "chromium"),
+                launch_options=req.get("launch_options"),
+                track=track_install,
+            )
+            async with self._admission_lock:
+                if (
+                    admission_generation != self.generation
+                    or self.stopping.is_set()
+                    or self.resetting
+                    or not self.healthy
+                    or not self.workspace_available()
+                    or self.browser is not browser_service
+                ):
+                    raise RuntimeError("Workspace is not accepting browser requests")
+            return result
+        if op in LIFECYCLE_START_OPS:
+            async with self._admission_lock:
+                self._check_dispatch_admission(op)
+                if generation and generation != self.generation:
+                    raise RuntimeError("Expired kernel generation")
+                return await self._dispatch_handlers(op, req, context)
+        return await self._dispatch_handlers(op, req, context)
+
+    async def _dispatch_handlers(self, op, req, context):
         for handler in (
             self._dispatch_execution, self._dispatch_messages, self._dispatch_storage,
             self._dispatch_tasks, self._dispatch_scan, self._dispatch_tools,
@@ -1316,14 +1376,16 @@ class Runtime:
         raise ValueError(f"Unknown operation: {op}")
 
     def _check_dispatch_admission(self, op):
+        if getattr(self, "resetting", False) and op in LIFECYCLE_START_OPS:
+            raise RuntimeError("Workspace restart/reset already in progress")
         if self.restarting and op in {
             "execute", "reset", "shell_start", "packages_add",
             "scan_start", "browser_server",
         }:
             raise RuntimeError(f"Workspace is restarting: {self.restarting}")
-        if self.stopping.is_set() and op in {
-            "init", "execute", "shell_start", "packages_add", "reset", "mcp",
-        }:
+        if self.stopping.is_set() and (
+            op in {"init", "execute", "reset", "mcp"} or op in LIFECYCLE_START_OPS
+        ):
             raise RuntimeError("Workspace manager is stopping")
 
     async def _update_connection(self, connection, requested_client, op):
@@ -1762,28 +1824,6 @@ class Runtime:
         self, op, req, *, client, connection_id, connection,
         requested_client, generation,
     ):
-        if op == "browser_server":
-            if self.stopping.is_set() or self.resetting or not self.healthy:
-                raise RuntimeError("Workspace is not accepting browser requests")
-            async with self._resource_lock:
-                if self.browser is None:
-                    self.browser = BrowserService(
-                        self.workspace,
-                        self.py,
-                        kernel_pid=self.km.provisioner.pid,
-                        generation=self.generation,
-                        shells=self.shells,
-                    )
-                browser_service = self.browser
-
-            def track_install(ident, **fields):
-                self.track_shell(ident, client, connection_id, req.get("exec_id"), **fields)
-
-            return await browser_service.ensure(
-                req.get("browser", "chromium"),
-                launch_options=req.get("launch_options"),
-                track=track_install,
-            )
         if op in {"search", "git"}:
             if self.stopping.is_set():
                 raise RuntimeError("Workspace manager is stopping")
@@ -1856,12 +1896,9 @@ class Runtime:
         if op == "shell_cancel":
             return await self.shells.cancel(req["id"])
         if op == "packages_add":
-            specs = req["specs"]
-            if (
-                not isinstance(specs, list) or not specs
-                or any(not isinstance(s, str) or not s or s.startswith("-") for s in specs)
-            ):
-                raise ValueError("Expected package requirements, not command options")
+            from .package_worker import _validate_specs
+
+            specs = _validate_specs(req["specs"])
             command = [
                 sys.executable, "-I", str(Path(__file__).with_name("package_worker.py")),
                 "--python", str(self.py), "--root", str(self.root),
@@ -2291,7 +2328,8 @@ class Runtime:
     async def close_kernel(self):
         self.healthy = False
         await self.cleanup_kernel_resources()
-        browser, self.browser = self.browser, None
+        async with self._resource_lock:
+            browser, self.browser = self.browser, None
         if browser is not None:
             try:
                 async with asyncio.timeout(8):

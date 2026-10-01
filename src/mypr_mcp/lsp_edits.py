@@ -6,10 +6,12 @@ import asyncio
 import difflib
 import hashlib
 import math
+import re
 import stat
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,11 @@ from .change_plans import PLAN_TTL, ChangePlanError, ChangePlanStore
 
 class EditError(ValueError):
     """A language-server edit cannot be safely represented or applied."""
+
+
+_HASH = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_PRECONDITION_TARGETS = 101
+_MISSING = object()
 
 
 def sha256(data: bytes | None) -> str | None:
@@ -142,6 +149,119 @@ def _safe_path(root: Path, value: Any) -> Path:
     return resolved
 
 
+def _plan_path(root: Path, value: Any) -> Path:
+    if not isinstance(value, Path) or not value.is_absolute():
+        raise EditError("LSP plan metadata path must be absolute")
+    workspace = root.resolve()
+    try:
+        resolved = value.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise EditError("LSP plan metadata path cannot be resolved") from exc
+    if value != resolved:
+        raise EditError("LSP plan metadata path must be canonical")
+    try:
+        resolved.relative_to(workspace)
+    except ValueError as exc:
+        raise EditError("LSP plan metadata path is outside the workspace") from exc
+    current = value
+    while current != workspace:
+        if current.is_symlink():
+            raise EditError("LSP plan metadata path cannot use symlinks")
+        current = current.parent
+    if value.exists() and (value.is_symlink() or not value.is_file()):
+        raise EditError("LSP plan metadata path must be a regular file")
+    return resolved
+
+
+def _revision(value: Any, *, nullable: bool) -> str | None:
+    if nullable and value is None:
+        return None
+    if not isinstance(value, str) or _HASH.fullmatch(value) is None:
+        raise EditError("LSP plan metadata has an invalid SHA-256 revision")
+    return value
+
+
+def _normalize_preconditions(
+    root: Path, values: Mapping[Path, str | None] | None,
+) -> dict[Path, str | None]:
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise EditError("LSP plan preconditions must be a mapping")
+    normalized: dict[Path, str | None] = {}
+    for raw_path, expected in values.items():
+        path = _plan_path(root, raw_path)
+        if path in normalized:
+            raise EditError("duplicate LSP plan precondition")
+        normalized[path] = _revision(expected, nullable=True)
+    return normalized
+
+
+def _normalize_documents(
+    root: Path, values: Mapping[Path, tuple[int, str]] | None,
+) -> dict[Path, tuple[int, str]]:
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise EditError("LSP plan documents must be a mapping")
+    normalized: dict[Path, tuple[int, str]] = {}
+    for raw_path, raw_document in values.items():
+        path = _plan_path(root, raw_path)
+        if path in normalized:
+            raise EditError("duplicate LSP plan document")
+        if not isinstance(raw_document, tuple) or len(raw_document) != 2:
+            raise EditError("LSP plan document metadata is invalid")
+        version, digest = raw_document
+        if type(version) is not int or version < 0:
+            raise EditError("LSP plan document version is invalid")
+        normalized[path] = (version, _revision(digest, nullable=False))
+    return normalized
+
+
+def _parse_preconditions(root: Path, raw: Any) -> dict[Path, str | None]:
+    if raw is _MISSING:
+        return {}
+    if not isinstance(raw, list):
+        raise EditError("LSP plan preconditions must be a list")
+    if len(raw) > _MAX_PRECONDITION_TARGETS:
+        raise EditError("LSP edit plan has too many precondition targets")
+    values: dict[Path, str | None] = {}
+    for item in raw:
+        if not isinstance(item, dict) or "path" not in item or "revision" not in item:
+            raise EditError("invalid persisted LSP plan precondition")
+        path = _plan_path(root, item["path"])
+        if path in values:
+            raise EditError("duplicate LSP plan precondition")
+        values[path] = _revision(item["revision"], nullable=True)
+    return values
+
+
+def _parse_documents(root: Path, raw: Any) -> dict[Path, tuple[int, str]]:
+    if raw is _MISSING:
+        return {}
+    if not isinstance(raw, list):
+        raise EditError("LSP plan documents must be a list")
+    if len(raw) > _MAX_PRECONDITION_TARGETS:
+        raise EditError("LSP edit plan has too many precondition targets")
+    values: dict[Path, tuple[int, str]] = {}
+    for item in raw:
+        if (
+            not isinstance(item, dict)
+            or "path" not in item
+            or "version" not in item
+            or "digest" not in item
+        ):
+            raise EditError("invalid persisted LSP plan document")
+        path = _plan_path(root, item["path"])
+        if path in values:
+            raise EditError("duplicate LSP plan document")
+        version = item["version"]
+        if type(version) is not int or version < 0:
+            raise EditError("LSP plan document version is invalid")
+        values[path] = (version, _revision(item["digest"], nullable=False))
+    return values
+
+
 @dataclass(slots=True)
 class PlannedOperation:
     operation: str
@@ -182,6 +302,14 @@ class EditPlan:
     unsupported_reason: str | None = None
     created: float = 0.0
     server: str | None = None
+    preconditions: dict[Path, str | None] = field(default_factory=dict)
+    documents: dict[Path, tuple[int, str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.preconditions = _normalize_preconditions(self.root, self.preconditions)
+        self.documents = _normalize_documents(self.root, self.documents)
+        if len(set(self.preconditions) | set(self.documents)) > _MAX_PRECONDITION_TARGETS:
+            raise EditError("LSP edit plan has too many precondition targets")
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -189,6 +317,14 @@ class EditPlan:
             "title": self.title,
             "unsupported_reason": self.unsupported_reason,
             "server": self.server,
+            "preconditions": [
+                {"path": path, "revision": revision}
+                for path, revision in self.preconditions.items()
+            ],
+            "documents": [
+                {"path": path, "version": version, "digest": digest}
+                for path, (version, digest) in self.documents.items()
+            ],
             "operations": [
                 {
                     "operation": operation.operation,
@@ -210,26 +346,15 @@ class EditPlan:
         raw_operations = payload.get("operations")
         if not isinstance(raw_operations, list):
             raise EditError("invalid persisted LSP edit plan")
+        preconditions = _parse_preconditions(root, payload.get("preconditions", _MISSING))
+        documents = _parse_documents(root, payload.get("documents", _MISSING))
         operations = []
         for raw in raw_operations:
             if not isinstance(raw, dict):
                 raise EditError("invalid persisted LSP edit operation")
-            path = raw.get("path")
-            source = raw.get("source")
-            if not isinstance(path, Path) or (source is not None and not isinstance(source, Path)):
-                raise EditError("invalid persisted LSP edit path")
-            for candidate in (path, source):
-                if candidate is None:
-                    continue
-                try:
-                    candidate.resolve(strict=False).relative_to(root)
-                except ValueError as exc:
-                    raise EditError("persisted LSP edit path is outside the workspace") from exc
-                current = candidate
-                while current != root:
-                    if current.is_symlink():
-                        raise EditError("persisted LSP edit path uses a symlink")
-                    current = current.parent
+            path = _plan_path(root, raw.get("path"))
+            raw_source = raw.get("source")
+            source = _plan_path(root, raw_source) if raw_source is not None else None
             operation = raw.get("operation")
             if operation not in {"create", "update", "delete", "rename"}:
                 raise EditError("invalid persisted LSP edit operation")
@@ -247,14 +372,16 @@ class EditPlan:
                 )
             )
         return cls(
-            ident,
-            root,
-            operations,
-            str(payload.get("generation", "")),
-            str(payload.get("title", "LSP edit")),
-            payload.get("unsupported_reason"),
-            time.monotonic(),
-            payload.get("server") if isinstance(payload.get("server"), str) else None,
+            ident=ident,
+            root=root,
+            operations=operations,
+            generation=str(payload.get("generation", "")),
+            title=str(payload.get("title", "LSP edit")),
+            unsupported_reason=payload.get("unsupported_reason"),
+            created=time.monotonic(),
+            server=payload.get("server") if isinstance(payload.get("server"), str) else None,
+            preconditions=preconditions,
+            documents=documents,
         )
 
     def result(self, *, diff_limit: int = 32_768) -> dict[str, Any]:
@@ -315,6 +442,9 @@ class EditPlanStore:
         title: str,
         unsupported_reason: str | None = None,
         server: str | None = None,
+        *,
+        preconditions: dict[Path, str | None] | None = None,
+        documents: dict[Path, tuple[int, str]] | None = None,
     ) -> EditPlan:
         with self._cache_lock:
             plan = EditPlan(
@@ -326,6 +456,8 @@ class EditPlanStore:
                 unsupported_reason,
                 time.monotonic(),
                 server,
+                preconditions=preconditions,
+                documents=documents,
             )
             try:
                 durable_id = self._durable.create(plan.payload())
@@ -344,6 +476,9 @@ class EditPlanStore:
         title: str,
         unsupported_reason: str | None = None,
         server: str | None = None,
+        *,
+        preconditions: dict[Path, str | None] | None = None,
+        documents: dict[Path, tuple[int, str]] | None = None,
     ) -> EditPlan:
         return await wait_owned(
             asyncio.to_thread(
@@ -354,6 +489,8 @@ class EditPlanStore:
                 title,
                 unsupported_reason,
                 server,
+                preconditions=preconditions,
+                documents=documents,
             )
         )
 

@@ -578,7 +578,9 @@ def _result(plans: list[dict[str, Any]], dry_run: bool, limit: int) -> dict[str,
         old_value = plan["source_old"] if plan["operation"] == "move" else plan["old"]
         old = old_value or b""
         new = plan["new"] or b""
-        changed = old != new or plan["operation"] in {"add", "delete", "move"}
+        changed = (
+            old != new or plan["operation"] in {"add", "delete", "move"} or _mode_changed(plan)
+        )
         entry = {
             "operation": plan["operation"],
             "path": plan["display"],
@@ -632,9 +634,7 @@ def _commit(
     primary: BaseException | None = None
     wrapped: BaseException | None = None
     completed = False
-    active_plans = [
-        plan for plan in plans if not (plan["operation"] == "update" and plan["old"] == plan["new"])
-    ]
+    active_plans = [plan for plan in plans if not _is_noop_update(plan)]
     try:
         for plan in active_plans:
             if plan["new"] is None:
@@ -673,6 +673,8 @@ def _commit(
                 stream.write(state.data)
                 stream.flush()
                 os.fsync(stream.fileno())
+        for state in states.values():
+            _assert_unchanged(state, _read_state(state.path, state.display))
         for plan in active_plans:
             path = plan["path"]
             state = states.get(path)
@@ -788,6 +790,21 @@ def _assert_unchanged(expected: _State, current: _State) -> None:
         and _signature(expected.info) != _signature(current.info)
     ):
         raise RuntimeError(f"File changed while applying patch: {expected.display}")
+
+
+def _mode_changed(plan: dict[str, Any]) -> bool:
+    old_info = plan["old_info"]
+    return (
+        plan["operation"] == "update"
+        and plan["old"] == plan["new"]
+        and old_info is not None
+        and plan["mode"] is not None
+        and stat.S_IMODE(old_info.st_mode) != plan["mode"]
+    )
+
+
+def _is_noop_update(plan: dict[str, Any]) -> bool:
+    return plan["operation"] == "update" and plan["old"] == plan["new"] and not _mode_changed(plan)
 
 
 def _restore(path: Path, data: bytes, info: os.stat_result | None) -> None:

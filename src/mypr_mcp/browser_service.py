@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 
 _ENGINES = {"chromium", "firefox", "webkit"}
 _MAX_SERVER_OUTPUT = 64 * 1024
@@ -69,6 +69,8 @@ class BrowserService:
         self._server: _Server | None = None
         self._lock = asyncio.Lock()
         self._closing = False
+        self._operation_tasks: set[asyncio.Task] = set()
+        self._close_task: asyncio.Task[None] | None = None
         self._verified: set[str] = set()
         self._install_root = self.workspace / ".mypr" / "browser"
         self._install_root.mkdir(parents=True, exist_ok=True)
@@ -82,6 +84,48 @@ class BrowserService:
         return self._server is not None and self._server.process.returncode is None
 
     async def ensure(
+        self,
+        browser: str = "chromium",
+        *,
+        launch_options: dict[str, Any] | None = None,
+        executable_path: str | None = None,
+        channel: str | None = None,
+        install: bool = True,
+        track: Callable[..., Any] | None = None,
+    ) -> dict[str, Any]:
+        if self._closing:
+            raise RuntimeError("browser service is closed")
+        operation = asyncio.create_task(
+            self._ensure(
+                browser,
+                launch_options=launch_options,
+                executable_path=executable_path,
+                channel=channel,
+                install=install,
+                track=track,
+            ),
+            name="mypr:browser-ensure",
+        )
+        self._operation_tasks.add(operation)
+        caller = asyncio.current_task()
+        cancelling = caller.cancelling() if caller is not None else 0
+        try:
+            result = await asyncio.shield(operation)
+            if self._closing:
+                raise RuntimeError("browser service is closed")
+            return result
+        except asyncio.CancelledError:
+            caller_cancelled = caller is not None and caller.cancelling() > cancelling
+            if not self._closing or caller_cancelled:
+                operation.cancel()
+                await wait_owned(self._drain_task(operation), propagate=False)
+                raise
+            await wait_owned(self._drain_task(operation), propagate=False)
+            raise RuntimeError("browser service is closed") from None
+        finally:
+            self._operation_tasks.discard(operation)
+
+    async def _ensure(
         self,
         browser: str = "chromium",
         *,
@@ -132,8 +176,9 @@ class BrowserService:
             try:
                 result = await asyncio.shield(server)
             except asyncio.CancelledError:
-                with contextlib.suppress(Exception):
-                    await _await_shielded(server, propagate=False)
+                if not server.done():
+                    server.cancel()
+                await wait_owned(self._drain_task(server), propagate=False)
                 if self._server is not None:
                     await self._close_locked()
                 raise
@@ -141,9 +186,20 @@ class BrowserService:
             return result
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_owned(), name="mypr:browser-close"
+            )
+        await wait_owned(self._close_task)
+
+    async def _close_owned(self) -> None:
         self._closing = True
+        operations = list(self._operation_tasks)
+        for operation in operations:
+            operation.cancel()
+        await asyncio.gather(*operations, return_exceptions=True)
         async with self._lock:
-            await wait_owned(self._close_locked())
+            await self._close_locked()
 
     async def reset(self) -> None:
         """Close resources before a generation is replaced."""
@@ -183,8 +239,10 @@ class BrowserService:
         if self.kernel_pid is not None:
             args += ["--watch-pid", str(self.kernel_pid)]
         args += ["--", *command]
-        try:
-            process = await asyncio.create_subprocess_exec(
+        caller = asyncio.current_task()
+        launch_cancelling = caller.cancelling() if caller is not None else 0
+        launch = asyncio.create_task(
+            asyncio.create_subprocess_exec(
                 *args,
                 cwd=str(self.workspace),
                 env=dict(os.environ),
@@ -192,9 +250,18 @@ class BrowserService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
-            )
+            ),
+            name="mypr:browser-launch",
+        )
+        try:
+            process, cancelled = await finish_owned(launch)
         except OSError as exc:
+            if caller is not None and caller.cancelling() > launch_cancelling:
+                raise asyncio.CancelledError from exc
             raise RuntimeError(f"unable to start Playwright server: {exc}") from exc
+        if cancelled:
+            await wait_owned(self._terminate_process(process), propagate=False)
+            raise asyncio.CancelledError
         assert process.stdout is not None and process.stderr is not None
         stderr_task = asyncio.create_task(self._drain_pipe(process.stderr))
         endpoint = None
@@ -238,10 +305,10 @@ class BrowserService:
                 "channel": channel,
             }
         except BaseException:
-            await self._terminate_process(process)
+            await wait_owned(self._terminate_process(process), propagate=False)
             if not stderr_task.done():
                 stderr_task.cancel()
-            await asyncio.gather(stderr_task, return_exceptions=True)
+            await wait_owned(self._drain_task(stderr_task), propagate=False)
             raise
 
     async def _close_locked(self) -> None:
@@ -311,7 +378,7 @@ class BrowserService:
             job = None
             wait = None
             try:
-                job = await _await_shielded(start)
+                job = await asyncio.shield(start)
                 ident = job.get("id") if isinstance(job, dict) else None
                 if not ident:
                     raise RuntimeError("browser installer did not return a job ID")
@@ -319,18 +386,25 @@ class BrowserService:
                 wait = asyncio.create_task(self.shells.wait(str(ident)))
                 result = await asyncio.shield(wait)
             except asyncio.CancelledError:
+                if not start.done():
+                    start.cancel()
                 if ident is None:
-                    with contextlib.suppress(Exception):
-                        job = await _await_shielded(start, propagate=False)
+                    result = await wait_owned(self._drain_result(start), propagate=False)
+                    if isinstance(result, dict):
+                        job = result
                     ident = job.get("id") if isinstance(job, dict) else None
                 if ident:
                     with contextlib.suppress(Exception):
-                        await self._cancel_install(str(ident), wait)
+                        await wait_owned(
+                            self._cancel_install(str(ident), wait), propagate=False
+                        )
                 raise
             except BaseException:
                 if ident:
                     with contextlib.suppress(Exception):
-                        await self._cancel_install(str(ident), wait)
+                        await wait_owned(
+                            self._cancel_install(str(ident), wait), propagate=False
+                        )
                 raise
             if result.get("state") != "succeeded":
                 detail = result.get("error") or (result.get("result") or {}).get("returncode")
@@ -363,6 +437,15 @@ class BrowserService:
         if wait is not None:
             with contextlib.suppress(Exception):
                 await _await_shielded(wait, propagate=False)
+
+    @staticmethod
+    async def _drain_task(task: asyncio.Task) -> None:
+        await asyncio.gather(task, return_exceptions=True)
+
+    @staticmethod
+    async def _drain_result(task: asyncio.Task) -> Any:
+        result, = await asyncio.gather(task, return_exceptions=True)
+        return result
 
     async def _installed(self, browser: str) -> bool:
         command = [

@@ -148,7 +148,11 @@ class Shells:
         self.jobs_root.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, _Job] = {}
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        self._starting = 0
+        self._start_changed = asyncio.Event()
+        self._start_changed.set()
 
     @property
     def active(self) -> list[str]:
@@ -159,6 +163,27 @@ class Shells:
         return len(self.active)
 
     async def start(
+        self,
+        command: str | list[str],
+        cwd: str | None = None,
+        env: Mapping[str, str | None] | None = None,
+        input: str | None = None,
+        stdin: bool = False,
+        pty: bool = False,
+        rows: int = 24,
+        cols: int = 80,
+        *,
+        inherit_env: bool = True,
+    ) -> dict[str, str]:
+        await self._begin_start()
+        try:
+            return await self._start(
+                command, cwd, env, input, stdin, pty, rows, cols, inherit_env=inherit_env
+            )
+        finally:
+            await wait_owned(self._end_start(), propagate=False)
+
+    async def _start(
         self,
         command: str | list[str],
         cwd: str | None = None,
@@ -201,29 +226,45 @@ class Shells:
                 raise ValueError(f"environment variable {key!r} contains a null byte")
             child_env[key] = value
         master_fd = slave_fd = None
+        caller_task = asyncio.current_task()
+        launch_cancelling = None
         try:
             if pty:
                 master_fd, slave_fd = os.openpty()
                 resize_terminal(slave_fd, rows, cols)
             command_args = self._guard_command(command, pty=pty)
-            process = await asyncio.create_subprocess_exec(
-                *command_args,
-                cwd=workdir,
-                env=child_env,
-                stdin=(
-                    slave_fd
-                    if pty
-                    else asyncio.subprocess.PIPE
-                    if input is not None or stdin
-                    else asyncio.subprocess.DEVNULL
-                ),
-                stdout=slave_fd if pty else asyncio.subprocess.PIPE,
-                stderr=slave_fd if pty else asyncio.subprocess.PIPE,
-                start_new_session=True,
+            launch_cancelling = caller_task.cancelling() if caller_task is not None else 0
+            launch = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    *command_args,
+                    cwd=workdir,
+                    env=child_env,
+                    stdin=(
+                        slave_fd
+                        if pty
+                        else asyncio.subprocess.PIPE
+                        if input is not None or stdin
+                        else asyncio.subprocess.DEVNULL
+                    ),
+                    stdout=slave_fd if pty else asyncio.subprocess.PIPE,
+                    stderr=slave_fd if pty else asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
             )
+            process, cancelled = await finish_owned(launch)
+            if cancelled:
+                await wait_owned(self._terminate_process(process), propagate=False)
+                close_terminal(master_fd)
+                raise asyncio.CancelledError
         except (OSError, ValueError) as exc:
             close_terminal(master_fd)
             close_terminal(slave_fd)
+            if (
+                launch_cancelling is not None
+                and caller_task is not None
+                and caller_task.cancelling() > launch_cancelling
+            ):
+                raise asyncio.CancelledError from exc
             job_id = uuid.uuid4().hex
             job = self._new_job(job_id, _NoProcess(), 0)
             self._jobs[job_id] = job
@@ -652,9 +693,20 @@ class Shells:
             self._signal_job(job, signal.SIGKILL)
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_owned(), name="mypr:shell-close")
+        await wait_owned(self._close_task)
+
+    async def _close_owned(self) -> None:
+        async with self._lock:
+            self._closed = True
+        while True:
+            async with self._lock:
+                if self._starting == 0:
+                    break
+                changed = self._start_changed
+                changed.clear()
+            await changed.wait()
         await asyncio.gather(
             *(self.cancel(job.id) for job in self._jobs.values()), return_exceptions=True
         )
@@ -663,6 +715,33 @@ class Shells:
         )
         for job in self._jobs.values():
             self._close_pty(job)
+
+    async def _begin_start(self) -> None:
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("shell service is closed")
+            self._starting += 1
+            self._start_changed.clear()
+
+    async def _end_start(self) -> None:
+        async with self._lock:
+            self._starting -= 1
+            if self._starting == 0:
+                self._start_changed.set()
+
+    @staticmethod
+    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), 2)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(process.wait()), 2)
 
     def _cwd(self, cwd: str | None) -> str:
         if cwd is None:

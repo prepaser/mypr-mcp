@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import difflib
 import hashlib
 import importlib
@@ -13,6 +14,7 @@ import json
 import os
 import sys
 import tokenize
+from importlib.abc import Loader, MetaPathFinder
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -302,33 +304,56 @@ class ModuleManager:
             raise ValueError(f"Revision mismatch: expected {expected_hash}, got {revision}")
         self._ensure_import_path()
         parent_name, _, child_name = qualified.rpartition(".")
-        parent = importlib.import_module(parent_name)
-        spec = importlib.util.spec_from_file_location(qualified, path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Unable to load module: {name}")
-        candidate = importlib.util.module_from_spec(spec)
         old_module = sys.modules.get(qualified)
-        old_attribute = getattr(parent, child_name, _MISSING)
-        sys.modules[qualified] = candidate
+        parent_before = sys.modules.get(parent_name)
+        old_attribute = (
+            getattr(parent_before, child_name, _MISSING)
+            if parent_before is not None
+            else _MISSING
+        )
+        finder = None
         try:
-            encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
-            source = data.decode(encoding)
-            exec(compile(source, str(path), "exec"), candidate.__dict__)
+            if old_module is None:
+                finder = _PinnedFinder(qualified, path, data)
+                sys.meta_path.insert(0, finder)
+            parent = importlib.import_module(parent_name)
+            if parent_before is None:
+                old_attribute = getattr(parent, child_name, _MISSING)
+            imported = sys.modules.get(qualified)
+            if old_module is None and imported is not None:
+                candidate = imported
+            else:
+                candidate = self._module_from_source(qualified, path, data)
+            setattr(parent, child_name, candidate)
+            return candidate
         except BaseException:
             if old_module is None:
                 sys.modules.pop(qualified, None)
             else:
                 sys.modules[qualified] = old_module
-            if old_attribute is _MISSING:
-                try:
-                    delattr(parent, child_name)
-                except AttributeError:
-                    pass
-            else:
-                setattr(parent, child_name, old_attribute)
+            parent = sys.modules.get(parent_name) or parent_before
+            if parent is not None:
+                if old_attribute is _MISSING:
+                    with contextlib.suppress(AttributeError):
+                        delattr(parent, child_name)
+                else:
+                    setattr(parent, child_name, old_attribute)
             raise
-        setattr(parent, child_name, candidate)
-        return candidate
+        finally:
+            if finder is not None:
+                with contextlib.suppress(ValueError):
+                    sys.meta_path.remove(finder)
+
+    @staticmethod
+    def _module_from_source(qualified: str, path: Path, data: bytes) -> ModuleType:
+        loader = _PinnedLoader(qualified, path, data)
+        spec = importlib.util.spec_from_loader(qualified, loader, origin=str(path))
+        if spec is None:
+            raise ImportError(f"Unable to load module: {qualified}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[qualified] = module
+        loader.exec_module(module)
+        return module
 
     def _module_path(self, name: str) -> Path:
         _validate_name(name)
@@ -363,6 +388,35 @@ class ModuleManager:
     def _validate_source(source: str | None) -> None:
         if source is not None and not isinstance(source, str):
             raise TypeError("source must be a string or None")
+
+
+class _PinnedLoader(Loader):
+    def __init__(self, fullname: str, path: Path, data: bytes) -> None:
+        self.fullname = fullname
+        self.path = path
+        self.data = data
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(self.data).readline)
+        source = self.data.decode(encoding)
+        module.__file__ = str(self.path)
+        exec(compile(source, str(self.path), "exec"), module.__dict__)
+
+
+class _PinnedFinder(MetaPathFinder):
+    def __init__(self, fullname: str, path: Path, data: bytes) -> None:
+        self.fullname = fullname
+        self.path = path
+        self.data = data
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != self.fullname:
+            return None
+        loader = _PinnedLoader(fullname, self.path, self.data)
+        return importlib.util.spec_from_loader(fullname, loader, origin=str(self.path))
 
 
 _MISSING = object()
