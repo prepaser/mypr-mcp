@@ -35,6 +35,7 @@ from .network_tools import NetworkTools
 from .skill_tools import SkillsWriting, _front_matter, _metadata_errors
 from .system_tools import SystemTools
 from .terminal import validate_size as _terminal_size
+from .timer_api import TimerAPI
 from .workspace_tools import Git
 
 _output_buffer: contextvars.ContextVar[OutputBuffer | None] = contextvars.ContextVar(
@@ -1835,6 +1836,7 @@ class Workspace:
         self.http = HTTPTools(self.workspace, lambda: self.client)
         self.net = NetworkTools(self.workspace, self.tasks, _rpc)
         self.system = SystemTools(self.workspace)
+        self.timers = TimerAPI(_rpc, _client_context)
         self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
         self.code = CodeTools(
             self.workspace, self.fs,

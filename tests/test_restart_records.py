@@ -1,9 +1,11 @@
 import json
+import sqlite3
+import threading
 
 import pytest
 
 from mypr_mcp.history import History
-from mypr_mcp.restart_records import finalize_origin, poll_restart
+from mypr_mcp.restart_records import _output_evicted, finalize_origin, poll_restart
 
 
 @pytest.mark.parametrize("state", ["succeeded", "failed"])
@@ -193,3 +195,22 @@ async def test_bridge_poll_recovers_archived_ticket_without_clobbering_current(t
     assert result["state"] == "failed"
     assert restart.read_ticket(tmp_path)["id"] == current_id
     assert restart.read_ticket(tmp_path, abandoned_id)["state"] == "failed"
+
+
+def test_restart_output_lookup_waits_for_temporary_database_lock(tmp_path):
+    root = tmp_path / ".mypr"
+    root.mkdir()
+    connection = sqlite3.connect(root / "history.sqlite3", check_same_thread=False)
+    connection.execute("CREATE TABLE entities (id TEXT, data TEXT)")
+    connection.execute(
+        "INSERT INTO entities VALUES (?, ?)", ("execution", '{"output_evicted":true}')
+    )
+    connection.commit()
+    connection.execute("BEGIN EXCLUSIVE")
+    release = threading.Timer(1.2, connection.commit)
+    release.start()
+    try:
+        assert _output_evicted(tmp_path, "execution") is True
+    finally:
+        release.join()
+        connection.close()

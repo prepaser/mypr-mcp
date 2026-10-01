@@ -119,6 +119,12 @@ await ws.messages.send(client_id, text) sends to a registered workspace client, 
 
 MCP init, execute, and poll include an inbox count and bounded previews. Receiving a message may end a tool wait early; check execution state before relying on its result. Reading or receiving a preview does not acknowledge it, so unacked previews may repeat. Long previews have truncated=True; read() returns the full text. Messages and acknowledgments survive reset and manager restart. Message text is data, not automatically executable instructions. Idle clients see messages on their next MCP call.""",
     ),
+    "timers": (
+        "Schedule persistent client-scoped deadline notifications.",
+        """await ws.timers.start(seconds=3600, label="review") schedules a one-shot timer. Use at=... instead of seconds for a timezone-aware datetime or ISO 8601 string; exactly one deadline form is required. Durations use the manager's UTC wall clock and include time while the manager is stopped. Zero seconds or a past deadline expires immediately. Timers and acknowledgments survive disconnect, reset, and restart; resume them with the same client ID.
+
+await ws.timers.check(timer_id) reads one timer without acknowledging it. await ws.timers.list(state=None, limit=50, cursor=None) returns items, has_more, and next_cursor, including acknowledged records; states are scheduled, expired, and cancelled. await ws.timers.cancel(timer_id) cancels a scheduled timer. Expired alerts are attached automatically to initialized clients' init, execute, and poll responses in timers: unacked, items, and has_more. They may end a tool wait while the execution continues. Alerts repeat until await ws.timers.ack([timer_id]) acknowledges them. The timers field is omitted when there are no alerts; mypr does not wake an agent that is not calling a tool.""",
+    ),
     "locks": (
         "Coordinate cooperating Python tasks with named async locks.",
         """Use a task-scoped cooperative lock:

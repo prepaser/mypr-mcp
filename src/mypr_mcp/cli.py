@@ -370,6 +370,17 @@ def _render_result(
         lines.append("warnings_truncated=true")
     if isinstance(result.get("inbox"), dict):
         lines.extend(_render_inbox(result["inbox"]))
+    if isinstance(result.get("timers"), dict):
+        timers = result["timers"]
+        lines.append(
+            f"timers unacked={timers.get('unacked', 0)} "
+            f"has_more={str(bool(timers.get('has_more', False))).lower()}"
+        )
+        for timer in timers.get("items", []):
+            lines.append(
+                f"[timer elapsed] id={timer.get('id')} "
+                f"label={timer.get('label', '')} due_at={timer.get('due_at')}"
+            )
     return "\n".join(lines)
 
 

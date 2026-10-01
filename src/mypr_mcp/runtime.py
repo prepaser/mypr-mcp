@@ -40,6 +40,7 @@ from .search import Search
 from .services import MCPBridge, Shells
 from .storage import Storage
 from .task_results import load_result, store_result
+from .timers import TimerStore
 from .timings import Timings
 from .transport import MAX_MESSAGE, socket_path, workspace_id
 
@@ -59,6 +60,11 @@ TIMING_OPS = {
     "message_reply",
     "message_read",
     "message_ack",
+    "timer_start",
+    "timer_check",
+    "timer_list",
+    "timer_cancel",
+    "timer_ack",
     "execute",
     "poll",
     "scan_start",
@@ -127,11 +133,15 @@ def _open_stores(workspace):
     return history, messages
 
 
-def _close_stores(history, messages):
+def _close_stores(history, messages, timers=None):
     try:
-        messages.close()
+        if timers is not None:
+            timers.close()
     finally:
-        history.close()
+        try:
+            messages.close()
+        finally:
+            history.close()
 
 
 def _store_task_result(workspace, history, record, encoded):
@@ -183,6 +193,7 @@ class Runtime:
         self.attachments = {}
         self.history = None
         self.messages = None
+        self.timers = None
         self.persistence = None
         self._admission_lock = asyncio.Lock()
         self._initialize_lock = asyncio.Lock()
@@ -190,6 +201,7 @@ class Runtime:
         self._task_locks = WeakValueDictionary()
         self._persistence_failure_task = None
         self.message_waiters = {}
+        self.timer_waiters = {}
         self.task_records = {}
         self.shell_watchers = set()
         self.stopping = asyncio.Event()
@@ -416,6 +428,7 @@ class Runtime:
     async def prepare(self):
         self.persistence = PersistenceWorker(on_failure=self.persistence_failed)
         self.history, self.messages = await self.persistence.call(_open_stores, self.workspace)
+        self.timers = await self.persistence.call(TimerStore, self.workspace)
         self.storage = Storage(
             self.workspace, history=self.history, active_ids=self.storage_active_ids
         )
@@ -1006,6 +1019,36 @@ class Runtime:
             rec.update(fields)
             await self.notify_execution_change(rec)
 
+    async def wait_notifications(self, tasks, client, wait_seconds, *, include_timers=False):
+        if not include_timers or not client or self.timers is None:
+            await asyncio.wait(tasks, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_seconds
+        while True:
+            changed = loop.create_future()
+            self.timer_waiters.setdefault(client, set()).add(changed)
+            try:
+                due_at = await self.io(self.timers.next_deadline, client)
+                remaining = max(0.0, deadline - loop.time())
+                timeout = remaining
+                if due_at is not None:
+                    timeout = min(timeout, max(0.0, due_at - time.time()))
+                if timeout <= 0:
+                    return
+                ready, _ = await asyncio.wait(
+                    [*tasks, changed], timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if any(task in ready for task in tasks):
+                    return
+            finally:
+                waiters = self.timer_waiters.get(client)
+                if waiters is not None:
+                    waiters.discard(changed)
+                    if not waiters:
+                        self.timer_waiters.pop(client, None)
+                changed.cancel()
+
     async def wait_activity(
         self,
         client,
@@ -1015,6 +1058,7 @@ class Runtime:
         after=None,
         sender=None,
         reply_to=None,
+        include_timers=False,
     ):
         notification = asyncio.get_running_loop().create_future() if client else None
         tasks = []
@@ -1039,7 +1083,9 @@ class Runtime:
             tasks.append(asyncio.create_task(self.stopping.wait()))
             if done:
                 tasks.append(asyncio.create_task(done.wait()))
-            await asyncio.wait(tasks, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+            await self.wait_notifications(
+                tasks, client, wait_seconds, include_timers=include_timers
+            )
             if self.stopping.is_set():
                 raise RuntimeError("Workspace manager is stopping")
         finally:
@@ -1071,7 +1117,7 @@ class Runtime:
         try:
             if client and (await self.io(self.messages.read, client, limit=1))["messages"]:
                 return
-            await asyncio.wait(tasks, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+            await self.wait_notifications(tasks, client, wait_seconds, include_timers=True)
             if self.stopping.is_set():
                 raise RuntimeError("Workspace manager is stopping")
         finally:
@@ -1254,7 +1300,9 @@ class Runtime:
                 revision = rec.get("_revision", 0)
                 await self.wait_poll_activity(rec, revision, inbox_client, wait_seconds)
             else:
-                await self.wait_activity(inbox_client, wait_seconds, rec["done"])
+                await self.wait_activity(
+                    inbox_client, wait_seconds, rec["done"], include_timers=True
+                )
             result, _ = await page()
         return result
 
@@ -1336,6 +1384,10 @@ class Runtime:
                     **result,
                     "inbox": await self.io(self.messages.inbox, connection["client_id"]),
                 }
+                if self.timers is not None:
+                    timers = await self.io(self.timers.notifications, connection["client_id"])
+                    if timers is not None:
+                        result["timers"] = timers
         finally:
             elapsed = time.perf_counter() - started
             label = op if op in TIMING_OPS else "other"
@@ -1462,7 +1514,8 @@ class Runtime:
 
     async def _dispatch_handlers(self, op, req, context):
         for handler in (
-            self._dispatch_execution, self._dispatch_messages, self._dispatch_storage,
+            self._dispatch_execution, self._dispatch_messages, self._dispatch_timers,
+            self._dispatch_storage,
             self._dispatch_tasks, self._dispatch_scan, self._dispatch_tools,
             self._dispatch_shell, self._dispatch_mcp, self._dispatch_lifecycle,
         ):
@@ -1801,6 +1854,43 @@ class Runtime:
                     reply_to=req.get("reply_to"),
                 )
         return _UNHANDLED
+
+    async def _dispatch_timers(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
+        if op not in {"timer_start", "timer_check", "timer_list", "timer_cancel", "timer_ack"}:
+            return _UNHANDLED
+        if not (connection and connection["client_id"]) and not requested_client:
+            raise RuntimeError("Timers require a client identity")
+        if self.stopping.is_set():
+            raise RuntimeError("Workspace manager is stopping")
+        if self.timers is None:
+            raise RuntimeError("Workspace timers are unavailable")
+        if op == "timer_check":
+            return await self.io(self.timers.check, client, req["timer_id"])
+        if op == "timer_list":
+            return await self.io(
+                self.timers.list, client, state=req.get("state"),
+                limit=req.get("limit", 50), cursor=req.get("cursor"),
+            )
+
+        async def change():
+            if op == "timer_start":
+                result = await self.io(
+                    self.timers.start, client, req.get("seconds"),
+                    at=req.get("at"), label=req.get("label", ""),
+                )
+            elif op == "timer_cancel":
+                result = await self.io(self.timers.cancel, client, req["timer_id"])
+            else:
+                result = await self.io(self.timers.ack, client, req["ids"])
+            for waiter in self.timer_waiters.get(client, ()):
+                if not waiter.done():
+                    waiter.set_result(None)
+            return result
+
+        return await await_completion(asyncio.create_task(change()))
 
     async def _dispatch_storage(
         self, op, req, *, client, connection_id, connection,
@@ -2888,12 +2978,16 @@ class Runtime:
                                 _close_stores,
                                 self.history,
                                 self.messages,
+                                self.timers,
                                 critical=True,
                             )
                         else:
                             await self.persistence.close()
-                            await asyncio.to_thread(_close_stores, self.history, self.messages)
+                            await asyncio.to_thread(
+                                _close_stores, self.history, self.messages, self.timers
+                            )
                     self.messages = None
+                    self.timers = None
                     self.history = None
                 with contextlib.suppress(Exception):
                     await self.persistence.close()

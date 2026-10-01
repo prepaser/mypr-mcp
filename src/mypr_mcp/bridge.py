@@ -14,6 +14,7 @@ from .diagnostics import RPCError
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, recover_ticket, wait_ticket
 from .restart_records import poll_restart, restart_id_for_execution
+from .timers import TimerStore
 from .transport import HANDSHAKE_TIMEOUT, attachment, find_runtime, rpc
 
 
@@ -68,21 +69,36 @@ class ConnectionBridge:
         self._reported_generation = self.generation
         return {**result, "runtime": info}
 
+    def _restart_result(self, exec_id, cursor, max_bytes):
+        result = poll_restart(self.workspace, exec_id, cursor, max_bytes=max_bytes)
+        if result is None or self.client_id is None:
+            return result, None
+        preview, due_at = TimerStore.snapshot_existing(
+            self.workspace, self.client_id, include_deadline=result["state"] == "running"
+        )
+        if preview is not None:
+            result["timers"] = preview
+        return result, due_at
+
     async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
         await self._recover_restart(exec_id)
         deadline = time.monotonic() + min(30000, max(0, wait_ms)) / 1000
         while True:
-            result = await asyncio.to_thread(
-                poll_restart, self.workspace, exec_id, cursor, max_bytes=max_bytes
+            result, due_at = await asyncio.to_thread(
+                self._restart_result, exec_id, cursor, max_bytes
             )
             if (
                 result is None
                 or result["state"] != "running"
                 or result["output"]
+                or result.get("timers")
                 or time.monotonic() >= deadline
             ):
                 return result
-            await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            pause = min(0.05, max(0, deadline - time.monotonic()))
+            if due_at is not None:
+                pause = min(pause, max(0, due_at - time.time()))
+            await asyncio.sleep(pause)
 
     async def _recover_restart(self, exec_id):
         ident = await asyncio.to_thread(restart_id_for_execution, self.workspace, exec_id)
@@ -144,21 +160,17 @@ class ConnectionBridge:
                 and origin.get("connection_id") == connection_id
                 and origin.get("request_id") == fields.get("request_id")
             ):
-                await self._recover_restart(origin["exec_id"])
-                result = await asyncio.to_thread(
-                    poll_restart, self.workspace, origin["exec_id"],
-                    max_bytes=fields.get("max_bytes"),
+                result = await self._poll_restart(
+                    origin["exec_id"], 0, 0, fields.get("max_bytes"),
                 )
                 if result is not None:
                     return self._decorate(result)
             if op == "poll" and ticket:
-                await self._recover_restart(fields["exec_id"])
-                result = await asyncio.to_thread(
-                    poll_restart,
-                    self.workspace,
+                result = await self._poll_restart(
                     fields["exec_id"],
                     fields.get("cursor") or 0,
-                    max_bytes=fields.get("max_bytes"),
+                    0,
+                    fields.get("max_bytes"),
                 )
                 if result is not None:
                     return self._decorate(result)

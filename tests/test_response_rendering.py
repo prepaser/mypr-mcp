@@ -86,6 +86,34 @@ async def test_init_runtime_instructions_remain_visible():
     assert "instructions:\nUse ws.help() for API details." in text
 
 
+async def test_timer_alerts_are_visible_without_changing_execution_errors():
+    payload = {
+        "exec_id": "exec-timer",
+        "state": "failed",
+        "error": "Python exception",
+        "cursor": 0,
+        "has_more": False,
+        "timers": {
+            "unacked": 6,
+            "items": [{"id": "timer-1", "label": "review", "due_at": 1000.0}],
+            "has_more": True,
+        },
+    }
+    result = await cli.tool_result(payload)
+    assert result.structured_content == payload
+    assert result.is_error
+    text = result.content[0].text
+    assert "timers unacked=6 has_more=true" in text
+    assert "[timer elapsed] id=timer-1 label=review due_at=1000.0" in text
+    assert "error: Python exception" in text
+
+
+async def test_response_without_timer_alerts_has_no_timer_text():
+    result = await cli.tool_result({"client_id": "bright-fox"})
+    assert "timers" not in result.structured_content
+    assert "timer" not in result.content[0].text
+
+
 async def test_inline_images_obey_aggregate_budget_and_keep_omitted_path(tmp_path, monkeypatch):
     first = tmp_path / "first.png"
     second = tmp_path / "second.jpg"

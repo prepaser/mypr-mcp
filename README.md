@@ -87,7 +87,7 @@ When an operation fails, inspect both the bounded `error` string and the optiona
 
 `execute` waits for completion, inbox activity, or its wait deadline so short cells normally need only one call. `poll` returns immediately when the requested output is available or the execution is terminal; otherwise it waits for output, completion, inbox activity, or its wait deadline. `wait_ms` bounds this notification wait, not total request latency or Python execution time. Continue polling running cells, and read remaining pages while `has_more` is true even after execution finishes.
 
-The `init`, `execute`, and `poll` responses include a small preview of the current client's unacknowledged inbox. Previews contain up to five messages and fit within a 4 KiB JSON budget; reading a preview does not acknowledge its messages. Use `ws.messages.read()` to page through full messages. Before `init`, `poll` omits the inbox.
+The `init`, `execute`, and `poll` responses include small previews of the current client's unacknowledged inbox and expired timers. Message previews contain up to five messages and fit within a 4 KiB JSON budget; timer previews contain up to five alerts in the same budget. Reading a preview or receiving a timer alert does not acknowledge it. Use `ws.messages.read()` and `ws.timers.list()` for full records. Before `init`, `poll` omits the inbox and timer previews.
 
 Call `init()` before the first `execute`:
 
@@ -144,6 +144,7 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | `ws.mcp` | Call and reconfigure external MCP servers |
 | `ws.config` | Inspect and persist global and workspace configuration |
 | `ws.messages` | Send and receive persistent client messages |
+| `ws.timers` | Schedule persistent client-scoped deadline notifications |
 | `ws.skills`, `ws.modules` | Validate, save, and reuse workspace capabilities |
 | `ws.git` | Read structured Git status, diffs, history, blame, and committed files |
 | `ws.http` | Use persistent HTTPX2 clients and extract readable HTML content |
@@ -573,6 +574,21 @@ await ws.messages.ack([message["id"] for message in ws.local["inbox"]["messages"
 The MCP responses from `init`, `execute`, and `poll` include up to five short inbox previews (within a 4 KiB budget), plus the total unacknowledged count. The `inbox` field contains `unacked`, `messages`, and `has_more`; each preview has `id`, `from`, `text`, `reply_to`, and `truncated`. Structured `data` is omitted from previews; use `read()` for full content. Messages can end an `execute` or `poll` wait early without cancelling the cell: check its state and continue polling if needed. Polling another client's execution still returns your own inbox. Before `init`, `poll` omits the inbox. They do not acknowledge the previews automatically. An agent that is not calling an MCP tool is not woken when a message arrives; use `read(wait_ms=...)` from a running Python task when a bounded wait is useful.
 
 `await ws.messages.clients(prefix=None, connected=None, limit=50, cursor=None)` lists registered logical clients with their current connection state, last activity, registration time, and unacknowledged message count. Use it before addressing a peer whose ID is not already known. The list is paged with `next_cursor`; offline clients remain addressable for persistent delivery.
+
+### Timers
+
+Timers are persistent, one-shot deadlines owned by the current logical client. Schedule a duration or an absolute timezone-aware deadline:
+
+```python
+ws.local["timer"] = await ws.timers.start(seconds=3600, label="review")
+await ws.timers.start(at="2026-10-02T09:00:00+09:00", label="check")
+```
+
+Use `await ws.timers.check(timer_id)` or `await ws.timers.list()` to inspect timers, `await ws.timers.cancel(timer_id)` to cancel a scheduled timer, and `await ws.timers.ack([timer_id])` after handling an expired alert. `list(state=None, limit=50, cursor=None)` returns bounded pages with `items`, `has_more`, and `next_cursor`, including acknowledged records. Timer states are `scheduled`, `expired`, and `cancelled`; acknowledgment is tracked separately.
+
+Durations use the manager's UTC wall clock and continue to elapse while the manager is stopped. Zero duration or a past deadline expires immediately; absolute deadlines must include a timezone. Timers and acknowledgments survive disconnect, kernel reset, and manager restart. Reconnect using the same logical client ID to resume them.
+
+Expired, unacknowledged timers are attached automatically to initialized clients' `init`, `execute`, and `poll` responses in the `timers` field and in readable response text. This field contains `unacked`, up to five previews in `items` within a 4 KiB JSON budget, and `has_more`. Alerts repeat until acknowledged and may end a tool's wait while Python execution continues; no tool call means no agent wake-up. In a normal response from a timer-capable runtime, the absence of a `timers` field means there were no unacknowledged expired timer alerts. Polling before `init` omits timer alerts.
 
 ### Skills and reusable Python
 

@@ -157,7 +157,7 @@ def _output_evicted(workspace, exec_id):
     database = workspace.resolve() / ".mypr" / "history.sqlite3"
     if not database.is_file():
         return False
-    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=30)
     try:
         row = connection.execute(
             "SELECT json_extract(data, '$.output_evicted') FROM entities WHERE id=?", (exec_id,)
