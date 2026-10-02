@@ -96,7 +96,7 @@ def make_scan_task(
 
 
 class Net:
-    """Manager-backed TCP and Nmap scans."""
+    """Manager-backed native and Nmap scans."""
 
     def __init__(
         self,
@@ -116,26 +116,44 @@ class Net:
         targets: str | list[str],
         *,
         ports: Any = "1-1024",
-        concurrency: int = 64,
-        rate: float = 200,
-        timeout: float = 1.0,  # noqa: ASYNC109
+        protocol: str = "tcp",
+        concurrency: int | None = None,
+        rate: float | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109
         max_probes: int | None = 1_000_000,
         max_duration: float | None = 3600.0,
         continue_after_output_limit: bool = False,
         family: str = "any",
-        retries: int = 0,
+        retries: int | None = None,
         banner: bool = False,
         banner_timeout: float = 0.5,
         banner_bytes: int = 1024,
         open_only: bool = False,
+        per_host_rate: float | None = None,
+        probe: str | None = None,
+        payload: bytes | None = None,
+        capture_response: bool = False,
+        response_bytes: int = 1024,
     ) -> Any:
+        if not isinstance(protocol, str) or protocol.lower() not in {"tcp", "udp"}:
+            raise ValueError("protocol must be 'tcp' or 'udp'")
+        protocol = protocol.lower()
+        if payload is not None:
+            from .scan_config import encode_payload
+
+            payload_b64 = encode_payload(payload)
+        else:
+            payload_b64 = None
+        if type(capture_response) is not bool:
+            raise TypeError("capture_response must be a boolean")
+        if type(response_bytes) is not int or not 1 <= response_bytes <= 4096:
+            raise ValueError("response_bytes must be between 1 and 4096")
         if isinstance(ports, (set, frozenset)):
             from .scan_worker import _ports
 
             ports = _ports(list(ports))
-        result = await self._rpc(
-            "scan_start",
-            mode="tcp",
+        request = dict(
+            mode=protocol,
             targets=targets,
             ports=ports,
             concurrency=concurrency,
@@ -150,6 +168,20 @@ class Net:
             banner_timeout=banner_timeout,
             banner_bytes=banner_bytes,
             open_only=open_only,
+            per_host_rate=per_host_rate,
+            probe=probe,
+            capture_response=capture_response,
+            response_bytes=response_bytes,
+        )
+        if payload_b64 is not None:
+            request["payload_b64"] = payload_b64
+        from .scan_config import normalize_native_config
+
+        request = normalize_native_config(request)
+        request.pop("protocol", None)
+        result = await self._rpc(
+            "scan_start",
+            **request,
         )
         ident = result.get("id") if isinstance(result, Mapping) else result
         if not ident:

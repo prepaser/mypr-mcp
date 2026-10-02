@@ -188,7 +188,7 @@ async def _resolve_worker(
 
 
 class NetworkTools:
-    """Async DNS, TCP and TLS helpers plus managed scan delegation."""
+    """Async DNS, native scan and TLS helpers plus managed scan delegation."""
 
     def __init__(self, workspace: str | os.PathLike[str], tasks: Any = None, rpc: Any = None):
         self.workspace = Path(workspace).resolve()
@@ -411,25 +411,33 @@ class NetworkTools:
         targets: str | list[str],
         ports: Any = "1-1024",
         *,
-        concurrency: int = 64,
-        rate: float = 200,
-        timeout: float = 1.0,  # noqa: ASYNC109
+        protocol: str = "tcp",
+        concurrency: int | None = None,
+        rate: float | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109
         max_probes: int | None = 1_000_000,
         max_duration: float | None = 3600.0,
         continue_after_output_limit: bool = False,
         family: str = "any",
-        retries: int = 0,
+        retries: int | None = None,
         banner: bool = False,
         banner_timeout: float = 0.5,
         banner_bytes: int = 1024,
         open_only: bool = False,
+        per_host_rate: float | None = None,
+        probe: str | None = None,
+        payload: bytes | None = None,
+        capture_response: bool = False,
+        response_bytes: int = 1024,
     ) -> Any:
         return await self._delegate(
             "scan", targets=targets, ports=ports, concurrency=concurrency, rate=rate,
             timeout=timeout, max_probes=max_probes, max_duration=max_duration,
             continue_after_output_limit=continue_after_output_limit, family=family,
             retries=retries, banner=banner, banner_timeout=banner_timeout,
-            banner_bytes=banner_bytes, open_only=open_only,
+            banner_bytes=banner_bytes, open_only=open_only, protocol=protocol,
+            per_host_rate=per_host_rate, probe=probe, payload=payload,
+            capture_response=capture_response, response_bytes=response_bytes,
         )
 
     async def nmap(

@@ -60,7 +60,7 @@ class ScanService:
                 continue
             if record.get("state") not in _TERMINAL:
                 record.update(state="lost", error="scan manager restarted before completion")
-                if record.get("mode") == "tcp":
+                if record.get("mode") in {"tcp", "udp"}:
                     record["complete"] = False
                 self._write_record(record)
                 self._remove_request(record)
@@ -100,63 +100,73 @@ class ScanService:
         *,
         targets: Any,
         ports: Any = None,
-        concurrency: int = 64,
-        rate: float = 200,
-        timeout: float = 1.0,  # noqa: ASYNC109
+        concurrency: int | None = None,
+        rate: float | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109
         max_probes: int | None = _DEFAULT_MAX_PROBES,
         max_duration: float | None = _DEFAULT_MAX_DURATION,
         continue_after_output_limit: bool = False,
         family: str = "any",
-        retries: int = 0,
+        retries: int | None = None,
         banner: bool = False,
         banner_timeout: float = 0.5,
         banner_bytes: int = 1024,
         open_only: bool = False,
+        per_host_rate: float | None = None,
+        probe: str | None = None,
+        payload_b64: str | None = None,
+        capture_response: bool = False,
+        response_bytes: int = 1024,
         args: list[str] | None = None,
         client_id: str | None = None,
         connection_id: str | None = None,
         exec_id: str | None = None,
     ) -> dict[str, Any]:
-        if mode not in {"tcp", "nmap"}:
-            raise ValueError("mode must be 'tcp' or 'nmap'")
+        if mode not in {"tcp", "udp", "nmap"}:
+            raise ValueError("mode must be 'tcp', 'udp', or 'nmap'")
         target_list = self._validate_targets(targets)
         self._validate_limits(max_probes, max_duration, continue_after_output_limit)
         estimate = None
-        if mode == "tcp":
-            from .scan_worker import _ports
-
-            ports = _ports(ports)
+        if mode == "udp" and banner:
+            raise ValueError("banner is only available for TCP scans")
         request_id = secrets.token_hex(16)
         result_path = self.root / f"{request_id}.jsonl"
         artifact_path = self.root / f"{request_id}.xml"
         summary_path = self.root / f"{request_id}.summary.json"
-        config = {
-            "mode": mode,
-            "targets": target_list,
-            "ports": ports,
-            "concurrency": concurrency,
-            "rate": rate,
-            "timeout": timeout,
-            "max_probes": max_probes,
-            "max_duration": max_duration,
-            "continue_after_output_limit": continue_after_output_limit,
-            "result_path": str(result_path),
-            "artifact_path": str(artifact_path),
-            "summary_path": str(summary_path),
-        }
-        if mode == "tcp":
+        if mode in {"tcp", "udp"}:
+            from .scan_config import normalize_native_config
+            from .scan_worker import _ports
+
+            config = normalize_native_config({
+                "mode": mode,
+                "targets": target_list,
+                "ports": _ports(ports),
+                "concurrency": concurrency,
+                "rate": rate,
+                "timeout": timeout,
+                "max_probes": max_probes,
+                "max_duration": max_duration,
+                "continue_after_output_limit": continue_after_output_limit,
+                "family": family,
+                "retries": retries,
+                "banner": banner,
+                "banner_timeout": banner_timeout,
+                "banner_bytes": banner_bytes,
+                "open_only": open_only,
+                "per_host_rate": per_host_rate,
+                "probe": probe,
+                "payload_b64": payload_b64,
+                "capture_response": capture_response,
+                "response_bytes": response_bytes,
+            })
             config.update(
-                family=family,
-                retries=retries,
-                banner=banner,
-                banner_timeout=banner_timeout,
-                banner_bytes=banner_bytes,
-                open_only=open_only,
+                result_path=str(result_path),
+                artifact_path=str(artifact_path),
+                summary_path=str(summary_path),
             )
-            self._validate_tcp(config)
             from .scan_worker import estimate_probes
 
-            estimate = estimate_probes(target_list, ports, family=family)
+            estimate = estimate_probes(target_list, config["ports"], family=config["family"])
         else:
             config = {
                 "mode": mode,
@@ -217,25 +227,8 @@ class ScanService:
             "truncated": False,
             "stop_reason": None,
             **(
-                {
-                    "family": family,
-                    "retries": retries,
-                    "banner": banner,
-                    "banner_timeout": banner_timeout,
-                    "banner_bytes": banner_bytes,
-                    "open_only": open_only,
-                    "completed": 0,
-                    "state_counts": {
-                        "open": 0,
-                        "closed": 0,
-                        "timeout": 0,
-                        "unreachable": 0,
-                    },
-                    "discarded_results": 0,
-                    "resolve_errors": 0,
-                    "complete": False,
-                }
-                if mode == "tcp"
+                self._native_record_fields(mode, config)
+                if mode in {"tcp", "udp"}
                 else {}
             ),
             "warnings": [],
@@ -330,7 +323,7 @@ class ScanService:
             "warnings": list(record.get("warnings", [])),
             "stop_reason": record.get("stop_reason"),
         }
-        if record.get("mode") == "tcp":
+        if record.get("mode") in {"tcp", "udp"}:
             result["complete"] = bool(record.get("complete", False))
         return result
 
@@ -414,7 +407,7 @@ class ScanService:
                 if state not in _TERMINAL:
                     state = "cancelled"
                 record["state"] = state
-                if record.get("mode") == "tcp" and state != "succeeded":
+                if record.get("mode") in {"tcp", "udp"} and state != "succeeded":
                     record["complete"] = False
                 result = shell_result.get("result")
                 if isinstance(result, dict):
@@ -587,7 +580,7 @@ class ScanService:
         async with self._state_lock:
             if record.get("state") in _TERMINAL:
                 state = record["state"]
-            if record.get("mode") == "tcp":
+            if record.get("mode") in {"tcp", "udp"}:
                 record["complete"] = complete if state == "succeeded" else False
             record.update(
                 state=state,
@@ -656,6 +649,33 @@ class ScanService:
         from .scan_worker import validate_tcp_config
 
         validate_tcp_config(config)
+
+    @staticmethod
+    def _native_record_fields(mode: str, config: dict[str, Any]) -> dict[str, Any]:
+        from .scan_config import TCP_STATES, UDP_STATES
+
+        states = TCP_STATES if mode == "tcp" else UDP_STATES
+        return {
+            "protocol": mode,
+            "family": config["family"],
+            "concurrency": config["concurrency"],
+            "rate": config["rate"],
+            "timeout": config["timeout"],
+            "retries": config["retries"],
+            "per_host_rate": config["per_host_rate"],
+            "banner": config["banner"],
+            "banner_timeout": config["banner_timeout"],
+            "banner_bytes": config["banner_bytes"],
+            "open_only": config["open_only"],
+            "probe": config["probe"],
+            "capture_response": config["capture_response"],
+            "response_bytes": config["response_bytes"],
+            "completed": 0,
+            "state_counts": {state: 0 for state in states},
+            "discarded_results": 0,
+            "resolve_errors": 0,
+            "complete": False,
+        }
 
     @staticmethod
     def _validate_limits(
