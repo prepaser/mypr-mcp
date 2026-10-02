@@ -47,6 +47,16 @@ def _validate_output_limit(value: int) -> None:
         )
 
 
+def _encode_html(html: str) -> bytes:
+    try:
+        encoded = html.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("html contains invalid Unicode") from None
+    if len(encoded) > MAX_INPUT_BYTES:
+        raise ValueError(f"html exceeds the {MAX_INPUT_BYTES} byte input limit")
+    return encoded
+
+
 def _kill_worker(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         try:
@@ -115,12 +125,7 @@ async def _run_worker(
     selector: str | None,
     include_structure: bool = False,
 ) -> dict[str, Any]:
-    try:
-        encoded = html.encode("utf-8")
-    except UnicodeEncodeError:
-        raise ValueError("html contains invalid Unicode") from None
-    if len(encoded) > MAX_INPUT_BYTES:
-        raise ValueError(f"html exceeds the {MAX_INPUT_BYTES} byte input limit")
+    encoded = _encode_html(html)
     header = json.dumps(
         {
             "url": url,
@@ -310,6 +315,7 @@ class HTMLExtractor:
             raise ValueError("url must be a string no longer than 8192 characters")
         if selector is not None and (not isinstance(selector, str) or len(selector) > 4096):
             raise ValueError("selector must be a string no longer than 4096 characters")
+        _encode_html(html)
         ensure = getattr(self._http_tools, "_ensure", None)
         if ensure is not None:
             await ensure("trafilatura", *("cssselect",) if selector else ())

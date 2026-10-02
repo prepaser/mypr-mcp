@@ -15,6 +15,8 @@ _MAX_PAYLOAD_BYTES = 16 * 1024
 _MAX_READ_BYTES = 32 * 1024
 _MAX_INBOX_BYTES = 4 * 1024
 _MAX_INBOX_MESSAGES = 5
+_MAX_READ_WARNINGS = 4
+_MAX_WARNING_TEXT = 256
 
 
 class MessageStore:
@@ -164,16 +166,37 @@ class MessageStore:
             ).fetchall()
 
         messages: list[dict[str, Any]] = []
+        warnings: list[dict[str, str]] = []
+        warnings_truncated = False
         cap_reached = False
         for row in rows[:limit]:
-            message = _message(row)
+            message, warning = _message(row)
             candidate = [*messages, message]
-            if _page_size(candidate) > _MAX_READ_BYTES:
-                cap_reached = True
-                break
+            candidate_warnings = warnings
+            warning_omitted = warning is not None and len(warnings) >= _MAX_READ_WARNINGS
+            if warning is not None and len(warnings) < _MAX_READ_WARNINGS:
+                candidate_warnings = [*warnings, warning]
+            if _page_size(candidate, candidate_warnings, warnings_truncated) > _MAX_READ_BYTES:
+                if _page_size(candidate, (), True) <= _MAX_READ_BYTES:
+                    candidate_warnings = []
+                    warnings_truncated = True
+                elif _page_size(candidate, (), False) <= _MAX_READ_BYTES:
+                    candidate_warnings = []
+                    warnings_truncated = False
+                else:
+                    cap_reached = True
+                    break
+            else:
+                warnings_truncated |= warning_omitted
+            warnings = candidate_warnings
             messages.append(message)
         has_more = cap_reached or len(rows) > len(messages)
-        return _page(messages, has_more)
+        return _page(
+            messages,
+            has_more,
+            warnings=warnings,
+            warnings_truncated=warnings_truncated,
+        )
 
     def reply(
         self,
@@ -375,33 +398,70 @@ def _fetch_ids(db: sqlite3.Connection, ids: list[int]) -> list[sqlite3.Row]:
     return rows
 
 
-def _message(row: sqlite3.Row) -> dict[str, Any]:
+def _message(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, str] | None]:
     message = {
         "id": int(row["id"]),
         "from": row["sender"],
         "to": row["recipient"],
         "text": row["text"],
         "created_at": row["created"],
-        "data": json.loads(row["data"]) if row["data"] is not None else None,
+        "data": None,
         "reply_to": int(row["reply_to"]) if row["reply_to"] is not None else None,
     }
-    return message
+    if row["data"] is None:
+        message["data"] = None
+        return message, None
+    try:
+        message["data"] = json.loads(row["data"])
+    except (TypeError, ValueError, UnicodeError):
+        message["data"] = None
+        message["data_corrupt"] = True
+        return message, {
+            "code": "message_data_corrupt",
+            "text": f"Message {message['id']} data is invalid and was omitted."[:_MAX_WARNING_TEXT],
+        }
+    return message, None
 
 
 def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
-def _page(messages: list[dict[str, Any]], has_more: bool) -> dict[str, Any]:
-    return {
+def _page(
+    messages: list[dict[str, Any]],
+    has_more: bool,
+    *,
+    warnings: list[dict[str, str]] | None = None,
+    warnings_truncated: bool = False,
+) -> dict[str, Any]:
+    page = {
         "messages": messages,
         "next_cursor": messages[-1]["id"] if has_more and messages else None,
         "has_more": has_more,
     }
+    if warnings:
+        page["warnings"] = warnings
+    if warnings_truncated:
+        page["warnings_truncated"] = True
+    return page
 
 
-def _page_size(messages: list[dict[str, Any]]) -> int:
-    return max(_json_size(_page(messages, more)) for more in (False, True))
+def _page_size(
+    messages: list[dict[str, Any]],
+    warnings: list[dict[str, str]] | None = None,
+    warnings_truncated: bool = False,
+) -> int:
+    return max(
+        _json_size(
+            _page(
+                messages,
+                more,
+                warnings=warnings,
+                warnings_truncated=warnings_truncated,
+            )
+        )
+        for more in (False, True)
+    )
 
 
 def _fit_inbox_message(

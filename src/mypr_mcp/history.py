@@ -23,6 +23,8 @@ from .client_ids import ADJECTIVES, ANIMALS
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
 _MAX_PAYLOAD_BYTES = 64 * 1024
+_MAX_HISTORY_WARNINGS = 8
+_MAX_WARNING_TEXT = 256
 
 
 def _python_history_id(record: Mapping[str, Any]) -> str | None:
@@ -77,12 +79,16 @@ class History:
                 CREATE INDEX IF NOT EXISTS entities_kind_idx
                     ON entities(kind, entity_seq DESC);
                 CREATE INDEX IF NOT EXISTS entities_public_id_idx ON entities(
-                    json_extract(data, '$.id'), entity_seq DESC
+                    CASE WHEN json_valid(data) THEN json_extract(data, '$.id') END,
+                    entity_seq DESC
                 );
                 CREATE INDEX IF NOT EXISTS execution_request_idx ON entities(
-                    COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client')),
-                    json_extract(data, '$.request_id'), entity_seq
-                ) WHERE kind = 'execution';
+                    CASE WHEN json_valid(data) THEN
+                        COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client'))
+                    END,
+                    CASE WHEN json_valid(data) THEN json_extract(data, '$.request_id') END,
+                    entity_seq
+                ) WHERE kind = 'execution' AND json_valid(data);
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     time REAL NOT NULL,
@@ -102,16 +108,44 @@ class History:
                     SELECT client_id FROM events WHERE client_id IS NOT NULL;
                 INSERT OR IGNORE INTO client_ids(id)
                     SELECT json_extract(data, '$.client_id') FROM entities
-                    WHERE json_extract(data, '$.client_id') IS NOT NULL;
+                    WHERE json_valid(data)
+                    AND json_extract(data, '$.client_id') IS NOT NULL;
                 INSERT OR IGNORE INTO client_ids(id)
                     SELECT json_extract(data, '$.client') FROM entities
-                    WHERE json_extract(data, '$.client') IS NOT NULL;
+                    WHERE json_valid(data)
+                    AND json_extract(data, '$.client') IS NOT NULL;
                 """
             )
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(client_ids)")}
             for column in ("created", "last_seen"):
                 if column not in columns:
                     self._db.execute(f"ALTER TABLE client_ids ADD COLUMN {column} REAL")
+            self._repair_json_indexes()
+
+    def _repair_json_indexes(self) -> None:
+        indexes = {
+            row["name"]: row["sql"] or ""
+            for row in self._db.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+                "AND name IN ('entities_public_id_idx', 'execution_request_idx')"
+            )
+        }
+        if "json_valid(data)" not in indexes.get("entities_public_id_idx", ""):
+            self._db.execute("DROP INDEX IF EXISTS entities_public_id_idx")
+            self._db.execute(
+                "CREATE INDEX entities_public_id_idx ON entities("
+                "CASE WHEN json_valid(data) THEN json_extract(data, '$.id') END, "
+                "entity_seq DESC)"
+            )
+        if "json_valid(data)" not in indexes.get("execution_request_idx", ""):
+            self._db.execute("DROP INDEX IF EXISTS execution_request_idx")
+            self._db.execute(
+                "CREATE INDEX execution_request_idx ON entities("
+                "CASE WHEN json_valid(data) THEN "
+                "COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client')) END, "
+                "CASE WHEN json_valid(data) THEN json_extract(data, '$.request_id') END, "
+                "entity_seq) WHERE kind = 'execution' AND json_valid(data)"
+            )
 
     def allocate_client_id(self) -> str:
         """Reserve a readable ID permanently, including connections that do no work."""
@@ -206,20 +240,64 @@ class History:
 
     def storage_records(self) -> list[dict[str, Any]]:
         self._ensure_open()
+        fields = (
+            "id", "kind", "state", "generation", "history_id", "exec_id",
+            "client_id", "connection_id", "result_ref", "output_evicted",
+            "result_evicted", "scan_output_evicted", "created", "finished", "artifacts",
+        )
+        projected = [
+            "id AS row_id", "kind AS row_kind",
+            "created AS row_created", "updated AS row_updated",
+            "CASE WHEN json_valid(data) THEN 1 ELSE 0 END AS data_valid",
+            "CASE WHEN json_valid(data) THEN json_type(data) END AS data_type",
+        ]
+        projected.extend(
+            "CASE WHEN json_valid(data) THEN "
+            "CASE WHEN json_type(data) = 'object' "
+            f"THEN json_extract(data, '$.{field}') END END AS data_{field}"
+            for field in ("id", "kind")
+        )
+        projected.extend(
+            "CASE WHEN json_valid(data) THEN "
+            "CASE WHEN json_type(data) = 'object' "
+            f"THEN json_extract(data, '$.{field}') END END AS {field}"
+            for field in fields
+            if field not in {"id", "kind"}
+        )
         with self._lock:
-            fields = (
-                "id", "kind", "state", "generation", "history_id", "exec_id",
-                "client_id", "connection_id", "result_ref", "output_evicted",
-                "result_evicted", "scan_output_evicted", "created", "finished", "artifacts",
-            )
-            select = ", ".join(f"json_extract(data, '$.{field}') AS {field}" for field in fields)
-            rows = self._db.execute(f"SELECT {select} FROM entities").fetchall()
+            rows = self._db.execute(f"SELECT {', '.join(projected)} FROM entities").fetchall()
         records = []
         for row in rows:
-            record = dict(row)
+            if not row["data_valid"]:
+                records.append(
+                    _corrupt_entity(
+                        row["row_id"], row["row_kind"], "invalid_json",
+                        created=row["row_created"], updated=row["row_updated"],
+                    )
+                )
+                continue
+            if row["data_type"] != "object":
+                records.append(
+                    _corrupt_entity(
+                        row["row_id"], row["row_kind"], "invalid_object",
+                        created=row["row_created"], updated=row["row_updated"],
+                    )
+                )
+                continue
+            record = {
+                field: row[f"data_{field}"] if field in {"id", "kind"} else row[field]
+                for field in fields
+            }
             for field in ("result_ref", "artifacts"):
                 if isinstance(record[field], str):
-                    record[field] = json.loads(record[field])
+                    try:
+                        record[field] = json.loads(record[field])
+                    except (TypeError, ValueError, UnicodeError):
+                        record = _corrupt_entity(
+                            row["row_id"], row["row_kind"], "invalid_nested_json",
+                            created=row["row_created"], updated=row["row_updated"],
+                        )
+                        break
             records.append(record)
         return records
 
@@ -280,7 +358,14 @@ class History:
 
     def storage_gc_snapshot(self) -> dict[str, Any]:
         active, protected, references, tombstones = set(), set(), {}, {}
+        warnings: list[dict[str, str]] = []
+        uncertain = False
+        warnings_truncated = False
         for record in self.storage_records():
+            if record.get("corrupt"):
+                uncertain = True
+                warnings_truncated |= _append_warning(warnings, record.get("warning"))
+                continue
             ident, kind = record.get("id"), record.get("kind")
             if not isinstance(ident, str):
                 continue
@@ -319,10 +404,14 @@ class History:
         return {
             "active_ids": active, "protected_paths": protected,
             "references": references, "tombstones": tombstones,
+            "uncertain": uncertain, "warnings": warnings,
+            "warnings_truncated": warnings_truncated,
         }
 
     def storage_gc_before_delete(self, candidates) -> list[str]:
         snapshot = self.storage_gc_snapshot()
+        if snapshot.get("uncertain"):
+            return []
         protected = set(snapshot["protected_paths"])
         paths = [item["path"] for item in candidates if item["path"] not in protected]
         return self.mark_storage_evicted(paths)
@@ -330,13 +419,17 @@ class History:
     def mark_storage_evicted(self, paths: list[str]) -> list[str]:
         """Preserve entity identity and deduplication while expiring owned data."""
         self._ensure_open()
+        if any(record.get("corrupt") for record in self.storage_records()):
+            return []
         selected = set(paths)
         marked: set[str] = set()
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 for row in self._db.execute("SELECT id, data FROM entities").fetchall():
-                    record = _load(row["data"])
+                    record, warning = _decode_entity(row)
+                    if warning is not None:
+                        continue
                     if record.get("state") not in {"succeeded", "failed", "cancelled", "lost"}:
                         continue
                     kind = record.get("kind")
@@ -441,7 +534,12 @@ class History:
                 else:
                     if row["kind"] != kind:
                         raise ValueError(f"entity {storage_id!r} already has kind {row['kind']!r}")
-                    previous = _load(row["data"])
+                    try:
+                        previous = _load(row["data"])
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise ValueError(
+                            f"cannot update corrupt history entity {storage_id!r}"
+                        ) from exc
                     merged = {**previous, **record}
                     merged["id"] = ident
                     merged.setdefault("kind", kind)
@@ -493,18 +591,32 @@ class History:
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
-        return [_event(row) for row in rows]
+        return [_event(row)[0] for row in rows]
 
     def find_request(self, client_id: str, request_id: str) -> dict[str, Any] | None:
         self._ensure_open()
         with self._lock:
+            corrupt = self._db.execute(
+                "SELECT 1 FROM entities WHERE kind = 'execution' AND "
+                "CASE WHEN json_valid(data) THEN json_type(data) != 'object' ELSE 1 END "
+                "LIMIT 1"
+            ).fetchone()
+            if corrupt is not None:
+                raise RuntimeError(
+                    "cannot verify request deduplication: persisted execution history is corrupt"
+                )
             row = self._db.execute(
-                "SELECT data FROM entities WHERE kind = 'execution' AND "
+                "SELECT id, kind, created, updated, data FROM entities "
+                "WHERE kind = 'execution' AND "
+                "json_valid(data) AND "
                 "COALESCE(json_extract(data, '$.client_id'), json_extract(data, '$.client')) = ? "
                 "AND json_extract(data, '$.request_id') = ? ORDER BY entity_seq LIMIT 1",
                 (client_id, request_id),
             ).fetchone()
-        return _load(row["data"]) if row else None
+        if row is None:
+            return None
+        record, warning = _decode_entity(row)
+        return None if warning is not None else record
 
     def list(
         self,
@@ -522,6 +634,7 @@ class History:
             if not isinstance(client_id, str):
                 raise TypeError("client_id must be a string or None")
             clauses.append(
+                "json_valid(data) AND "
                 "(json_extract(data, '$.client_id') = ? OR json_extract(data, '$.client') = ?)"
             )
             params.append(client_id)
@@ -532,23 +645,30 @@ class History:
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._db.execute(
-                f"SELECT entity_seq, data FROM entities{where} ORDER BY entity_seq DESC LIMIT ?",
+                f"SELECT entity_seq, id, kind, created, updated, data FROM entities{where} "
+                "ORDER BY entity_seq DESC LIMIT ?",
                 (*params, limit + 1),
             ).fetchall()
         has_more = len(rows) > limit
         visible = rows[:limit]
         items = []
+        warnings: list[dict[str, str]] = []
+        warnings_truncated = False
         for row in visible:
-            item = _load(row["data"])
+            item, warning = _decode_entity(row)
+            warnings_truncated |= _append_warning(warnings, warning)
             item.pop("code", None)
             item.pop("output", None)
             item.pop("events", None)
-            history_id = _python_history_id(item)
-            if history_id is not None:
-                item["history_id"] = history_id
+            if not item.get("corrupt"):
+                history_id = _python_history_id(item)
+                if history_id is not None:
+                    item["history_id"] = history_id
             items.append(item)
         next_cursor = int(visible[-1]["entity_seq"]) if has_more and visible else None
-        return {"items": items, "next_cursor": next_cursor}
+        result = {"items": items, "next_cursor": next_cursor}
+        _attach_warnings(result, warnings, warnings_truncated)
+        return result
 
     def get(self, ident: str) -> dict[str, Any] | None:
         """Return a complete entity, including code and output when present."""
@@ -560,31 +680,41 @@ class History:
             if python_key is not None:
                 generation, task_id = python_key
                 row = self._db.execute(
-                    "SELECT data FROM entities "
+                    "SELECT id, kind, created, updated, data FROM entities "
                     "WHERE kind = 'python' "
+                    "AND json_valid(data) "
                     "AND json_extract(data, '$.id') = ? "
                     "AND json_extract(data, '$.generation') = ? "
                     "ORDER BY entity_seq DESC LIMIT 1",
                     (task_id, generation),
                 ).fetchone()
                 if row is not None:
-                    result = _load(row["data"])
+                    result, warning = _decode_entity(row)
+                    if warning is not None:
+                        return result
                     result["history_id"] = _python_history_id(result) or ident
                     return result
-            row = self._db.execute("SELECT data FROM entities WHERE id = ?", (ident,)).fetchone()
+            row = self._db.execute(
+                "SELECT id, kind, created, updated, data FROM entities WHERE id = ?",
+                (ident,),
+            ).fetchone()
             if row is not None:
-                exact = _load(row["data"])
+                exact, warning = _decode_entity(row)
+                if warning is not None:
+                    return exact
                 if exact.get("history_id") == ident:
                     return exact
             row = self._db.execute(
-                "SELECT data FROM entities "
-                "WHERE json_extract(data, '$.id') = ? "
+                "SELECT id, kind, created, updated, data FROM entities "
+                "WHERE json_valid(data) AND json_extract(data, '$.id') = ? "
                 "ORDER BY entity_seq DESC LIMIT 1",
                 (ident,),
             ).fetchone()
         if row is None:
             return None
-        result = _load(row["data"])
+        result, warning = _decode_entity(row)
+        if warning is not None:
+            return result
         history_id = _python_history_id(result)
         if history_id is not None:
             result["history_id"] = history_id
@@ -635,7 +765,16 @@ class History:
                 next_cursor = (
                     int(rows[-1]["seq"]) if len(rows) == limit else max(cursor_value, high)
                 )
-        return {"events": [_event(row) for row in rows], "cursor": next_cursor}
+        events: list[dict[str, Any]] = []
+        warnings: list[dict[str, str]] = []
+        warnings_truncated = False
+        for row in rows:
+            event, warning = _event(row)
+            events.append(event)
+            warnings_truncated |= _append_warning(warnings, warning)
+        result = {"events": events, "cursor": next_cursor}
+        _attach_warnings(result, warnings, warnings_truncated)
+        return result
 
     def recover(self) -> int:
         """Mark unfinished entities lost after manager startup."""
@@ -655,16 +794,18 @@ class History:
             raise ValueError("state must be a non-empty string")
         with self._lock:
             params: list[Any] = [*sorted(_ACTIVE_STATES)]
-            where = "json_extract(data, '$.state') IN (?, ?, ?)"
+            where = "json_valid(data) AND json_extract(data, '$.state') IN (?, ?, ?)"
             if kind is not None:
                 where += " AND kind = ?"
                 params.append(kind)
             rows = self._db.execute(
-                f"SELECT id, kind, data FROM entities WHERE {where}", params
+                f"SELECT id, kind, created, updated, data FROM entities WHERE {where}", params
             ).fetchall()
             count = 0
             for row in rows:
-                record = _load(row["data"])
+                record, warning = _decode_entity(row)
+                if warning is not None:
+                    continue
                 record.update(state=state, finished=time.time())
                 if error is None:
                     record.pop("error", None)
@@ -760,6 +901,65 @@ def _load(value: str) -> dict[str, Any]:
     return loaded
 
 
+def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _corrupt_entity(
+    ident: Any,
+    kind: Any,
+    reason: str,
+    *,
+    created: Any = None,
+    updated: Any = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "id": ident,
+        "kind": kind,
+        "corrupt": True,
+        "corruption": reason,
+    }
+    if created is not None:
+        record["created"] = created
+    if updated is not None:
+        record["updated"] = updated
+    record["warning"] = {
+        "code": "history_entity_corrupt",
+        "text": f"History entity {ident!r} data is unavailable ({reason})."[:_MAX_WARNING_TEXT],
+    }
+    return record
+
+
+def _decode_entity(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, str] | None]:
+    ident = _row_value(row, "id", "unknown")
+    kind = _row_value(row, "kind", "unknown")
+    try:
+        loaded = json.loads(row["data"])
+    except (TypeError, ValueError, UnicodeError):
+        record = _corrupt_entity(
+            ident,
+            kind,
+            "invalid_json",
+            created=_row_value(row, "created"),
+            updated=_row_value(row, "updated"),
+        )
+    else:
+        if not isinstance(loaded, dict):
+            record = _corrupt_entity(
+                ident,
+                kind,
+                "invalid_object",
+                created=_row_value(row, "created"),
+                updated=_row_value(row, "updated"),
+            )
+        else:
+            return loaded, None
+    return record, record["warning"]
+
+
 def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -786,7 +986,7 @@ def _bounded(value: Any) -> Any:
     return {"truncated": True}
 
 
-def _event(row: sqlite3.Row) -> dict[str, Any]:
+def _event(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, str] | None]:
     result: dict[str, Any] = {
         "seq": int(row["seq"]),
         "time": row["time"],
@@ -801,5 +1001,37 @@ def _event(row: sqlite3.Row) -> dict[str, Any]:
     if row["error"] is not None:
         result["error"] = row["error"]
     if row["data"] is not None:
-        result["data"] = json.loads(row["data"])
-    return result
+        try:
+            result["data"] = json.loads(row["data"])
+        except (TypeError, ValueError, UnicodeError):
+            result["data_corrupt"] = True
+            return result, {
+                "code": "history_event_corrupt",
+                "text": (
+                    f"History event {result['seq']} data is invalid and was omitted."
+                    [: _MAX_WARNING_TEXT]
+                ),
+            }
+    return result, None
+
+
+def _append_warning(
+    warnings: list[dict[str, str]], warning: dict[str, str] | None
+) -> bool:
+    if warning is None:
+        return False
+    if len(warnings) >= _MAX_HISTORY_WARNINGS:
+        return True
+    warnings.append(warning)
+    return False
+
+
+def _attach_warnings(
+    result: dict[str, Any],
+    warnings: list[dict[str, str]],
+    truncated: bool = False,
+) -> None:
+    if warnings:
+        result["warnings"] = warnings
+    if truncated:
+        result["warnings_truncated"] = True

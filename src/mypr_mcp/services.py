@@ -432,9 +432,13 @@ class Shells:
                 raise ValueError("invalid shell job ID")
             metadata_path = self.jobs_root / f"{job_id}.json"
             try:
-                metadata = json.loads(read_bytes(metadata_path, max_bytes=1024 * 1024))
+                metadata, metadata_warning = self._load_persisted_metadata(metadata_path)
             except FileNotFoundError:
                 raise ValueError("unknown job") from None
+            state, state_warnings, outcome_unknown = self._persisted_state(
+                metadata, metadata_warning
+            )
+            persisted_warnings = state_warnings + self._metadata_warnings(metadata)
             page, next_index, next_offset, has_more = await asyncio.to_thread(
                 self._read_journal_page,
                 self.jobs_root / f"{job_id}.jsonl",
@@ -444,15 +448,17 @@ class Shells:
             )
             return {
                 "id": job_id,
-                "state": metadata.get("state", "unknown"),
+                "state": state,
                 "output": page,
                 "cursor": self._encode_read_cursor(job_id, next_index, next_offset),
                 "has_more": has_more,
                 "result": metadata.get("result"),
                 "error": metadata.get("error"),
                 "truncated": bool(metadata.get("truncated", False)),
-                "warnings": metadata.get("warnings", []),
-                "warnings_truncated": bool(metadata.get("warnings_truncated", False)),
+                "warnings": persisted_warnings[:_MAX_SHELL_WARNINGS],
+                "outcome_unknown": outcome_unknown,
+                "warnings_truncated": bool(metadata.get("warnings_truncated", False))
+                or len(persisted_warnings) > _MAX_SHELL_WARNINGS,
                 "pty": bool(metadata.get("pty", False)),
                 "rows": metadata.get("rows", 24),
                 "cols": metadata.get("cols", 80),
@@ -607,7 +613,7 @@ class Shells:
         metadata_path = self.jobs_root / f"{job_id}.json"
         journal_path = self.jobs_root / f"{job_id}.jsonl"
         try:
-            metadata = json.loads(read_bytes(metadata_path, max_bytes=1024 * 1024))
+            metadata, metadata_warning = self._load_persisted_metadata(metadata_path)
         except FileNotFoundError:
             return {
                 "id": job_id,
@@ -618,17 +624,15 @@ class Shells:
                 "error": "unknown job",
                 "warnings": [],
             }
-        if not isinstance(metadata, dict):
-            raise RuntimeError("invalid persisted shell metadata")
         output = self._read_journal(journal_path)
         output_count = metadata.get("output_count", len(output))
         if type(output_count) is not int or output_count < len(output):
             output_count = len(output)
         self._validate_cursor(cursor, output_count)
-        warnings = metadata.get("warnings", [])
-        if not isinstance(warnings, list):
-            warnings = []
-        warnings = [warning for warning in warnings if isinstance(warning, dict)]
+        state, state_warnings, outcome_unknown = self._persisted_state(
+            metadata, metadata_warning
+        )
+        warnings = state_warnings + self._metadata_warnings(metadata)
         warnings_truncated = bool(metadata.get("warnings_truncated", False))
         for event in output:
             if event.get("type") == "warning":
@@ -644,7 +648,7 @@ class Shells:
         warnings_truncated |= len(warnings) > _MAX_SHELL_WARNINGS
         return {
             "id": job_id,
-            "state": metadata.get("state", "unknown"),
+            "state": state,
             "output": output[cursor:],
             "cursor": output_count,
             "result": metadata.get("result"),
@@ -656,7 +660,51 @@ class Shells:
             "pty": bool(metadata.get("pty", False)),
             "rows": metadata.get("rows", 24),
             "cols": metadata.get("cols", 80),
+            "outcome_unknown": outcome_unknown,
         }
+
+    @staticmethod
+    def _load_persisted_metadata(path: Path) -> tuple[dict[str, Any], dict[str, str] | None]:
+        try:
+            metadata = json.loads(read_bytes(path, max_bytes=1024 * 1024))
+        except (TypeError, ValueError, UnicodeError) as exc:
+            return {}, {
+                "code": "shell_metadata_corrupt",
+                "text": f"Persisted shell metadata is invalid and was omitted: {exc}"[
+                    :_MAX_SHELL_WARNING_TEXT
+                ],
+            }
+        if not isinstance(metadata, dict):
+            return {}, {
+                "code": "shell_metadata_corrupt",
+                "text": "Persisted shell metadata is not an object and was omitted.",
+            }
+        return metadata, None
+
+    @staticmethod
+    def _metadata_warnings(metadata: dict[str, Any]) -> list[dict[str, str]]:
+        warnings = metadata.get("warnings", [])
+        if not isinstance(warnings, list):
+            return []
+        return [warning for warning in warnings if isinstance(warning, dict)]
+
+    @staticmethod
+    def _persisted_state(
+        metadata: dict[str, Any], metadata_warning: dict[str, str] | None
+    ) -> tuple[str, list[dict[str, str]], bool]:
+        state = metadata.get("state")
+        if isinstance(state, str) and state in {
+            "queued", "running", "cancelling", "succeeded", "failed", "cancelled", "lost"
+        }:
+            return state, [metadata_warning] if metadata_warning else [], False
+        warning = {
+            "code": "shell_outcome_unknown",
+            "text": "Persisted shell outcome is unavailable; treating the job as lost.",
+        }
+        warnings = [metadata_warning] if metadata_warning else []
+        if warning not in warnings:
+            warnings.append(warning)
+        return "lost", warnings, True
 
     @staticmethod
     def _poll_job(job: _Job, cursor: int) -> dict[str, Any]:

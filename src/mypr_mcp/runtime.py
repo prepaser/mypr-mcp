@@ -23,11 +23,12 @@ from jupyter_client.kernelspec import KernelSpec
 from . import __version__
 from .async_utils import wait_owned
 from .bootstrap import ensure_runtime
-from .browser_service import BrowserService
+from .browser_service import BrowserService, validate_launch_options
 from .config import ConfigStore
 from .config_runtime import RuntimeConfig
 from .dependency_service import DependencyService
 from .diagnostics import RPCError, error_info, error_response, safe_error
+from .file_io import open_regular
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
@@ -115,7 +116,14 @@ def _persist_execution(root, history, record, event=None, journal_events=None, h
 
 
 def _load_execution(path):
-    return json.loads(path.read_text())
+    with open_regular(path) as stream:
+        raw = stream.read(MAX_MESSAGE + 1)
+    if len(raw) > MAX_MESSAGE:
+        raise ValueError("execution record exceeds its size limit")
+    record = json.loads(raw)
+    if not isinstance(record, dict) or not isinstance(record.get("state"), str):
+        raise ValueError("execution record must be an object with a string state")
+    return record
 
 
 def _persist_task_update(history, journal, kind, record, event=None, output=None, entity_id=None):
@@ -162,13 +170,14 @@ def _store_task_result(workspace, history, record, encoded):
 def _recover_runs(root, history):
     for path in (root / "runs").glob("*.json"):
         try:
-            old = json.loads(path.read_text())
+            old = _load_execution(path)
             if old["state"] not in TERMINAL and old["state"] != "restarting":
                 old.update(state="lost", error="Manager stopped before completion")
                 _write_json(path, old)
             old.setdefault("client_id", old.get("client") or "legacy")
             history.record("execution", old)
-        except ValueError, KeyError:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"Skipping execution record {path.name}: {safe_error(exc)}", file=sys.stderr)
             continue
 
 
@@ -216,6 +225,7 @@ class Runtime:
         self.healthy = False
         self.health_error = None
         self.registry_error = None
+        self._registry_generation = None
         self.km = None
         self.kc = None
         self.worker = None
@@ -1198,6 +1208,23 @@ class Runtime:
                 rec = await self.io(_load_execution, path)
             except FileNotFoundError as exc:
                 raise ValueError("Unknown execution") from exc
+            except (OSError, ValueError, TypeError) as exc:
+                raise RPCError(
+                    "Saved execution metadata is corrupt or unreadable",
+                    code="execution_metadata_corrupt",
+                    details={"exec_id": ident, "outcome_unknown": True},
+                ) from exc
+            if (
+                rec.get("id", ident) != ident
+                or not isinstance(rec.get("generation"), str)
+                or not rec["generation"]
+                or rec["state"] not in TERMINAL | {"queued", "running", "cancelling", "restarting"}
+            ):
+                raise RPCError(
+                    "Saved execution metadata is invalid",
+                    code="execution_metadata_corrupt",
+                    details={"exec_id": ident, "outcome_unknown": True},
+                )
         if rec.get("restart_id"):
             from .restart import recover_ticket
 
@@ -1487,6 +1514,10 @@ class Runtime:
         context = dict(client=client, connection_id=connection_id, connection=connection,
                        requested_client=requested_client, generation=generation)
         if op == "browser_server":
+            browser_name = req.get("browser", "chromium")
+            launch_options, executable_path, channel = validate_launch_options(
+                browser_name, req.get("launch_options")
+            )
             async with self._admission_lock:
                 self._check_dispatch_admission(op)
                 if generation and generation != self.generation:
@@ -1521,21 +1552,18 @@ class Runtime:
                 self.track_shell(ident, client, connection_id, req.get("exec_id"), **fields)
 
             dependency_service = getattr(self, "dependencies", None)
-            if dependency_service and not dependency_service.config["auto_install"]:
-                options = req.get("launch_options") or {}
-                if isinstance(options, dict) and not any(
-                    options.get(key) for key in ("executable_path", "executablePath", "channel")
-                ):
+            if dependency_service is not None:
+                if executable_path is None and channel is None:
                     await dependency_service.ensure(
-                        [f"browser:{req.get('browser', 'chromium')}"], automatic=True,
+                        [f"browser:{browser_name}"], automatic=True,
                         context={"client_id": client, "connection_id": connection_id,
                                  "exec_id": req.get("exec_id"),
                                  "generation": admission_generation},
                     )
-            options = {"launch_options": req.get("launch_options"), "track": track_install}
+            options = {"launch_options": launch_options, "track": track_install}
             if dependency_service is not None:
-                options["install"] = dependency_service.config["auto_install"]
-            result = await browser_service.ensure(req.get("browser", "chromium"), **options)
+                options["install"] = False
+            result = await browser_service.ensure(browser_name, **options)
             async with self._admission_lock:
                 if (
                     admission_generation != self.generation
@@ -1703,6 +1731,8 @@ class Runtime:
             record = await self.io(self.history.get, req.get("id", req.get("exec_id")))
             if record is None:
                 raise ValueError("Unknown history ID")
+            if record.get("corrupt"):
+                return record
             output_evicted = bool(
                 record.get("output_evicted") or record.get("scan_output_evicted")
             )
@@ -1761,6 +1791,11 @@ class Runtime:
             record = await self.io(self.history.get, history_id)
             if record is None or record.get("kind") not in {"python", "execution"}:
                 raise ValueError("Unknown Python task history ID")
+            if record.get("corrupt"):
+                raise RPCError(
+                    "Saved task metadata is corrupt", code="history_corrupt",
+                    details={"history_id": history_id, "outcome_unknown": True},
+                )
             expected_history_id = (
                 self.task_history_id(record) if record.get("kind") == "python" else record.get("id")
             )
@@ -2131,6 +2166,11 @@ class Runtime:
                 return reference
         if op == "task_result_get":
             record = await self.io(self.history.get, req["id"])
+            if record and record.get("corrupt"):
+                raise RPCError(
+                    "Saved task metadata is corrupt", code="history_corrupt",
+                    details={"history_id": req["id"], "outcome_unknown": True},
+                )
             if not record or not record.get("result_ref") or record.get("result_evicted"):
                 raise RuntimeError("Persisted task result is unavailable or expired")
             return await self.io(load_result, self.workspace, record["result_ref"])
@@ -2624,6 +2664,38 @@ class Runtime:
         except Exception as exc:
             self.health_error = f"Restart monitoring failed: {safe_error(exc)}"
 
+    async def _register_manager(self):
+        from .runtime_registry import register
+
+        try:
+            await wait_owned(asyncio.to_thread(
+                register, self.workspace, self.socket, self.generation,
+                self.config_store.global_path,
+            ))
+        except Exception as exc:
+            self.registry_error = f"manager registry unavailable: {safe_error(exc)}"
+            print(self.registry_error, file=sys.stderr)
+            await self._unregister_manager()
+        else:
+            self._registry_generation = self.generation
+            self.registry_error = None
+
+    async def _unregister_manager(self):
+        from .runtime_registry import unregister
+
+        previous = getattr(self, "_registry_generation", None)
+        generations = dict.fromkeys(value for value in (self.generation, previous) if value)
+        for generation in generations:
+            try:
+                removed = await wait_owned(asyncio.to_thread(
+                    unregister, self.workspace, generation, identity=self.workspace_id,
+                ), propagate=False)
+            except Exception as exc:
+                print(f"manager registry cleanup failed: {safe_error(exc)}", file=sys.stderr)
+            else:
+                if removed:
+                    self._registry_generation = None
+
     async def reset(self, current):
         async with self._lifecycle_lock:
             try:
@@ -2649,20 +2721,12 @@ class Runtime:
                 self.shells = self.new_shells()
                 self.scans = ScanService(self.workspace, self.shells, self.track_shell)
                 self.queue = asyncio.Queue()
+                self._registry_generation = (
+                    getattr(self, "_registry_generation", None) or self.generation
+                )
                 self.generation = uuid.uuid4().hex
                 await self.start_kernel()
-                from .runtime_registry import register
-
-                try:
-                    await asyncio.to_thread(
-                        register, self.workspace, self.socket, self.generation,
-                        self.config_store.global_path,
-                    )
-                except Exception as exc:
-                    self.registry_error = f"manager registry unavailable: {safe_error(exc)}"
-                    print(self.registry_error, file=sys.stderr)
-                else:
-                    self.registry_error = None
+                await self._register_manager()
                 if current:
                     await self.append(
                         current, {"type": "result", "text": "Workspace reset completed"}
@@ -3128,18 +3192,7 @@ class Runtime:
             )
             try:
                 await self.start_kernel()
-                from .runtime_registry import register
-
-                try:
-                    await asyncio.to_thread(
-                        register, self.workspace, self.socket, self.generation,
-                        self.config_store.global_path,
-                    )
-                except Exception as exc:
-                    self.registry_error = f"manager registry unavailable: {safe_error(exc)}"
-                    print(self.registry_error, file=sys.stderr)
-                else:
-                    self.registry_error = None
+                await self._register_manager()
                 self.spawn(self.maintain_storage())
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     asyncio.get_running_loop().add_signal_handler(sig, self.stopping.set)
@@ -3154,12 +3207,7 @@ class Runtime:
                 await server.wait_closed()
                 await self.drain_background()
         finally:
-            from .runtime_registry import unregister
-
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    unregister, self.workspace, self.generation, identity=self.workspace_id,
-                )
+            await self._unregister_manager()
             for writer in list(self.attachments.values()):
                 writer.close()
             self.socket.unlink(missing_ok=True)

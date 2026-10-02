@@ -60,6 +60,32 @@ async def test_image_info_and_transform_are_bounded_and_keep_source(tmp_path):
         await fs.image("missing.png", resize=(4, 4))
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"resize": (0, 1)}, "resize dimensions"),
+        ({"crop": (1, 1, 1, 2)}, "crop must be a non-empty"),
+        ({"resize": (2, 2), "max_bytes": 2 * 1024 * 1024 + 1}, "max_output_bytes"),
+    ],
+)
+async def test_invalid_image_transform_options_fail_before_dependency_install(
+    tmp_path, kwargs, message
+):
+    calls = []
+
+    async def ensure(*names, **options):
+        calls.append((names, options))
+
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(b"placeholder")
+    fs = Filesystem(tmp_path, ensure_dependencies=ensure)
+
+    with pytest.raises(ValueError, match=message):
+        await fs.image(image_path.name, **kwargs)
+
+    assert calls == []
+
+
 async def test_jpeg_exif_orientation_defines_info_and_crop_coordinates(tmp_path):
     pillow_image = pytest.importorskip("PIL.Image")
     image_path = tmp_path / "oriented.jpg"

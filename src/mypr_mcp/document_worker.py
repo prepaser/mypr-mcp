@@ -288,6 +288,7 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
     display = request["display"]
     suffix = Path(display).suffix.lower()
     language = request["language"]
+    max_pages = request["max_pages"]
     executable = shutil.which("tesseract")
     if executable is None:
         raise _Failure(
@@ -304,7 +305,7 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
         if document.needs_pass:
             document.close()
             raise _Failure("ValueError", "Encrypted PDFs are not supported")
-        first, max_pages, dpi = request["start_page"], request["max_pages"], request["dpi"]
+        first, dpi = request["start_page"], request["dpi"]
         if first > document.page_count:
             document.close()
             raise _Failure(
@@ -442,10 +443,17 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
         "warnings": [],
     }
     if resume is not None:
-        resume["next_page"] = (
-            resume["page"] + 1 if resume["page"] < last_page else None
-        )
-        resume["remaining_pages"] = max(0, last_page - resume["page"])
+        resume_page = resume["page"]
+        page_count = pdf_page_count if suffix == ".pdf" else 1
+        resume["next_page"] = resume_page + 1 if resume_page < page_count else None
+        if resume["next_page"] is None:
+            resume["remaining_pages"] = 0
+        elif resume["next_page"] <= last_page:
+            resume["remaining_pages"] = last_page - resume_page
+        else:
+            resume["remaining_pages"] = max_pages
+        resume["page_limit"] = max_pages
+        resume["page_count"] = page_count
         result["resume"] = resume
     return result
 

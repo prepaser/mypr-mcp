@@ -470,9 +470,11 @@ class DocumentExtractor:
             page_snapshot = {
                 **snapshot,
                 "items": items,
-                "complete": False,
-                "truncated": True,
-                "truncation_reason": "result_size_limit",
+                "complete": resume.get("next_page") is None,
+                "truncated": resume.get("next_page") is not None,
+                "truncation_reason": (
+                    "page_limit" if resume.get("next_page") is not None else None
+                ),
                 "resume": resume,
             }
             page = await asyncio.to_thread(_page, self._store, page_snapshot, 0, max_bytes)
@@ -495,6 +497,16 @@ class DocumentExtractor:
                 page["truncated"] = False
                 page["truncation_reason"] = None
                 return page
+            page["resume_cursor"] = self._store.resume_cursor(
+                snapshot["id"], absolute, item_offsets[consumed]
+            )
+            page["complete"] = False
+            page["truncated"] = True
+            page["truncation_reason"] = "page_limit"
+            page["next_page"] = resume["next_page"]
+            page["has_more"] = False
+            page["next_cursor"] = None
+            return page
         next_page = resume.get("next_page")
         if next_page is None:
             terminal = {
@@ -507,7 +519,13 @@ class DocumentExtractor:
             terminal.pop("resume", None)
             return await asyncio.to_thread(_page, self._store, terminal, 0, max_bytes)
         options = snapshot.get("options", {})
-        remaining_pages = max(1, int(resume.get("remaining_pages", 1)))
+        try:
+            page_budget = int(options.get("max_pages", 1))
+            remaining_pages = int(resume.get("remaining_pages", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid OCR resume cursor") from exc
+        if not 1 <= page_budget <= 5 or not 1 <= remaining_pages <= page_budget:
+            remaining_pages = page_budget if 1 <= page_budget <= 5 else 1
         current_revision = await asyncio.to_thread(
             _file_revision, resolved, int(options.get("max_input_bytes", _MAX_INPUT_BYTES))
         )

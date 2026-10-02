@@ -34,7 +34,18 @@ from .mail_api import MailAPI
 from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
-from .skill_tools import SkillsWriting, _front_matter, _metadata_errors
+from .skill_tools import (
+    SkillsWriting,
+    _bounded_metadata,
+    _fit_skill_item,
+    _front_matter,
+    _json_bytes,
+    _mark_skill_list_truncated,
+    _metadata_errors,
+    _MetadataLimitError,
+    _read_metadata_prefix,
+    _read_prefix,
+)
 from .system_tools import SystemTools
 from .terminal import validate_size as _terminal_size
 from .timer_api import TimerAPI
@@ -949,6 +960,11 @@ class TaskManager:
         record = await _rpc("history_get", id=task_id)
         if not isinstance(record, Mapping):
             raise RPCError("invalid persisted task record")
+        if record.get("corrupt"):
+            raise RPCError(
+                "Saved task metadata is corrupt", code="history_corrupt",
+                details={"history_id": task_id, "outcome_unknown": True},
+            )
         kind = record.get("kind")
         current = self._handles.get(str(record.get("id")))
         if current is not None and (
@@ -1739,6 +1755,14 @@ class Packages:
 
 
 class Skills(SkillsWriting):
+    DEFAULT_LIST_LIMIT = 100
+    MAX_LIST_LIMIT = 1000
+    DEFAULT_METADATA_BYTES = 64 * 1024
+    MAX_METADATA_BYTES = 1024 * 1024
+    DEFAULT_RESPONSE_BYTES = 64 * 1024
+    MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+    DEFAULT_READ_BYTES = 1024 * 1024
+
     def __init__(self, workspace: Path, fs: Filesystem | None = None) -> None:
         self.root = workspace / ".mypr" / "skills"
         self._fs = fs or Filesystem(workspace)
@@ -1752,29 +1776,79 @@ class Skills(SkillsWriting):
         return candidate
 
     @staticmethod
-    def _metadata(path: Path) -> dict[str, Any]:
-        text = read_bytes(path, max_bytes=16 * 1024 * 1024).decode("utf-8")
+    def _metadata(path: Path, max_bytes: int) -> dict[str, Any]:
+        prefix, truncated = _read_prefix(path, max_bytes)
+        try:
+            text = _read_metadata_prefix(prefix)
+        except UnicodeDecodeError:
+            return {
+                "error": "skill metadata is not valid UTF-8",
+                "metadata_truncated": truncated,
+            }
+        if text is None:
+            return {}
         front = _front_matter(text)
         if isinstance(front, str):
-            return {"error": front}
+            result: dict[str, Any] = {"error": front}
+            if truncated and front == "YAML front matter is missing its closing ---":
+                result = {
+                    "error": "YAML front matter exceeds the metadata byte limit",
+                    "metadata_truncated": True,
+                }
+            return result
         metadata = front or {}
         errors = _metadata_errors(metadata)
+        try:
+            result, values_truncated = _bounded_metadata(metadata)
+            if values_truncated:
+                result["metadata_truncated"] = True
+        except (RecursionError, _MetadataLimitError) as exc:
+            result = {
+                key: value[:4096]
+                for key in ("name", "description")
+                if isinstance(value := metadata.get(key), str)
+            }
+            result["error"] = str(exc)
+            result["metadata_truncated"] = True
         if errors:
-            metadata["error"] = "; ".join(errors)
-        return metadata
+            result["error"] = "; ".join(errors)
+        return result
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(
+        self,
+        *,
+        limit: int = DEFAULT_LIST_LIMIT,
+        max_metadata_bytes: int = DEFAULT_METADATA_BYTES,
+        max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+    ) -> list[dict[str, Any]]:
+        if type(limit) is not int or not 1 <= limit <= self.MAX_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {self.MAX_LIST_LIMIT}")
+        if (
+            type(max_metadata_bytes) is not int
+            or not 256 <= max_metadata_bytes <= self.MAX_METADATA_BYTES
+        ):
+            raise ValueError(
+                f"max_metadata_bytes must be between 256 and {self.MAX_METADATA_BYTES}"
+            )
+        if (
+            type(max_response_bytes) is not int
+            or not 16 * 1024 <= max_response_bytes <= self.MAX_RESPONSE_BYTES
+        ):
+            raise ValueError(
+                f"max_response_bytes must be between 16384 and {self.MAX_RESPONSE_BYTES}"
+            )
         if not self.root.is_dir():
             return []
         found = []
-        for path in sorted(self.root.rglob("*/SKILL.md")):
+        paths = sorted(self.root.rglob("*/SKILL.md"))
+        for index, path in enumerate(paths[:limit]):
             name = path.parent.relative_to(self.root).as_posix()
             try:
                 resolved = self._path(name)
             except OSError, ValueError:
                 continue
             try:
-                item = self._metadata(resolved)
+                item = self._metadata(resolved, max_metadata_bytes)
             except (OSError, UnicodeError, ValueError) as exc:
                 detail = str(exc).strip() or exc.__class__.__name__
                 item = {"error": f"Unable to read skill: {detail}"}
@@ -1782,11 +1856,42 @@ class Skills(SkillsWriting):
                 item["declared_name"] = item["name"]
             item["name"] = name
             item["path"] = str(path)
+            item = _fit_skill_item(item, max_response_bytes)
+            candidate = [*found, item]
+            if len(_json_bytes(candidate)) > max_response_bytes:
+                if found:
+                    _mark_skill_list_truncated(
+                        found,
+                        len(paths) - index,
+                        max_response_bytes,
+                    )
+                else:
+                    found.append(_fit_skill_item(item, max_response_bytes))
+                    _mark_skill_list_truncated(found, len(paths) - index - 1, max_response_bytes)
+                break
             found.append(item)
+        else:
+            if len(paths) > limit:
+                _mark_skill_list_truncated(
+                    found,
+                    len(paths) - limit,
+                    max_response_bytes,
+                )
         return found
 
-    def read(self, name: str) -> str:
-        return read_bytes(self._path(name)).decode("utf-8")
+    def read(self, name: str, *, max_bytes: int | None = DEFAULT_READ_BYTES) -> str:
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
+            raise ValueError("max_bytes must be a positive integer or None")
+        path = self._path(name)
+        try:
+            data = read_bytes(path, max_bytes=max_bytes)
+        except ValueError as exc:
+            if max_bytes is not None:
+                raise ValueError(
+                    f"skill exceeds max_bytes={max_bytes}; pass max_bytes=None to read it fully"
+                ) from exc
+            raise
+        return data.decode("utf-8")
 
 
 class History:

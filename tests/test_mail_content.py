@@ -142,6 +142,58 @@ def test_parse_message_falls_back_for_unknown_charset_and_attachment_metadata():
     assert attachment_bytes(raw, result["attachments"][0]["id"])[1] == b"data"
 
 
+def test_parse_message_bounds_attachment_metadata_but_preserves_ids():
+    message = EmailMessage()
+    message["From"] = "sender@example.test"
+    message["To"] = "to@example.test"
+    message.set_content("body")
+    for index in range(mail_content.MAX_ATTACHMENT_METADATA + 3):
+        message.add_attachment(
+            f"data-{index}".encode(), maintype="text", subtype="plain", filename=f"{index}.txt"
+        )
+    raw = message.as_bytes()
+
+    result = parse_message(raw)
+    assert len(result["attachments"]) == mail_content.MAX_ATTACHMENT_METADATA
+    assert result["attachment_total"] == mail_content.MAX_ATTACHMENT_METADATA + 3
+    assert result["attachments_truncated"] is True
+    parts = list(BytesParser(policy=policy.default).parsebytes(raw).walk())
+    omitted = next(
+        str(index)
+        for index, part in enumerate(parts)
+        if part.get_filename() == "66.txt"
+    )
+    assert attachment_bytes(raw, omitted)[1] == b"data-66"
+
+
+def test_parse_message_rejects_too_many_attachments_when_forwarding():
+    message = EmailMessage()
+    message["From"] = "sender@example.test"
+    message["To"] = "to@example.test"
+    message.set_content("body")
+    for index in range(mail_content.MAX_ATTACHMENTS + 1):
+        message.add_attachment(
+            f"data-{index}".encode(), maintype="text", subtype="plain", filename=f"{index}.txt"
+        )
+
+    with pytest.raises(MailContentError, match="more than"):
+        parse_message(message.as_bytes(), include_attachment_data=True)
+
+
+def test_build_mime_rejects_forward_with_omitted_attachments():
+    with pytest.raises(MailContentError, match="omitted attachments"):
+        build_mime(
+            sender="sender@example.test",
+            to="to@example.test",
+            forward={
+                "text": "body",
+                "attachment_data": [],
+                "attachment_total": 1,
+                "attachments_truncated": True,
+            },
+        )
+
+
 def test_normalize_addresses_rejects_invalid_values_and_limits():
     assert normalize_addresses("A <a@example.test>", "to") == ["a@example.test"]
     with pytest.raises(MailContentError):

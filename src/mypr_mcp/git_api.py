@@ -20,6 +20,16 @@ _MAX_COMMIT_SCAN_BYTES = 16 * 1024 * 1024
 _HISTORY_SNAPSHOT_LOCK = threading.Lock()
 
 
+class _Unset:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "unspecified"
+
+
+_UNSET = _Unset()
+
+
 class Git:
     def __init__(self, workspace: str | os.PathLike[str], shell: Any):
         self.workspace = Path(workspace).expanduser().resolve()
@@ -111,20 +121,26 @@ class Git:
     async def diff(
         self,
         *,
-        staged: bool = False,
-        rev: str | None = None,
-        paths: str | list[str] | None = None,
+        staged: bool | _Unset = _UNSET,
+        rev: str | None | _Unset = _UNSET,
+        paths: str | list[str] | None | _Unset = _UNSET,
         cursor: str | None = None,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
     ) -> dict[str, Any]:
-        if type(staged) is not bool:
-            raise TypeError("staged must be a boolean")
+        self._validate_query_inputs({"staged": staged, "rev": rev, "paths": paths})
         self._validate_limit(max_bytes)
         if cursor is not None:
             snapshot, offset = await asyncio.to_thread(
                 self.snapshots.decode, cursor, expected_kind="diff"
             )
+            self._validate_cursor_query(
+                snapshot,
+                {"staged": staged, "rev": rev, "paths": paths},
+            )
             return await asyncio.to_thread(self._text_page, snapshot, offset, max_bytes)
+        staged = False if staged is _UNSET else staged
+        rev = None if rev is _UNSET else rev
+        paths = None if paths is _UNSET else paths
         root = await self._repo_root()
         common = ["diff", "--no-ext-diff", "--no-textconv", "--no-color"]
         if staged:
@@ -197,18 +213,22 @@ class Git:
 
     async def show(
         self,
-        ref: str = "HEAD",
+        ref: str | _Unset = _UNSET,
         *,
-        path: str | None = None,
+        path: str | None | _Unset = _UNSET,
         cursor: str | None = None,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
     ) -> dict[str, Any]:
+        self._validate_query_inputs({"ref": ref, "path": path})
         self._validate_limit(max_bytes)
         if cursor is not None:
             snapshot, offset = await asyncio.to_thread(
                 self.snapshots.decode, cursor, expected_kind="show"
             )
+            self._validate_cursor_query(snapshot, {"ref": ref, "path": path})
             return await asyncio.to_thread(self._text_page, snapshot, offset, max_bytes)
+        ref = "HEAD" if ref is _UNSET else ref
+        path = None if path is _UNSET else path
         if not isinstance(ref, str) or not ref or ref.startswith("-"):
             raise ValueError("ref must be a non-empty string")
         if path is not None and not isinstance(path, str):
@@ -223,26 +243,53 @@ class Git:
 
     async def log(
         self,
-        ref: str = "HEAD",
+        ref: str | _Unset = _UNSET,
         *,
-        path: str | None = None,
-        author: str | None = None,
-        since: str | None = None,
-        until: str | None = None,
-        follow: bool = False,
+        path: str | None | _Unset = _UNSET,
+        author: str | None | _Unset = _UNSET,
+        since: str | None | _Unset = _UNSET,
+        until: str | None | _Unset = _UNSET,
+        follow: bool | _Unset = _UNSET,
         cursor: str | None = None,
         max_entries: int = 50,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
     ) -> dict[str, Any]:
+        self._validate_query_inputs(
+            {
+                "ref": ref,
+                "path": path,
+                "author": author,
+                "since": since,
+                "until": until,
+                "follow": follow,
+            }
+        )
         self._validate_limit(max_bytes)
         self._validate_entries(max_entries)
         if cursor is not None:
             snapshot, offset = await asyncio.to_thread(
                 self.history_snapshots.decode, cursor, expected_kind="log"
             )
+            self._validate_cursor_query(
+                snapshot,
+                {
+                    "ref": ref,
+                    "path": path,
+                    "author": author,
+                    "since": since,
+                    "until": until,
+                    "follow": follow,
+                },
+            )
             return await asyncio.to_thread(
                 self._history_page, snapshot, offset, max_entries, max_bytes
             )
+        ref = "HEAD" if ref is _UNSET else ref
+        path = None if path is _UNSET else path
+        author = None if author is _UNSET else author
+        since = None if since is _UNSET else since
+        until = None if until is _UNSET else until
+        follow = False if follow is _UNSET else follow
         if type(follow) is not bool:
             raise TypeError("follow must be a boolean")
         if follow and path is None:
@@ -292,22 +339,34 @@ class Git:
 
     async def commit_info(
         self,
-        ref: str = "HEAD",
+        ref: str | _Unset = _UNSET,
         *,
-        include_files: bool = True,
-        include_patch: bool = False,
+        include_files: bool | _Unset = _UNSET,
+        include_patch: bool | _Unset = _UNSET,
         cursor: str | None = None,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
     ) -> dict[str, Any]:
         """Return one resolved commit with bounded, cursor-paged details."""
+        self._validate_query_inputs(
+            {"ref": ref, "include_files": include_files, "include_patch": include_patch}
+        )
         self._validate_limit(max_bytes)
-        if type(include_files) is not bool or type(include_patch) is not bool:
-            raise TypeError("include_files and include_patch must be booleans")
         if cursor is not None:
             snapshot, offset = await asyncio.to_thread(
                 self.history_snapshots.decode, cursor, expected_kind="commit_info"
             )
+            self._validate_cursor_query(
+                snapshot,
+                {
+                    "ref": ref,
+                    "include_files": include_files,
+                    "include_patch": include_patch,
+                },
+            )
             return await asyncio.to_thread(self._commit_info_page, snapshot, offset, max_bytes)
+        ref = "HEAD" if ref is _UNSET else ref
+        include_files = True if include_files is _UNSET else include_files
+        include_patch = False if include_patch is _UNSET else include_patch
         self._validate_ref(ref)
         root = await self._repo_root()
         commit = await self._resolve_commit(ref)
@@ -411,24 +470,44 @@ class Git:
 
     async def blame(
         self,
-        path: str | None = None,
-        ref: str = "HEAD",
+        path: str | None | _Unset = _UNSET,
+        ref: str | _Unset = _UNSET,
         *,
-        start_line: int | None = None,
-        end_line: int | None = None,
+        start_line: int | None | _Unset = _UNSET,
+        end_line: int | None | _Unset = _UNSET,
         cursor: str | None = None,
         max_entries: int = 100,
         max_bytes: int = _DEFAULT_RESPONSE_BYTES,
     ) -> dict[str, Any]:
+        self._validate_query_inputs(
+            {
+                "path": path,
+                "ref": ref,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+        )
         self._validate_limit(max_bytes)
         self._validate_entries(max_entries)
         if cursor is not None:
             snapshot, offset = await asyncio.to_thread(
                 self.history_snapshots.decode, cursor, expected_kind="blame"
             )
+            self._validate_cursor_query(
+                snapshot,
+                {
+                    "path": path,
+                    "ref": ref,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                },
+            )
             return await asyncio.to_thread(
                 self._history_page, snapshot, offset, max_entries, max_bytes
             )
+        ref = "HEAD" if ref is _UNSET else ref
+        start_line = None if start_line is _UNSET else start_line
+        end_line = None if end_line is _UNSET else end_line
         if not isinstance(path, str) or not path:
             raise ValueError("path must be a non-empty string")
         self._validate_ref(ref)
@@ -834,6 +913,93 @@ class Git:
     def _validate_filter(name: str, value: str | None) -> None:
         if value is not None and (not isinstance(value, str) or not value or "\0" in value):
             raise ValueError(f"{name} must be a non-empty string or None")
+
+    def _validate_query_inputs(self, supplied: dict[str, Any]) -> None:
+        for name, value in supplied.items():
+            if value is _UNSET:
+                continue
+            if name in {"staged", "follow", "include_files", "include_patch"}:
+                if type(value) is not bool:
+                    raise TypeError(f"{name} must be a boolean")
+            elif name == "rev":
+                if value is not None:
+                    self._validate_ref(value)
+            elif name == "ref":
+                self._validate_ref(value)
+            elif name in {"author", "since", "until"}:
+                self._validate_filter(name, value)
+            elif name in {"path", "paths"}:
+                if value is None:
+                    continue
+                values = [value] if isinstance(value, str) else value
+                if name == "path":
+                    if not isinstance(value, str) or "\0" in value:
+                        raise ValueError("path must be a string or None")
+                elif not isinstance(values, list) or any(
+                    not isinstance(item, str) or "\0" in item for item in values
+                ):
+                    raise TypeError("paths must be a string, list of strings, or None")
+            elif name in {"start_line", "end_line"}:
+                if value is not None and (type(value) is not int or value < 1):
+                    raise ValueError(f"{name} must be a positive integer or None")
+        start = supplied.get("start_line", _UNSET)
+        end = supplied.get("end_line", _UNSET)
+        if (
+            start is not _UNSET
+            and end is not _UNSET
+            and start is not None
+            and end is not None
+            and end < start
+        ):
+            raise ValueError("line range must use positive lines with end_line >= start_line")
+
+    def _validate_cursor_query(
+        self, snapshot: dict[str, Any], supplied: dict[str, Any]
+    ) -> None:
+        query = snapshot.get("query")
+        if not isinstance(query, dict):
+            raise RuntimeError("invalid persisted Git query")
+        raw_root = snapshot.get("root", self.workspace)
+        root = Path(raw_root).expanduser() if isinstance(raw_root, str) else self.workspace
+        for name, value in supplied.items():
+            if value is _UNSET:
+                continue
+            expected = self._canonical_query_value(name, value, root)
+            actual = self._canonical_query_value(name, query.get(name), root)
+            if expected != actual:
+                raise ValueError("cursor belongs to a different query")
+
+    def _canonical_query_value(self, name: str, value: Any, root: Path) -> Any:
+        if name == "rev" and value is None:
+            return None
+        if name in {"ref", "rev"}:
+            self._validate_ref(value)
+            return value
+        if name in {"author", "since", "until"}:
+            self._validate_filter(name, value)
+            return value
+        if name in {"staged", "follow", "include_files", "include_patch"}:
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+            return value
+        if name in {"path", "paths"}:
+            if value is None:
+                return None
+            if name == "path":
+                if not isinstance(value, str) or "\0" in value:
+                    raise ValueError("path must be a non-empty string or None")
+                return self._path(value, root)
+            values = [value] if isinstance(value, str) else value
+            if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+                raise TypeError("paths must be a string, list of strings, or None")
+            return tuple(self._path(item, root) for item in values)
+        if name in {"start_line", "end_line"}:
+            if value is None:
+                return None
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer or None")
+            return value
+        raise ValueError(f"unknown Git query field: {name}")
 
     def _show_snapshot(
         self, result: dict[str, Any], ref: str, path: str | None, max_bytes: int, root: Path

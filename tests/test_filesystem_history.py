@@ -58,6 +58,52 @@ async def test_destructive_lifecycle_requires_cas_and_destination_overwrite_is_r
 
 
 @pytest.mark.asyncio
+async def test_delete_rejects_terminal_symlink_without_touching_target_or_history(tmp_path: Path):
+    target = tmp_path / "target.txt"
+    target.write_text("keep")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    fs = Filesystem(tmp_path)
+
+    with pytest.raises(ValueError, match="Path must not be a symlink"):
+        await fs.delete("link.txt", expected_hash="0" * 64)
+
+    assert target.read_text() == "keep"
+    assert link.is_symlink()
+    assert not (tmp_path / ".mypr").exists()
+
+
+@pytest.mark.asyncio
+async def test_move_history_failure_rolls_back_files_and_previous_indexes(
+    tmp_path: Path, monkeypatch
+):
+    from mypr_mcp.revisions import RevisionStore
+
+    fs = Filesystem(tmp_path)
+    created = await fs.write("source.txt", "source")
+    before = await fs.history("source.txt")
+    original = RevisionStore._write_index_sync
+
+    def fail_destination(store, resource, index):
+        if resource == "destination.txt":
+            raise OSError("injected destination index failure")
+        return original(store, resource, index)
+
+    monkeypatch.setattr(RevisionStore, "_write_index_sync", fail_destination)
+    with pytest.raises(RuntimeError, match="lifecycle change was rolled back"):
+        await fs.move(
+            "source.txt",
+            "destination.txt",
+            expected_hash=created["revision"],
+        )
+
+    assert (tmp_path / "source.txt").read_text() == "source"
+    assert not (tmp_path / "destination.txt").exists()
+    assert await fs.history("source.txt") == before
+    assert (await fs.history("destination.txt"))["items"] == []
+
+
+@pytest.mark.asyncio
 async def test_history_failure_rolls_back_single_file(tmp_path: Path, monkeypatch):
     fs = Filesystem(tmp_path)
     first = await fs.write("value.txt", "one\n")

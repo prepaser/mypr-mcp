@@ -21,6 +21,7 @@ from weakref import WeakValueDictionary
 
 from .async_utils import wait_owned
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES
+from .revisions import RevisionIndexOutcomeUnknown
 
 _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
 _PATH_LOCKS_GUARD = Lock()
@@ -626,6 +627,7 @@ class Filesystem:
     ) -> dict[str, Any]:
         if expected_hash is None:
             raise ValueError("delete requires expected_hash")
+        _reject_symlink_input(self.workspace, path)
         resolved, display = self._path(path)
         if history:
             _validate_history_target(resolved, display)
@@ -715,6 +717,7 @@ class Filesystem:
         if history:
             _validate_history_target(source_path, source_display)
             _validate_history_target(destination_path, destination_display)
+        history_store = self._history_store() if history else None
         resources = (
             sorted(
                 {
@@ -729,8 +732,9 @@ class Filesystem:
         history_enabled = bool(resources)
         locks = [self._lock(path) for path in sorted({source_path, destination_path}, key=str)]
         async with AsyncExitStack() as stack:
-            for resource in resources:
-                await stack.enter_async_context(self._history_store().transaction(resource))
+            if history_store is not None:
+                for resource in resources:
+                    await stack.enter_async_context(history_store.transaction(resource))
             for lock in locks:
                 await lock.acquire()
                 stack.callback(lock.release)
@@ -771,6 +775,32 @@ class Filesystem:
                 _validate_history_size(old, old, source_display)
             if destination_path.parent != self.workspace and not destination_path.parent.exists():
                 destination_path.parent.mkdir(parents=True, exist_ok=True)
+            transitions = []
+            plans = []
+            if source_resource is not None and move:
+                transitions.append((source_path, source_display, old, None))
+                plans.append(
+                    {
+                        "operation": "move",
+                        "source": source_path,
+                        "source_old": old,
+                        "path": destination_path,
+                        "new": old,
+                    }
+                )
+            if destination_resource is not None:
+                transitions.append((destination_path, destination_display, destination_old, old))
+                if not move or source_resource is None:
+                    plans.append(
+                        {
+                            "operation": "copy",
+                            "path": destination_path,
+                            "old": destination_old,
+                            "new": old,
+                        }
+                    )
+            if history_enabled:
+                await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
             try:
                 copy_state = {"destination_committed": False}
                 await _to_thread_uncancelled(
@@ -802,16 +832,13 @@ class Filesystem:
                     ) from exc
                 raise
             if history_enabled:
-                transitions = []
-                if source_resource is not None:
-                    transitions.append((source_path, source_display, old, None if move else old))
-                if destination_resource is not None:
-                    transitions.append(
-                        (destination_path, destination_display, destination_old, old)
-                    )
                 try:
-                    for target, target_display, before, after in transitions:
-                        await self._record_history(target, target_display, before, after)
+                    await _to_thread_uncancelled(history_store.record_changes_sync, plans)
+                except RevisionIndexOutcomeUnknown as exc:
+                    raise RuntimeError(
+                        "history index outcome is unknown; the lifecycle change remains in "
+                        "place. Inspect history before retrying."
+                    ) from exc
                 except BaseException as exc:
                     recovery = []
                     for target, _, before, after in reversed(transitions):
@@ -924,6 +951,15 @@ class Filesystem:
         resolved, display = self._path(path)
         await _to_thread_uncancelled(_preflight_input, resolved, display, max_input_bytes)
         if resize is not None or crop is not None:
+            from .media_tools import (
+                _MAX_OUTPUT_BYTES,
+                _validate_box,
+                _validate_limit,
+            )
+
+            _validate_limit("max_output_bytes", max_bytes, _MAX_OUTPUT_BYTES)
+            _validate_box("resize", resize, 2, max_pixels=16_000_000)
+            _validate_box("crop", crop, 4)
             await self._ensure("pillow")
             from .media_tools import display_image, transform_image
 

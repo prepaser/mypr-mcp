@@ -28,6 +28,27 @@ _INSTALL_LOCK_TIMEOUT = 300.0
 _ENDPOINT = re.compile(r"^ws://(?:127\.0\.0\.1|localhost|\[::1\]):\d+/.+$")
 
 
+def validate_launch_options(
+    browser: str, options: dict[str, Any] | None, *, executable_path=None, channel=None
+):
+    if not isinstance(browser, str) or browser not in _ENGINES:
+        raise ValueError("browser must be chromium, firefox, or webkit")
+    if options is not None and not isinstance(options, dict):
+        raise TypeError("launch_options must be a mapping or None")
+    options = dict(options or {})
+    if executable_path is None:
+        executable_path = options.get("executable_path", options.get("executablePath"))
+    if executable_path is not None:
+        executable_path = str(executable_path)
+        if not executable_path:
+            raise ValueError("executable_path must not be empty")
+    if channel is None:
+        channel = options.get("channel")
+    if channel is not None and (not isinstance(channel, str) or not channel):
+        raise ValueError("channel must be a non-empty string")
+    return options, executable_path, channel
+
+
 @dataclass
 class _Server:
     process: asyncio.subprocess.Process
@@ -135,23 +156,13 @@ class BrowserService:
         install: bool = True,
         track: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
-        browser = self._validate_browser(browser)
-        if launch_options is not None and not isinstance(launch_options, dict):
-            raise TypeError("launch_options must be a mapping or None")
-        launch_options = dict(launch_options or {})
-        if executable_path is None:
-            executable_path = launch_options.get(
-                "executable_path", launch_options.get("executablePath")
-            )
-        if channel is None:
-            channel = launch_options.get("channel")
-        if executable_path is not None:
-            executable_path = str(executable_path)
-            if not executable_path:
-                raise ValueError("executable_path must not be empty")
-            install = False
+        launch_options, executable_path, channel = validate_launch_options(
+            browser, launch_options, executable_path=executable_path, channel=channel,
+        )
         if type(install) is not bool:
             raise TypeError("install must be a boolean")
+        if executable_path is not None or channel is not None:
+            install = False
         async with self._lock:
             if self._closing:
                 raise RuntimeError("browser service is closed")

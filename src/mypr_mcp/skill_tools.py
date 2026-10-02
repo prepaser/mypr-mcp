@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _datetime
 import difflib
 import hashlib
+import json
+import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -228,6 +232,175 @@ class SkillsWriting:
             # The regular Skills root is below the workspace's .mypr folder.
             workspace = self.root.parent.parent
         return str(path.resolve().relative_to(Path(workspace).resolve()))
+
+
+class _MetadataLimitError(ValueError):
+    pass
+
+
+def _read_metadata_prefix(prefix: bytes) -> str | None:
+    if not prefix.startswith(b"---"):
+        return None
+    lines = prefix.splitlines(keepends=True)
+    for index, line in enumerate(lines[1:], start=1):
+        if line.rstrip(b"\r\n") == b"---":
+            return b"".join(lines[: index + 1]).decode("utf-8")
+    return prefix.decode("utf-8", errors="replace")
+
+
+def _read_prefix(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"skill path is not a regular file: {path}")
+        data = os.read(descriptor, max_bytes + 1)
+    finally:
+        os.close(descriptor)
+    return data[:max_bytes], len(data) > max_bytes
+
+
+def _bounded_metadata(value: Any) -> tuple[Any, bool]:
+    active: set[int] = set()
+    truncated = [False]
+    result = _bounded_metadata_value(value, active=active, depth=0, nodes=[0], truncated=truncated)
+    return result, truncated[0]
+
+
+def _bounded_metadata_value(
+    value: Any,
+    *,
+    active: set[int],
+    depth: int,
+    nodes: list[int],
+    truncated: list[bool],
+) -> Any:
+    nodes[0] += 1
+    if nodes[0] > 256:
+        raise _MetadataLimitError("skill metadata exceeds the item limit")
+    if depth > 16:
+        raise _MetadataLimitError("skill metadata exceeds the nesting limit")
+    if isinstance(value, str):
+        if len(value) > 4096:
+            truncated[0] = True
+        return value[:4096]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (_datetime.date, _datetime.datetime, _datetime.time)):
+        return value.isoformat()
+    identity = id(value)
+    if identity in active:
+        raise _MetadataLimitError("skill metadata contains a recursive YAML alias")
+    active.add(identity)
+    try:
+        if isinstance(value, Mapping):
+            result = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= 256:
+                    raise _MetadataLimitError("skill metadata exceeds the item limit")
+                bounded_key = _bounded_metadata_value(
+                    key,
+                    active=active,
+                    depth=depth + 1,
+                    nodes=nodes,
+                    truncated=truncated,
+                )
+                if not isinstance(bounded_key, str):
+                    bounded_key = str(bounded_key)
+                result[bounded_key] = _bounded_metadata_value(
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                    nodes=nodes,
+                    truncated=truncated,
+                )
+            return result
+        if isinstance(value, (list, tuple, set, frozenset)):
+            if len(value) > 256:
+                raise _MetadataLimitError("skill metadata exceeds the item limit")
+            return [
+                _bounded_metadata_value(
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                    nodes=nodes,
+                    truncated=truncated,
+                )
+                for item in value
+            ]
+        text = str(value)
+        if len(text) > 4096:
+            truncated[0] = True
+        return text[:4096]
+    finally:
+        active.remove(identity)
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _fit_skill_item(item: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    try:
+        if len(_json_bytes([item])) <= max_bytes:
+            return item
+    except (TypeError, ValueError, RecursionError):
+        pass
+    name = str(item.get("name", ""))
+    path = str(item.get("path", ""))
+    description = item.get("description")
+    reduced = {
+        "name": name,
+        "path": path,
+        "error": "skill metadata exceeds the response byte budget",
+        "metadata_truncated": True,
+    }
+    if isinstance(description, str):
+        reduced["description"] = description[:4096]
+    while len(_json_bytes([reduced])) > max_bytes:
+        if reduced.get("description"):
+            reduced["description"] = reduced["description"][: len(reduced["description"]) // 2]
+        elif "error" in reduced:
+            reduced.pop("error")
+        else:
+            break
+    return reduced
+
+
+def _mark_skill_list_truncated(
+    items: list[dict[str, Any]], omitted: int, max_bytes: int
+) -> None:
+    if not items:
+        return
+    item = items[-1]
+    item["list_truncated"] = True
+    item["omitted"] = max(0, omitted)
+    reserved = {
+        "name",
+        "path",
+        "description",
+        "error",
+        "metadata_truncated",
+        "list_truncated",
+        "omitted",
+    }
+    while len(_json_bytes(items)) > max_bytes:
+        candidates = [key for key in item if key not in reserved]
+        if candidates:
+            key = max(candidates, key=lambda candidate: len(_json_bytes(item[candidate])))
+            item.pop(key)
+            item["metadata_truncated"] = True
+        elif item.get("description"):
+            item["description"] = item["description"][: len(item["description"]) // 2]
+            item["metadata_truncated"] = True
+        elif len(items) > 1:
+            items.pop()
+            omitted += 1
+            item = items[-1]
+            item["list_truncated"] = True
+            item["omitted"] = max(0, omitted)
+        else:
+            break
 
 
 def _validate_skill(name: str, path: Path, text: str, root: Path) -> dict[str, Any]:

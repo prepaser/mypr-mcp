@@ -134,6 +134,15 @@ def test_estimate_probes_matches_ipaddress_hosts_for_ipv6():
     assert scan_worker.estimate_probes(["2001:db8::/128"], [443]) == 1
 
 
+def test_nmap_args_keep_port_and_script_options_but_reject_output_escape():
+    args = ["-sV", "-p", "22,443", "--script", "default,safe"]
+    assert ScanService._validate_nmap_args(args) == args
+    with pytest.raises(ValueError, match="cannot contain '--'"):
+        ScanService._validate_nmap_args(["-sV", "--", "-oN", "outside.txt"])
+    with pytest.raises(ValueError, match="output options"):
+        ScanService._validate_nmap_args(["-oX", "outside.xml"])
+
+
 @pytest.mark.asyncio
 async def test_nmap_result_limit_keeps_partial_hosts_successful(tmp_path: Path, monkeypatch):
     fake = tmp_path / "nmap"

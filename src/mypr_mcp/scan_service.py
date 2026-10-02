@@ -628,6 +628,8 @@ class ScanService:
             return []
         if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
             raise TypeError("nmap args must be a list of strings")
+        if "--" in args:
+            raise ValueError("nmap args cannot contain '--'")
         if any(
             item in {"-oX", "--xml", "-oA", "-oN", "-oG"} or item.startswith("-o") for item in args
         ):

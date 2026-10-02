@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mypr_mcp.git_api import Git
+from mypr_mcp.kernel_api import Workspace
 
 
 class ShellRunner:
@@ -26,6 +27,37 @@ class ShellRunner:
             "truncated": len(stdout) > max_bytes,
             "warnings": [],
         }
+
+
+def test_git_help_uses_stable_unspecified_defaults(tmp_path: Path):
+    workspace = Workspace(tmp_path)
+    for name in ("diff", "show", "log", "blame", "commit_info"):
+        text = workspace.help(f"git.{name}")
+        assert "unspecified" in text
+        assert "object at 0x" not in text
+
+
+@pytest.mark.asyncio
+async def test_git_commit_cursor_rejects_non_boolean_query_values(tmp_path: Path):
+    api = Git(tmp_path, ShellRunner())
+    ident = api.history_snapshots.create(
+        {"ref": "HEAD", "include_files": True, "include_patch": False},
+        [],
+        kind="commit_info",
+        root=str(tmp_path),
+        ref="HEAD",
+        commit={
+            "commit": "a" * 40,
+            "parents": [],
+            "root": True,
+            "body": "",
+        },
+        truncated=False,
+        warnings=[],
+    )
+    cursor = api.history_snapshots.cursor(ident, 0, "commit_info")
+    with pytest.raises(TypeError, match="include_files must be a boolean"):
+        await api.commit_info(cursor=cursor, include_files=1)
 
 
 @pytest.mark.parametrize("staged", ["false", 0, None])
@@ -88,6 +120,37 @@ async def test_git_views_page_and_reject_cross_view_cursors(tmp_path: Path):
 
     with pytest.raises(ValueError, match="different query"):
         await api.diff(cursor=first["cursor"] or first["next_cursor"])
+
+
+@pytest.mark.asyncio
+async def test_git_diff_cursor_validates_explicit_query_without_requiring_it(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    path = tmp_path / "file.txt"
+    path.write_text("old\n", encoding="utf-8")
+    _git(tmp_path, "add", "file.txt")
+    _git(tmp_path, "commit", "-qm", "initial")
+    path.write_text("new\n" * 1000, encoding="utf-8")
+    _git(tmp_path, "add", "file.txt")
+
+    api = Git(tmp_path, ShellRunner())
+    first = await api.diff(staged=True, rev="HEAD", paths="file.txt", max_bytes=1024)
+    assert first["has_more"]
+    resumed = await api.diff(cursor=first["next_cursor"], max_bytes=4096)
+    assert resumed["patch"]
+    matching = await api.diff(
+        staged=True,
+        rev="HEAD",
+        paths="./file.txt",
+        cursor=first["next_cursor"],
+        max_bytes=4096,
+    )
+    assert matching["patch"] == resumed["patch"]
+    with pytest.raises(ValueError, match="different query"):
+        await api.diff(staged=False, cursor=first["next_cursor"])
+    with pytest.raises(TypeError, match="staged must be a boolean"):
+        await api.diff(cursor=first["next_cursor"], staged=0)
 
 
 def test_git_parses_rename_and_unmerged_records():

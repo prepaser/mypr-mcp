@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,70 @@ def test_list_applies_read_path_policy_to_symlinks(tmp_path: Path):
     assert skills.read("internal-link") == "# Inside\n"
     with pytest.raises(ValueError, match="escapes workspace"):
         skills.read("external-link")
+
+
+def test_list_bounds_metadata_and_marks_incomplete_front_matter(tmp_path: Path):
+    root = tmp_path / ".mypr" / "skills"
+    write_skill(root, "large-body", "---\ndescription: Small\n---\n" + "한글" * 100_000)
+    write_skill(root, "large-front", "---\ndescription: " + "x" * 512 + "\n---\nBody\n")
+    skills = Skills(tmp_path)
+
+    items = {item["name"]: item for item in skills.list(max_metadata_bytes=256) if "name" in item}
+    assert items["large-body"]["description"] == "Small"
+    assert items["large-front"]["metadata_truncated"] is True
+    assert "exceeds the metadata byte limit" in items["large-front"]["error"]
+
+
+def test_list_marks_omitted_items_and_read_has_a_default_bound(tmp_path: Path):
+    root = tmp_path / ".mypr" / "skills"
+    write_skill(root, "one", "# One\n")
+    write_skill(root, "two", "# Two\n")
+    large = write_skill(root, "large", "# Large\n" + "x" * (1024 * 1024 + 1))
+    skills = Skills(tmp_path)
+
+    listed = skills.list(limit=2)
+    assert listed[-1]["list_truncated"] is True
+    assert listed[-1]["omitted"] == 1
+    with pytest.raises(ValueError, match="pass max_bytes=None"):
+        skills.read("large")
+    assert skills.read("large", max_bytes=None).startswith("# Large\n")
+    assert large.exists()
+
+
+def test_list_has_an_aggregate_response_budget_and_handles_recursive_yaml(tmp_path: Path):
+    root = tmp_path / ".mypr" / "skills"
+    for index in range(10):
+        write_skill(
+            root,
+            f"skill-{index}",
+            "---\ndescription: " + ("x" * 2000) + "\n---\n# Skill\n",
+        )
+    write_skill(root, "recursive", "---\na: &a [*a]\n---\n# Recursive\n")
+    skills = Skills(tmp_path)
+
+    listed = skills.list(max_response_bytes=16 * 1024)
+    assert len(json.dumps(listed, ensure_ascii=False).encode()) <= 16 * 1024
+    assert any(item.get("list_truncated") for item in listed)
+    recursive = next(item for item in skills.list() if item.get("name") == "recursive")
+    assert recursive["metadata_truncated"] is True
+    assert "recursive YAML alias" in recursive["error"]
+
+
+def test_list_budget_preserves_skill_identity_when_metadata_is_trimmed(tmp_path: Path):
+    root = tmp_path / ".mypr" / "skills"
+    name = "nested/review"
+    write_skill(
+        root,
+        name,
+        "---\ndescription: " + "x" * 6000 + "\ncustom: " + "y" * 6000 + "\n---\n# Review\n",
+    )
+    skills = Skills(tmp_path)
+
+    listed = skills.list(max_metadata_bytes=16 * 1024, max_response_bytes=16 * 1024)
+    item = next(value for value in listed if value.get("name") == name)
+    assert item["path"].endswith("nested/review/SKILL.md")
+    assert item["metadata_truncated"] is True
+    assert "Review" in skills.read(item["name"])
 
 
 async def test_nested_skills_have_readable_names_and_preserve_declared_names(tmp_path: Path):

@@ -19,6 +19,7 @@ MAX_BODY_BYTES = 1 * 1024 * 1024
 MAX_MIME_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENTS = 32
+MAX_ATTACHMENT_METADATA = 64
 MAX_RECIPIENTS = 256
 _HEADER_LIMIT = 4096
 _CONTENT_TYPE = re.compile(r"^[^\s/;]+/[^\s/;]+$")
@@ -159,12 +160,20 @@ def parse_message(
     text, html, next_cursor, has_more = _page_body(text, html, max_bytes, cursor)
     attachments = []
     attachment_data = []
+    attachment_total = 0
     for index, part in enumerate(message.walk()):
         if part.is_multipart():
             continue
         filename = part.get_filename()
         disposition = part.get_content_disposition()
         if filename or disposition == "attachment":
+            attachment_total += 1
+            if include_attachment_data and attachment_total > MAX_ATTACHMENTS:
+                raise MailContentError(
+                    f"forwarded message has more than {MAX_ATTACHMENTS} attachments"
+                )
+            if not include_attachment_data and len(attachments) >= MAX_ATTACHMENT_METADATA:
+                continue
             payload = part.get_payload(decode=True) or b""
             if include_attachment_data:
                 attachment_data.append(
@@ -189,6 +198,8 @@ def parse_message(
         "text": text,
         "html": html,
         "attachments": attachments,
+        "attachment_total": attachment_total,
+        "attachments_truncated": attachment_total > len(attachments),
         "size": len(raw),
         "has_more": has_more,
         "next_cursor": next_cursor,
@@ -257,6 +268,18 @@ def build_mime(
 ) -> tuple[bytes, list[str], str]:
     if reply_to is not None and forward is not None:
         raise MailContentError("reply_to and forward cannot both be set")
+    if forward is not None:
+        if not isinstance(forward, Mapping):
+            raise MailContentError("forward must be an object")
+        forward_data = forward.get("attachment_data") or ()
+        if forward.get("attachments_truncated"):
+            raise MailContentError("forward contains omitted attachments")
+        total = forward.get("attachment_total")
+        if total is not None:
+            if type(total) is not int or total < 0:
+                raise MailContentError("forward attachment_total is invalid")
+            if total != len(forward_data):
+                raise MailContentError("forward attachment metadata is incomplete")
     sender_address = _single_address(sender, "sender")
     to_values = normalize_addresses(to, "to")
     cc_values = normalize_addresses(cc, "cc")

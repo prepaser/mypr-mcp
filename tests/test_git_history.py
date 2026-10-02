@@ -136,6 +136,78 @@ async def test_blame_ranges_unicode_paths_and_pages_use_saved_snapshot(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_history_cursors_validate_explicit_filters_and_keep_nondefaults(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    path = tmp_path / "file.txt"
+    path.write_text("one\ntwo\n", encoding="utf-8")
+    first = _commit(tmp_path, "first", "Ada", "2020-06-01T12:00:00+0000")
+    path.write_text("one\nthree\n", encoding="utf-8")
+    second = _commit(tmp_path, "second", "Ada", "2021-06-01T12:00:00+0000")
+
+    api = Git(tmp_path, ShellRunner())
+    log = await api.log(
+        ref=second,
+        path="file.txt",
+        author="Ada",
+        since="2020-01-01",
+        until="2022-01-01",
+        follow=False,
+        max_entries=1,
+        max_bytes=1024,
+    )
+    assert log["has_more"]
+    resumed = await api.log(cursor=log["next_cursor"], max_entries=10, max_bytes=4096)
+    assert [item["commit"] for item in resumed["commits"]] == [first]
+    matching = await api.log(
+        ref=second,
+        path="./file.txt",
+        author="Ada",
+        since="2020-01-01",
+        until="2022-01-01",
+        follow=False,
+        cursor=log["next_cursor"],
+        max_entries=10,
+        max_bytes=4096,
+    )
+    assert matching["commits"] == resumed["commits"]
+    with pytest.raises(ValueError, match="different query"):
+        await api.log(author="Grace", cursor=log["next_cursor"])
+    with pytest.raises(TypeError, match="follow must be a boolean"):
+        await api.log(cursor=log["next_cursor"], follow=0)
+
+    blame = await api.blame("file.txt", ref=second, start_line=1, end_line=2, max_entries=1)
+    assert blame["has_more"]
+    resumed_blame = await api.blame(cursor=blame["next_cursor"], max_entries=10)
+    assert [item["line"] for item in resumed_blame["lines"]] == [2]
+    with pytest.raises(ValueError, match="different query"):
+        await api.blame(ref=first, cursor=blame["next_cursor"])
+    with pytest.raises(ValueError, match="start_line must be a positive integer"):
+        await api.blame(cursor=blame["next_cursor"], start_line=True)
+
+
+@pytest.mark.asyncio
+async def test_show_cursor_validates_ref_and_path_but_allows_cursor_only(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    path = tmp_path / "file.txt"
+    path.write_text("content\n" * 1000, encoding="utf-8")
+    commit = _commit(tmp_path, "initial", "Ada", "2020-06-01T12:00:00+0000")
+    api = Git(tmp_path, ShellRunner())
+
+    page = await api.show(commit, path="file.txt", max_bytes=1024)
+    assert page["has_more"]
+    resumed = await api.show(cursor=page["next_cursor"], max_bytes=4096)
+    matching = await api.show(
+        commit,
+        path="./file.txt",
+        cursor=page["next_cursor"],
+        max_bytes=4096,
+    )
+    assert matching["text"] == resumed["text"]
+    with pytest.raises(ValueError, match="different query"):
+        await api.show("HEAD", cursor=page["next_cursor"])
+
+
+@pytest.mark.asyncio
 async def test_history_pages_enforce_record_budget_and_cursor_kind(tmp_path: Path):
     _git(tmp_path, "init", "-q")
     (tmp_path / "large.txt").write_text("x" * 2000, encoding="utf-8")

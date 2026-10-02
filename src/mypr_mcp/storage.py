@@ -235,6 +235,8 @@ class Storage:
         if not isinstance(raw, Mapping):
             result["error"] = "history snapshot was not an object"
             return result
+        if raw.get("uncertain") is True:
+            result["error"] = "history snapshot is uncertain"
         active_source = raw.get("active_ids", ())
         if not isinstance(active_source, Iterable):
             active_source = ()
@@ -463,6 +465,24 @@ class Storage:
                     "deleted_bytes": 0,
                     "tombstones_required": plan["tombstones"],
                 }
+            entries, scan_truncated = self._entries()
+            history_state = self._history_snapshot()
+            history_state["mail"] = self._mail_snapshot()
+            if history_state.get("error"):
+                return {
+                    "plan_id": plan["plan_id"],
+                    "deleted": [],
+                    "skipped": [
+                        {**item, "reason": "history_snapshot_uncertain"}
+                        for item in plan["candidates"]
+                    ],
+                    "deleted_bytes": 0,
+                    "remaining_bytes": self._usage(entries, scan_truncated)["total_bytes"],
+                    "over_budget": None,
+                    "revision_pruned": [],
+                    "scan_truncated": scan_truncated,
+                    "tombstones_required": plan["tombstones"],
+                }
             try:
                 revision_pruned = self._prune_revision_indexes(plan["options"]["revision_keep"])
             except Exception as exc:
@@ -479,9 +499,6 @@ class Storage:
                     "error": f"{type(exc).__name__}: {exc}",
                     "tombstones_required": plan["tombstones"],
                 }
-            entries, scan_truncated = self._entries()
-            history_state = self._history_snapshot()
-            history_state["mail"] = self._mail_snapshot()
             active = self._active_ids() | set(history_state["active_ids"])
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
@@ -836,6 +853,8 @@ class Storage:
         options: dict[str, Any],
         history_state: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
+        if history_state.get("error"):
+            return []
         protected_paths = set(protected["paths"])
         references = protected["references"]
         record_by_id = {record.ident: record for record in records}
