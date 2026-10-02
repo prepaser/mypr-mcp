@@ -2209,6 +2209,12 @@ class Runtime:
                 max_probes=req.get("max_probes", 1_000_000),
                 max_duration=req.get("max_duration", 3600),
                 continue_after_output_limit=req.get("continue_after_output_limit", False),
+                family=req.get("family", "any"),
+                retries=req.get("retries", 0),
+                banner=req.get("banner", False),
+                banner_timeout=req.get("banner_timeout", 0.5),
+                banner_bytes=req.get("banner_bytes", 1024),
+                open_only=req.get("open_only", False),
             )
         if op == "scan_results":
             history_record = await self.io(self.history.get, req["id"])

@@ -60,6 +60,8 @@ class ScanService:
                 continue
             if record.get("state") not in _TERMINAL:
                 record.update(state="lost", error="scan manager restarted before completion")
+                if record.get("mode") == "tcp":
+                    record["complete"] = False
                 self._write_record(record)
                 self._remove_request(record)
         for path in self.root.glob("*.request.json"):
@@ -104,6 +106,12 @@ class ScanService:
         max_probes: int | None = _DEFAULT_MAX_PROBES,
         max_duration: float | None = _DEFAULT_MAX_DURATION,
         continue_after_output_limit: bool = False,
+        family: str = "any",
+        retries: int = 0,
+        banner: bool = False,
+        banner_timeout: float = 0.5,
+        banner_bytes: int = 1024,
+        open_only: bool = False,
         args: list[str] | None = None,
         client_id: str | None = None,
         connection_id: str | None = None,
@@ -115,9 +123,9 @@ class ScanService:
         self._validate_limits(max_probes, max_duration, continue_after_output_limit)
         estimate = None
         if mode == "tcp":
-            from .scan_worker import estimate_probes
+            from .scan_worker import _ports
 
-            estimate = estimate_probes(target_list, ports)
+            ports = _ports(ports)
         request_id = secrets.token_hex(16)
         result_path = self.root / f"{request_id}.jsonl"
         artifact_path = self.root / f"{request_id}.xml"
@@ -137,7 +145,18 @@ class ScanService:
             "summary_path": str(summary_path),
         }
         if mode == "tcp":
+            config.update(
+                family=family,
+                retries=retries,
+                banner=banner,
+                banner_timeout=banner_timeout,
+                banner_bytes=banner_bytes,
+                open_only=open_only,
+            )
             self._validate_tcp(config)
+            from .scan_worker import estimate_probes
+
+            estimate = estimate_probes(target_list, ports, family=family)
         else:
             config = {
                 "mode": mode,
@@ -197,6 +216,28 @@ class ScanService:
             "max_duration": max_duration,
             "truncated": False,
             "stop_reason": None,
+            **(
+                {
+                    "family": family,
+                    "retries": retries,
+                    "banner": banner,
+                    "banner_timeout": banner_timeout,
+                    "banner_bytes": banner_bytes,
+                    "open_only": open_only,
+                    "completed": 0,
+                    "state_counts": {
+                        "open": 0,
+                        "closed": 0,
+                        "timeout": 0,
+                        "unreachable": 0,
+                    },
+                    "discarded_results": 0,
+                    "resolve_errors": 0,
+                    "complete": False,
+                }
+                if mode == "tcp"
+                else {}
+            ),
             "warnings": [],
             "client_id": client_id,
             "connection_id": connection_id,
@@ -278,7 +319,7 @@ class ScanService:
             record.get("state") not in _TERMINAL,
         )
         next_cursor = self._encode_cursor(scan_id, next_offset) if more else None
-        return {
+        result = {
             "id": scan_id,
             "results": rows,
             "cursor": next_cursor,
@@ -287,7 +328,11 @@ class ScanService:
             "state": record.get("state", "unknown"),
             "truncated": bool(record.get("truncated")),
             "warnings": list(record.get("warnings", [])),
+            "stop_reason": record.get("stop_reason"),
         }
+        if record.get("mode") == "tcp":
+            result["complete"] = bool(record.get("complete", False))
+        return result
 
     @staticmethod
     def _read_results_page(
@@ -369,6 +414,8 @@ class ScanService:
                 if state not in _TERMINAL:
                     state = "cancelled"
                 record["state"] = state
+                if record.get("mode") == "tcp" and state != "succeeded":
+                    record["complete"] = False
                 result = shell_result.get("result")
                 if isinstance(result, dict):
                     record["returncode"] = result.get("returncode")
@@ -475,6 +522,11 @@ class ScanService:
                 "artifact_bytes",
                 "artifact_truncated",
                 "returncode",
+                "estimate",
+                "completed",
+                "state_counts",
+                "discarded_results",
+                "resolve_errors",
             ):
                 if key in message:
                     target = {
@@ -489,6 +541,7 @@ class ScanService:
             record["error"] = str(message.get("error", "scan failed"))
 
     async def _finish(self, record: dict[str, Any], page: dict[str, Any]) -> None:
+        complete = False
         summary_path = record.get("summary_path")
         if summary_path:
             try:
@@ -507,9 +560,15 @@ class ScanService:
                         "artifact_truncated",
                         "returncode",
                         "error",
+                        "estimate",
+                        "completed",
+                        "state_counts",
+                        "discarded_results",
+                        "resolve_errors",
                     ):
                         if key in summary:
                             record[key] = summary[key]
+                    complete = summary.get("complete") is True
             except (OSError, ValueError) as exc:
                 self._warning(record, "summary_unavailable", str(exc)[:256])
         state = str(page.get("state", "failed"))
@@ -528,6 +587,8 @@ class ScanService:
         async with self._state_lock:
             if record.get("state") in _TERMINAL:
                 state = record["state"]
+            if record.get("mode") == "tcp":
+                record["complete"] = complete if state == "succeeded" else False
             record.update(
                 state=state,
                 finished=time.time(),
@@ -592,17 +653,9 @@ class ScanService:
 
     @staticmethod
     def _validate_tcp(config: dict[str, Any]) -> None:
-        concurrency = config["concurrency"]
-        if type(concurrency) is not int or not 1 <= concurrency <= 1024:
-            raise ValueError("concurrency must be between 1 and 1024")
-        for name in ("rate", "timeout"):
-            if (
-                isinstance(config[name], bool)
-                or not isinstance(config[name], (int, float))
-                or not math.isfinite(config[name])
-                or config[name] <= 0
-            ):
-                raise ValueError(f"{name} must be positive")
+        from .scan_worker import validate_tcp_config
+
+        validate_tcp_config(config)
 
     @staticmethod
     def _validate_limits(

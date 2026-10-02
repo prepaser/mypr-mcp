@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import errno
 import ipaddress
 import json
+import math
 import os
 import signal
 import socket
@@ -21,6 +23,48 @@ _DEFAULT_MAX_PROBES = 1_000_000
 _DEFAULT_MAX_DURATION = 3600.0
 
 
+def validate_tcp_config(config: dict[str, Any]) -> None:
+    _ports(config.get("ports"))
+    concurrency = config.get("concurrency", 64)
+    if type(concurrency) is not int or not 1 <= concurrency <= 1024:
+        raise ValueError("concurrency must be between 1 and 1024")
+    for name, default in (("rate", 200), ("timeout", 1.0), ("banner_timeout", 0.5)):
+        value = config.get(name, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be positive and finite")
+    if config.get("family", "any") not in ("any", "ipv4", "ipv6"):
+        raise ValueError("family must be any, ipv4, or ipv6")
+    retries = config.get("retries", 0)
+    if type(retries) is not int or not 0 <= retries <= 3:
+        raise ValueError("retries must be between 0 and 3")
+    size = config.get("banner_bytes", 1024)
+    if type(size) is not int or not 1 <= size <= 4096:
+        raise ValueError("banner_bytes must be between 1 and 4096")
+    for name in ("banner", "open_only", "continue_after_output_limit"):
+        if type(config.get(name, False)) is not bool:
+            raise TypeError(f"{name} must be a boolean")
+    probes = config.get("max_probes", _DEFAULT_MAX_PROBES)
+    if probes is not None and (type(probes) is not int or probes < 1):
+        raise ValueError("max_probes must be a positive integer or None")
+    duration = config.get("max_duration", _DEFAULT_MAX_DURATION)
+    if duration is not None and (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration <= 0
+    ):
+        raise ValueError("max_duration must be positive and finite or None")
+
+
+def _family(value: str) -> int:
+    return {"any": socket.AF_UNSPEC, "ipv4": socket.AF_INET, "ipv6": socket.AF_INET6}[value]
+
+
 def _targets(value: Any) -> Iterator[str]:
     values = value if isinstance(value, (list, tuple, set)) else [value]
     produced = 0
@@ -33,17 +77,22 @@ def _targets(value: Any) -> Iterator[str]:
         except ValueError:
             yield target
         else:
+            scope = (
+                target.partition("%")[2].partition("/")[0]
+                if network.version == 6 and "%" in target else None
+            )
             for address in network.hosts():
                 produced += 1
                 if produced > 1_000_000:
                     raise ValueError("target network expands to more than 1000000 hosts")
-                yield str(address)
+                text = str(address)
+                yield f"{text.partition('%')[0]}%{scope}" if scope else text
 
 
 def _ports(value: Any) -> list[int]:
     if value is None:
         value = "1-1024"
-    values = value if isinstance(value, (list, tuple, set)) else [value]
+    values = value if isinstance(value, (list, tuple, set, frozenset)) else [value]
     result: set[int] = set()
     for item in values:
         if isinstance(item, int) and not isinstance(item, bool):
@@ -115,194 +164,301 @@ class _Rate:
             return
         async with self.lock:
             now = time.monotonic()
-            self.next_at = max(now, self.next_at) + self.delay
             pause = self.next_at - now
-        if pause > 0:
-            await asyncio.sleep(pause)
+            if pause > 0:
+                await asyncio.sleep(pause)
+            self.next_at = time.monotonic() + self.delay
+
+
+class _OutputLimit(Exception):
+    pass
+
+
+_LOCAL_ERRORS = {
+    errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM,
+    errno.EADDRNOTAVAIL, errno.EACCES, errno.EPERM,
+}
+
+
+async def _resolve(host: str, family: int) -> list[tuple[int, tuple]]:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        resolved_family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+        if family not in (socket.AF_UNSPEC, resolved_family):
+            return []
+        if "%" not in host:
+            sockaddr = (str(address), 0) if address.version == 4 else (str(address), 0, 0, 0)
+            return [(resolved_family, sockaddr)]
+    from mypr_mcp.network_tools import _resolve_worker
+
+    rows = await _resolve_worker(host, 0, family, socket.SOCK_STREAM, socket.IPPROTO_TCP, 5.0)
+    found = []
+    seen = set()
+    for row in rows:
+        resolved_family = row["family"]
+        if resolved_family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        if family not in (socket.AF_UNSPEC, resolved_family):
+            continue
+        sockaddr = tuple(row["sockaddr"])
+        key = (resolved_family, sockaddr)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+    return found
 
 
 async def _probe(
     host: str,
     port: int,
     timeout: float,  # noqa: ASYNC109
-    rate: _Rate,
+    *,
+    family: int,
+    sockaddr: tuple,
+    banner: bool = False,
+    banner_timeout: float = 0.5,
+    banner_bytes: int = 1024,
 ) -> dict[str, Any]:
-    await rate.wait()
     started = time.monotonic()
-    state = "closed"
-    reason = None
-    address = None
-    writer = None
-    try:
-        async with asyncio.timeout(timeout):
-            _, writer = await asyncio.open_connection(host, port)
-            address = writer.get_extra_info("peername")
-            state = "open"
-    except TimeoutError:
-        state, reason = "timeout", "connect_timeout"
-    except socket.gaierror as exc:
-        state, reason = "unreachable", str(exc)
-    except ConnectionRefusedError as exc:
-        state, reason = "closed", str(exc)
-    except OSError as exc:
-        state, reason = "unreachable", str(exc)
-    finally:
-        if writer is not None:
-            writer.close()
-            with contextlib.suppress(OSError):
-                await writer.wait_closed()
     result: dict[str, Any] = {
-        "host": host,
-        "port": port,
-        "state": state,
-        "duration_ms": round((time.monotonic() - started) * 1000, 3),
+        "host": host, "address": sockaddr[0], "port": port,
+        "family": "ipv4" if family == socket.AF_INET else "ipv6",
+        "protocol": "tcp",
     }
-    if address:
-        result["address"] = address[0] if isinstance(address, tuple) else str(address)
-    if reason:
-        result["reason"] = reason
+    if family == socket.AF_INET6 and len(sockaddr) > 3 and sockaddr[3]:
+        result["scope_id"] = sockaddr[3]
+    connection = None
+    try:
+        connection = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        connection.setblocking(False)
+        endpoint = (sockaddr[0], port, *sockaddr[2:])
+        async with asyncio.timeout(timeout):
+            await asyncio.get_running_loop().sock_connect(connection, endpoint)
+        result["state"] = "open"
+        if banner:
+            data = bytearray()
+            eof = False
+            try:
+                async with asyncio.timeout(banner_timeout):
+                    while len(data) <= banner_bytes:
+                        chunk = await asyncio.get_running_loop().sock_recv(
+                            connection, banner_bytes + 1 - len(data)
+                        )
+                        if not chunk:
+                            eof = True
+                            break
+                        data.extend(chunk)
+            except TimeoutError:
+                result["banner_error"] = "read_timeout"
+            except OSError as exc:
+                result["banner_error"] = errno.errorcode.get(exc.errno, "read_error")
+            result.update(
+                banner=data[:banner_bytes].decode("utf-8", errors="replace"),
+                banner_bytes=min(len(data), banner_bytes),
+                banner_truncated=len(data) > banner_bytes, banner_complete=eof,
+            )
+    except TimeoutError:
+        result.update(state="timeout", reason="connection timed out", reason_code="connect_timeout")
+    except OSError as exc:
+        if exc.errno in _LOCAL_ERRORS:
+            raise
+        state = "closed" if exc.errno == errno.ECONNREFUSED else "unreachable"
+        if exc.errno == errno.ETIMEDOUT:
+            state = "timeout"
+        result.update(
+            state=state, reason=str(exc)[:256], errno=exc.errno,
+            reason_code=errno.errorcode.get(exc.errno, "connect_error"),
+        )
+    finally:
+        if connection is not None:
+            with contextlib.suppress(OSError):
+                connection.close()
+    result["duration_ms"] = round((time.monotonic() - started) * 1000, 3)
     return result
 
 
 async def _tcp(config: dict[str, Any], results: _Results) -> int:
+    validate_tcp_config(config)
     targets = _targets(config.get("targets"))
     ports = _ports(config.get("ports"))
-    workers = int(config.get("concurrency", 64))
+    workers = config.get("concurrency", 64)
     timeout = float(config.get("timeout", 1.0))
+    family = _family(config.get("family", "any"))
     rate = _Rate(float(config.get("rate", 200)))
     max_probes = config.get("max_probes", _DEFAULT_MAX_PROBES)
     max_duration = config.get("max_duration", _DEFAULT_MAX_DURATION)
-    continue_after_output_limit = bool(config.get("continue_after_output_limit", False))
-    if workers < 1 or workers > 1024:
-        raise ValueError("concurrency must be between 1 and 1024")
-    if timeout <= 0:
-        raise ValueError("timeout must be positive")
-    if max_probes is not None and (isinstance(max_probes, bool) or not isinstance(max_probes, int)):
-        raise ValueError("max_probes must be a positive integer or None")
-    if max_probes is not None and max_probes < 1:
-        raise ValueError("max_probes must be a positive integer or None")
-    if max_duration is not None and (
-        isinstance(max_duration, bool)
-        or not isinstance(max_duration, (int, float))
-        or not 0 < float(max_duration) < float("inf")
-    ):
-        raise ValueError("max_duration must be positive and finite or None")
-    queue: asyncio.Queue[tuple[str, int] | None] = asyncio.Queue(maxsize=workers * 2)
+    retries = config.get("retries", 0)
+    continue_after_output_limit = config.get("continue_after_output_limit", False)
+    queue: asyncio.Queue[tuple | None] = asyncio.Queue(maxsize=workers * 2)
     stop = asyncio.Event()
-    attempts = 0
-    attempt_lock = asyncio.Lock()
-    started = time.monotonic()
-    deadline = started + float(max_duration) if max_duration is not None else None
+    config.update(
+        attempts=0, completed=0, discarded_results=0, resolve_errors=0, complete=False,
+        state_counts=dict.fromkeys(("open", "closed", "timeout", "unreachable"), 0),
+        estimate=estimate_probes(config.get("targets", []), config.get("ports"),
+                                 family=config.get("family", "any")),
+    )
+    exhausted = False
 
-    async def stop_for(reason: str) -> None:
+    def stop_for(reason: str) -> None:
         if not stop.is_set():
             config["stop_reason"] = reason
             stop.set()
 
-    async def reserve() -> bool:
-        nonlocal attempts
-        async with attempt_lock:
-            if stop.is_set():
-                return False
-            if deadline is not None and time.monotonic() >= deadline:
-                await stop_for("time_limit")
-                return False
-            if max_probes is not None and attempts >= max_probes:
-                await stop_for("probe_limit")
-                return False
-            attempts += 1
-            return True
+    async def until_stop(operation):
+        task = asyncio.create_task(operation)
+        stopped = asyncio.create_task(stop.wait())
+        try:
+            done, _ = await asyncio.wait((task, stopped), return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return True, task.result()
+            return False, None
+        finally:
+            for pending in (task, stopped):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(task, stopped, return_exceptions=True)
+
+    def store(row: dict[str, Any]) -> None:
+        if not results.append(row):
+            config["discarded_results"] += 1
+            if not continue_after_output_limit:
+                stop_for("result_size_limit")
+                raise _OutputLimit
 
     async def produce() -> None:
-        async def put(item: tuple[str, int] | None) -> bool:
-            put_task = asyncio.create_task(queue.put(item))
-            stop_task = asyncio.create_task(stop.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    (put_task, stop_task), return_when=asyncio.FIRST_COMPLETED
-                )
-                if put_task in done:
-                    return True
-                put_task.cancel()
-                await asyncio.gather(put_task, return_exceptions=True)
-                return False
-            finally:
-                if not put_task.done():
-                    put_task.cancel()
-                await asyncio.gather(put_task, return_exceptions=True)
-                if not stop_task.done():
-                    stop_task.cancel()
-                await asyncio.gather(stop_task, return_exceptions=True)
-
+        nonlocal exhausted
+        cache: dict[str, list[tuple[int, tuple]] | Exception] = {}
+        planned = 0
         for host in targets:
-            for port in ports:
-                if stop.is_set():
-                    return
-                if not await put((host, port)):
-                    return
             if stop.is_set():
                 return
+            try:
+                literal = ipaddress.ip_address(host)
+            except ValueError:
+                literal = None
+            if literal is None or "%" in host:
+                cached = cache.get(host)
+                if isinstance(cached, Exception):
+                    resolved = cached
+                elif cached is not None:
+                    resolved = cached
+                else:
+                    try:
+                        allowed, resolved = await until_stop(_resolve(host, family))
+                        if not allowed:
+                            return
+                    except (OSError, TimeoutError) as exc:
+                        if exc.errno in _LOCAL_ERRORS:
+                            stop_for("local_resource_error")
+                            raise
+                        resolved = exc
+                    if literal is None:
+                        cache[host] = resolved
+            else:
+                resolved = await _resolve(host, family)
+            if isinstance(resolved, Exception) or not resolved:
+                excluded = literal is not None and (
+                    (family == socket.AF_INET and literal.version == 6)
+                    or (family == socket.AF_INET6 and literal.version == 4)
+                )
+                if not excluded:
+                    config["resolve_errors"] += 1
+                    row = {
+                        "host": host, "port": None, "phase": "resolve",
+                        "state": "unreachable", "reason": str(resolved)[:256]
+                        if isinstance(resolved, Exception) else "no matching addresses",
+                        "reason_code": "resolve_timeout" if isinstance(resolved, TimeoutError)
+                        else "resolve_failed",
+                    }
+                    if not config.get("open_only", False):
+                        store(row)
+                continue
+            for resolved_family, sockaddr in resolved:
+                for port in ports:
+                    if stop.is_set():
+                        return
+                    queued, _ = await until_stop(queue.put((host, port, resolved_family, sockaddr)))
+                    if not queued:
+                        return
+                    planned += 1
+        exhausted = True
+        if not config["resolve_errors"]:
+            config["estimate"] = planned
         for _ in range(workers):
-            if stop.is_set():
-                return
-            if not await put(None):
+            queued, _ = await until_stop(queue.put(None))
+            if not queued:
                 return
 
     async def consume() -> None:
-        async def get() -> tuple[str, int] | None:
-            get_task = asyncio.create_task(queue.get())
-            stop_task = asyncio.create_task(stop.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    (get_task, stop_task), return_when=asyncio.FIRST_COMPLETED
+        while not stop.is_set():
+            received, pair = await until_stop(queue.get())
+            if not received or pair is None:
+                return
+            host, port, resolved_family, sockaddr = pair
+            row = None
+            endpoint_attempts = 0
+            for _ in range(retries + 1):
+                if max_probes is not None and config["attempts"] >= max_probes:
+                    stop_for("probe_limit")
+                    break
+                allowed, _ = await until_stop(rate.wait())
+                if not allowed or stop.is_set():
+                    break
+                if max_probes is not None and config["attempts"] >= max_probes:
+                    stop_for("probe_limit")
+                    break
+                config["attempts"] += 1
+                endpoint_attempts += 1
+                try:
+                    row = await _probe(
+                        host, port, timeout, family=resolved_family, sockaddr=sockaddr,
+                        banner=config.get("banner", False),
+                        banner_timeout=config.get("banner_timeout", 0.5),
+                        banner_bytes=config.get("banner_bytes", 1024),
+                    )
+                except OSError:
+                    stop_for("local_resource_error")
+                    raise
+                if row["state"] != "timeout":
+                    break
+            if row is None:
+                return
+            row["attempts"] = endpoint_attempts
+            config["completed"] += 1
+            config["state_counts"][row["state"]] += 1
+            if not config.get("open_only", False) or row["state"] == "open":
+                store(row)
+            if config["completed"] % 100 == 0:
+                _progress(
+                    count=results.count, bytes=results.bytes, attempts=config["attempts"],
+                    completed=config["completed"], state_counts=config["state_counts"],
+                    discarded_results=config["discarded_results"],
+                    resolve_errors=config["resolve_errors"],
                 )
-                if get_task in done:
-                    return get_task.result()
-                get_task.cancel()
-                await asyncio.gather(get_task, return_exceptions=True)
-                return None
-            finally:
-                if not get_task.done():
-                    get_task.cancel()
-                await asyncio.gather(get_task, return_exceptions=True)
-                if not stop_task.done():
-                    stop_task.cancel()
-                await asyncio.gather(stop_task, return_exceptions=True)
 
-        while True:
-            pair = await get()
-            if pair is None:
-                return
-            if not await reserve():
-                return
+    try:
+        async with asyncio.timeout(max_duration):
             try:
-                if deadline is None:
-                    row = await _probe(*pair, timeout, rate)
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        await stop_for("time_limit")
-                        return
-                    row = await asyncio.wait_for(_probe(*pair, timeout, rate), remaining)
-            except TimeoutError:
-                await stop_for("time_limit")
-                return
-            stored = results.append(row)
-            if not stored and not continue_after_output_limit:
-                await stop_for("result_size_limit")
-            if results.count % 100 == 0:
-                _progress(count=results.count, bytes=results.bytes, attempts=attempts)
-
-    async with asyncio.TaskGroup() as group:
-        group.create_task(produce())
-        for _ in range(workers):
-            group.create_task(consume())
-    config["attempts"] = attempts
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(produce())
+                    for _ in range(workers):
+                        group.create_task(consume())
+            except* _OutputLimit:
+                pass
+    except TimeoutError:
+        stop_for("time_limit")
     config.setdefault("stop_reason", results.stop_reason)
+    config["complete"] = (
+        exhausted and not config.get("stop_reason") and not config["resolve_errors"]
+        and not results.truncated
+    )
     return 0
 
 
-def estimate_probes(targets: list[str], ports: Any) -> int | None:
+def estimate_probes(targets: list[str], ports: Any, *, family: str = "any") -> int | None:
     """Return a cheap exact estimate for literal IP/CIDR targets."""
 
     try:
@@ -310,11 +466,15 @@ def estimate_probes(targets: list[str], ports: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     target_count = 0
-    for value in targets:
+    for value in targets if isinstance(targets, (list, tuple)) else [targets]:
         try:
             network = ipaddress.ip_network(value, strict=False)
         except ValueError:
             return None
+        if (family == "ipv4" and network.version != 4) or (
+            family == "ipv6" and network.version != 6
+        ):
+            continue
         count = network.num_addresses
         if network.version == 4 and network.prefixlen < 31:
             count = max(0, count - 2)
@@ -553,6 +713,10 @@ async def run(config: dict[str, Any]) -> int:
             attempts=config.get("attempts", results.count),
             stop_reason=config.get("stop_reason") or results.stop_reason,
             returncode=returncode,
+            **({key: config[key] for key in (
+                "completed", "state_counts", "discarded_results", "resolve_errors",
+                "complete", "estimate",
+            ) if key in config} if config.get("mode", "tcp") == "tcp" else {}),
         )
         return returncode
     except asyncio.CancelledError:
@@ -582,6 +746,17 @@ async def run(config: dict[str, Any]) -> int:
                 "cancelled": cancelled,
                 "error": error or config.get("error"),
             }
+            if config.get("mode", "tcp") == "tcp":
+                summary.update({
+                    key: config[key] for key in (
+                        "completed", "state_counts", "discarded_results", "resolve_errors",
+                        "estimate",
+                    ) if key in config
+                })
+                summary["complete"] = (
+                    bool(config.get("complete")) and not cancelled and returncode == 0
+                    and not summary["error"]
+                )
             temporary = Path(summary_path).with_suffix(".tmp")
             try:
                 temporary.write_text(json.dumps(summary, separators=(",", ":")), encoding="utf-8")

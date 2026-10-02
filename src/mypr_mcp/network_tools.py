@@ -417,11 +417,19 @@ class NetworkTools:
         max_probes: int | None = 1_000_000,
         max_duration: float | None = 3600.0,
         continue_after_output_limit: bool = False,
+        family: str = "any",
+        retries: int = 0,
+        banner: bool = False,
+        banner_timeout: float = 0.5,
+        banner_bytes: int = 1024,
+        open_only: bool = False,
     ) -> Any:
         return await self._delegate(
             "scan", targets=targets, ports=ports, concurrency=concurrency, rate=rate,
             timeout=timeout, max_probes=max_probes, max_duration=max_duration,
-            continue_after_output_limit=continue_after_output_limit,
+            continue_after_output_limit=continue_after_output_limit, family=family,
+            retries=retries, banner=banner, banner_timeout=banner_timeout,
+            banner_bytes=banner_bytes, open_only=open_only,
         )
 
     async def nmap(

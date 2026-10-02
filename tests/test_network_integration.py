@@ -232,13 +232,20 @@ async def test_network_diagnostics_and_scan_attach_survive_reset_and_restart(
         scan_id = await _json_cell(
             session,
             f"scan = await ws.net.scan('127.0.0.1', ports=[{tcp_server}, {tcp_server + 1}], "
-            "concurrency=2, rate=10000, timeout=0.5)\n"
+            "concurrency=2, rate=10000, timeout=0.5, family='ipv4', "
+            "retries=1, banner=True, banner_timeout=0.02, open_only=True)\n"
             "summary = await scan\n"
             "page = await scan.results(max_entries=10)\n"
             "print(json.dumps({'id': scan.id, 'summary': summary, 'page': page}))",
         )
         assert scan_id["summary"]["state"] == "succeeded"
+        assert scan_id["summary"]["completed"] == 2
+        assert scan_id["summary"]["attempts"] >= 2
+        assert scan_id["summary"]["complete"] is True
         assert scan_id["page"]["results"]
+        assert scan_id["page"]["complete"] is True
+        assert all(row["family"] == "ipv4" and row["state"] == "open"
+                   for row in scan_id["page"]["results"])
         assert {row["state"] for row in scan_id["page"]["results"]} <= {
             "open",
             "closed",
