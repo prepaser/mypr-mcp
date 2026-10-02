@@ -9,8 +9,8 @@ INSTRUCTIONS = """Use execute for workspace work through Python and poll for sub
 
 Getting started
 - init() assigns an adjective-animal client ID; init(client_id="...") creates or resumes a logical client. This connection keeps that ID, so execute does not need it. Repeated init returns the same ID; switching IDs or sharing one across live connections is rejected. Poll is available before init.
-- For API details, run print(ws.help()) for topics, print(ws.help("fs")) for guidance, or print(ws.help("shell.run")) for a method's live signature and defaults. Use await ws.doctor() to check optional tools and packages before starting a workflow. Help comes from this running kernel; use its API and reported capabilities. Use ws.help("config") for layered configuration and explicit reload behavior.
-- Files and search: ws.fs; commands and background work: ws.shell/ws.tasks; Git: ws.git. Help also covers system, messages, timers, mail, locks, mcp, config, http, browser, net, skills, modules, packages, history, and lifecycle.
+- For API details, run print(ws.help()) for topics, print(ws.help("fs")) for guidance, or print(ws.help("shell.run")) for a method's live signature and defaults. Use await ws.doctor() to inspect optional tools and packages before starting a workflow. Missing registered dependencies are prepared automatically by default; use await ws.dependencies.ensure("name") for an explicit install, including when dependencies.auto_install is false. Help comes from this running kernel; use its API and reported capabilities. Use ws.help("config") for layered configuration and explicit reload behavior.
+- Files and search: ws.fs; commands and background work: ws.shell/ws.tasks; Git: ws.git. Help also covers system, messages, timers, mail, locks, mcp, config, dependencies, http, browser, net, skills, modules, packages, history, and lifecycle.
 
 Read and search before editing:
     ws.local["page"] = await ws.fs.read("src/app.py", end_line=80)

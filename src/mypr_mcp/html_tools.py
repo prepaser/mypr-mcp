@@ -310,6 +310,9 @@ class HTMLExtractor:
             raise ValueError("url must be a string no longer than 8192 characters")
         if selector is not None and (not isinstance(selector, str) or len(selector) > 4096):
             raise ValueError("selector must be a string no longer than 4096 characters")
+        ensure = getattr(self._http_tools, "_ensure", None)
+        if ensure is not None:
+            await ensure("trafilatura", *("cssselect",) if selector else ())
         result = await _run_worker(
             html, url=url, selector=selector, include_structure=include_structure
         )

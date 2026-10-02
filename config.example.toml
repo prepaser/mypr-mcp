@@ -21,6 +21,12 @@
 # max_bytes = 1073741824
 # gc_interval_seconds = 300
 
+# Built-in features prepare registered dependencies when needed. Binary tools
+# and OCR models are shared under XDG_DATA_HOME/mypr; Python packages use the
+# workspace .mypr environment. Set false to require ws.dependencies.ensure().
+# [dependencies]
+# auto_install = true
+
 # Mail accounts use environment-variable names for passwords. The manager resolves
 # those variables when it opens a connection; values are never stored in TOML.
 # [mail]

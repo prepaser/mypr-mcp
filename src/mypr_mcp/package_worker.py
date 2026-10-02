@@ -17,6 +17,21 @@ from pathlib import Path
 from typing import Any
 
 _MAX_FREEZE_BYTES = 16 * 1024 * 1024
+_PROBE_TIMEOUT = 30
+
+# Automatic installation is deliberately limited to packages used by built-in
+# features. Manual ``ws.packages.add`` remains the escape hatch for everything
+# else.
+PYTHON_PACKAGES = {
+    "pillow": "PIL",
+    "pymupdf": "pymupdf",
+    "trafilatura": "trafilatura",
+    "cssselect": "cssselect",
+    "python-docx": "docx",
+    "python-pptx": "pptx",
+    "openpyxl": "openpyxl",
+}
+AUTO_PACKAGE_MODULES = PYTHON_PACKAGES
 
 
 class _ManifestCommitError(OSError):
@@ -40,6 +55,99 @@ def _validate_specs(specs: list[str]) -> list[str]:
     if any(not spec or spec.startswith("-") for spec in values):
         raise ValueError("package requirements must be non-empty and cannot be options")
     return values
+
+
+def _canonical_name(value: str) -> str:
+    return value.lower().replace("_", "-").replace(".", "-")
+
+
+def _validate_automatic_specs(specs: list[str]) -> list[str]:
+    """Validate the restricted package names accepted by automatic installs."""
+
+    normalized = []
+    for spec in specs:
+        key = _canonical_name(spec)
+        if key != spec.lower() or key not in AUTO_PACKAGE_MODULES:
+            raise ValueError(
+                "automatic installation accepts only supported plain package names: "
+                + ", ".join(sorted(AUTO_PACKAGE_MODULES))
+            )
+        normalized.append(key)
+    return normalized
+
+
+def _probe_environment(python: Path, modules: list[str]) -> dict[str, Any]:
+    """Read distribution versions and import status from the workspace Python."""
+
+    script = """
+import importlib.metadata as metadata
+import json
+import sys
+
+requested = json.loads(sys.argv[1])
+dist = {}
+for item in metadata.distributions():
+    name = item.metadata.get("Name")
+    version = item.version
+    if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
+        continue
+    dist[name.lower().replace("_", "-").replace(".", "-")] = {
+        "name": name,
+        "version": version,
+    }
+imports = {}
+for name in requested:
+    try:
+        __import__(name)
+    except BaseException as exc:
+        imports[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:512]}
+    else:
+        imports[name] = {"ok": True}
+print(json.dumps({"distributions": dist, "imports": imports}, separators=(",", ":")))
+"""
+    try:
+        completed = subprocess.run(
+            [str(python), "-I", "-c", script, json.dumps(modules)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("workspace package probe timed out") from exc
+    if completed.returncode:
+        output = (completed.stderr or completed.stdout)[-4096:]
+        raise RuntimeError(
+            f"workspace package probe failed with exit code {completed.returncode}: {output}"
+        )
+    try:
+        result = json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("workspace package probe returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("workspace package probe returned invalid data")
+    return result
+
+
+def _constraint_lines(distributions: dict[str, Any]) -> str:
+    lines = []
+    for _key, value in sorted(distributions.items()):
+        if not isinstance(value, dict):
+            raise RuntimeError("workspace package probe returned invalid distribution data")
+        name = value.get("name")
+        version = value.get("version")
+        if (
+            not isinstance(name, str)
+            or not name
+            or any(char in name for char in "\r\n")
+            or not isinstance(version, str)
+            or not version
+            or any(char.isspace() for char in version)
+        ):
+            raise RuntimeError("workspace package metadata contains an invalid distribution")
+        lines.append(f"{name}=={version}\n")
+    return "".join(lines)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -74,6 +182,7 @@ def install_packages(
     *,
     uv: str = "uv",
     lock_timeout: float = 300,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     """Install requirements under a workspace lock and atomically refresh freeze output."""
 
@@ -84,6 +193,8 @@ def install_packages(
     if not root_path.is_dir():
         raise NotADirectoryError(root_path)
     specs = _validate_specs(specs)
+    if automatic:
+        specs = _validate_automatic_specs(specs)
     executable = shutil.which(uv) if os.path.sep not in uv else uv
     if executable is None:
         raise FileNotFoundError(f"package installer not found: {uv}")
@@ -97,13 +208,105 @@ def install_packages(
             raise TimeoutError("timed out waiting for workspace package lock") from None
         try:
             _emit("locked", root=str(root_path))
+            constraint_path = None
+            already_satisfied = []
+            missing = specs
+            before = None
+            requested_modules = []
+            if automatic:
+                requested_modules = [AUTO_PACKAGE_MODULES[spec] for spec in specs]
+                before = _probe_environment(python_path, requested_modules)
+                distributions = before.get("distributions", {})
+                imports = before.get("imports", {})
+                if not isinstance(distributions, dict) or not isinstance(imports, dict):
+                    raise RuntimeError("workspace package probe returned invalid data")
+                unusable = []
+                already_satisfied = []
+                missing = []
+                for spec, module in zip(specs, requested_modules, strict=True):
+                    distribution = distributions.get(spec)
+                    import_state = imports.get(module)
+                    if distribution is not None and not isinstance(import_state, dict):
+                        raise RuntimeError("workspace package probe returned invalid import data")
+                    if distribution is not None and import_state.get("ok") is not True:
+                        error = import_state.get("error", "import failed")
+                        unusable.append(f"{spec} ({module}: {error})")
+                    elif distribution is not None and import_state.get("ok") is True:
+                        already_satisfied.append(spec)
+                    else:
+                        missing.append(spec)
+                if unusable:
+                    raise RuntimeError(
+                        "automatic package is installed but unusable: " + ", ".join(unusable)
+                    )
+                if not missing:
+                    _emit("already_satisfied", specs=already_satisfied)
+                    return {
+                        "manifest": str(manifest),
+                        "bytes": manifest.stat().st_size if manifest.is_file() else 0,
+                        "specs": [],
+                        "already_satisfied": already_satisfied,
+                        "automatic": True,
+                        "durability": "unchanged",
+                    }
+                constraint = _constraint_lines(distributions)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", prefix=".constraints.", suffix=".txt",
+                    dir=root_path, delete=False,
+                ) as stream:
+                    constraint_path = Path(stream.name)
+                    stream.write(constraint)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                install_command = [
+                    executable, "pip", "install", "--python", str(python_path),
+                    "--constraint", str(constraint_path), *missing,
+                ]
+            else:
+                install_command = [
+                    executable, "pip", "install", "--python", str(python_path), *specs,
+                ]
             _run(
-                [executable, "pip", "install", "--python", str(python_path), *specs],
+                install_command,
                 "install",
                 lock_fd=lock.fileno(),
                 stream=True,
             )
-            _emit("installed", specs=specs)
+            if automatic:
+                after = _probe_environment(python_path, requested_modules)
+                after_distributions = after.get("distributions", {})
+                after_imports = after.get("imports", {})
+                if not isinstance(after_distributions, dict) or not isinstance(after_imports, dict):
+                    raise RuntimeError("workspace package probe returned invalid data")
+                changed = []
+                for name, value in before["distributions"].items():
+                    if after_distributions.get(name) != value:
+                        changed.append(name)
+                if changed:
+                    raise RuntimeError(
+                        "automatic package installation changed existing distributions: "
+                        + ", ".join(sorted(changed))
+                    )
+                unusable = []
+                for spec, module in zip(specs, requested_modules, strict=True):
+                    distribution = after_distributions.get(spec)
+                    import_state = after_imports.get(module)
+                    if (
+                        distribution is None
+                        or not isinstance(import_state, dict)
+                        or import_state.get("ok") is not True
+                    ):
+                        detail = (
+                            import_state.get("error", "import failed")
+                            if isinstance(import_state, dict)
+                            else "distribution or module is missing"
+                        )
+                        unusable.append(f"{spec} ({module}: {detail})")
+                if unusable:
+                    raise RuntimeError(
+                        "automatic package could not be verified: " + ", ".join(unusable)
+                    )
+            _emit("installed", specs=missing)
             freeze = _run(
                 [executable, "--color", "never", "pip", "freeze", "--python", str(python_path)],
                 "freeze",
@@ -125,21 +328,31 @@ def install_packages(
                     bytes=len(freeze),
                     durability="unknown",
                 )
-                return {
+                result = {
                     "manifest": str(manifest),
                     "bytes": len(freeze),
-                    "specs": specs,
+                    "specs": missing,
                     "durability": "unknown",
                     "warnings": [warning],
                 }
+                if automatic:
+                    result["already_satisfied"] = already_satisfied
+                    result["automatic"] = True
+                return result
             _emit("saved", manifest=str(manifest), bytes=len(freeze), durability="confirmed")
-            return {
+            result = {
                 "manifest": str(manifest),
                 "bytes": len(freeze),
-                "specs": specs,
+                "specs": missing,
                 "durability": "confirmed",
             }
+            if automatic:
+                result["already_satisfied"] = already_satisfied
+                result["automatic"] = True
+            return result
         finally:
+            if constraint_path is not None:
+                constraint_path.unlink(missing_ok=True)
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
@@ -232,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--uv", default="uv")
     parser.add_argument("--lock-timeout", type=float, default=300)
+    parser.add_argument("--automatic", action="store_true")
     parser.add_argument("--spec", action="append", default=[])
     parser.add_argument("--spec-json", "--specs-json", dest="spec_json")
     parser.add_argument("specs", nargs="*")
@@ -249,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
             specs,
             uv=args.uv,
             lock_timeout=args.lock_timeout,
+            automatic=args.automatic,
         )
     except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
         _emit("error", type=type(exc).__name__, message=str(exc)[:4096])

@@ -31,7 +31,7 @@ await ws.fs.image(path) returns a PNG or JPEG as inline image content; the defau
     ),
     "docs": (
         "Inspect, extract text from, and render PDF pages.",
-        """PDF helpers require PyMuPDF in the workspace Python environment. Install it explicitly: job = await ws.packages.add("pymupdf"); await job. Image transformations also need "pillow". Installing packages only in the MCP client's environment does not install them in the workspace kernel.
+        """PDF helpers prepare PyMuPDF in the workspace Python environment when it is missing. Image transformations also prepare "pillow". Automatic preparation is enabled by default; use await ws.dependencies.ensure("pymupdf", "pillow") for an explicit install, including when dependencies.auto_install is false. Installing packages only in the MCP client's environment does not install them in the workspace kernel.
 
 await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR. Use await ws.docs.ocr(path, ...) explicitly for scanned PDF pages or PNG/JPEG images. OCR accepts resume_cursor for continuing a bounded cached page result; it cannot be combined with the ordinary result cursor. Cached words remain readable after a source edit, while the next unprocessed page rechecks the source revision before OCR. await ws.docs.extract(path, ...) reads DOCX paragraphs/tables, PPTX slides, or XLSX cells. await ws.docs.backends() checks optional packages and OCR language data. These operations run outside the kernel, preserve source files, and return bounded pages tied to the source revision.
 
@@ -46,13 +46,13 @@ Search work and each returned page are bounded. timeout, scan_bytes, and scan_li
     ws.local["hits"] = await ws.fs.search("TODO", paths="src", glob="*.py")
     print(ws.local["hits"]["matches"][:5])
 
-await ws.fs.search_docs(pattern, paths=...) uses rga to search documents and archives. Returned locations refer to extracted text, not editable source positions; document converters are optional.
+await ws.fs.search_docs(pattern, paths=...) uses rga to search documents and archives. Missing registered search tools and selected converters are prepared automatically by default. Returned locations refer to extracted text, not editable source positions; document converters remain optional.
 
-await ws.fs.search_ast(pattern, lang="python", paths=...) performs read-only structural matching. Pass rule, constraints, or utils for AST rules. Results include source ranges and captures; details_truncated indicates omitted details. await ws.fs.search_backends() reports available search engines and document conversion dependencies.""",
+await ws.fs.search_ast(pattern, lang="python", paths=...) performs read-only structural matching. Missing ast-grep is prepared automatically by default. Pass rule, constraints, or utils for AST rules. Results include source ranges and captures; details_truncated indicates omitted details. await ws.fs.search_backends() reports available search engines and document conversion dependencies.""",
     ),
     "code": (
         "Use optional language servers for definitions, references, hover, and diagnostics.",
-        """await ws.code.configure("clangd", ["clangd", "-j=2"], ["c", "cpp"]) starts an explicitly selected stdio language server. Install the server separately; mypr does not download one. Servers are shared within this workspace and close during reset.
+        """await ws.code.configure("clangd", ["clangd", "-j=2"], ["c", "cpp"]) starts an explicitly selected stdio language server. Language servers remain a manual dependency; mypr does not download them. Servers are shared within this workspace and close during reset.
 
 await ws.code.definition("clangd", "src/main.c", line=10, character=5), references(...), and hover(...) query saved source. Public line and character values are one-based Unicode code-point positions; mypr converts the server's negotiated position encoding. Source changes are synchronized before queries. Inspect result truncation and coordinate metadata; diagnostics report the synchronized document version.
 
@@ -167,14 +167,14 @@ await ws.config.explain(path) reports desired and applied values, source, revisi
         "Make bounded asynchronous HTTP requests and downloads.",
         """ws.http provides named persistent HTTPX2 (httpx2.AsyncClient) clients. Use await ws.http.get/post/... for bounded decoded responses, async with ws.http.stream(...) for incremental bodies, and await ws.http.download(url, path) for atomic workspace downloads. A completed download returns its Path even if temporary-file cleanup fails; ws.http.last_warnings reports warnings from the current logical client's most recently completed download.
 
-await ws.http.extract_html(html, url=..., selector=...) extracts readable content from existing HTML. await ws.http.read_html(url, ...) fetches through a named HTTP client before extraction. Both return bounded text and link results with source metadata. Pass include_structure=True when heading hierarchy and document metadata are needed. Parsing requires optional workspace packages trafilatura and cssselect; it does not execute JavaScript. Pass browser page.content() to extract a rendered document.
+await ws.http.extract_html(html, url=..., selector=...) extracts readable content from existing HTML. await ws.http.read_html(url, ...) fetches through a named HTTP client before extraction. Both return bounded text and link results with source metadata. Pass include_structure=True when heading hierarchy and document metadata are needed. Parsing prepares trafilatura and, when selector is used, cssselect in the workspace environment as needed; it does not execute JavaScript. Pass browser page.content() to extract a rendered document.
 
 Default limits are 16 MiB for requests and 256 MiB for downloads. ws.http.client(name, ...)
 returns the native client; close it before changing its options.""",
     ),
     "browser": (
         "Automate managed or external browsers with Playwright.",
-        """await ws.browser.context(name, ...) returns a native async Playwright BrowserContext. Use launch_options for the managed browser. Use await ws.browser.connect(endpoint, protocol=...) to connect to an external Playwright or CDP browser, then await ws.browser.context(..., connection=name) to use it.
+        """await ws.browser.context(name, ...) returns a native async Playwright BrowserContext. The Playwright package and a managed browser engine are prepared automatically by default; use await ws.dependencies.ensure("browser:chromium") for an explicit install. Use launch_options for the managed browser. Use await ws.browser.connect(endpoint, protocol=...) to connect to an external Playwright or CDP browser, then await ws.browser.context(..., connection=name) to use it.
 
 The first managed use installs a missing browser engine automatically. Await ws.browser.save_state(...) and ws.browser.load_state(...) for explicit authentication-state persistence, and await ws.browser.screenshot(page, path) to save an artifact and return inline image output.
 
@@ -206,7 +206,17 @@ await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newe
     ),
     "packages": (
         "Install packages into the workspace Python environment.",
-        """await ws.packages.add("package") starts an installation and returns a task handle. Keep the handle in ws.local to inspect or await the installation. Package changes are serialized per workspace; the frozen manifest is replaced atomically after installation succeeds. Failures before replacement leave the previous manifest intact. If the replacement cannot be confirmed durable, the job succeeds with a manifest_durability_unknown warning in its status and output. Installation can change the environment before a later freeze or manifest failure. Reset is not required for unrelated imports, but already-imported modules may need a reset before an upgrade is visible.""",
+        """await ws.packages.add("package") starts an explicit installation and returns a task handle. Keep the handle in ws.local to inspect or await the installation. Package changes are serialized per workspace; the frozen manifest is replaced atomically after installation succeeds. Failures before replacement leave the previous manifest intact. If the replacement cannot be confirmed durable, the job succeeds with a manifest_durability_unknown warning in its status and output. Installation can change the environment before a later freeze or manifest failure. Reset is not required for unrelated imports, but already-imported modules may need a reset before an upgrade is visible.
+
+Built-in features automatically prepare their registered Python packages when dependencies.auto_install is true. Use await ws.dependencies.ensure("pymupdf") for an explicit preparation; use ws.packages.add(...) for arbitrary user packages. Automatic preparation never installs an arbitrary import and preserves existing compatible package versions.""",
+    ),
+    "dependencies": (
+        "Inspect and prepare registered tools, packages, browser engines, and OCR models.",
+        """await ws.dependencies.list(kind=None, limit=50, cursor=None) returns items, has_more, next_cursor, and auto_install without installing anything. kind may be binary, python, model, browser, or None.
+
+await ws.dependencies.ensure("rg", "ast-grep", "pymupdf", "tessdata:eng") prepares registered dependencies and waits for completion. Explicit ensure bypasses dependencies.auto_install for missing items. Supported binaries are rg 15.2.0, ast-grep 0.45.3, rga 0.10.10, and pandoc 3.12; browser names are browser:chromium, browser:firefox, and browser:webkit. Supported automatic Python packages are pillow, pymupdf, trafilatura, cssselect, python-docx, python-pptx, and openpyxl. OCR models use the pinned tessdata_fast 4.1.0 catalog.
+
+Binary tools and OCR models are shared under the XDG data directory, with downloads under the XDG cache directory. Python packages belong to the workspace .mypr environment. Built-in feature calls prepare only the dependencies they declare; cached-page reads and list/doctor/status operations do not install anything. Tesseract, FFmpeg, Poppler, Git, LSP servers, and external services remain manual dependencies. Explicit TESSDATA_PREFIX is preserved.""",
     ),
     "history": (
         "Find execution records and inspect event logs.",
@@ -227,11 +237,12 @@ await ws.modules.history(name, limit=20, cursor=None) lists saved revisions newe
     "doctor": (
         "Diagnose workspace readiness and optional dependencies.",
         """await ws.doctor() checks the workspace Python environment, packages,
-search backends, LSP configuration, browser engine, OCR data, MCP settings,
-runtime health, and available storage. Each check reports ready, missing,
-invalid, or unknown with a bounded reason and suggested action. The same
-diagnostics are available without starting a manager through `mypr-mcp doctor`.
-The command does not install packages, start servers, or rewrite configuration.""",
+registered dependency tools and models, search backends, LSP configuration,
+browser engine, OCR data, MCP settings, runtime health, and available storage.
+Each check reports ready, missing, invalid, or unknown with a bounded reason and
+suggested action. The same diagnostics are available without starting a manager
+through `mypr-mcp doctor`. The command does not install packages or dependency
+artifacts, start servers, or rewrite configuration.""",
     ),
     "lifecycle": (
         "Understand client identity, persistence, reset, restart, and recovery.",
@@ -291,6 +302,8 @@ _METHOD_NOTES = {
     "config.explain": "Reports desired/applied values, source, revisions, pending state, and restart requirements for a path.",
     "config.reload": "Explicitly applies persisted configuration and reports applied, deferred, failed, and restart-required changes.",
     "doctor": "Returns readiness checks for runtime, packages, tools, LSP, browser, OCR, MCP configuration, and storage without installing or changing anything.",
+    "dependencies.list": "Returns a paged dependency inventory without installing anything.",
+    "dependencies.ensure": "Prepares registered dependencies and waits for completion; explicit ensure bypasses dependencies.auto_install.",
 }
 _WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "doctor", "reset", "restart"}
 

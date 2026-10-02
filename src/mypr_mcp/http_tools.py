@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import tempfile
 from collections import OrderedDict
@@ -62,16 +63,28 @@ class HTTPTools:
     """Manage named native HTTPX2 clients for one workspace kernel."""
 
     def __init__(
-        self, workspace: str | os.PathLike[str], identity: Callable[[], Any] | None = None
+        self,
+        workspace: str | os.PathLike[str],
+        identity: Callable[[], Any] | None = None,
+        ensure_dependencies: Callable[..., Any] | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self._identity = identity
+        self._ensure_dependencies = ensure_dependencies
         self._clients: dict[tuple[str, str, str], Any] = {}
         self._options: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._closed = False
         self._shutdown_task: asyncio.Task[None] | None = None
         self._html = None
         self._download_warnings: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
+
+    async def _ensure(self, *names: str) -> dict[str, Any]:
+        if not names or self._ensure_dependencies is None:
+            return {}
+        result = self._ensure_dependencies(*names, automatic=True)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if isinstance(result, dict) else {}
 
     @property
     def last_warnings(self) -> list[dict[str, str]]:

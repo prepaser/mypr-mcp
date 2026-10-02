@@ -1,13 +1,12 @@
 # Images and PDFs
 
-Image transforms and PDF operations use Pillow and PyMuPDF inside short-lived worker processes. Install them into the workspace kernel before the first call:
+Image transforms and PDF operations use Pillow and PyMuPDF inside short-lived worker processes. Registered packages are prepared automatically when `dependencies.auto_install` is enabled. Prepare them explicitly with:
 
 ```python
-ws.local["media_install"] = await ws.packages.add("pillow", "pymupdf")
-await ws.local["media_install"]
+await ws.dependencies.ensure("pillow", "pymupdf")
 ```
 
-The MCP server's own environment is separate from the workspace kernel, so installing packages with `uvx` does not make them available here. Operations fail with an install hint when a package is missing. The worker limits each input to 64 MiB, each image to 40 million source pixels, PDF text reads to 10 pages and 64,000 characters, and each rendered image to 4 million pixels and 2 MiB. At most two workers run at once. On Linux, each worker also has CPU, memory, file-size, and file-descriptor limits, and a process guard cleans up its descendants when the kernel exits. Cancelling a media call waits for an in-progress worker launch and finishes process cleanup before propagating cancellation. Operations never write over the source file.
+The MCP server's own environment is separate from the workspace kernel, so installing packages with `uvx` does not make them available here. When automatic installation is disabled, an operation reports the missing registered dependency and the explicit `ws.dependencies.ensure(...)` action. The worker limits each input to 64 MiB, each image to 40 million source pixels, PDF text reads to 10 pages and 64,000 characters, and each rendered image to 4 million pixels and 2 MiB. At most two workers run at once. On Linux, each worker also has CPU, memory, file-size, and file-descriptor limits, and a process guard cleans up its descendants when the kernel exits. Cancelling a media call waits for an in-progress worker launch and finishes process cleanup before propagating cancellation. Operations never write over the source file.
 
 ## Images
 
@@ -48,25 +47,23 @@ while result["next_cursor"]:
 
 ## OCR and Office files
 
-`ws.docs.ocr(path, language="eng", start_page=1, max_pages=5, dpi=200, cursor=None, resume_cursor=None, max_bytes=32768)` runs OCR for PDF, PNG, and JPEG files. Install Tesseract and the required language data on the workstation, and install the Python backends in the workspace kernel before use:
+`ws.docs.ocr(path, language="eng", start_page=1, max_pages=5, dpi=200, cursor=None, resume_cursor=None, max_bytes=32768)` runs OCR for PDF, PNG, and JPEG files. Install Tesseract on the workstation. Python backends are prepared automatically when enabled; system OCR data is reused when it provides every requested language. Explicitly prepare backends with:
 
 ```python
-job = await ws.packages.add("pillow", "pymupdf")
-await job
+await ws.dependencies.ensure("pillow", "pymupdf")
 await ws.docs.backends()
 result = await ws.docs.ocr("scans/report.pdf", language="eng", max_pages=5)
 ```
 
 `backends()` reports Python package availability, the Tesseract executable and version, and installed language codes. PDF OCR also requires PyMuPDF; PNG and JPEG OCR require Pillow. The default page budget is five pages at 200 DPI, and pages above 16 million pixels are rendered at a lower effective DPI. Image EXIF orientation is normalized before OCR; `start_page` must be 1 for images. Each word item contains its text, Tesseract confidence, and `[left, top, width, height]` bounding box; `coordinate_space` identifies the coordinate system and `pages` reports each rendered size and effective DPI. Follow `next_cursor` to read the immutable result in bounded pages. If a PDF has additional pages, `next_page` identifies the next page to pass as `start_page`. `complete` and `truncation_reason` distinguish a full result from page, item, or output limits. When a page's bounded word stream is cut, use its `resume_cursor` on a new call to continue that cached page without rerunning OCR; cached words remain readable even if the source file changes. `resume_cursor` and the ordinary result `cursor` are mutually exclusive. Before OCR runs for the next unprocessed page, mypr rechecks the source revision and rejects the resume if the source changed. `next_page` is set only when the selected page range finished; a worker item/output limit within a page cannot resume that page.
 
-`ws.docs.extract(path, cursor=None, max_bytes=32768, cached_values=False)` extracts `.docx`, `.pptx`, and `.xlsx` files. Install only the parser packages needed by the document type:
+`ws.docs.extract(path, cursor=None, max_bytes=32768, cached_values=False)` extracts `.docx`, `.pptx`, and `.xlsx` files. The parser package for the selected format is prepared automatically when enabled. To prepare all three explicitly:
 
 ```python
-job = await ws.packages.add("python-docx", "python-pptx", "openpyxl")
-await job
+await ws.dependencies.ensure("python-docx", "python-pptx", "openpyxl")
 result = await ws.docs.extract("reports/summary.docx")
 ```
 
 Results contain ordered blocks with paragraph, slide, table-cell, or worksheet cell locations and source SHA-256 revision. Long text is split into ordered `part` chunks with character offsets; concatenate the chunks sharing a location to reconstruct the original cell or text block. Nested DOCX tables and PowerPoint groups are traversed up to eight levels; deeper content is reported as incomplete with a warning. XLSX extraction uses read-only mode and returns formulas by default. Set `cached_values=True` to read cached cell values; formulas are never evaluated, and cells without cached values may be omitted. Repeat `cached_values=True` when continuing a cached-value query. Continue with `next_cursor`; pages remain tied to their original immutable result even if the source file changes. Results are stored under `.mypr/document-results/`, with at most 16 snapshots and 32 MiB total; older results expire as new results are added.
 
-OCR and Office parsing run in guarded workers with a 60-second operation limit, two-worker concurrency, 64 MiB input limit, bounded result storage, and an Office ZIP expansion cap. Encrypted files, macro-enabled Office formats, legacy binary Office formats, and unsupported extensions are rejected. Optional dependencies are never installed automatically.
+OCR and Office parsing run in guarded workers with a 60-second operation limit, two-worker concurrency, 64 MiB input limit, bounded result storage, and an Office ZIP expansion cap. Encrypted files, macro-enabled Office formats, legacy binary Office formats, and unsupported extensions are rejected. Cached page reads do not install anything. Tesseract remains a manual system dependency; missing registered language models are prepared per call without overriding an explicit `TESSDATA_PREFIX`.

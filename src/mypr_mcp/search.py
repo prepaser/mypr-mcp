@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import inspect
 import json
 import math
 import os
@@ -30,9 +31,15 @@ _QUERY_BYTES = 16 * 1024 * 1024
 class Search:
     """Search files below a workspace through the managed shell API."""
 
-    def __init__(self, workspace: Path, shell: Any):
+    def __init__(
+        self,
+        workspace: Path,
+        shell: Any,
+        ensure_dependencies: Any = None,
+    ):
         self.workspace = Path(workspace).expanduser().resolve()
         self.shell = shell
+        self._ensure_dependencies = ensure_dependencies
         self._slots = asyncio.Semaphore(2)
         self.snapshots = SnapshotStore(self.workspace / ".mypr", name="searches")
 
@@ -114,14 +121,62 @@ class Search:
         if cursor is not None:
             return await self._continue(request)
         mode, options = self._normalize_request(request)
+        prepared = await self._prepare_dependencies(backend, options)
         collector = Results(backend, mode, parse_match=self._match_item, limit=scan_limit)
         run, items = await self._run_backend(
-            backend, options, collector, timeout=timeout, scan_bytes=scan_bytes
+            backend, prepared, collector, timeout=timeout, scan_bytes=scan_bytes
         )
         outcome = self._classify_run(backend, mode, collector, items, run)
         return await self._save_snapshot(
             backend, mode, options, max_bytes, max_matches, run, items, outcome
         )
+
+    async def _prepare_dependencies(self, backend, options):
+        if self._ensure_dependencies is None:
+            return options
+        names = ["rg"]
+        if backend == "rga":
+            names.append("rga")
+            adapters = options.get("adapters")
+            adapter_values = [adapters] if isinstance(adapters, str) else adapters or []
+            if adapters is None or any(
+                str(value).lower() == "pandoc" for value in adapter_values
+            ):
+                names.append("pandoc")
+        elif backend == "ast":
+            names = ["ast-grep"]
+        result = self._ensure_dependencies(*names, automatic=True)
+        if inspect.isawaitable(result):
+            result = await result
+        items = result.get("items", ()) if isinstance(result, dict) else ()
+        paths = {
+            item.get("name"): str(item["path"])
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("path"), str)
+            and item["path"]
+        }
+        if backend == "ast":
+            executable = paths.get("ast-grep") or shutil.which("ast-grep") or shutil.which("sg")
+            if executable:
+                paths["ast-grep"] = executable
+        else:
+            for name in names:
+                if name not in paths:
+                    executable = shutil.which(name)
+                    if executable:
+                        paths[name] = executable
+        private_path = None
+        if backend == "rga":
+            directories = list(dict.fromkeys(str(Path(path).parent) for path in paths.values()))
+            inherited = os.environ.get("PATH", "")
+            private_path = os.pathsep.join([*directories, inherited])
+        return {
+            **options,
+            "_executables": paths,
+            "_env": {"PATH": private_path} if private_path else None,
+        }
 
     async def _inspect_backends(self):
         from .search_backends import inspect_backends
@@ -314,27 +369,31 @@ class Search:
                 acquired = True
                 prepare = asyncio.create_task(asyncio.to_thread(self._prepare, backend, options))
                 try:
-                    command, temporary_cache = await asyncio.shield(prepare)
+                    command, temporary_cache, env = await asyncio.shield(prepare)
                 except asyncio.CancelledError:
-                    command, temporary_cache = await _uncancelled(prepare, propagate=False)
+                    command, temporary_cache, env = await _uncancelled(prepare, propagate=False)
                     raise
             remaining = max(0.001, deadline - time.monotonic())
             if hasattr(self.shell, "stream"):
-                run = await self.shell.stream(
-                    command,
-                    cwd=self.workspace,
-                    timeout=remaining,
-                    max_bytes=scan_bytes,
-                    on_stdout=lambda chunk: self._consume(collector, chunk),
-                )
+                kwargs = {
+                    "cwd": self.workspace,
+                    "timeout": remaining,
+                    "max_bytes": scan_bytes,
+                    "on_stdout": lambda chunk: self._consume(collector, chunk),
+                }
+                if env is not None and "env" in inspect.signature(self.shell.stream).parameters:
+                    kwargs["env"] = env
+                run = await self.shell.stream(command, **kwargs)
             else:
-                run = await self.shell.run(
-                    command,
-                    cwd=self.workspace,
-                    check=False,
-                    timeout=remaining,
-                    max_bytes=scan_bytes,
-                )
+                kwargs = {
+                    "cwd": self.workspace,
+                    "check": False,
+                    "timeout": remaining,
+                    "max_bytes": scan_bytes,
+                }
+                if env is not None and "env" in inspect.signature(self.shell.run).parameters:
+                    kwargs["env"] = env
+                run = await self.shell.run(command, **kwargs)
                 await self._consume(collector, str(run.get("stdout", "")))
         except TimeoutError:
             run = {**run, "timed_out": True, "stop_reason": "timeout"}
@@ -426,7 +485,7 @@ class Search:
             temporary = tempfile.mkdtemp(prefix=".rga-", dir=self.snapshots.root)
             options = {**options, "_cache_path": temporary}
         try:
-            return self._build(backend, options), temporary
+            return self._build(backend, options), temporary, options.get("_env")
         except BaseException:
             if temporary:
                 shutil.rmtree(temporary, ignore_errors=True)
@@ -436,22 +495,28 @@ class Search:
         if backend != "rg":
             from .search_backends import build
 
-            if backend == "rga" and shutil.which("rga") is None:
+            executables = options.get("_executables", {})
+            if backend == "rga" and not (executables.get("rga") or shutil.which("rga")):
                 raise RuntimeError(
                     "ripgrep-all (rga) is required for ws.fs.search_docs; install ripgrep-all"
                 )
             if backend == "ast":
-                executable = shutil.which("ast-grep") or shutil.which("sg")
+                executable = (
+                    executables.get("ast-grep")
+                    or shutil.which("ast-grep")
+                    or shutil.which("sg")
+                )
                 if executable is None:
                     raise RuntimeError(
                         "ast-grep is required for ws.fs.search_ast; install ast-grep"
                     )
                 options = {**options, "executable": executable}
             return build(self.workspace, backend, options)
-        if shutil.which("rg") is None:
+        executable = options.get("_executables", {}).get("rg") or shutil.which("rg")
+        if executable is None:
             raise RuntimeError("ripgrep (rg) is required for ws.fs.search; install ripgrep")
         pattern, mode = options["pattern"], options["mode"]
-        command = ["rg", "--no-config", "--threads", "2"]
+        command = [executable, "--no-config", "--threads", "2"]
         if pattern is None:
             command += ["--files", "--null"]
         else:

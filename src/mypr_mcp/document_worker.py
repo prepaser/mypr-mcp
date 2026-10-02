@@ -351,7 +351,7 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
         number: int, image_data: bytes, width: int, height: int, effective_dpi: int
     ) -> None:
         nonlocal resume
-        tsv = _tesseract(executable, image_data, language)
+        tsv = _tesseract(executable, image_data, language, request.get("tessdata_dir"))
         if len(tsv) > _MAX_RESUME_TSV:
             raise _Failure("ValueError", "Tesseract output exceeds the 8 MiB page limit")
         page_info.append({"page": number, "width": width, "height": height, "dpi": effective_dpi})
@@ -450,12 +450,18 @@ def _ocr(request: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _tesseract(executable: str, image_data: bytes, language: str) -> bytes:
+def _tesseract(
+    executable: str, image_data: bytes, language: str, tessdata_dir: str | None = None
+) -> bytes:
     with tempfile.TemporaryDirectory(prefix="mypr-ocr-") as directory:
         output = os.path.join(directory, "result")
         try:
+            command = [executable, "stdin", output, "-l", language]
+            if tessdata_dir:
+                command.extend(["--tessdata-dir", tessdata_dir])
+            command.append("tsv")
             completed = subprocess.run(
-                [executable, "stdin", output, "-l", language, "tsv"],
+                command,
                 input=image_data,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

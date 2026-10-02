@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, ConfigStore
+from .dependency_store import DependencyStore
 from .startup import read_startup_failure
 
 _PYTHON_PACKAGES = {
@@ -269,15 +270,18 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         "lsp": {},
         "mcp": {},
         "mail": {},
+        "dependencies": {},
         "warnings": [],
     }
     startup_failure = await asyncio.to_thread(read_startup_failure, root)
     if startup_failure is not None:
         result["startup_error"] = startup_failure
     config_store = ConfigStore(path)
+    dependency_config = {"auto_install": True}
     result["config"]["paths"]["global"] = str(config_store.global_path)
     try:
         snapshot = config_store.load()
+        dependency_config = snapshot.values.get("dependencies", dependency_config)
         result["mail"] = _mail_readiness(snapshot.values.get("mail", {}))
         result["config"].update(
             valid=True,
@@ -300,6 +304,27 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     for name in _BINARIES:
         found = shutil.which(name)
         result["binaries"][name] = {"available": found is not None, "path": found}
+    store = DependencyStore()
+    try:
+        states = await asyncio.gather(*(store.inspect(name) for name in store.names("binary")),
+                                     return_exceptions=True)
+        items = []
+        for name, state in zip(store.names("binary"), states, strict=True):
+            if isinstance(state, BaseException):
+                items.append({"name": name, "status": "unusable", "reason": str(state)[:512]})
+                continue
+            items.append(state)
+            result["binaries"][name] = {
+                "available": state.get("status") == "installed", "path": state.get("path"),
+                "source": state.get("source"), "version": state.get("version"),
+                "reason": state.get("reason"),
+            }
+        result["dependencies"] = {
+            **dependency_config, "data_root": str(store.data_root),
+            "cache_root": str(store.cache_root), "items": items,
+        }
+    finally:
+        await store.close()
     result["search"] = {
         name: result["binaries"][name] for name in _SEARCH_BINARIES
     }
@@ -325,6 +350,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result["mcp"] = await _service_status(ws, "mcp", "list_servers")
     if ws is not None:
         result["mail"]["service"] = await _service_status(ws, "mail", "status")
+        result["dependencies"]["service"] = await _service_status(ws, "dependencies", "list")
     result["ready"] = bool(
         result["config"]["valid"]
         and result["python"].get("available")

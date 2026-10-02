@@ -4,14 +4,13 @@
 
 `await ws.http.download(url, path, overwrite=False)` streams a successful response into a temporary file and atomically publishes the target, returning its `Path`. Errors before publication leave the target unchanged. If publication succeeds but temporary-file cleanup fails, the target is returned and `ws.http.last_warnings` contains a `download_cleanup_failed` warning. Warnings belong to the current logical client and describe its most recently completed download; concurrent downloads keep separate warning lists. At most four warnings per client and 32 client records are retained.
 
-Install the optional extraction packages into the workspace Python environment before using HTML extraction:
+HTML extraction prepares its registered workspace packages automatically when `dependencies.auto_install` is enabled. Prepare them explicitly with:
 
 ```python
-ws.local["html_install"] = await ws.packages.add("trafilatura", "cssselect")
-await ws.local["html_install"]
+await ws.dependencies.ensure("trafilatura", "cssselect")
 ```
 
-The MCP server's environment is separate from the workspace kernel. Installing packages with `uvx` does not make them available to `ws.http`. HTML extraction reports an install hint when these packages are missing and never installs them automatically.
+The MCP server's environment is separate from the workspace kernel. Installing packages with `uvx` does not make them available to `ws.http`. When automatic installation is disabled, HTML extraction reports the missing registered package and the explicit `ws.dependencies.ensure(...)` action. The `cssselect` package is needed only when `selector` is supplied.
 
 `await ws.http.extract_html(html, url=None, selector=None, max_bytes=32768, cursor=None, include_structure=False)` extracts the page title, main text, and links from an HTML string without making a network request. `selector` is an optional CSS selector; when supplied, text and links are extracted from matching elements while the document title and metadata still come from the full page. Set `include_structure=True` to add bounded headings and canonical, description, and language metadata. Relative links resolve against the page URL and the document's first valid `<base href>`. The HTML is parsed as static input; scripts are not run. If Trafilatura finds no article text, extraction falls back to cleaned visible text and adds a warning; non-content elements such as navigation, headers, footers, and scripts are removed first.
 

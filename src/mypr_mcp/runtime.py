@@ -26,7 +26,8 @@ from .bootstrap import ensure_runtime
 from .browser_service import BrowserService
 from .config import ConfigStore
 from .config_runtime import RuntimeConfig
-from .diagnostics import error_info, error_response, safe_error
+from .dependency_service import DependencyService
+from .diagnostics import RPCError, error_info, error_response, safe_error
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
@@ -85,6 +86,7 @@ TIMING_OPS = {
     "mcp",
     "mail",
     "packages_add",
+    "dependencies",
     "task_event",
     "task_terminal",
     "restart",
@@ -197,6 +199,7 @@ class Runtime:
         self.messages = None
         self.timers = None
         self.mail = None
+        self.dependencies = None
         self.persistence = None
         self._admission_lock = asyncio.Lock()
         self._initialize_lock = asyncio.Lock()
@@ -486,6 +489,15 @@ class Runtime:
             await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
         await ensure_runtime(py, self.command)
         self.py = py
+        self.dependencies = DependencyService(
+            self.workspace, self.py, self.config.get("dependencies", {}),
+            self._install_dependency_packages, self._install_dependency_browser,
+            self._record_dependency,
+        )
+        bin_root = str(self.dependencies.store.bin_root)
+        search_path = os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if bin_root not in search_path:
+            os.environ["PATH"] = os.pathsep.join([*search_path, bin_root])
         self.scans = ScanService(self.workspace, self.shells, self.track_shell)
         await self.io(_recover_runs, self.root, self.history, critical=True)
 
@@ -1508,11 +1520,22 @@ class Runtime:
             def track_install(ident, **fields):
                 self.track_shell(ident, client, connection_id, req.get("exec_id"), **fields)
 
-            result = await browser_service.ensure(
-                req.get("browser", "chromium"),
-                launch_options=req.get("launch_options"),
-                track=track_install,
-            )
+            dependency_service = getattr(self, "dependencies", None)
+            if dependency_service and not dependency_service.config["auto_install"]:
+                options = req.get("launch_options") or {}
+                if isinstance(options, dict) and not any(
+                    options.get(key) for key in ("executable_path", "executablePath", "channel")
+                ):
+                    await dependency_service.ensure(
+                        [f"browser:{req.get('browser', 'chromium')}"], automatic=True,
+                        context={"client_id": client, "connection_id": connection_id,
+                                 "exec_id": req.get("exec_id"),
+                                 "generation": admission_generation},
+                    )
+            options = {"launch_options": req.get("launch_options"), "track": track_install}
+            if dependency_service is not None:
+                options["install"] = dependency_service.config["auto_install"]
+            result = await browser_service.ensure(req.get("browser", "chromium"), **options)
             async with self._admission_lock:
                 if (
                     admission_generation != self.generation
@@ -1536,6 +1559,7 @@ class Runtime:
         for handler in (
             self._dispatch_execution, self._dispatch_messages, self._dispatch_timers,
             self._dispatch_mail, self._dispatch_storage,
+            self._dispatch_dependencies,
             self._dispatch_tasks, self._dispatch_scan, self._dispatch_tools,
             self._dispatch_shell, self._dispatch_mcp, self._dispatch_lifecycle,
         ):
@@ -1605,6 +1629,9 @@ class Runtime:
                     ),
                     "storage_maintenance": dict(self.storage_maintenance),
                     "mail": self.mail.status() if self.mail is not None else None,
+                    "dependencies": (
+                        self.dependencies.status() if getattr(self, "dependencies", None) else None
+                    ),
                     "active_count": len(self.active),
                     "queued_count": sum(
                         record["state"] == "queued" for record in self.execs.values()
@@ -1655,6 +1682,9 @@ class Runtime:
                 ),
                 "storage_maintenance": dict(self.storage_maintenance),
                 "mail": self.mail.status() if self.mail is not None else None,
+                "dependencies": (
+                    self.dependencies.status() if getattr(self, "dependencies", None) else None
+                ),
                 "active": list(self.active),
                 "queued": [r["id"] for r in self.execs.values() if r["state"] == "queued"],
             }
@@ -1970,6 +2000,110 @@ class Runtime:
             return page
         return _UNHANDLED
 
+    async def _dispatch_dependencies(
+        self, op, req, *, client, connection_id, connection, requested_client, generation,
+    ):
+        if op != "dependencies":
+            return _UNHANDLED
+        service = self.dependencies
+        if service is None:
+            raise RuntimeError("Workspace dependencies are unavailable")
+        method = req.get("method")
+        params = req.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError("dependency parameters must be an object")
+        if method == "list":
+            return await service.list(**params)
+        if method != "ensure":
+            raise ValueError("Unknown dependency operation")
+        if not (connection and connection.get("client_id")) and not requested_client:
+            raise RuntimeError("Dependency installation requires an initialized client")
+        async with self._admission_lock:
+            self._check_dispatch_admission("shell_start")
+            if self.resetting or not self.healthy or not self.workspace_available():
+                raise RuntimeError("Workspace is not accepting dependency installation")
+            task = asyncio.create_task(service.ensure(
+                params.get("names"), automatic=params.get("automatic", False),
+                context={"client_id": client, "connection_id": connection_id,
+                         "exec_id": req.get("exec_id"), "generation": self.generation},
+            ))
+            await asyncio.sleep(0)
+        return await task
+
+    async def _record_dependency(self, state, fields):
+        if self.history is not None:
+            await self.io(self.history.append, "dependency", state, fields, critical=True)
+
+    async def _install_dependency_packages(self, names, context):
+        async with self._admission_lock:
+            self._check_dispatch_admission("packages_add")
+            if context.get("generation") and context["generation"] != self.generation:
+                raise RuntimeError("Expired kernel generation")
+            job = await self._start_package_job(names, context, automatic=True)
+        try:
+            async with asyncio.timeout(300):
+                result = await self.shells.wait(job["id"])
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.shells.cancel(job["id"])
+            raise
+        if result.get("state") != "succeeded":
+            raise RPCError(
+                "Package installation failed; inspect the package job output for the conflict.",
+                code="dependency_install_failed", details={"job_id": job["id"], "names": names},
+            )
+        return result
+
+    async def _start_package_job(self, specs, context, *, automatic=False):
+        from .package_worker import _validate_specs
+
+        specs = _validate_specs(specs)
+        command = [
+            sys.executable, "-I", str(Path(__file__).with_name("package_worker.py")),
+            "--python", str(self.py), "--root", str(self.root),
+            "--spec-json", json.dumps(specs),
+        ]
+        if automatic:
+            command.append("--automatic")
+        launch = asyncio.create_task(self.shells.start(
+            command, str(self.workspace), dict(os.environ), kind="package",
+        ))
+        cancelled = False
+        try:
+            job = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            job = await await_completion(launch)
+            cancelled = True
+        self.track_shell(
+            job["id"], context.get("client_id"), context.get("connection_id"),
+            context.get("exec_id"), kind="package", specs=specs, automatic=automatic,
+        )
+        if cancelled:
+            await self.shells.cancel(job["id"])
+            raise asyncio.CancelledError
+        return job
+
+    async def _install_dependency_browser(self, name, context):
+        async with self._admission_lock:
+            self._check_dispatch_admission("browser_server")
+            if self.resetting or not self.healthy:
+                raise RuntimeError("Workspace is not accepting browser installation")
+            if context.get("generation") and context["generation"] != self.generation:
+                raise RuntimeError("Expired kernel generation")
+            async with self._resource_lock:
+                if self.browser is None:
+                    self.browser = BrowserService(
+                        self.workspace, self.py, kernel_pid=self.km.provisioner.pid,
+                        generation=self.generation, shells=self.shells,
+                    )
+                browser = self.browser
+
+        def track(ident, **fields):
+            self.track_shell(ident, context.get("client_id"), context.get("connection_id"),
+                             context.get("exec_id"), **fields)
+
+        return await browser.prepare(name, track=track)
+
     async def _dispatch_tasks(
         self, op, req, *, client, connection_id, connection,
         requested_client, generation,
@@ -2078,7 +2212,18 @@ class Runtime:
             if not isinstance(args, dict):
                 raise TypeError("args must be an object")
             if op == "search":
-                return await Search(self.workspace, runner).search(**args)
+                callback = None
+                if getattr(self, "dependencies", None) is not None:
+                    async def callback(*names, automatic=True):
+                        return await self.dependencies.ensure(
+                            names, automatic=automatic,
+                            context={"client_id": client, "connection_id": connection_id,
+                                     "exec_id": req.get("exec_id"),
+                                     "generation": self.generation},
+                        )
+                return await Search(
+                    self.workspace, runner, ensure_dependencies=callback,
+                ).search(**args)
             method = req.get("method")
             if method not in {"status", "diff", "show", "log", "blame", "commit_info"}:
                 raise ValueError("Unknown Git method")
@@ -2142,24 +2287,10 @@ class Runtime:
         if op == "shell_cancel":
             return await self.shells.cancel(req["id"])
         if op == "packages_add":
-            from .package_worker import _validate_specs
-
-            specs = _validate_specs(req["specs"])
-            command = [
-                sys.executable, "-I", str(Path(__file__).with_name("package_worker.py")),
-                "--python", str(self.py), "--root", str(self.root),
-                "--spec-json", json.dumps(specs),
-            ]
-            job = await self.shells.start(
-                command,
-                str(self.workspace),
-                dict(os.environ),
-                kind="package",
-            )
-            self.track_shell(
-                job["id"], client, connection_id, req.get("exec_id"), kind="package", specs=specs
-            )
-            return job
+            return await self._start_package_job(req["specs"], {
+                "client_id": client, "connection_id": connection_id,
+                "exec_id": req.get("exec_id"),
+            })
         return _UNHANDLED
 
     async def _dispatch_mcp(
@@ -2425,7 +2556,8 @@ class Runtime:
                 for rec in self.task_records.values()
             )
             or self.shells.active
-            or (self.mail is not None and self.mail.active_count)
+            or (getattr(self, "mail", None) is not None and self.mail.active_count)
+            or (getattr(self, "dependencies", None) is not None and self.dependencies.active_count)
         ):
             raise RuntimeError("Workspace has active work; pass force=True to restart")
 
@@ -2558,6 +2690,8 @@ class Runtime:
             await self.close_kernel()
             with contextlib.suppress(Exception):
                 await self.lose_python_tasks("Manager stopped")
+            if self.dependencies is not None:
+                await self.dependencies.close()
             await self.close_shells()
             await self.mcp.close()
             if self.mail is not None:
@@ -3033,6 +3167,10 @@ class Runtime:
                 with contextlib.suppress(Exception):
                     await self.mail.close()
                 self.mail = None
+            if self.dependencies is not None:
+                with contextlib.suppress(Exception):
+                    await self.dependencies.close()
+                self.dependencies = None
             if self.persistence is not None:
                 if self.messages is not None and self.history is not None:
                     with contextlib.suppress(Exception):

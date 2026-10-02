@@ -50,7 +50,18 @@ async def rewrite_ast(
     _validate(pattern, rule, replacement, lang, paths, glob)
     if fs._shell is None:
         raise RuntimeError("AST rewrites require the workspace shell")
-    executable = shutil.which("ast-grep") or shutil.which("sg")
+    prepared = await fs._ensure("ast-grep") if hasattr(fs, "_ensure") else {}
+    executable = next(
+        (
+            str(item["path"])
+            for item in prepared.get("items", ())
+            if isinstance(item, Mapping)
+            and item.get("name") == "ast-grep"
+            and isinstance(item.get("path"), str)
+        ),
+        None,
+    )
+    executable = executable or shutil.which("ast-grep") or shutil.which("sg")
     if executable is None:
         raise RuntimeError("ast-grep is required for ws.fs.rewrite_ast; install ast-grep")
     if Path(executable).name == "sg":

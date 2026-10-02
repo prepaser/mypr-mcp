@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .async_utils import finish_owned, wait_owned
-from .document_tools import DocumentExtractor
+from .document_tools import DocumentExtractor, _preflight_file
 
 _WORKER = Path(__file__).with_name("media_worker.py")
 _GUARD = Path(__file__).with_name("process_guard.py")
@@ -243,6 +243,8 @@ class Documents:
         if page is not None:
             _validate_positive_int("page", page)
         resolved, display = self._filesystem._path(path)
+        await asyncio.to_thread(_preflight_file, resolved, display, max_input_bytes)
+        await self._filesystem._ensure("pymupdf")
         return await _call(
             "pdf_info",
             resolved,
@@ -276,6 +278,8 @@ class Documents:
                 "cursor must be at most 2048 characters and cannot be combined with start_page"
             )
         resolved, display = self._filesystem._path(path)
+        await asyncio.to_thread(_preflight_file, resolved, display, max_input_bytes)
+        await self._filesystem._ensure("pymupdf")
         return await _call(
             "pdf_read",
             resolved,
@@ -311,6 +315,8 @@ class Documents:
         _validate_limit("max_input_bytes", max_input_bytes, _MAX_INPUT_BYTES)
         clip_value = _validate_clip(clip)
         resolved, display = self._filesystem._path(path)
+        await asyncio.to_thread(_preflight_file, resolved, display, max_input_bytes)
+        await self._filesystem._ensure("pymupdf")
         result = await _call(
             "pdf_render",
             resolved,

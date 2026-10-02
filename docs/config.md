@@ -1,6 +1,6 @@
 # Layered configuration
 
-`ws.config` controls the managed configuration for the current workspace. It exposes the global defaults and the workspace overrides without making Python code edit TOML directly. The known managed sections are `mcp`, `lsp`, `mail`, `limits`, and `storage`; unrelated TOML data remains outside this API.
+`ws.config` controls the managed configuration for the current workspace. It exposes the global defaults and the workspace overrides without making Python code edit TOML directly. The known managed sections are `mcp`, `lsp`, `mail`, `limits`, `storage`, and `dependencies`; unrelated TOML data remains outside this API.
 
 ## Create a configuration file
 
@@ -77,6 +77,18 @@ The optional top-level `version` field is the configuration format version. Its 
 | `gc_interval_seconds` | `300` | Integer ≥ `1` | Interval between automatic maintenance passes |
 
 All storage settings apply through reload. Reload updates the policy and reschedules maintenance without immediately running GC; the next maintenance pass uses the new policy. Active work, current files, and other protected data are not removed merely to meet the target. See [workspace storage](storage.md) for cleanup plans and protected data.
+
+### Dependencies
+
+| Field under `[dependencies]` | Default | Allowed value | Purpose |
+| --- | --- | --- | --- |
+| `auto_install` | `true` | Boolean | Prepare registered dependencies automatically when a built-in feature needs them |
+
+`auto_install` applies to registered binary tools, OCR models, workspace Python packages, and managed Playwright browser engines. It is merged globally and per workspace and applies after `await ws.config.reload()`. Set it to `false` to make feature calls report a missing dependency; `await ws.dependencies.ensure("name")` remains an explicit installation request and bypasses this setting. `await ws.dependencies.list()` and `ws.doctor()` only inspect state.
+
+Binary tools and OCR models are shared under `$XDG_DATA_HOME/mypr` (`~/.local/share/mypr` by default), with temporary downloads under `$XDG_CACHE_HOME/mypr` (`~/.cache/mypr` by default). Workspace Python packages are installed into `.mypr/venv`; the uv download cache is shared globally. The initial binary catalog contains `rg` 15.2.0, `ast-grep` 0.45.3, `rga` 0.10.10, and `pandoc` 3.12. OCR models come from the pinned `tessdata_fast` 4.1.0 catalog. Existing compatible Python package versions are preserved.
+
+The supported automatic Python packages are `pillow`, `pymupdf`, `trafilatura`, `cssselect` when a CSS selector is requested, `python-docx`, `python-pptx`, and `openpyxl`. `ws.packages.add()` remains the explicit API for arbitrary packages. Tesseract, FFmpeg, Poppler, Git, LSP servers, and external services remain manual dependencies. Explicit `TESSDATA_PREFIX` is never overridden; when system OCR data already provides every requested language, no model download is needed.
 
 ### Mail
 

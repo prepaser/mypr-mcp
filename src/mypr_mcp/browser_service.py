@@ -185,6 +185,24 @@ class BrowserService:
             result["launch_options"] = launch_options
             return result
 
+    async def prepare(self, browser: str, *, track=None) -> dict[str, Any]:
+        """Install a missing engine without launching a browser server."""
+        if browser not in _ENGINES:
+            raise ValueError("browser must be chromium, firefox, or webkit")
+        if self._closing:
+            raise RuntimeError("browser service is closed")
+        operation = asyncio.create_task(self._ensure_installed(browser, track=track))
+        self._operation_tasks.add(operation)
+        try:
+            await asyncio.shield(operation)
+            return {"browser": browser, "installed": True}
+        except asyncio.CancelledError:
+            operation.cancel()
+            await wait_owned(self._drain_task(operation), propagate=False)
+            raise
+        finally:
+            self._operation_tasks.discard(operation)
+
     async def close(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(

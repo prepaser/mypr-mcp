@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -316,7 +317,49 @@ class DocumentExtractor:
 
     async def backends(self) -> dict[str, Any]:
         """Report optional Python packages, Tesseract, and installed language data."""
-        return await _run_worker("backends", None, None, {}, limit_seconds=8)
+        result = await _run_worker("backends", None, None, {}, limit_seconds=8)
+        result["managed_models"] = await asyncio.to_thread(_managed_model_report)
+        return result
+
+    async def _ensure(self, *names: str) -> dict[str, Any]:
+        ensure = getattr(self._filesystem, "_ensure", None)
+        if ensure is None:
+            return {}
+        return await ensure(*names)
+
+    async def _ocr_dependencies(self, display: str, language: str) -> dict[str, Any]:
+        executable = shutil.which("tesseract")
+        if executable is None:
+            raise RuntimeError(
+                "Tesseract is required for OCR; install the system Tesseract package"
+            )
+        languages = await _tesseract_languages(executable)
+        requested = _ocr_languages(language)
+        missing = [value for value in requested if value not in languages]
+        explicit_prefix = "TESSDATA_PREFIX" in os.environ
+        if missing and explicit_prefix:
+            raise RuntimeError(
+                "Tesseract is missing language data for "
+                + ", ".join(missing)
+                + "; explicit TESSDATA_PREFIX is set"
+            )
+        if missing and getattr(self._filesystem, "_ensure_dependencies", None) is not None:
+            version = await _tesseract_version(executable)
+            if version is None or version < (4, 0, 0):
+                raise RuntimeError("managed OCR language data requires Tesseract 4 or newer")
+        suffix = Path(display).suffix.lower()
+        package = "pymupdf" if suffix == ".pdf" else "pillow"
+        names = [package]
+        if missing and getattr(self._filesystem, "_ensure_dependencies", None) is not None:
+            names.extend(f"tessdata:{value}" for value in requested)
+        prepared = await self._ensure(*names)
+        if not missing:
+            return prepared
+        model_dir = _model_dir(prepared)
+        if model_dir is None:
+            return prepared
+        prepared["model_dir"] = model_dir
+        return prepared
 
     async def ocr(
         self,
@@ -349,7 +392,10 @@ class DocumentExtractor:
         ):
             raise ValueError("language must be a short Tesseract language code")
         resolved, display = self._filesystem._path(path)
-        if Path(display).suffix.lower() in {".png", ".jpg", ".jpeg"} and start_page != 1:
+        suffix = Path(display).suffix.lower()
+        if suffix not in {".pdf", ".png", ".jpg", ".jpeg"}:
+            raise ValueError("OCR supports PDF, PNG, and JPEG files")
+        if suffix in {".png", ".jpg", ".jpeg"} and start_page != 1:
             raise ValueError("start_page must be 1 for image files")
         if resume_cursor is not None:
             snapshot, offset, tsv_offset, raw = await _thread_settle(
@@ -363,6 +409,8 @@ class DocumentExtractor:
                 self._store.decode, cursor, kind="ocr", path=display
             )
             return await asyncio.to_thread(_page, self._store, snapshot, offset, max_bytes)
+        await asyncio.to_thread(_preflight_file, resolved, display, max_input_bytes)
+        prepared = await self._ocr_dependencies(display, language)
         result = await _run_worker(
             "ocr",
             resolved,
@@ -373,6 +421,7 @@ class DocumentExtractor:
                 "max_pages": max_pages,
                 "dpi": dpi,
                 "max_input_bytes": max_input_bytes,
+                **({"tessdata_dir": prepared["model_dir"]} if prepared.get("model_dir") else {}),
             },
         )
         snapshot = {
@@ -464,6 +513,7 @@ class DocumentExtractor:
         )
         if current_revision != snapshot.get("source", {}).get("revision"):
             raise ValueError("source changed before the next OCR page was processed")
+        prepared = await self._ocr_dependencies(display, options.get("language", "eng"))
         result = await _run_worker(
             "ocr",
             resolved,
@@ -474,6 +524,7 @@ class DocumentExtractor:
                 "max_pages": remaining_pages,
                 "dpi": int(options.get("dpi", 200)),
                 "max_input_bytes": int(options.get("max_input_bytes", _MAX_INPUT_BYTES)),
+                **({"tessdata_dir": prepared["model_dir"]} if prepared.get("model_dir") else {}),
             },
         )
         next_snapshot = {"kind": "ocr", "options": options, **result}
@@ -512,6 +563,16 @@ class DocumentExtractor:
             if snapshot.get("options", {}).get("cached_values") != cached_values:
                 raise ValueError("cursor belongs to a different document query")
             return await asyncio.to_thread(_page, self._store, snapshot, offset, max_bytes)
+        suffix = Path(display).suffix.lower()
+        dependency = {
+            ".docx": "python-docx",
+            ".pptx": "python-pptx",
+            ".xlsx": "openpyxl",
+        }.get(suffix)
+        if dependency is None:
+            raise ValueError("document extraction supports DOCX, PPTX, and XLSX files")
+        await asyncio.to_thread(_preflight_file, resolved, display, max_input_bytes)
+        await self._ensure(dependency)
         result = await _run_worker(
             "extract",
             resolved,
@@ -600,6 +661,13 @@ def _file_revision(path: Path, limit: int) -> str:
                 raise ValueError("File exceeds max_input_bytes")
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _preflight_file(path: Path, display: str, limit: int) -> None:
+    with open_regular(path) as stream:
+        info = os.fstat(stream.fileno())
+        if info.st_size > limit:
+            raise ValueError(f"file exceeds max_input_bytes: {display}")
 
 
 def _decode_resume_tsv(encoded: str, *, compressed: bool = False) -> bytes:
@@ -717,6 +785,88 @@ def _validate_page_bytes(value: int) -> None:
     _validate_range("max_bytes", value, _MAX_PAGE_BYTES)
     if value < 16_384:
         raise ValueError("max_bytes must be at least 16384")
+
+
+def _ocr_languages(language: str) -> list[str]:
+    return list(dict.fromkeys(language.split("+")))
+
+
+async def _bounded_process_output(
+    command: list[str], *, limit: int, timeout: float  # noqa: ASYNC109
+) -> tuple[int, bytes]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not run Tesseract: {exc}") from None
+    try:
+        output = await asyncio.wait_for(process.stdout.read(limit + 1), timeout)
+        if len(output) > limit:
+            raise RuntimeError("Tesseract readiness output exceeded its size limit")
+        returncode = await asyncio.wait_for(process.wait(), timeout)
+        return returncode, output
+    except (TimeoutError, asyncio.IncompleteReadError):
+        raise RuntimeError("Tesseract readiness check timed out") from None
+    finally:
+        if process.returncode is None:
+            process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                await process.wait()
+
+
+async def _tesseract_languages(executable: str) -> set[str]:
+    returncode, output = await _bounded_process_output(
+        [executable, "--list-langs"], limit=64 * 1024, timeout=3
+    )
+    if returncode:
+        raise RuntimeError("Tesseract could not list installed language data")
+    lines = output.decode("utf-8", "replace").splitlines()
+    return {line.strip() for line in lines[1:] if line.strip()}
+
+
+async def _tesseract_version(executable: str) -> tuple[int, int, int] | None:
+    returncode, output = await _bounded_process_output(
+        [executable, "--version"], limit=4096, timeout=2
+    )
+    if returncode:
+        return None
+    match = re.search(rb"tesseract\s+(\d+)\.(\d+)(?:\.(\d+))?", output, re.IGNORECASE)
+    if match is None:
+        return None
+    return tuple(int(value or 0) for value in match.groups())  # type: ignore[return-value]
+
+
+def _model_dir(result: dict[str, Any]) -> str | None:
+    for item in result.get("items", []):
+        if isinstance(item, dict) and item.get("model_dir"):
+            return str(item["model_dir"])
+    return None
+
+
+def _managed_model_report() -> dict[str, Any]:
+    from .dependency_catalog import CATALOG, MODEL_NAMES
+    from .dependency_store import DependencyStore
+
+    store = DependencyStore()
+    model_dirs: set[str] = set()
+    languages: list[str] = []
+    for name in MODEL_NAMES:
+        artifact = CATALOG[name]
+        model_dir = store._model_dir(artifact)
+        model_dirs.add(str(model_dir))
+        path = model_dir / f"{name.removeprefix('tessdata:')}.traineddata"
+        if path.is_file() and not path.is_symlink():
+            languages.append(name.removeprefix("tessdata:"))
+    return {
+        "source": "shared",
+        "model_dirs": sorted(model_dirs),
+        "languages": languages,
+        "installed_count": len(languages),
+    }
 
 
 async def _run_worker(

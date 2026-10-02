@@ -19,7 +19,7 @@ from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
 MAX_RESPONSE_BYTES = 1024 * 1024
-MANAGED_SECTIONS = frozenset({"limits", "storage", "mcp", "lsp", "mail"})
+MANAGED_SECTIONS = frozenset({"limits", "storage", "mcp", "lsp", "mail", "dependencies"})
 _SERVER_SECTIONS = frozenset({"mcp", "lsp"})
 _NAMED_SECTIONS = frozenset({"mail"})
 _MAX_CONFIG_BYTES = 16 * 1024 * 1024
@@ -78,6 +78,9 @@ DEFAULT_STORAGE = {
 DEFAULT_MAIL = {
     "default_account": "",
     "accounts": {},
+}
+DEFAULT_DEPENDENCIES = {
+    "auto_install": True,
 }
 
 _MAIL_SECURITY = frozenset({"ssl", "starttls", "plain"})
@@ -230,6 +233,22 @@ def _validate_storage(value):
             result[key] = item
         elif key in DEFAULT_STORAGE:
             result[key] = _positive(item, f"storage.{key}")
+        else:
+            result[key] = copy.deepcopy(item)
+    return result
+
+
+def _validate_dependencies(value):
+    if value is None:
+        return dict(DEFAULT_DEPENDENCIES)
+    if not isinstance(value, dict):
+        raise _field_error("dependencies", "must be a table")
+    result = dict(DEFAULT_DEPENDENCIES)
+    for key, item in value.items():
+        if key == "auto_install":
+            if type(item) is not bool:
+                raise _field_error("dependencies.auto_install", "must be a boolean")
+            result[key] = item
         else:
             result[key] = copy.deepcopy(item)
     return result
@@ -424,6 +443,7 @@ def validate_config(values):
     result["version"] = version
     result["limits"] = _validate_limits(result.get("limits"))
     result["storage"] = _validate_storage(result.get("storage"))
+    result["dependencies"] = _validate_dependencies(result.get("dependencies"))
     result["lsp"] = _validate_lsp(result.get("lsp"))
     result["mail"] = validate_mail_config(result.get("mail"))
     mcp = result.get("mcp")
@@ -492,6 +512,12 @@ def _validate_layer(values: Any, path: Path) -> dict:
                     raise _field_error("storage.enabled", "must be a boolean")
             elif key in DEFAULT_STORAGE:
                 _positive(value, f"storage.{key}")
+    dependencies = result.get("dependencies")
+    if dependencies is not None:
+        if not isinstance(dependencies, Mapping):
+            raise _field_error("dependencies", "must be a table")
+        if "auto_install" in dependencies and type(dependencies["auto_install"]) is not bool:
+            raise _field_error("dependencies.auto_install", "must be a boolean")
     for section in _SERVER_SECTIONS:
         table = result.get(section)
         if table is None:
@@ -678,7 +704,7 @@ def _lookup(values: Any, parts: tuple[str, ...]) -> tuple[bool, Any]:
 
 def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for section in ("limits", "storage", "mcp", "lsp", "mail"):
+    for section in ("limits", "storage", "dependencies", "mcp", "lsp", "mail"):
         value = values.get(section)
         if not isinstance(value, Mapping):
             continue
@@ -689,6 +715,12 @@ def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
         elif section == "storage":
             result[section] = {
                 key: copy.deepcopy(value[key]) for key in DEFAULT_STORAGE if key in value
+            }
+        elif section == "dependencies":
+            result[section] = {
+                key: copy.deepcopy(value[key])
+                for key in DEFAULT_DEPENDENCIES
+                if key in value
             }
         elif section in _SERVER_SECTIONS:
             result[section] = {"servers": copy.deepcopy(value.get("servers", {}))}
@@ -704,8 +736,12 @@ def _validate_public_path(parts: tuple[str, ...]) -> None:
     section = parts[0]
     if len(parts) == 1 and section in MANAGED_SECTIONS:
         return
-    if section in {"limits", "storage"}:
-        allowed = DEFAULT_LIMITS if section == "limits" else DEFAULT_STORAGE
+    if section in {"limits", "storage", "dependencies"}:
+        allowed = {
+            "limits": DEFAULT_LIMITS,
+            "storage": DEFAULT_STORAGE,
+            "dependencies": DEFAULT_DEPENDENCIES,
+        }[section]
         if len(parts) > 2 or (len(parts) == 2 and parts[1] not in allowed):
             raise ConfigError("unknown managed configuration field", path=".".join(parts))
         return

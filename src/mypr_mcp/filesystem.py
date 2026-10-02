@@ -8,6 +8,7 @@ import codecs
 import difflib
 import hashlib
 import heapq
+import inspect
 import os
 import stat
 import tempfile
@@ -44,11 +45,24 @@ class Filesystem:
     """
 
     def __init__(
-        self, workspace: str | os.PathLike[str], shell: Any = None, searcher: Any = None
+        self,
+        workspace: str | os.PathLike[str],
+        shell: Any = None,
+        searcher: Any = None,
+        ensure_dependencies: Callable[..., Any] | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self._shell = shell
         self._searcher = searcher
+        self._ensure_dependencies = ensure_dependencies
+
+    async def _ensure(self, *names: str) -> dict[str, Any]:
+        if not names or self._ensure_dependencies is None:
+            return {}
+        result = self._ensure_dependencies(*names, automatic=True)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if isinstance(result, dict) else {}
 
     def _path(self, path: str | os.PathLike[str]) -> tuple[Path, str]:
         supplied = Path(path).expanduser()
@@ -908,7 +922,9 @@ class Filesystem:
         ):
             raise ValueError("max_input_bytes must be between 1 and 67108864")
         resolved, display = self._path(path)
+        await _to_thread_uncancelled(_preflight_input, resolved, display, max_input_bytes)
         if resize is not None or crop is not None:
+            await self._ensure("pillow")
             from .media_tools import display_image, transform_image
 
             data, metadata = await transform_image(
@@ -941,7 +957,15 @@ class Filesystem:
         """
         from .media_tools import inspect_image
 
+        if (
+            not isinstance(max_input_bytes, int)
+            or isinstance(max_input_bytes, bool)
+            or not 1 <= max_input_bytes <= 64 * 1024 * 1024
+        ):
+            raise ValueError("max_input_bytes must be between 1 and 67108864")
         resolved, display = self._path(path)
+        await _to_thread_uncancelled(_preflight_input, resolved, display, max_input_bytes)
+        await self._ensure("pillow")
         return await inspect_image(resolved, display, max_input_bytes=max_input_bytes)
 
     async def patch(
@@ -1183,7 +1207,11 @@ class Filesystem:
             raise RuntimeError("workspace search requires the workspace shell")
         from .search import Search
 
-        return await Search(self.workspace, self._shell).search(**args)
+        return await Search(
+            self.workspace,
+            self._shell,
+            ensure_dependencies=self._ensure_dependencies,
+        ).search(**args)
 
     async def tree(
         self,
@@ -1399,6 +1427,16 @@ def _require_regular(info: os.stat_result, display: str) -> None:
         raise IsADirectoryError(display)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"Path must be a regular file: {display}")
+
+
+def _preflight_input(path: Path, display: str, max_bytes: int) -> None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        raise FileNotFoundError(display) from None
+    _require_regular(info, display)
+    if info.st_size > max_bytes:
+        raise ValueError(f"file exceeds max_input_bytes: {display}")
 
 
 def _read_regular(

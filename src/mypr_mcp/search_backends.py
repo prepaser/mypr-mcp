@@ -76,7 +76,10 @@ def _build_rga(workspace: Path, options: Mapping[str, Any]) -> list[str]:
         raise ValueError("pattern must be a non-empty string or list of strings")
     mode = _mode(options)
     _ensure_rga_config(workspace)
-    command = ["rga", "--rga-config-file=" + str(_rga_config(workspace))]
+    command = [
+        str(options.get("_executables", {}).get("rga") or "rga"),
+        "--rga-config-file=" + str(_rga_config(workspace)),
+    ]
     cache_path = options.get("_cache_path", _rga_cache(workspace))
     if not isinstance(cache_path, (str, Path)) or not str(cache_path):
         raise ValueError("_cache_path must be a non-empty path")

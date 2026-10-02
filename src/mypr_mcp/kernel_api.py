@@ -24,6 +24,7 @@ from .async_utils import wait_owned
 from .browser_tools import BrowserTools
 from .code_tools import CodeTools
 from .config_api import ConfigAPI
+from .dependency_api import Dependencies
 from .diagnostics import RPCError, safe_error, safe_error_details
 from .file_io import read_bytes
 from .filesystem import Filesystem
@@ -653,7 +654,8 @@ class TaskHandle:
             "output": _bounded_history_output(self.output()),
             "output_delta": "",
             "output_truncated": (
-                self._buffer.truncated or self._buffer.size > HISTORY_OUTPUT_LIMIT
+                self._buffer.truncated
+                or self._buffer.size > HISTORY_OUTPUT_LIMIT
                 or output_unconfirmed
             ),
         }
@@ -719,13 +721,16 @@ class TaskHandle:
         error = asyncio.CancelledError() if reporter.cancelled() else reporter.exception()
         if error is not None and self._persist_result:
             code = (
-                "task_report_incomplete" if self._result_persisted is not None
+                "task_report_incomplete"
+                if self._result_persisted is not None
                 else "result_persistence_unknown"
             )
-            self._result_warnings.append({
-                "code": code,
-                "text": safe_error(error),
-            })
+            self._result_warnings.append(
+                {
+                    "code": code,
+                    "text": safe_error(error),
+                }
+            )
 
     async def _wait_reporter(self) -> None:
         reporter = self._reporter
@@ -742,12 +747,15 @@ class TaskHandle:
         if self._result_persisted is not True:
             detail = self._result_warnings[-1]["text"] if self._result_warnings else "not confirmed"
             code = (
-                "result_not_serializable" if self._result_persisted is False
+                "result_not_serializable"
+                if self._result_persisted is False
                 else "result_persistence_unknown"
             )
             raise ResultUnavailable(
                 f"result storage for task {self.id}: {detail}",
-                code=code, operation="tasks.wait_saved", details={"task_id": self.id},
+                code=code,
+                operation="tasks.wait_saved",
+                details={"task_id": self.id},
             )
 
     async def _wait(self) -> Any:
@@ -758,7 +766,8 @@ class TaskHandle:
         except BaseException:
             current = asyncio.current_task()
             if (
-                self._persist_result and self._task.done()
+                self._persist_result
+                and self._task.done()
                 and not (current and current.cancelling())
             ):
                 await self._wait_reporter()
@@ -967,9 +976,7 @@ class TaskManager:
         if kind in {"python", "execution"}:
             if record.get("result_persisted"):
                 try:
-                    record["saved_result"] = await _rpc(
-                        "task_result_get", id=task_id
-                    )
+                    record["saved_result"] = await _rpc("task_result_get", id=task_id)
                     record["saved_result_available"] = True
                 except RPCError as exc:
                     record["result_warning"] = safe_error(exc)
@@ -1424,9 +1431,7 @@ class Shell:
         self._tasks = tasks
 
     @staticmethod
-    def _environment(
-        env: Mapping[str, str | None] | None, inherit_env: bool
-    ) -> dict[str, str]:
+    def _environment(env: Mapping[str, str | None] | None, inherit_env: bool) -> dict[str, str]:
         if type(inherit_env) is not bool:
             raise TypeError("inherit_env must be a boolean")
         if env is not None and not isinstance(env, Mapping):
@@ -1705,8 +1710,12 @@ class Messages:
         return await _rpc("message_ack", ids=list(ids))
 
     async def clients(
-        self, *, prefix: str | None = None, connected: bool | None = None,
-        limit: int = 50, cursor: str | None = None,
+        self,
+        *,
+        prefix: str | None = None,
+        connected: bool | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """List registered clients, including disconnected message recipients."""
         self._require_client()
@@ -1823,7 +1832,13 @@ class Workspace:
         self._locals: dict[str, dict[str, Any]] = {}
         self.tasks = TaskManager()
         self.shell = Shell(self.tasks)
-        self.fs = Filesystem(self.workspace, self.shell, self._search)
+        self.dependencies = Dependencies(_rpc)
+        ensure_dependencies = (
+            self.dependencies._automatic if os.environ.get("MYPR_SOCKET") else None
+        )
+        self.fs = Filesystem(
+            self.workspace, self.shell, self._search, ensure_dependencies=ensure_dependencies
+        )
         self.docs = Documents(self.fs)
         self.mcp = MCP()
         self.config = ConfigAPI(_rpc)
@@ -1834,14 +1849,17 @@ class Workspace:
         self.git = Git(_rpc)
         self.locks = WorkspaceLocks(self._lock_identity)
         self.history = History()
-        self.http = HTTPTools(self.workspace, lambda: self.client)
+        self.http = HTTPTools(
+            self.workspace, lambda: self.client, ensure_dependencies=ensure_dependencies
+        )
         self.net = NetworkTools(self.workspace, self.tasks, _rpc)
         self.system = SystemTools(self.workspace)
         self.timers = TimerAPI(_rpc, _client_context)
         self.mail = MailAPI(_rpc, _client_context)
         self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
         self.code = CodeTools(
-            self.workspace, self.fs,
+            self.workspace,
+            self.fs,
             config_rpc=self._code_config if os.environ.get("MYPR_SOCKET") else None,
         )
         from .pages import Pages
@@ -1870,9 +1888,7 @@ class Workspace:
         self._closing = True
         self.tasks._closing = True
         handles = [
-            handle
-            for handle in self.tasks.active()
-            if getattr(handle, "_task", None) is not origin
+            handle for handle in self.tasks.active() if getattr(handle, "_task", None) is not origin
         ]
         await asyncio.gather(*(handle.cancel() for handle in handles), return_exceptions=True)
         pending = [

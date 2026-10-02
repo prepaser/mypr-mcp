@@ -18,20 +18,28 @@ from mcp.client.stdio import stdio_client
 from mypr_mcp.cli import stop_runtime
 from mypr_mcp.transport import socket_path
 
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent
+
 
 @pytest.fixture(scope="session", autouse=True)
 def test_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     runtime = tmp_path_factory.mktemp("xdg-runtime")
     config = tmp_path_factory.mktemp("xdg-config")
     state = tmp_path_factory.mktemp("xdg-state")
+    data = tmp_path_factory.mktemp("xdg-data")
+    cache = tmp_path_factory.mktemp("xdg-cache")
     config_previous = os.environ.get("XDG_CONFIG_HOME")
     state_previous = os.environ.get("XDG_STATE_HOME")
+    data_previous = os.environ.get("XDG_DATA_HOME")
+    xdg_cache_previous = os.environ.get("XDG_CACHE_HOME")
     global_previous = os.environ.pop("MYPR_GLOBAL_CONFIG", None)
     previous = os.environ.get("XDG_RUNTIME_DIR")
     cache_previous = os.environ.get("UV_CACHE_DIR")
     os.environ["XDG_RUNTIME_DIR"] = str(runtime)
     os.environ["XDG_CONFIG_HOME"] = str(config)
     os.environ["XDG_STATE_HOME"] = str(state)
+    os.environ["XDG_DATA_HOME"] = str(data)
+    os.environ["XDG_CACHE_HOME"] = str(cache)
     os.environ["UV_CACHE_DIR"] = "/tmp/mypr-uv-cache"
     Path(os.environ["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
     try:
@@ -40,6 +48,8 @@ def test_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Iterat
         for key, previous_value in (
             ("XDG_CONFIG_HOME", config_previous),
             ("XDG_STATE_HOME", state_previous),
+            ("XDG_DATA_HOME", data_previous),
+            ("XDG_CACHE_HOME", xdg_cache_previous),
             ("MYPR_GLOBAL_CONFIG", global_previous),
         ):
             if previous_value is None:
@@ -75,11 +85,19 @@ async def mcp_session(
     client_id: str | None = None,
 ) -> AsyncIterator[ClientSession]:
     args = ["-m", "mypr_mcp.cli", "serve"]
+    env = dict(os.environ)
+    pythonpath = env.get("PYTHONPATH")
+    if pythonpath:
+        env["PYTHONPATH"] = os.pathsep.join(
+            entry if os.path.isabs(entry) else str(_SOURCE_ROOT / entry)
+            for entry in pythonpath.split(os.pathsep)
+            if entry
+        )
     params = StdioServerParameters(
         command=sys.executable,
         args=args,
         cwd=str(workspace),
-        env=dict(os.environ),
+        env=env,
     )
     async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:

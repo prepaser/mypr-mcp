@@ -6,7 +6,7 @@ import asyncio
 import copy
 
 from .async_utils import wait_owned
-from .config import ConfigStore, parse_path, validate_mail_config
+from .config import ConfigStore, _validate_dependencies, parse_path, validate_mail_config
 from .diagnostics import safe_error
 
 HOT_LIMITS = ("response_bytes", "completed_records", "cache_bytes")
@@ -87,6 +87,11 @@ class RuntimeConfig:
                 configured = self.applied.get("mail")
             if isinstance(configured, dict):
                 values["mail"] = copy.deepcopy(configured)
+        dependencies = getattr(self.runtime, "dependencies", None)
+        if dependencies is not None:
+            configured = getattr(dependencies, "config", None)
+            if isinstance(configured, dict):
+                values["dependencies"] = copy.deepcopy(configured)
         value = values
         for part in parse_path(path):
             if not isinstance(value, dict) or part not in value:
@@ -198,6 +203,16 @@ class RuntimeConfig:
                     runtime._storage_wake.set()
                 result["applied"]["storage"] = changed_storage
             try:
+                dependencies_result = self._apply_dependencies(values["dependencies"])
+                if dependencies_result.get("applied") is not None:
+                    result["applied"]["dependencies"] = dependencies_result.get("applied")
+                if dependencies_result.get("deferred"):
+                    result["deferred"]["dependencies"] = dependencies_result["deferred"]
+                if dependencies_result.get("errors"):
+                    result["errors"]["dependencies"] = dependencies_result["errors"]
+            except Exception as exc:
+                result["errors"]["dependencies"] = safe_error(exc)
+            try:
                 result["applied"]["mcp"] = await bridge.apply_snapshot(snapshot, force=force)
                 self.applied["mcp"] = copy.deepcopy(values["mcp"])
             except RuntimeError as exc:
@@ -260,6 +275,31 @@ class RuntimeConfig:
         response = await apply_config(copy.deepcopy(desired), force=force)
         if not isinstance(response, dict):
             raise RuntimeError("Mail service returned an invalid configuration result")
+        return copy.deepcopy(response)
+
+    def _apply_dependencies(self, desired) -> dict:
+        """Apply dependency policy to the manager-owned service synchronously."""
+
+        desired = _validate_dependencies(desired)
+        service = getattr(self.runtime, "dependencies", None)
+        current = self.applied.get("dependencies", {})
+        if desired == current:
+            return {"applied": {}}
+        if service is None:
+            return {"deferred": "Dependency service is unavailable"}
+        apply_config = getattr(service, "apply_config", None)
+        if not callable(apply_config):
+            return {"deferred": "Dependency service cannot reload configuration"}
+        response = apply_config(copy.deepcopy(desired))
+        if response is None:
+            response = {"applied": True, "applied_config": desired}
+        if not isinstance(response, dict):
+            raise RuntimeError("Dependency service returned an invalid configuration result")
+        if response.get("applied", True) is False:
+            return copy.deepcopy(response)
+        applied_config = response.get("applied_config", desired)
+        normalized = _validate_dependencies(applied_config)
+        self.applied["dependencies"] = copy.deepcopy(normalized)
         return copy.deepcopy(response)
 
     def _record_mail_application(self, result: dict) -> None:

@@ -1,6 +1,6 @@
 # Code navigation
 
-`ws.code` connects to an installed Language Server Protocol (LSP) server for code navigation and revision-checked edit previews. It does not install servers. A configured command runs with the workspace as its working directory and has the current user's permissions.
+`ws.code` connects to an installed Language Server Protocol (LSP) server for code navigation and revision-checked edit previews. LSP servers remain manual dependencies and are not part of the registered automatic dependency catalog. A configured command runs with the workspace as its working directory and has the current user's permissions.
 
 ```python
 await ws.code.configure(
