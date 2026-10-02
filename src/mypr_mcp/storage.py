@@ -69,6 +69,7 @@ _CATEGORIES = {
     "results": "task_results",
     "artifacts": "artifacts",
     "revisions": "revisions",
+    "mail": "mail",
 }
 
 
@@ -99,6 +100,15 @@ class Storage:
     Before deleting output files, ``storage_gc_before_delete(candidates)`` may
     persist eviction metadata and return the paths whose markers were stored.
     The callback must finish its durable write before returning.
+
+    A mail adapter may provide a synchronous ``storage_gc_snapshot()`` with
+    ``protected_paths`` and a ``candidates`` iterable.  Mail candidates must
+    be relative paths below ``.mypr/mail/`` and may include ``reason``,
+    ``group`` and ``requires_tombstone`` fields.  The method runs in the
+    storage worker thread, so an adapter backed by SQLite must use a fresh
+    read-only connection or another thread-safe snapshot rather than a
+    persistence-thread connection.  A failing or malformed mail snapshot
+    protects every mail file for that pass.
     """
 
     def __init__(
@@ -106,6 +116,7 @@ class Storage:
         workspace: str | os.PathLike[str],
         *,
         history: Any = None,
+        mail: Any = None,
         active_ids: Callable[[], Iterable[str]] | None = None,
         now: Callable[[], float] | None = None,
     ) -> None:
@@ -117,6 +128,7 @@ class Storage:
             raise ValueError("workspace storage escapes the workspace") from exc
         self.lock_path = self.root / "storage.lock"
         self.history = history
+        self.mail = mail
         self.active_ids = active_ids
         self._now = now or time.time
         self._plans: dict[str, dict[str, Any]] = {}
@@ -264,6 +276,99 @@ class Storage:
             }
         return result
 
+    def _mail_snapshot(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "protected_paths": set(),
+            "candidates": {},
+            "error": None,
+            "truncated": False,
+        }
+        method = getattr(self.mail, "storage_gc_snapshot", None)
+        if not callable(method):
+            return result
+        try:
+            raw = method()
+        except Exception as exc:
+            result["error"] = f"mail snapshot failed: {type(exc).__name__}"
+            return result
+        if not isinstance(raw, Mapping):
+            result["error"] = "mail snapshot was not an object"
+            return result
+
+        protected = raw.get("protected_paths", ())
+        if isinstance(protected, (str, bytes)) or not isinstance(protected, Iterable):
+            result["error"] = "mail protected_paths was not an iterable"
+        else:
+            values = list(islice(protected, _MAX_PLAN_CANDIDATES + 1))
+            if len(values) > _MAX_PLAN_CANDIDATES:
+                result["truncated"] = True
+            result["protected_paths"] = self._mail_relative_set(
+                values[:_MAX_PLAN_CANDIDATES], result
+            )
+
+        candidates = raw.get("candidates", ())
+        if isinstance(candidates, Mapping):
+            candidates = [
+                {"path": path, **value}
+                for path, value in candidates.items()
+                if isinstance(value, Mapping)
+            ]
+        if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Iterable):
+            result["error"] = "mail candidates was not an iterable"
+            return result
+        values = list(islice(candidates, _MAX_PLAN_CANDIDATES + 1))
+        if len(values) > _MAX_PLAN_CANDIDATES:
+            result["truncated"] = True
+        for value in values[:_MAX_PLAN_CANDIDATES]:
+            if not isinstance(value, Mapping):
+                result["error"] = "mail candidate was not an object"
+                continue
+            path = value.get("path")
+            if not self._is_mail_path(path):
+                result["error"] = "mail candidate path was invalid"
+                continue
+            reason = value.get("reason", "mail_retained_data")
+            group = value.get("group", path)
+            requires_tombstone = value.get("requires_tombstone", False)
+            if not isinstance(reason, str) or not reason:
+                result["error"] = "mail candidate reason was invalid"
+                continue
+            if not isinstance(group, str) or not group:
+                result["error"] = "mail candidate group was invalid"
+                continue
+            if type(requires_tombstone) is not bool:
+                result["error"] = "mail candidate requires_tombstone was invalid"
+                continue
+            result["candidates"][path] = {
+                "reason": reason[:256],
+                "group": group[:512],
+                "requires_tombstone": requires_tombstone,
+            }
+        if result["truncated"]:
+            result["error"] = "mail snapshot was truncated"
+        return result
+
+    def _mail_relative_set(self, values: Iterable[Any], result: dict[str, Any]) -> set[str]:
+        paths: set[str] = set()
+        for value in values:
+            if not self._is_mail_path(value):
+                result["error"] = "mail protected path was invalid"
+                continue
+            paths.add(value)
+        return paths
+
+    @staticmethod
+    def _is_mail_path(value: Any) -> bool:
+        if not isinstance(value, str) or not value.startswith(".mypr/mail/"):
+            return False
+        path = Path(value)
+        return (
+            not path.is_absolute()
+            and ".." not in path.parts
+            and "\\" not in value
+            and len(path.parts) > 2
+        )
+
     @staticmethod
     def _safe_relative_set(values: Iterable[Any]) -> set[str]:
         result = set()
@@ -299,6 +404,7 @@ class Storage:
         with StorageLock(self.lock_path):
             entries, truncated = self._entries()
             history_state = self._history_snapshot()
+            history_state["mail"] = self._mail_snapshot()
             active = active_ids | set(history_state["active_ids"])
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
@@ -341,11 +447,13 @@ class Storage:
                 "candidates": selected,
                 "tombstones": tombstones,
                 "protected": protected,
+                "mail": self._public_mail_state(history_state["mail"]),
             }
 
     def _apply_sync(self, plan: dict[str, Any], acknowledged: set[str]) -> dict[str, Any]:
         deleted: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
+        mail_cleanup_error: str | None = None
         with StorageLock(self.lock_path):
             if plan.get("workspace_id") != self._workspace_identity():
                 return {
@@ -373,6 +481,7 @@ class Storage:
                 }
             entries, scan_truncated = self._entries()
             history_state = self._history_snapshot()
+            history_state["mail"] = self._mail_snapshot()
             active = self._active_ids() | set(history_state["active_ids"])
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
@@ -434,10 +543,28 @@ class Storage:
                 if current_plan["requires_tombstone"]
             ]
             marker = getattr(self.history, "storage_gc_before_delete", None)
+            mail_marker = getattr(self.mail, "storage_gc_before_delete", None)
             marker_failed = False
             if marker_candidates and callable(marker):
                 try:
-                    acknowledged.update(self._safe_relative_set(marker(marker_candidates)))
+                    history_candidates = [
+                        item for item in marker_candidates if item["category"] != "mail"
+                    ]
+                    if history_candidates:
+                        acknowledged.update(
+                            self._safe_relative_set(marker(history_candidates))
+                        )
+                except Exception:
+                    marker_failed = True
+            if marker_candidates and callable(mail_marker):
+                try:
+                    mail_candidates = [
+                        item for item in marker_candidates if item["category"] == "mail"
+                    ]
+                    if mail_candidates:
+                        acknowledged.update(
+                            self._mail_relative_set(mail_marker(mail_candidates), {})
+                        )
                 except Exception:
                     marker_failed = True
             for item, _, current_plan in prevalidated.values():
@@ -485,6 +612,13 @@ class Storage:
                     skipped.append({**item, "reason": f"delete_failed: {type(exc).__name__}"})
                 else:
                     deleted.append(item)
+        mail_after = getattr(self.mail, "storage_gc_after_delete", None)
+        deleted_mail = [item for item in deleted if item["category"] == "mail"]
+        if callable(mail_after):
+            try:
+                mail_after(deleted_mail)
+            except Exception as exc:
+                mail_cleanup_error = f"{type(exc).__name__}: {exc}"
         remaining_usage = self._usage(*self._entries())
         return {
             "plan_id": plan["plan_id"],
@@ -501,6 +635,7 @@ class Storage:
                 else plan["options"]["max_bytes"] is not None
                 and remaining_usage["total_bytes"] > plan["options"]["max_bytes"]
             ),
+            "mail_cleanup_error": mail_cleanup_error,
         }
 
     def _entries(self) -> tuple[list[_Entry], bool]:
@@ -666,6 +801,13 @@ class Storage:
             for entry in entries:
                 if entry.category in {"runs", "jobs", "scans", "artifacts", "task_results"}:
                     protected_paths.add(entry.relative)
+        mail_state = history_state.get("mail", {})
+        if isinstance(mail_state, Mapping):
+            protected_paths.update(mail_state.get("protected_paths", ()))
+            if mail_state.get("error"):
+                protected_paths.update(
+                    entry.relative for entry in entries if entry.category == "mail"
+                )
         for entry in entries:
             if entry.category in {"runs", "jobs", "scans"} and entry.relative.endswith(".json"):
                 if not entry.relative.endswith((".summary.json", ".request.json")):
@@ -683,6 +825,7 @@ class Storage:
             "active_ids": sorted(active_ids),
             "references": {key: sorted(value) for key, value in references.items()},
             "tombstones": dict(history_state.get("tombstones", {})),
+            "mail": self._public_mail_state(mail_state),
         }
 
     def _candidates(
@@ -758,6 +901,19 @@ class Storage:
                     group = min(entry.relative, partner)
                 reason = f"expired_{entry.category}"
                 requires_tombstone = False
+            elif entry.category == "mail":
+                mail_state = history_state.get("mail", {})
+                mail_candidates = (
+                    mail_state.get("candidates", {})
+                    if isinstance(mail_state, Mapping)
+                    else {}
+                )
+                details = mail_candidates.get(entry.relative)
+                if not isinstance(details, Mapping):
+                    continue
+                reason = details.get("reason", "mail_retained_data")
+                group = details.get("group", entry.relative)
+                requires_tombstone = details.get("requires_tombstone", False)
             else:
                 continue
             candidates.append(
@@ -1113,6 +1269,31 @@ class Storage:
             return json.loads(read_bytes(path, max_bytes=max_bytes).decode("utf-8"))
         except (OSError, UnicodeError, ValueError):
             return None
+
+    @staticmethod
+    def _public_mail_state(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {"protected_paths": [], "candidates": [], "error": "invalid"}
+        protected = sorted(
+            path for path in value.get("protected_paths", ()) if isinstance(path, str)
+        )
+        candidates = value.get("candidates", {})
+        if isinstance(candidates, Mapping):
+            candidates = [
+                {"path": path, **details}
+                for path, details in candidates.items()
+                if isinstance(path, str) and isinstance(details, Mapping)
+            ]
+        if not isinstance(candidates, list):
+            candidates = []
+        return {
+            "protected_paths": protected[:_MAX_PUBLIC_ITEMS],
+            "candidates": candidates[:_MAX_PUBLIC_ITEMS],
+            "error": value.get("error"),
+            "truncated": bool(value.get("truncated")),
+            "public_truncated": len(protected) > _MAX_PUBLIC_ITEMS
+            or len(candidates) > _MAX_PUBLIC_ITEMS,
+        }
 
     def _referenced_paths(self, value: Any) -> set[Path]:
         found: set[Path] = set()

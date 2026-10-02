@@ -145,6 +145,7 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | `ws.config` | Inspect and persist global and workspace configuration |
 | `ws.messages` | Send and receive persistent client messages |
 | `ws.timers` | Schedule persistent client-scoped deadline notifications |
+| `ws.mail` | Search configured mailboxes, draft and send mail, and watch for arrivals |
 | `ws.skills`, `ws.modules` | Validate, save, and reuse workspace capabilities |
 | `ws.git` | Read structured Git status, diffs, history, blame, and committed files |
 | `ws.http` | Use persistent HTTPX2 clients and extract readable HTML content |
@@ -589,6 +590,42 @@ Use `await ws.timers.check(timer_id)` or `await ws.timers.list()` to inspect tim
 Durations use the manager's UTC wall clock and continue to elapse while the manager is stopped. Zero duration or a past deadline expires immediately; absolute deadlines must include a timezone. Timers and acknowledgments survive disconnect, kernel reset, and manager restart. Reconnect using the same logical client ID to resume them.
 
 Expired, unacknowledged timers are attached automatically to initialized clients' `init`, `execute`, and `poll` responses in the `timers` field and in readable response text. This field contains `unacked`, up to five previews in `items` within a 4 KiB JSON budget, and `has_more`. Alerts repeat until acknowledged and may end a tool's wait while Python execution continues; no tool call means no agent wake-up. In a normal response from a timer-capable runtime, the absence of a `timers` field means there were no unacknowledged expired timer alerts. Polling before `init` omits timer alerts.
+
+### Mail
+
+Mail access is provided by the manager through configured IMAP and SMTP accounts. Start by checking the account and connection state; account passwords are referenced by environment variable name in configuration and are never sent through Python calls or returned in results:
+
+```python
+await ws.mail.accounts()
+await ws.mail.status()
+page = await ws.mail.search(mailbox="INBOX", unread=True, limit=20)
+message = await ws.mail.read(page["items"][0]["id"])
+```
+
+Search returns bounded header pages with opaque message references. `read()` fetches a bounded parsed body and attachment metadata without marking the message as seen. Use `ws.mail.download_attachment(message_id, attachment_id, path)` for a workspace file with overwrite protection. Message references are tied to the account's IMAP namespace and become invalid after a UIDVALIDITY or account identity change. `mark_read()` and `mark_unread()` change server flags explicitly.
+
+Create a draft before sending. Drafts are immutable and are validated and persisted before any network delivery:
+
+```python
+draft = await ws.mail.draft(
+    to=["recipient@example.test"],
+    subject="Review complete",
+    text="The requested review is complete.",
+)
+send = await ws.mail.send(draft["id"], request_id="review-2026-10-02")
+```
+
+`reply_to` and `forward` create derived drafts using the original message's account unless another account is specified; they cannot be combined. Attachments must resolve inside the workspace. Draft MIME and individual attachments are limited to 25 MiB. `send()` returns a queued record; inspect `await ws.mail.get_send(send["id"])` until it settles. Omitting `request_id` uses a draft-bound key, and reusing a key returns its existing send record. Retry a definitively `failed` send with a new key. `accepted` means SMTP acceptance, and `partial` lists recipients the server refused. Both prevent resubmitting that draft. `unknown` means acceptance could not be confirmed and also prevents resubmission; verify delivery outside mypr before creating another draft. `sent_mailbox` opts in to an append copy whose failure does not undo SMTP acceptance.
+
+Mail watches belong to the current logical client and share manager connections across clients:
+
+```python
+watch = await ws.mail.watch(mailbox="INBOX")
+notifications = await ws.mail.notifications()
+await ws.mail.ack([item["id"] for item in notifications["items"]])
+```
+
+Watch cursors and notifications survive disconnects, reset, and manager restart. New arrivals appear as bounded `mail` previews on later `init`, `execute`, and `poll` responses and may end a tool wait early; the Python execution continues. A preview or notification acknowledgment does not mark a message read. Use `watches()` to inspect synchronization and errors and `unwatch(watch_id)` to remove a subscription. The `mail` field is absent when there are no cached notifications, pending or uncertain sends, or reportable watch issues; that absence does not prove that a mailbox is empty. Watches use IMAP IDLE when supported and otherwise poll every 30 seconds. Watch sockets close when all subscribed clients disconnect and catch up when a subscriber reconnects. Unsent drafts, active sends, uncertain outcomes, and unacknowledged notifications remain protected from GC; terminal MIME and acknowledged notification records become eligible after 30 days.
 
 ### Skills and reusable Python
 

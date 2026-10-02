@@ -1,10 +1,10 @@
 # Layered configuration
 
-`ws.config` controls the managed configuration for the current workspace. It exposes the global defaults and the workspace overrides without making Python code edit TOML directly. The known managed sections are `mcp`, `lsp`, `limits`, and `storage`; unrelated TOML data remains outside this API.
+`ws.config` controls the managed configuration for the current workspace. It exposes the global defaults and the workspace overrides without making Python code edit TOML directly. The known managed sections are `mcp`, `lsp`, `mail`, `limits`, and `storage`; unrelated TOML data remains outside this API.
 
 ## Create a configuration file
 
-[config.example.toml](../config.example.toml) lists every supported field, the built-in limits and storage defaults, and examples for stdio MCP, HTTP MCP, LSP, and disabled inherited servers. Everything is commented out: copying it preserves inheritance and built-in defaults. Uncomment the relevant table header and only the fields you want to override. Server commands and URLs are examples to replace, not preconfigured services.
+[config.example.toml](../config.example.toml) lists every supported field, the built-in limits and storage defaults, and examples for stdio MCP, HTTP MCP, LSP, mail accounts, and disabled inherited entries. Everything is commented out: copying it preserves inheritance and built-in defaults. Uncomment the relevant table header and only the fields you want to override. Server commands and URLs are examples to replace, not preconfigured services.
 
 From a repository checkout, copy the example to the default global location:
 
@@ -34,7 +34,7 @@ Configuration files are not generated at startup. Missing files use inherited se
 
 The manager freezes its selected global path at startup. Reload rereads that file; changing the selected path requires starting the manager with the updated environment. Global defaults are shared by every workspace that uses the same file, while Python memory, client state, and workspace data remain separate.
 
-Scalar fields inherit individually. Lists replace the inherited list. MCP and LSP server entries are complete replacements by name, so a workspace entry does not inherit omitted fields from the global entry. For example, a workspace replacement of a global MCP server must repeat its `command` or `url`; omitted environment mappings are not inherited.
+Scalar fields inherit individually. Lists replace the inherited list. MCP and LSP server entries and mail accounts are complete replacements by name, so a workspace entry does not inherit omitted fields from the global entry. For example, a workspace replacement of a global MCP server must repeat its `command` or `url`; omitted environment mappings are not inherited.
 
 To disable an inherited server, use an entry containing only `enabled = false`:
 
@@ -77,6 +77,37 @@ The optional top-level `version` field is the configuration format version. Its 
 | `gc_interval_seconds` | `300` | Integer ≥ `1` | Interval between automatic maintenance passes |
 
 All storage settings apply through reload. Reload updates the policy and reschedules maintenance without immediately running GC; the next maintenance pass uses the new policy. Active work, current files, and other protected data are not removed merely to meet the target. See [workspace storage](storage.md) for cleanup plans and protected data.
+
+### Mail
+
+Mail accounts are configured under `[mail.accounts.<name>]`. An account definition is complete by name: a workspace entry replaces the corresponding global entry instead of inheriting individual endpoint fields. An entry containing only `enabled = false` hides an inherited account. `default_account` is optional; an empty value lets the mail API select the only enabled account and reports an error when that is ambiguous.
+
+```toml
+[mail]
+default_account = "work"
+
+[mail.accounts.work]
+from = "Me <me@example.com>"
+sent_mailbox = "Sent"
+
+[mail.accounts.work.imap]
+host = "imap.example.com"
+security = "ssl"
+username = "me@example.com"
+password_from = "MYPR_IMAP_PASSWORD"
+
+[mail.accounts.work.smtp]
+host = "smtp.example.com"
+security = "starttls"
+username = "me@example.com"
+password_from = "MYPR_SMTP_PASSWORD"
+```
+
+Each account requires a sender address, an IMAP endpoint, and an SMTP endpoint. `security` accepts `ssl`, `starttls`, or `plain`; omitted ports default to 993/143 for IMAP and 465/587/25 for SMTP respectively. IMAP authentication is required. SMTP authentication is optional for a trusted relay, and `password_from` names an environment variable rather than storing a password. `ca_file` can point to an additional CA bundle. `sent_mailbox` opts in to appending accepted outgoing messages to the provider's Sent mailbox; without it, sent copies remain in the local outbox history only.
+
+The manager resolves password variables from its own environment when a connection opens. Status reports source availability and cached connection state without contacting a provider. Missing variables and connection failures are reported lazily when a mailbox or send operation opens a connection, and values are never returned by `ws.config` or written to history. Changing a client process environment does not change an already-running manager.
+
+Mail settings apply through `await ws.config.reload()`. Reload keeps existing connections when their account definition is unchanged. A busy account is reported under `deferred` until its current send or mailbox operation settles, including when `force=True`; this prevents a configuration reload from interrupting an SMTP transaction. The applied configuration reported by `ws.config.explain()` reflects only accounts that the manager has actually reconfigured.
 
 ### MCP servers
 
@@ -149,7 +180,7 @@ Apply persisted settings explicitly:
 result = await ws.config.reload()
 ```
 
-The result reports `applied`, `deferred`, `errors`, `restart_required`, and the resulting `revision`. `force=True` allows the manager to interrupt work when an affected resource requires it. Reload keeps the workspace namespace, Python state, and client identity. It applies hot settings and MCP/LSP changes that can be admitted safely; settings that shape process startup remain in `restart_required`.
+The result reports `applied`, `deferred`, `errors`, `restart_required`, and the resulting `revision`. `force=True` allows the manager to interrupt work when an affected resource requires it. Reload keeps the workspace namespace, Python state, and client identity. It applies hot settings, MCP/LSP changes, and mail account changes that can be admitted safely; settings that shape process startup remain in `restart_required`.
 
 Manager response and completed-record/cache limits can be changed by reload. `limits.output_bytes` and `limits.completed_tasks` require a manager and kernel restart; reload reports them as restart-required and does not perform an implicit reset. Storage policy changes are picked up by the next storage-maintenance pass. The workspace namespace and saved Python state remain workspace-specific even when global defaults are shared.
 

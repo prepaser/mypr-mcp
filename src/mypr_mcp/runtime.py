@@ -30,6 +30,7 @@ from .diagnostics import error_info, error_response, safe_error
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
+from .mail_service import MailService
 from .managed_commands import ManagedCommands
 from .messages import MessageStore
 from .persistence import PersistenceUnavailable, PersistenceWorker, await_completion
@@ -82,6 +83,7 @@ TIMING_OPS = {
     "shell_resize",
     "shell_cancel",
     "mcp",
+    "mail",
     "packages_add",
     "task_event",
     "task_terminal",
@@ -194,6 +196,7 @@ class Runtime:
         self.history = None
         self.messages = None
         self.timers = None
+        self.mail = None
         self.persistence = None
         self._admission_lock = asyncio.Lock()
         self._initialize_lock = asyncio.Lock()
@@ -246,6 +249,9 @@ class Runtime:
         self._resource_lock = asyncio.Lock()
         self.search_slots = asyncio.Semaphore(2)
         self.background = set()
+
+    def connected_client_ids(self):
+        return {info["client_id"] for info in self.clients.values() if info["client_id"]}
 
     def storage_active_ids(self):
         records = [*self.execs.values(), *self.task_records.values()]
@@ -429,8 +435,14 @@ class Runtime:
         self.persistence = PersistenceWorker(on_failure=self.persistence_failed)
         self.history, self.messages = await self.persistence.call(_open_stores, self.workspace)
         self.timers = await self.persistence.call(TimerStore, self.workspace)
+        self.mail = MailService(
+            self.workspace, self.config.get("mail", {}), self.io,
+            self.notify_message, self.connected_client_ids,
+        )
+        await self.mail.start()
         self.storage = Storage(
-            self.workspace, history=self.history, active_ids=self.storage_active_ids
+            self.workspace, history=self.history, mail=self.mail,
+            active_ids=self.storage_active_ids,
         )
         for name in ["lib/ws_lib", "skills", "runs", "artifacts", "ipython", "jupyter"]:
             (self.root / name).mkdir(parents=True, exist_ok=True)
@@ -457,6 +469,7 @@ class Runtime:
             "html-results/",
             "task-results/",
             "change-plans/",
+            "mail/",
         ]
         missing = [entry for entry in required if entry not in entries]
         if missing:
@@ -1020,6 +1033,9 @@ class Runtime:
             await self.notify_execution_change(rec)
 
     async def wait_notifications(self, tasks, client, wait_seconds, *, include_timers=False):
+        if include_timers and client and self.mail is not None:
+            if await self.io(self.mail.snapshot, client):
+                return
         if not include_timers or not client or self.timers is None:
             await asyncio.wait(tasks, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
             return
@@ -1388,6 +1404,10 @@ class Runtime:
                     timers = await self.io(self.timers.notifications, connection["client_id"])
                     if timers is not None:
                         result["timers"] = timers
+                if self.mail is not None:
+                    mail = await self.io(self.mail.snapshot, connection["client_id"])
+                    if mail is not None:
+                        result["mail"] = mail
         finally:
             elapsed = time.perf_counter() - started
             label = op if op in TIMING_OPS else "other"
@@ -1515,7 +1535,7 @@ class Runtime:
     async def _dispatch_handlers(self, op, req, context):
         for handler in (
             self._dispatch_execution, self._dispatch_messages, self._dispatch_timers,
-            self._dispatch_storage,
+            self._dispatch_mail, self._dispatch_storage,
             self._dispatch_tasks, self._dispatch_scan, self._dispatch_tools,
             self._dispatch_shell, self._dispatch_mcp, self._dispatch_lifecycle,
         ):
@@ -1584,6 +1604,7 @@ class Runtime:
                         }
                     ),
                     "storage_maintenance": dict(self.storage_maintenance),
+                    "mail": self.mail.status() if self.mail is not None else None,
                     "active_count": len(self.active),
                     "queued_count": sum(
                         record["state"] == "queued" for record in self.execs.values()
@@ -1633,6 +1654,7 @@ class Runtime:
                     {c["client_id"] for c in connections if c["client_id"] is not None}
                 ),
                 "storage_maintenance": dict(self.storage_maintenance),
+                "mail": self.mail.status() if self.mail is not None else None,
                 "active": list(self.active),
                 "queued": [r["id"] for r in self.execs.values() if r["state"] == "queued"],
             }
@@ -1891,6 +1913,34 @@ class Runtime:
             return result
 
         return await await_completion(asyncio.create_task(change()))
+
+    async def _dispatch_mail(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
+        if op != "mail":
+            return _UNHANDLED
+        if not (connection and connection["client_id"]) and not requested_client:
+            raise RuntimeError("Mail requires a client identity")
+        if self.mail is None:
+            raise RuntimeError("Workspace mail is unavailable")
+        method = req.get("method")
+        params = req.get("params", {})
+        if not isinstance(method, str) or not isinstance(params, dict):
+            raise ValueError("Mail requires a method and parameter object")
+        async def run():
+            async with self._admission_lock:
+                if self.stopping.is_set() or self.restarting:
+                    raise RuntimeError("Workspace manager is stopping or restarting")
+                if self.settings.applying:
+                    raise RuntimeError(
+                        "Configuration reload is in progress; retry after it completes"
+                    )
+                operation = asyncio.create_task(self.mail.dispatch(method, client, params))
+                await asyncio.sleep(0)
+            return await await_completion(operation)
+
+        return await await_completion(asyncio.create_task(run()))
 
     async def _dispatch_storage(
         self, op, req, *, client, connection_id, connection,
@@ -2266,6 +2316,7 @@ class Runtime:
                             for rec in self.task_records.values()
                         )
                         or self.shells.active
+                        or (self.mail is not None and self.mail.active_count)
                     )
                 ):
                     raise RuntimeError("Workspace has active work; pass --force")
@@ -2374,6 +2425,7 @@ class Runtime:
                 for rec in self.task_records.values()
             )
             or self.shells.active
+            or (self.mail is not None and self.mail.active_count)
         ):
             raise RuntimeError("Workspace has active work; pass force=True to restart")
 
@@ -2508,6 +2560,8 @@ class Runtime:
                 await self.lose_python_tasks("Manager stopped")
             await self.close_shells()
             await self.mcp.close()
+            if self.mail is not None:
+                await self.mail.close()
 
     async def cleanup_kernel_resources(self):
         if not self.kc or not self.km or not self.replies or self.replies.done():
@@ -2685,6 +2739,8 @@ class Runtime:
         await self.io(self.history.append, "connection", "initialized", initialized, critical=True)
         await self.io(self.history.touch_client, client_id, critical=True)
         connection.update(initialized)
+        if self.mail is not None:
+            await self.mail.client_changed()
         return {"client_id": client_id}
 
     async def attach(self, reader, writer, req):
@@ -2726,6 +2782,9 @@ class Runtime:
         finally:
             self.clients.pop(connection_id, None)
             self.attachments.pop(connection_id, None)
+            if self.mail is not None:
+                with contextlib.suppress(Exception):
+                    await self.mail.client_changed()
             if self.history:
                 if info.get("client_id") is not None:
                     with contextlib.suppress(Exception):
@@ -2970,6 +3029,10 @@ class Runtime:
             for writer in list(self.attachments.values()):
                 writer.close()
             self.socket.unlink(missing_ok=True)
+            if self.mail is not None:
+                with contextlib.suppress(Exception):
+                    await self.mail.close()
+                self.mail = None
             if self.persistence is not None:
                 if self.messages is not None and self.history is not None:
                     with contextlib.suppress(Exception):

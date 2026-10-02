@@ -381,6 +381,27 @@ def _render_result(
                 f"[timer elapsed] id={timer.get('id')} "
                 f"label={timer.get('label', '')} due_at={timer.get('due_at')}"
             )
+    if isinstance(result.get("mail"), dict):
+        mail = result["mail"]
+        lines.append(
+            f"mail unacked={mail.get('unacked', 0)} "
+            f"has_more={str(bool(mail.get('has_more', False))).lower()}"
+        )
+        for item in mail.get("items", []):
+            lines.append(
+                f"[mail] id={item.get('id')} account={item.get('account')} "
+                f"mailbox={item.get('mailbox')!r} subject={item.get('subject', '')!r}"
+            )
+        for send in mail.get("sends", []):
+            lines.append(
+                f"[mail send] id={send.get('id')} draft_id={send.get('draft_id')} "
+                f"state={send.get('state')}"
+            )
+        for watch in mail.get("watches", []):
+            lines.append(
+                f"[mail watch] account={watch.get('account')} "
+                f"mailbox={watch.get('mailbox')!r} state={watch.get('state')}"
+            )
     return "\n".join(lines)
 
 

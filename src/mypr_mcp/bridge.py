@@ -11,6 +11,7 @@ from typing import Any
 
 from .async_utils import wait_owned
 from .diagnostics import RPCError
+from .mail_store import MailStore
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, recover_ticket, wait_ticket
 from .restart_records import poll_restart, restart_id_for_execution
@@ -78,6 +79,9 @@ class ConnectionBridge:
         )
         if preview is not None:
             result["timers"] = preview
+        mail = MailStore.snapshot_existing(self.workspace, self.client_id, offline=True)
+        if mail is not None:
+            result["mail"] = mail
         return result, due_at
 
     async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
@@ -92,6 +96,7 @@ class ConnectionBridge:
                 or result["state"] != "running"
                 or result["output"]
                 or result.get("timers")
+                or result.get("mail")
                 or time.monotonic() >= deadline
             ):
                 return result

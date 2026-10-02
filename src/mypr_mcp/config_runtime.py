@@ -6,7 +6,7 @@ import asyncio
 import copy
 
 from .async_utils import wait_owned
-from .config import ConfigStore, parse_path
+from .config import ConfigStore, parse_path, validate_mail_config
 from .diagnostics import safe_error
 
 HOT_LIMITS = ("response_bytes", "completed_records", "cache_bytes")
@@ -80,6 +80,13 @@ class RuntimeConfig:
             attribute = "response_limit" if key == "response_bytes" else key
             values["limits"][key] = getattr(self.runtime, attribute)
         values["storage"] = copy.deepcopy(self.runtime.storage_policy)
+        mail = getattr(self.runtime, "mail", None)
+        if mail is not None:
+            configured = getattr(mail, "applied_config", None)
+            if configured is None:
+                configured = self.applied.get("mail")
+            if isinstance(configured, dict):
+                values["mail"] = copy.deepcopy(configured)
         value = values
         for part in parse_path(path):
             if not isinstance(value, dict) or part not in value:
@@ -198,6 +205,17 @@ class RuntimeConfig:
                 result[category]["mcp"] = safe_error(exc)
             except Exception as exc:
                 result["errors"]["mcp"] = safe_error(exc)
+            try:
+                mail_result = await self._apply_mail(values["mail"], force=force)
+                self._record_mail_application(mail_result)
+                if mail_result.get("applied") is not None:
+                    result["applied"]["mail"] = mail_result.get("applied")
+                if mail_result.get("deferred"):
+                    result["deferred"]["mail"] = mail_result["deferred"]
+                if mail_result.get("errors"):
+                    result["errors"]["mail"] = mail_result["errors"]
+            except Exception as exc:
+                result["errors"]["mail"] = safe_error(exc)
             if not runtime.healthy:
                 result["deferred"]["lsp"] = "Kernel is unavailable"
             else:
@@ -225,6 +243,37 @@ class RuntimeConfig:
             if bridge is not None:
                 bridge._config_applying = False
             self.applying = False
+
+    async def _apply_mail(self, desired, *, force: bool) -> dict:
+        """Ask the manager-owned mail service to apply a validated snapshot."""
+
+        service = getattr(self.runtime, "mail", None)
+        if service is None:
+            if desired == self.applied.get("mail", {}):
+                return {"applied": {}}
+            return {"deferred": "Mail service is unavailable"}
+        apply_config = getattr(service, "apply_config", None)
+        if not callable(apply_config):
+            if desired == self.applied.get("mail", {}):
+                return {"applied": {}}
+            return {"deferred": "Mail service cannot reload configuration"}
+        response = await apply_config(copy.deepcopy(desired), force=force)
+        if not isinstance(response, dict):
+            raise RuntimeError("Mail service returned an invalid configuration result")
+        return copy.deepcopy(response)
+
+    def _record_mail_application(self, result: dict) -> None:
+        """Record only the normalized configuration confirmed by the service."""
+
+        applied_config = result.get("applied_config")
+        if not isinstance(applied_config, dict):
+            return
+        try:
+            normalized = validate_mail_config(applied_config)
+        except Exception:
+            return
+        if normalized == applied_config:
+            self.applied["mail"] = copy.deepcopy(normalized)
 
     async def _apply_lsp(self, snapshot, generation, force, *, starting=False):
         runtime = self.runtime

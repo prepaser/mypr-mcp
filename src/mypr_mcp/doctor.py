@@ -221,6 +221,33 @@ async def _service_status(ws: Any, attr: str, method: str) -> dict[str, Any]:
         }
 
 
+def _mail_readiness(config: dict[str, Any]) -> dict[str, Any]:
+    accounts = {}
+    for name, account in config.get("accounts", {}).items():
+        if not account.get("enabled", True):
+            continue
+        references = {}
+        for protocol in ("imap", "smtp"):
+            endpoint = account.get(protocol, {})
+            variable = endpoint.get("password_from")
+            if variable:
+                references[protocol] = {
+                    "source": variable,
+                    "available": variable in os.environ,
+                }
+        accounts[name] = {
+            "credentials": references,
+            "ready": all(value["available"] for value in references.values()),
+            "sent_mailbox": account.get("sent_mailbox"),
+        }
+    return {
+        "configured": bool(accounts),
+        "default_account": config.get("default_account") or None,
+        "accounts": accounts,
+        "network_checked": False,
+    }
+
+
 async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) -> dict[str, Any]:
     """Return local readiness information without repairing or starting anything."""
 
@@ -241,6 +268,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         "browser": {},
         "lsp": {},
         "mcp": {},
+        "mail": {},
         "warnings": [],
     }
     startup_failure = await asyncio.to_thread(read_startup_failure, root)
@@ -250,6 +278,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result["config"]["paths"]["global"] = str(config_store.global_path)
     try:
         snapshot = config_store.load()
+        result["mail"] = _mail_readiness(snapshot.values.get("mail", {}))
         result["config"].update(
             valid=True,
             revision=snapshot.revision,
@@ -294,6 +323,8 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     }
     result["lsp"] = await _service_status(ws, "code", "status")
     result["mcp"] = await _service_status(ws, "mcp", "list_servers")
+    if ws is not None:
+        result["mail"]["service"] = await _service_status(ws, "mail", "status")
     result["ready"] = bool(
         result["config"]["valid"]
         and result["python"].get("available")

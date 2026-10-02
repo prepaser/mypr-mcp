@@ -21,6 +21,37 @@
 # max_bytes = 1073741824
 # gc_interval_seconds = 300
 
+# Mail accounts use environment-variable names for passwords. The manager resolves
+# those variables when it opens a connection; values are never stored in TOML.
+# [mail]
+# default_account = "work"
+
+# Each account is a complete replacement by name across the global/workspace layers.
+# The IMAP password is required. SMTP username/password are optional for local relay.
+# [mail.accounts.work]
+# from = "Me <me@example.com>"
+# sent_mailbox = "Sent"
+#
+# [mail.accounts.work.imap]
+# host = "imap.example.com"
+# security = "ssl"       # ssl, starttls, or plain
+# port = 993              # defaults depend on security
+# username = "me@example.com"
+# password_from = "MYPR_IMAP_PASSWORD"
+# ca_file = "/etc/ssl/certs/ca-certificates.crt"
+#
+# [mail.accounts.work.smtp]
+# host = "smtp.example.com"
+# security = "ssl"       # ssl, starttls, or plain
+# port = 465
+# username = "me@example.com"
+# password_from = "MYPR_SMTP_PASSWORD"
+# ca_file = "/etc/ssl/certs/ca-certificates.crt"
+
+# Disable an inherited account with an entry containing only enabled = false.
+# [mail.accounts.inherited]
+# enabled = false
+
 # MCP stdio example. Replace the command before enabling this entry.
 # [mcp.servers.reports]
 # command = "reports-mcp"

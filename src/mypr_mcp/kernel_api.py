@@ -29,6 +29,7 @@ from .file_io import read_bytes
 from .filesystem import Filesystem
 from .http_tools import HTTPTools
 from .locks import WorkspaceLocks
+from .mail_api import MailAPI
 from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
@@ -1837,6 +1838,7 @@ class Workspace:
         self.net = NetworkTools(self.workspace, self.tasks, _rpc)
         self.system = SystemTools(self.workspace)
         self.timers = TimerAPI(_rpc, _client_context)
+        self.mail = MailAPI(_rpc, _client_context)
         self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
         self.code = CodeTools(
             self.workspace, self.fs,
@@ -2028,6 +2030,7 @@ __all__ = [
     "ResetRequested",
     "TaskHandle",
     "TaskManager",
+    "MailAPI",
     "Workspace",
     "create_workspace",
     "execution_context",

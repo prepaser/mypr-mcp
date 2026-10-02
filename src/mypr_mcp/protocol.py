@@ -56,6 +56,7 @@ CAPABILITIES = [
     "execution_output_budget",
     "config",
     "timers",
+    "mail",
 ]
 LEGACY_INSTRUCTIONS = """This workspace uses the legacy 0.9.0 runtime.
 Use execute for Python and poll for submitted executions. Store client-local values in

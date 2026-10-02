@@ -2,11 +2,13 @@ import copy
 import fcntl
 import hashlib
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -17,8 +19,9 @@ from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
 MAX_RESPONSE_BYTES = 1024 * 1024
-MANAGED_SECTIONS = frozenset({"limits", "storage", "mcp", "lsp"})
+MANAGED_SECTIONS = frozenset({"limits", "storage", "mcp", "lsp", "mail"})
 _SERVER_SECTIONS = frozenset({"mcp", "lsp"})
+_NAMED_SECTIONS = frozenset({"mail"})
 _MAX_CONFIG_BYTES = 16 * 1024 * 1024
 
 
@@ -72,6 +75,16 @@ DEFAULT_STORAGE = {
     "max_bytes": 1024**3,
     "gc_interval_seconds": 300,
 }
+DEFAULT_MAIL = {
+    "default_account": "",
+    "accounts": {},
+}
+
+_MAIL_SECURITY = frozenset({"ssl", "starttls", "plain"})
+_MAIL_ACCOUNT_FIELDS = frozenset({"from", "imap", "smtp", "sent_mailbox"})
+_MAIL_ENDPOINT_FIELDS = frozenset(
+    {"host", "port", "security", "username", "password_from", "ca_file"}
+)
 
 
 def global_config_path() -> Path:
@@ -235,6 +248,170 @@ def _validate_lsp(value):
     return result
 
 
+def _mail_text(value: Any, path: str, *, maximum: int = 512) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(char in value for char in "\x00\r\n")
+    ):
+        raise _field_error(path, "must be a non-empty string")
+    if len(value) > maximum:
+        raise _field_error(path, f"must contain at most {maximum} characters")
+    return value
+
+
+def _mail_env_name(value: Any, path: str) -> str:
+    value = _mail_text(value, path, maximum=256)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
+        raise _field_error(path, "must be a valid environment variable name")
+    return value
+
+
+def _mail_port(value: Any, path: str, default: int) -> int:
+    if value is None:
+        return default
+    if type(value) is not int or not 1 <= value <= 65535:
+        raise _field_error(path, "must be an integer between 1 and 65535")
+    return value
+
+
+def _validate_mail_endpoint(value: Any, path: str, *, kind: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _field_error(path, "must be a table")
+    unknown = set(value) - _MAIL_ENDPOINT_FIELDS
+    if unknown:
+        raise _field_error(path, f"unknown fields: {', '.join(sorted(unknown))}")
+    host = _mail_text(value.get("host"), f"{path}.host", maximum=253)
+    security = value.get("security", "ssl")
+    if not isinstance(security, str) or security not in _MAIL_SECURITY:
+        raise _field_error(
+            f"{path}.security", "must be one of ssl, starttls, or plain"
+        )
+    defaults = {
+        "imap": {"ssl": 993, "starttls": 143, "plain": 143},
+        "smtp": {"ssl": 465, "starttls": 587, "plain": 25},
+    }[kind]
+    result = {
+        "host": host,
+        "port": _mail_port(value.get("port"), f"{path}.port", defaults[security]),
+        "security": security,
+    }
+    username = value.get("username")
+    password_from = value.get("password_from")
+    if kind == "imap":
+        result["username"] = _mail_text(username, f"{path}.username", maximum=320)
+        result["password_from"] = _mail_env_name(password_from, f"{path}.password_from")
+    else:
+        if username is not None:
+            result["username"] = _mail_text(username, f"{path}.username", maximum=320)
+            if password_from is None:
+                raise _field_error(
+                    f"{path}.password_from", "is required when username is configured"
+                )
+            result["password_from"] = _mail_env_name(
+                password_from, f"{path}.password_from"
+            )
+        elif password_from is not None:
+            raise _field_error(
+                f"{path}.password_from", "requires a username for SMTP authentication"
+            )
+    if "ca_file" in value:
+        result["ca_file"] = _mail_text(value["ca_file"], f"{path}.ca_file", maximum=4096)
+    return result
+
+
+def _validate_mail_account(value: Any, path: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _field_error(path, "must be a table")
+    unknown = set(value) - _MAIL_ACCOUNT_FIELDS
+    if unknown:
+        raise _field_error(path, f"unknown fields: {', '.join(sorted(unknown))}")
+    sender = _mail_text(value.get("from"), f"{path}.from", maximum=320)
+    address = parseaddr(sender)[1]
+    if not address or "@" not in address or any(char.isspace() for char in address):
+        raise _field_error(f"{path}.from", "must contain a valid email address")
+    if "imap" not in value:
+        raise _field_error(f"{path}.imap", "is required")
+    if "smtp" not in value:
+        raise _field_error(f"{path}.smtp", "is required")
+    result = {
+        "from": sender,
+        "imap": _validate_mail_endpoint(value["imap"], f"{path}.imap", kind="imap"),
+        "smtp": _validate_mail_endpoint(value["smtp"], f"{path}.smtp", kind="smtp"),
+    }
+    if "sent_mailbox" in value:
+        result["sent_mailbox"] = _mail_text(
+            value["sent_mailbox"], f"{path}.sent_mailbox", maximum=255
+        )
+    return result
+
+
+def _validate_mail_name(name: Any, path: str) -> str:
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or len(name) > 128
+        or any(char in name for char in "\x00\r\n")
+    ):
+        raise _field_error(path, "must contain 1..128 characters")
+    return name
+
+
+def _validate_mail_accounts(value: Any, path: str, *, normalize: bool) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _field_error(path, "must be a table")
+    result: dict[str, Any] = {}
+    for name, definition in value.items():
+        account_path = f"{path}.{name}"
+        _validate_mail_name(name, path)
+        if isinstance(definition, Mapping) and definition == {"enabled": False}:
+            result[name] = {"enabled": False}
+            continue
+        validated = _validate_mail_account(definition, account_path)
+        result[name] = validated if normalize else copy.deepcopy(definition)
+    return result
+
+
+def _validate_mail_layer(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise _field_error("mail", "must be a table")
+    result = copy.deepcopy(dict(value))
+    unknown = set(value) - {"default_account", "accounts"}
+    if unknown:
+        raise _field_error("mail", f"unknown fields: {', '.join(sorted(unknown))}")
+    if "default_account" in value:
+        default = value["default_account"]
+        if (
+            not isinstance(default, str)
+            or len(default) > 128
+            or any(char in default for char in "\x00\r\n")
+        ):
+            raise _field_error("mail.default_account", "must be an account name or empty")
+    if "accounts" in value:
+        result["accounts"] = _validate_mail_accounts(
+            value["accounts"], "mail.accounts", normalize=False
+        )
+    return result
+
+
+def validate_mail_config(value: Any) -> dict[str, Any]:
+    """Validate and normalize the effective ``mail`` configuration."""
+
+    if value is None:
+        return copy.deepcopy(DEFAULT_MAIL)
+    layer = _validate_mail_layer(value)
+    result = copy.deepcopy(DEFAULT_MAIL)
+    if "default_account" in layer:
+        result["default_account"] = layer["default_account"]
+    if "accounts" in layer:
+        result["accounts"] = _validate_mail_accounts(
+            layer["accounts"], "mail.accounts", normalize=True
+        )
+    return result
+
+
 def validate_config(values):
     """Validate known configuration sections while preserving future sections."""
 
@@ -248,6 +425,7 @@ def validate_config(values):
     result["limits"] = _validate_limits(result.get("limits"))
     result["storage"] = _validate_storage(result.get("storage"))
     result["lsp"] = _validate_lsp(result.get("lsp"))
+    result["mail"] = validate_mail_config(result.get("mail"))
     mcp = result.get("mcp")
     if mcp is None:
         result["mcp"] = {"servers": {}}
@@ -323,6 +501,8 @@ def _validate_layer(values: Any, path: Path) -> dict:
         servers = table.get("servers")
         if servers is not None:
             _validate_server_layer(section, servers)
+    if "mail" in result:
+        _validate_mail_layer(result["mail"])
     return result
 
 
@@ -333,6 +513,23 @@ def _merge_servers(global_value: Any, workspace_value: Any) -> dict:
             continue
         if not isinstance(source, Mapping):
             raise ConfigError("servers must be a table")
+        for name, definition in source.items():
+            if isinstance(definition, Mapping) and definition.get("enabled") is False:
+                result.pop(name, None)
+            else:
+                result[name] = copy.deepcopy(definition)
+    return result
+
+
+def _merge_named(global_value: Any, workspace_value: Any) -> dict:
+    """Merge named complete replacements with disabled-entry tombstones."""
+
+    result: dict[str, Any] = {}
+    for source in (global_value, workspace_value):
+        if source is None:
+            continue
+        if not isinstance(source, Mapping):
+            raise ConfigError("accounts must be a table")
         for name, definition in source.items():
             if isinstance(definition, Mapping) and definition.get("enabled") is False:
                 result.pop(name, None)
@@ -377,6 +574,22 @@ def _merge_layers(global_value: Mapping, workspace_value: Mapping) -> dict:
                 else None,
             )
         merged[section] = section_value
+    global_mail = global_value.get("mail", {})
+    workspace_mail = workspace_value.get("mail", {})
+    mail_value = merged.get("mail", {})
+    if not isinstance(mail_value, Mapping):
+        mail_value = {}
+    mail_value = copy.deepcopy(dict(mail_value))
+    if (
+        isinstance(global_mail, Mapping) and "accounts" in global_mail
+    ) or (
+        isinstance(workspace_mail, Mapping) and "accounts" in workspace_mail
+    ):
+        mail_value["accounts"] = _merge_named(
+            global_mail.get("accounts") if isinstance(global_mail, Mapping) else None,
+            workspace_mail.get("accounts") if isinstance(workspace_mail, Mapping) else None,
+        )
+    merged["mail"] = mail_value
     return merged
 
 
@@ -465,7 +678,7 @@ def _lookup(values: Any, parts: tuple[str, ...]) -> tuple[bool, Any]:
 
 def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for section in ("limits", "storage", "mcp", "lsp"):
+    for section in ("limits", "storage", "mcp", "lsp", "mail"):
         value = values.get(section)
         if not isinstance(value, Mapping):
             continue
@@ -479,6 +692,11 @@ def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
             }
         elif section in _SERVER_SECTIONS:
             result[section] = {"servers": copy.deepcopy(value.get("servers", {}))}
+        elif section == "mail":
+            result[section] = {
+                "default_account": copy.deepcopy(value.get("default_account", "")),
+                "accounts": copy.deepcopy(value.get("accounts", {})),
+            }
     return result
 
 
@@ -493,6 +711,13 @@ def _validate_public_path(parts: tuple[str, ...]) -> None:
         return
     if section in _SERVER_SECTIONS and len(parts) >= 2 and parts[1] == "servers":
         return
+    if section == "mail":
+        if len(parts) == 2 and parts[1] == "default_account":
+            return
+        if len(parts) == 2 and parts[1] == "accounts":
+            return
+        if len(parts) == 3 and parts[1] == "accounts":
+            return
     raise ConfigError("unknown managed configuration field", path=".".join(parts))
 
 
@@ -504,7 +729,7 @@ def _quote_key(value: str) -> str:
     if value and all(char.isascii() and (char.isalnum() or char in "_-") for char in value):
         return value
     if any(ord(char) < 0x20 for char in value):
-        raise ConfigError("server name contains a control character", path="mcp.servers")
+        raise ConfigError("configuration name contains a control character", path="mail.accounts")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
@@ -798,6 +1023,120 @@ class ConfigStore:
 
         return self._mutate(
             f"{section}.servers",
+            "global" if self.workspace_path is None else "workspace",
+            expected_revision,
+            change,
+        )
+
+    def save_mail_account(
+        self,
+        name: str,
+        definition: Mapping[str, Any] | None,
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        """Replace one workspace account, preserving inherited-account semantics."""
+
+        _validate_mail_name(name, "mail.accounts")
+        path = f"mail.accounts.{_quote_key(name)}"
+        if definition is not None:
+            if not isinstance(definition, Mapping):
+                raise ConfigError("mail account definition must be a table", path=path)
+            scope = "global" if self.workspace_path is None else "workspace"
+            if isinstance(definition, Mapping) and definition == {"enabled": False}:
+                return self.set(
+                    path, {"enabled": False}, scope=scope,
+                    expected_revision=expected_revision,
+                )
+            normalized = _validate_mail_account(definition, path)
+            return self.set(path, normalized, scope=scope, expected_revision=expected_revision)
+
+        parts = parse_path(path)
+
+        def remove(document: Any, layers: dict[str, dict]) -> bool:
+            if self.workspace_path is None:
+                return _unset_document(document, parts)
+            mail = layers["global"].get("mail", {})
+            global_accounts = mail.get("accounts", {}) if isinstance(mail, Mapping) else {}
+            inherited = global_accounts.get(name) if isinstance(global_accounts, Mapping) else None
+            if inherited is not None and not _server_tombstone(inherited):
+                _set_document(document, parts, {"enabled": False})
+                return True
+            return _unset_document(document, parts)
+
+        return self._mutate(
+            path,
+            "global" if self.workspace_path is None else "workspace",
+            expected_revision,
+            remove,
+        )
+
+    def save_mail_accounts(
+        self,
+        definitions: Mapping[str, Mapping[str, Any]],
+        expected_revision: str | None = None,
+    ) -> ConfigSnapshot:
+        """Replace the effective account map while keeping global inheritance compact."""
+
+        if not isinstance(definitions, Mapping):
+            raise ConfigError("mail accounts must be a table", path="mail.accounts")
+        desired = _validate_mail_accounts(definitions, "mail.accounts", normalize=True)
+        path_parts = ("mail", "accounts")
+
+        def change(document: Any, layers: dict[str, dict]) -> None:
+            global_mail = layers["global"].get("mail", {})
+            workspace_mail = layers["workspace"].get("mail", {})
+            global_accounts = (
+                global_mail.get("accounts", {}) if isinstance(global_mail, Mapping) else {}
+            )
+            workspace_accounts = (
+                workspace_mail.get("accounts", {}) if isinstance(workspace_mail, Mapping) else {}
+            )
+            if not isinstance(global_accounts, Mapping):
+                global_accounts = {}
+            if not isinstance(workspace_accounts, Mapping):
+                workspace_accounts = {}
+            names = set(desired) | set(global_accounts) | set(workspace_accounts)
+            for name in sorted(names):
+                wanted = desired.get(name)
+                if _server_tombstone(wanted):
+                    wanted = None
+                inherited = global_accounts.get(name)
+                current = workspace_accounts.get(name)
+                if wanted is None:
+                    if (
+                        self.workspace_path is not None
+                        and name in global_accounts
+                        and not _server_tombstone(inherited)
+                    ):
+                        if not _server_tombstone(current):
+                            _set_document(document, (*path_parts, name), {"enabled": False})
+                    else:
+                        _unset_document(document, (*path_parts, name))
+                    continue
+                if (
+                    self.workspace_path is not None
+                    and current is not None
+                    and not _server_tombstone(current)
+                ):
+                    if _validate_mail_account(current, f"mail.accounts.{name}") == wanted:
+                        continue
+                    _set_document(document, (*path_parts, name), wanted)
+                elif (
+                    self.workspace_path is not None
+                    and inherited is not None
+                    and not _server_tombstone(inherited)
+                ):
+                    if _validate_mail_account(inherited, f"mail.accounts.{name}") == wanted:
+                        _unset_document(document, (*path_parts, name))
+                    else:
+                        _set_document(document, (*path_parts, name), wanted)
+                elif inherited == wanted:
+                    _unset_document(document, (*path_parts, name))
+                else:
+                    _set_document(document, (*path_parts, name), wanted)
+
+        return self._mutate(
+            "mail.accounts",
             "global" if self.workspace_path is None else "workspace",
             expected_revision,
             change,
