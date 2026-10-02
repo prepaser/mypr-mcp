@@ -2,6 +2,8 @@
 
 `mypr-mcp` provides a persistent, workspace-scoped Python layer between an LLM agent and the workstation. Each workspace has one Python kernel. Every MCP connection opened for that workspace shares the same variables, imports, functions, and background-task handles.
 
+It provides a development toolkit for LLM agents: file operations, code and document search, Git, shell commands, HTTP, browser automation, network scanning, and system diagnostics through one Python API. Agents can combine these tools in scripts and extend the environment with reusable Python functions, skills, and external MCP integrations.
+
 The runtime is intended for Linux, Python 3.14, and [uv](https://docs.astral.sh/uv/). Commands run with the current OS user's permissions; mypr-mcp does not provide a sandbox.
 
 Licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
