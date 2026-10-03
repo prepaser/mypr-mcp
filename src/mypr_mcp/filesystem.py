@@ -6,6 +6,7 @@ import asyncio
 import base64
 import codecs
 import difflib
+import errno
 import hashlib
 import heapq
 import inspect
@@ -25,6 +26,145 @@ from .revisions import RevisionIndexOutcomeUnknown
 
 _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
 _PATH_LOCKS_GUARD = Lock()
+
+
+class _LspPathPins:
+    def __init__(self, workspace: Path, paths: set[Path]) -> None:
+        self.workspace = workspace
+        self.paths = paths
+        self._fds: dict[tuple[str, ...], int] = {}
+        self._target_fds: dict[Path, int] = {}
+        self._absent_targets: set[Path] = set()
+        self._created: list[tuple[int, str]] = []
+        self._committed = False
+
+    def __enter__(self) -> _LspPathPins:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if (
+            not getattr(os, "O_DIRECTORY", 0)
+            or not getattr(os, "O_NOFOLLOW", 0)
+            or os.open not in os.supports_dir_fd
+        ):
+            raise RuntimeError("LSP edit path ownership cannot be pinned on this platform")
+        root_fd = os.open(self.workspace, flags)
+        self._fds[()] = root_fd
+        try:
+            for path in sorted(self.paths, key=str):
+                self._pin_parent(path, flags)
+            for path in self.paths:
+                self._pin_target(path)
+            self.assert_current()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        if not self._committed:
+            for parent_fd, name in reversed(self._created):
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+        for fd in reversed(tuple(self._fds.values())):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for fd in self._target_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+        self._target_fds.clear()
+        self._absent_targets.clear()
+
+    def committed(self) -> None:
+        self._committed = True
+
+    def path(self, path: Path) -> Path:
+        relative = path.relative_to(self.workspace)
+        parent_fd = self._fds[relative.parts[:-1]]
+        return Path(f"/proc/self/fd/{parent_fd}") / relative.parts[-1]
+
+    def state_path(self, path: Path) -> Path:
+        target_fd = self._target_fds.get(path)
+        if target_fd is not None:
+            return Path(f"/proc/self/fd/{target_fd}")
+        return self.path(path)
+
+    def assert_current(self) -> None:
+        for relative, fd in self._fds.items():
+            candidate = self.workspace.joinpath(*relative)
+            try:
+                current = os.stat(candidate, follow_symlinks=False)
+                pinned = os.fstat(fd)
+            except FileNotFoundError as exc:
+                raise RuntimeError("LSP edit parent directory changed while applying") from exc
+            if not stat.S_ISDIR(current.st_mode) or _inode(current) != _inode(pinned):
+                raise RuntimeError("LSP edit parent directory changed while applying")
+        for path, fd in self._target_fds.items():
+            try:
+                current = os.stat(path, follow_symlinks=False)
+                pinned = os.fstat(fd)
+            except FileNotFoundError as exc:
+                raise RuntimeError("LSP edit target changed while applying patch") from exc
+            if _inode(current) != _inode(pinned):
+                raise RuntimeError("LSP edit target changed while applying patch")
+        for path in self._absent_targets:
+            try:
+                os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise RuntimeError("LSP edit target changed while applying patch")
+
+    def _pin_parent(self, path: Path, flags: int) -> None:
+        relative = path.relative_to(self.workspace)
+        prefix: tuple[str, ...] = ()
+        for name in relative.parts[:-1]:
+            next_prefix = (*prefix, name)
+            if next_prefix in self._fds:
+                prefix = next_prefix
+                continue
+            parent_fd = self._fds[prefix]
+            try:
+                fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                os.mkdir(name, dir_fd=parent_fd)
+                self._created.append((parent_fd, name))
+                fd = os.open(name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError("LSP edit path must not contain symlinks") from exc
+                raise
+            self._fds[next_prefix] = fd
+            prefix = next_prefix
+
+    def _pin_target(self, path: Path) -> None:
+        relative = path.relative_to(self.workspace)
+        parent_fd = self._fds[relative.parts[:-1]]
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            fd = os.open(relative.parts[-1], flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            self._absent_targets.add(path)
+            return
+        except OSError as exc:
+            if exc.errno == getattr(errno, "ELOOP", 40):
+                raise ValueError(f"LSP edit path must not be a symlink: {path}") from exc
+            raise
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            return
+        self._target_fds[path] = fd
 
 
 class _ReadLimitExceeded(ValueError):
@@ -365,12 +505,19 @@ class Filesystem:
             for lock in locks:
                 await lock.acquire()
                 stack.callback(lock.release)
+            pins = _LspPathPins(self.workspace, paths)
+            stack.enter_context(pins)
 
             initial: dict[Path, _State] = {}
             for path in sorted(paths, key=str):
+                state_path = pins.state_path(path)
                 initial[path] = await _to_thread_uncancelled(
-                    _read_state, path, str(path.relative_to(self.workspace))
+                    _read_state,
+                    state_path,
+                    str(path.relative_to(self.workspace)),
+                    no_symlink=state_path == pins.path(path),
                 )
+            pins.assert_current()
             for path, expected in preconditions.items():
                 state = initial[path]
                 actual = _sha256(state.data) if state.exists else None
@@ -544,10 +691,35 @@ class Filesystem:
                             )
                         )
 
-            await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
+            pinned_initial = {
+                pins.path(path): _State(
+                    pins.state_path(path),
+                    state.display,
+                    state.exists,
+                    state.data,
+                    state.info,
+                )
+                for path, state in initial.items()
+            }
+            pinned_plans = []
+            for plan in plans:
+                pinned = dict(plan)
+                pinned["path"] = pins.path(plan["path"])
+                if plan["source"] is not None:
+                    pinned["source"] = pins.path(plan["source"])
+                pinned_plans.append(pinned)
+
+            await _to_thread_uncancelled(history_store.prepare_changes_sync, pinned_plans)
+            pins.assert_current()
             result = await _to_thread_uncancelled(
-                _commit, plans, initial, 32 * 1024, history_store=history_store
+                _commit,
+                pinned_plans,
+                pinned_initial,
+                32 * 1024,
+                history_store=history_store,
+                no_symlink=True,
             )
+            pins.committed()
             result["history_recorded"] = True
             return result
 
@@ -1458,6 +1630,10 @@ def _signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _inode(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
 def _require_regular(info: os.stat_result, display: str) -> None:
     if stat.S_ISDIR(info.st_mode):
         raise IsADirectoryError(display)
@@ -1476,9 +1652,16 @@ def _preflight_input(path: Path, display: str, max_bytes: int) -> None:
 
 
 def _read_regular(
-    path: Path, display: str, *, max_bytes: int | None = None
+    path: Path,
+    display: str,
+    *,
+    max_bytes: int | None = None,
+    nofollow: bool = False,
 ) -> tuple[bytes, os.stat_result]:
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if nofollow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
         _require_regular(info, display)

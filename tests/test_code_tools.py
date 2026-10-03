@@ -143,6 +143,22 @@ def _messages(log: Path) -> list[dict]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["workspace/semanticTokens/refresh", "workspace/diagnostic/refresh"]
+)
+async def test_refresh_requests_return_null(tmp_path, method):
+    server = _LanguageServer(tmp_path, "fake", ("fake",), frozenset({"python"}), timeout=1)
+    replies = []
+
+    async def send(message):
+        replies.append(message)
+
+    server._send = send
+    await server._handle_method({"jsonrpc": "2.0", "id": 1, "method": method})
+    assert replies == [{"jsonrpc": "2.0", "id": 1, "result": None}]
+
+
+@pytest.mark.asyncio
 async def test_lsp_framing_unicode_positions_and_document_changes(tmp_path):
     code, workspace, log = await _configured(tmp_path)
     path = workspace / "sample.py"

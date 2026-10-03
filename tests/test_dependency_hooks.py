@@ -74,6 +74,34 @@ async def test_search_cursor_does_not_prepare_dependencies(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapters,needs_pandoc",
+    [
+        (None, False),
+        (["pandoc"], True),
+        ("pandoc,poppler", True),
+        ("+pandoc", True),
+        (["-poppler", "pandoc"], False),
+    ],
+)
+async def test_document_search_prepares_only_requested_converters(tmp_path, adapters, needs_pandoc):
+    calls = []
+
+    async def ensure(*names, automatic=False):
+        calls.append((names, automatic))
+        assert "pandoc" not in names or needs_pandoc
+        return {"items": [{"name": name, "path": f"/managed/{name}"} for name in names]}
+
+    runner = _Runner()
+    fs = Filesystem(tmp_path, runner, ensure_dependencies=ensure)
+    await fs.search_docs("needle", paths="fixture.txt", adapters=adapters)
+
+    expected = ("rg", "rga", "pandoc") if needs_pandoc else ("rg", "rga")
+    assert calls == [(expected, True)]
+    assert runner.commands[0][0] == "/managed/rga"
+
+
+@pytest.mark.asyncio
 async def test_html_selector_requests_cssselect_only_when_needed(tmp_path, monkeypatch):
     calls = []
 

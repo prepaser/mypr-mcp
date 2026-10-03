@@ -543,7 +543,7 @@ class _LanguageServer:
             "workspace/semanticTokens/refresh",
             "workspace/diagnostic/refresh",
         }:
-            result = [] if method.endswith("/refresh") else None
+            result = None
         elif method == "workspace/applyEdit":
             result = {"applied": False, "failureReason": "mypr code navigation is read-only"}
         else:

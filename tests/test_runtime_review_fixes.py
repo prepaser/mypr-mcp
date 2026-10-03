@@ -14,7 +14,9 @@ from mypr_mcp.runtime import Runtime, _recover_runs
 from mypr_mcp.runtime_registry import list_managers
 
 
-@pytest.mark.parametrize("bad", [[], None, 42, {"state": []}])
+@pytest.mark.parametrize(
+    "bad", [[], None, 42, {"state": []}, {"id": "bad", "state": "succeeded", "finished": 10**1000}]
+)
 def test_corrupt_run_does_not_hide_valid_recovered_execution(tmp_path, capsys, bad):
     runs = tmp_path / "runs"
     runs.mkdir()
@@ -130,6 +132,11 @@ async def test_browser_auto_install_uses_dependency_events_and_active_count(tmp_
     service = DependencyService(
         tmp_path, runtime.py, {}, None, runtime._install_dependency_browser, record,
     )
+
+    async def packages(names):
+        return {name: {"name": name, "status": "installed"} for name in names}
+
+    service._packages = packages
     service._browsers = inventory
     runtime.dependencies = service
     request = asyncio.create_task(runtime._dispatch({

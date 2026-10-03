@@ -14,8 +14,15 @@ import inspect
 import os
 import tempfile
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Mapping,
+    MutableSequence,
+    MutableSet,
+)
 from contextlib import asynccontextmanager
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +46,62 @@ class BodyTooLarge(RuntimeError):
         self.limit = limit
         self.received = received
         super().__init__(f"HTTP response body exceeds the {limit} byte limit")
+
+
+class _MappingSnapshot:
+    __slots__ = ("items",)
+
+    def __init__(self, items: tuple[Any, ...] = ()):
+        self.items = items
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _MappingSnapshot) or len(self.items) != len(other.items):
+            return False
+        unmatched = list(other.items)
+        for item in self.items:
+            for index, candidate in enumerate(unmatched):
+                if item == candidate:
+                    unmatched.pop(index)
+                    break
+            else:
+                return False
+        return True
+
+
+def _cookie_snapshot(value: Any) -> _MappingSnapshot | None:
+    if isinstance(value, CookieJar):
+        jar = value
+    else:
+        try:
+            jar = getattr(value, "jar", None)
+        except Exception:
+            return None
+    if not isinstance(jar, CookieJar):
+        return None
+    records = []
+    for cookie in jar:
+        records.append(
+            (
+                cookie.version,
+                cookie.name,
+                cookie.value,
+                cookie.port,
+                cookie.port_specified,
+                cookie.domain,
+                cookie.domain_specified,
+                cookie.domain_initial_dot,
+                cookie.path,
+                cookie.path_specified,
+                cookie.secure,
+                cookie.expires,
+                cookie.discard,
+                cookie.comment,
+                cookie.comment_url,
+                tuple(sorted(cookie._rest.items())),
+                cookie.rfc2109,
+            )
+        )
+    return _MappingSnapshot(tuple(records))
 
 
 def _client_id(identity: Callable[[], Any] | None) -> str:
@@ -206,6 +269,53 @@ class HTTPTools:
         result.setdefault("timeout", DEFAULT_TIMEOUT)
         return result
 
+    @classmethod
+    def _snapshot_option(cls, value: Any, seen: dict[int, Any] | None = None) -> Any:
+        """Copy mutable option containers while retaining native object identity."""
+
+        if seen is None:
+            seen = {}
+        identity = id(value)
+        if identity in seen:
+            return seen[identity]
+        if isinstance(value, bytearray):
+            return bytearray(value)
+        cookie_snapshot = _cookie_snapshot(value)
+        if cookie_snapshot is not None:
+            seen[identity] = cookie_snapshot
+            return cookie_snapshot
+        if isinstance(value, Mapping):
+            multi_items = getattr(value, "multi_items", None)
+            pairs = multi_items() if callable(multi_items) else value.items()
+            result = _MappingSnapshot()
+            seen[identity] = result
+            result.items = tuple(
+                (cls._snapshot_option(key, seen), cls._snapshot_option(item, seen))
+                for key, item in pairs
+            )
+            return result
+        if isinstance(value, MutableSequence):
+            result = []
+            seen[identity] = result
+            result.extend(cls._snapshot_option(item, seen) for item in value)
+            return result
+        if isinstance(value, tuple):
+            result = tuple(cls._snapshot_option(item, seen) for item in value)
+            seen[identity] = result
+            return result
+        if isinstance(value, MutableSet):
+            result = {cls._snapshot_option(item, seen) for item in value}
+            seen[identity] = result
+            return result
+        return value
+
+    @classmethod
+    def _snapshot_options(cls, options: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: cls._snapshot_option(value)
+            for key, value in options.items()
+        }
+
     @staticmethod
     def _needs_socksio(options: Mapping[str, Any]) -> bool:
         for key in ("proxy", "proxies"):
@@ -272,7 +382,7 @@ class HTTPTools:
             self._options.pop(key, None)
             existing = None
         if existing is not None:
-            if has_options and self._options[key] != requested:
+            if has_options and self._options[key] != self._snapshot_options(requested):
                 raise RuntimeError(
                     f"HTTP client {name!r} already exists with different options; "
                     "await ws.http.close(...) before reconfiguring it"
@@ -309,9 +419,10 @@ class HTTPTools:
             return existing
         import httpx2
 
+        option_snapshot = self._snapshot_options(requested)
         created = httpx2.AsyncClient(**requested)
         self._clients[key] = created
-        self._options[key] = requested
+        self._options[key] = option_snapshot
         return created
 
     async def _get_client(

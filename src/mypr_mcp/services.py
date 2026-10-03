@@ -1569,25 +1569,29 @@ class MCPBridge:
                     raise RuntimeError(
                         "LSP candidate does not match name and definition; reload before saving"
                     )
-                saved = await wait_owned(
+                saved, cancelled = await finish_owned(
                     asyncio.to_thread(
                         self._store.save_server, "lsp", name, definition, snapshot.revision
                     )
                 )
                 self._snapshot = saved
                 self._revision = saved.revision
+                if cancelled:
+                    raise asyncio.CancelledError
                 return {
                     "servers": copy.deepcopy(saved.values["lsp"]["servers"]),
                     "revision": saved.revision,
                 }
-            revision, cancelled = await finish_owned(
+            _, cancelled = await finish_owned(
                 asyncio.to_thread(self.store.save_lsp, definitions, snapshot.revision)
             )
-            if cancelled:
-                raise asyncio.CancelledError
-            current_snapshot = await wait_owned(asyncio.to_thread(self._load_snapshot))
+            current_snapshot, load_cancelled = await finish_owned(
+                asyncio.to_thread(self._load_snapshot)
+            )
             self._snapshot = current_snapshot
             self._revision = current_snapshot.revision
+            if cancelled or load_cancelled:
+                raise asyncio.CancelledError
             return {
                 "servers": copy.deepcopy(current_snapshot.values["lsp"]["servers"]),
                 "revision": current_snapshot.revision,
@@ -1607,8 +1611,12 @@ class MCPBridge:
             action = "added" if old is None else "unchanged" if old == config else "updated"
             if action == "unchanged":
                 self._check_config_current()
-                snapshot = await wait_owned(asyncio.to_thread(self._save_server, server, config))
+                snapshot, cancelled = await finish_owned(
+                    asyncio.to_thread(self._save_server, server, config)
+                )
                 self._commit_snapshot(snapshot, set())
+                if cancelled:
+                    raise asyncio.CancelledError
                 connected = self._connections.get(server)
                 return {
                     "server": server,
@@ -1617,9 +1625,16 @@ class MCPBridge:
                 }
             try:
                 connection = await self._block_affected({server}, force)
-                snapshot = await wait_owned(asyncio.to_thread(self._save_server, server, config))
+                snapshot, operation_cancelled = await finish_owned(
+                    asyncio.to_thread(self._save_server, server, config)
+                )
                 self._commit_snapshot(snapshot, {server})
-                await self._close_connections_resilient(connection, force)
+                try:
+                    await self._close_connections_resilient(connection, force)
+                except asyncio.CancelledError:
+                    operation_cancelled = True
+                if operation_cancelled:
+                    raise asyncio.CancelledError
                 return {"server": server, "action": action, "connected": False}
             finally:
                 await self._unblock(connection if "connection" in locals() else {})
@@ -1636,9 +1651,16 @@ class MCPBridge:
                 raise ValueError(f"unknown MCP server: {server!r}")
             try:
                 connection = await self._block_affected({server}, force)
-                snapshot = await wait_owned(asyncio.to_thread(self._save_server, server, None))
+                snapshot, operation_cancelled = await finish_owned(
+                    asyncio.to_thread(self._save_server, server, None)
+                )
                 self._commit_snapshot(snapshot, {server})
-                await self._close_connections_resilient(connection, force)
+                try:
+                    await self._close_connections_resilient(connection, force)
+                except asyncio.CancelledError:
+                    operation_cancelled = True
+                if operation_cancelled:
+                    raise asyncio.CancelledError
                 return {
                     "server": server,
                     "action": "removed",

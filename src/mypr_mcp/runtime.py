@@ -178,8 +178,56 @@ def _recover_runs(root, history):
                 old.update(state="lost", error="Manager stopped before completion")
                 _write_json(path, old)
             old.setdefault("client_id", old.get("client") or "legacy")
-            history.record("execution", old)
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+            existing = None
+            get_history = getattr(history, "get", None)
+            if callable(get_history):
+                existing = get_history(old["id"])
+            if existing is not None and existing.get("body_evicted") is True:
+                code = old.get("code")
+                compact = {
+                    key: value
+                    for key, value in old.items()
+                    if key not in {"code", "output", "events"}
+                }
+                if isinstance(code, str):
+                    compact["code_sha256"] = hashlib.sha256(code.encode()).hexdigest()
+                compact["body_evicted"] = True
+                if "body_evicted_at" in existing:
+                    compact["body_evicted_at"] = existing["body_evicted_at"]
+                if compact != old:
+                    _write_json(path, compact)
+                old = compact
+                if any(field in existing for field in {"code", "output", "events"}):
+                    history.record("execution", old, preserve_updated=True)
+                    existing = history.get(old["id"])
+            finished = old.get("finished")
+            existing_finished = existing.get("finished") if existing is not None else None
+            newer = (
+                isinstance(finished, (int, float))
+                and not isinstance(finished, bool)
+                and math.isfinite(finished)
+                and (
+                    not isinstance(existing_finished, (int, float))
+                    or isinstance(existing_finished, bool)
+                    or not math.isfinite(existing_finished)
+                    or finished > existing_finished
+                )
+            )
+            if (
+                existing is not None
+                and existing.get("state") == old.get("state")
+                and not newer
+            ):
+                continue
+            kwargs = {}
+            if (
+                isinstance(finished, (int, float))
+                and not isinstance(finished, bool)
+                and math.isfinite(finished)
+            ):
+                kwargs["updated_at"] = finished
+            history.record("execution", old, **kwargs)
+        except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
             print(f"Skipping execution record {path.name}: {safe_error(exc)}", file=sys.stderr)
             continue
 
@@ -1187,6 +1235,17 @@ class Runtime:
                     code="execution_metadata_corrupt",
                     details={"exec_id": ident, "outcome_unknown": True},
                 )
+            get_history = getattr(self.history, "get", None)
+            if callable(get_history):
+                durable = await self.io(get_history, ident)
+                if isinstance(durable, dict) and (
+                    durable.get("output_evicted") or durable.get("scan_output_evicted")
+                ):
+                    rec = {
+                        **rec,
+                        "output_evicted": True,
+                        "scan_output_evicted": bool(durable.get("scan_output_evicted")),
+                    }
         if rec.get("restart_id"):
             from .restart import recover_ticket
 
@@ -1236,7 +1295,12 @@ class Runtime:
             if error is not None:
                 error = error.encode(errors="replace")[:error_limit].decode(errors="ignore")
             size = len(json.dumps(error, ensure_ascii=False).encode())
-            if cold:
+            output_evicted = bool(
+                rec.get("output_evicted") or rec.get("scan_output_evicted")
+            )
+            if output_evicted:
+                output, total = [], cursor
+            elif cold:
                 output, total = await self.io(
                     read_page,
                     self.root / "runs" / f"{ident}.jsonl",
@@ -1268,6 +1332,13 @@ class Runtime:
                     output.append(event)
                     size += n
             warnings = list(rec.get("warnings", []))
+            if output_evicted:
+                warning = {
+                    "code": "output_expired",
+                    "text": "Retained task output has expired and is no longer available.",
+                }
+                if warning not in warnings:
+                    warnings.append(warning)
             warnings.extend(
                 {"code": event["code"], "text": event["text"]}
                 for event in output
@@ -1302,7 +1373,10 @@ class Runtime:
                     if rec.get("warnings_truncated") or len(warnings) > 4
                     else {}
                 ),
+                **({"output_evicted": True} if output_evicted else {}),
             }
+            if output_evicted:
+                result["truncated"] = True
             return result, total
 
         result, total = await page()

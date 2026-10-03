@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 
 from mypr_mcp.config import ConfigStore
@@ -174,4 +177,178 @@ async def test_lsp_save_allows_external_lsp_and_unrelated_scalar_changes(tmp_pat
         saved = await bridge.save_lsp({}, current["servers"])
         assert saved["servers"] == {}
     finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_configure_cancellation_commits_persisted_server(tmp_path, monkeypatch):
+    bridge = MCPBridge(tmp_path, global_path=tmp_path / "global.toml")
+    started = threading.Event()
+    release = threading.Event()
+    original = bridge._save_server
+
+    def delayed(*args):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test save was not released")
+        return original(*args)
+
+    monkeypatch.setattr(bridge, "_save_server", delayed)
+    config = {"command": "server"}
+    task = asyncio.create_task(bridge.configure("server", config))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert bridge.get_config("server") == config
+        snapshot = ConfigStore(tmp_path, tmp_path / "global.toml").load()
+        assert snapshot.values["mcp"]["servers"]["server"] == config
+    finally:
+        release.set()
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_remove_cancellation_commits_persisted_tombstone(tmp_path, monkeypatch):
+    global_path = tmp_path / "global.toml"
+    bridge = MCPBridge(tmp_path, global_path=global_path)
+    await bridge.configure("server", {"command": "server"})
+    started = threading.Event()
+    release = threading.Event()
+    original = bridge._save_server
+
+    def delayed(*args):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test save was not released")
+        return original(*args)
+
+    monkeypatch.setattr(bridge, "_save_server", delayed)
+    task = asyncio.create_task(bridge.remove("server"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ValueError):
+            bridge.get_config("server")
+        snapshot = ConfigStore(tmp_path, global_path).load()
+        assert "server" not in snapshot.values["mcp"]["servers"]
+    finally:
+        release.set()
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_configure_cancellation_finishes_connection_transition(tmp_path):
+    bridge = MCPBridge(tmp_path, global_path=tmp_path / "global.toml")
+    await bridge.configure("server", {"command": "old"})
+    started = asyncio.Event()
+    release = threading.Event()
+
+    class Connection:
+        busy = False
+        connected = True
+
+        def block_admissions(self):
+            pass
+
+        def unblock_admissions(self):
+            pass
+
+        async def close(self, force=False):
+            del force
+            started.set()
+            await asyncio.to_thread(release.wait, 5)
+            self.closed = True
+
+    connection = Connection()
+    bridge._connections["server"] = connection
+    task = asyncio.create_task(bridge.configure("server", {"command": "new"}))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert bridge.get_config("server") == {"command": "new"}
+        assert connection.closed is True
+        assert "server" not in bridge._connections
+    finally:
+        release.set()
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_full_lsp_save_cancellation_refreshes_runtime_snapshot(tmp_path, monkeypatch):
+    bridge = MCPBridge(tmp_path, global_path=tmp_path / "global.toml")
+    started = threading.Event()
+    release = threading.Event()
+    original = bridge.store.save_lsp
+
+    def delayed(*args):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test save was not released")
+        return original(*args)
+
+    monkeypatch.setattr(bridge.store, "save_lsp", delayed)
+    definition = {
+        "command": ["pyright-langserver", "--stdio"],
+        "languages": ["python"],
+        "timeout": 10.0,
+    }
+    task = asyncio.create_task(bridge.save_lsp({"pyright": definition}, {}))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        snapshot = ConfigStore(tmp_path, tmp_path / "global.toml").load()
+        assert bridge._snapshot.values["lsp"]["servers"] == {"pyright": definition}
+        assert bridge._revision == snapshot.revision
+        assert snapshot.values["lsp"]["servers"] == {"pyright": definition}
+    finally:
+        release.set()
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_named_lsp_save_cancellation_refreshes_runtime_snapshot(tmp_path, monkeypatch):
+    bridge = MCPBridge(tmp_path, global_path=tmp_path / "global.toml")
+    started = threading.Event()
+    release = threading.Event()
+    original = bridge._store.save_server
+
+    def delayed(*args):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test save was not released")
+        return original(*args)
+
+    monkeypatch.setattr(bridge._store, "save_server", delayed)
+    definition = {
+        "command": ["pyright-langserver", "--stdio"],
+        "languages": ["python"],
+        "timeout": 10.0,
+    }
+    task = asyncio.create_task(
+        bridge.save_lsp({"pyright": definition}, {}, name="pyright", definition=definition)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        snapshot = ConfigStore(tmp_path, tmp_path / "global.toml").load()
+        assert bridge._snapshot.values["lsp"]["servers"] == {"pyright": definition}
+        assert bridge._revision == snapshot.revision
+        assert snapshot.values["lsp"]["servers"] == {"pyright": definition}
+    finally:
+        release.set()
         await bridge.close()

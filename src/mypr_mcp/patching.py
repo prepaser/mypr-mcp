@@ -443,21 +443,33 @@ def _history_limit(path: Path, history_store: Any) -> int | None:
     return _history_blob_limit()
 
 
-def _read_state(path: Path, display: str, max_bytes: int | None = None) -> _State:
+def _read_state(
+    path: Path,
+    display: str,
+    max_bytes: int | None = None,
+    *,
+    no_symlink: bool = False,
+) -> _State:
     try:
-        info = path.stat()
+        info = path.lstat() if no_symlink else path.stat()
     except FileNotFoundError:
         return _State(path, display, False, None, None)
+    if no_symlink and stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Path must not be a symlink: {display}")
     _require_regular(info, display)
     if max_bytes is not None and info.st_size > max_bytes:
         raise _history_size_error(display, max_bytes)
     try:
-        data, opened = _read_regular(path, display, max_bytes=max_bytes)
+        data, opened = _read_regular(
+            path, display, max_bytes=max_bytes, nofollow=no_symlink
+        )
     except _ReadLimitExceeded as exc:
         if max_bytes is not None:
             raise _history_size_error(display, exc.limit) from exc
         raise
-    after = path.stat()
+    after = path.lstat() if no_symlink else path.stat()
+    if no_symlink and stat.S_ISLNK(after.st_mode):
+        raise ValueError(f"Path must not be a symlink: {display}")
     if _signature(info) != _signature(opened) or _signature(info) != _signature(after):
         raise RuntimeError(f"File changed while reading: {display}")
     return _State(path, display, True, data, after)
@@ -641,6 +653,7 @@ def _commit(
     limit: int,
     *,
     history_store: Any = None,
+    no_symlink: bool = False,
 ) -> dict[str, Any]:
     temporaries: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
@@ -707,6 +720,7 @@ def _commit(
                 path,
                 plan["display"],
                 _history_limit(path, history_store),
+                no_symlink=no_symlink,
             )
             if state is None:
                 state = _State(path, plan["display"], False, None, None)
@@ -737,6 +751,7 @@ def _commit(
                     source,
                     plan["source_display"] or str(source),
                     _history_limit(source, history_store),
+                    no_symlink=no_symlink,
                 )
                 _assert_unchanged(source_state, current_source)
                 source.unlink()
@@ -760,6 +775,7 @@ def _commit(
                     path,
                     str(path),
                     _history_limit(path, history_store),
+                    no_symlink=no_symlink,
                 )
                 if expected_new is None and current.exists:
                     raise RuntimeError("path changed outside this patch")

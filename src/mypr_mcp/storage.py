@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .file_io import open_regular, read_bytes
+from .history import _TERMINAL_STATES
 from .storage_lock import StorageLock
 
 DEFAULT_AGE_DAYS = 30
@@ -37,7 +38,6 @@ _MAX_PLAN_COUNT = 16
 _MAX_PLAN_AGE = 60 * 60
 _MAX_PLAN_CANDIDATES = 4096
 _MAX_PUBLIC_ITEMS = 1024
-_TERMINAL = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
 _REVISION = set("0123456789abcdef")
 _PROTECTED_TOP_LEVEL = {
     "venv",
@@ -388,6 +388,7 @@ class Storage:
             "selected_ids": list(database.get("selected_ids", ())),
             "pruned_count": 0,
             "pruned_bytes": 0,
+            "json_compacted": 0,
             "checkpoint": None,
             "vacuum": None,
             "reclaimed_bytes": 0,
@@ -425,6 +426,9 @@ class Storage:
             value = raw.get(key, result[key])
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 result[key] = value
+        json_compacted = raw.get("json_compacted", 0)
+        if isinstance(json_compacted, int) and not isinstance(json_compacted, bool):
+            result["json_compacted"] = max(0, json_compacted)
         for key in ("checkpoint", "vacuum"):
             if key in raw:
                 result[key] = raw[key]
@@ -433,6 +437,22 @@ class Storage:
             errors = [errors]
         if isinstance(errors, Iterable) and not isinstance(errors, (str, bytes)):
             result["errors"] = [str(value)[:512] for value in errors if value is not None][:8]
+        json_errors = raw.get("json_compaction_errors", ())
+        if isinstance(json_errors, Mapping):
+            json_errors = [json_errors]
+        if isinstance(json_errors, Iterable) and not isinstance(json_errors, (str, bytes)):
+            remaining = max(0, 8 - len(result["errors"]))
+            for value in islice(json_errors, remaining):
+                if value is None:
+                    continue
+                if isinstance(value, Mapping):
+                    ident = str(value.get("id", ""))[:64]
+                    detail = str(value.get("error", ""))[:512]
+                    text = f"execution JSON compaction: {ident}: {detail}"
+                else:
+                    text = f"execution JSON compaction: {str(value)[:512]}"
+                result["errors"].append(text[:512])
+            result["errors"] = result["errors"][:8]
         return result
 
     def _mail_snapshot(self) -> dict[str, Any]:
@@ -622,6 +642,7 @@ class Storage:
             "selected_ids": list(plan.get("database", {}).get("selected_ids", ())),
             "pruned_count": 0,
             "pruned_bytes": 0,
+            "json_compacted": 0,
             "checkpoint": None,
             "vacuum": None,
             "reclaimed_bytes": 0,
@@ -951,7 +972,7 @@ class Storage:
             state = payload.get("state")
             state = str(state) if state is not None else None
             paths = frozenset(self._referenced_paths(payload))
-            active = ident in active_ids or state not in _TERMINAL
+            active = ident in active_ids or state not in _TERMINAL_STATES
             records.append(_Record(ident, state, active, paths))
         return records
 

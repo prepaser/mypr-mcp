@@ -457,7 +457,25 @@ class HTMLExtractor:
             page["structure"] = {"headings": [], "metadata": {}}
             page["structure_truncated"] = bool(snapshot.get("structure_truncated", False))
             page["structure_has_more"] = structure_offset < len(structure_entries)
-        size = len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode())
+
+        def set_page_state(
+            candidate: dict[str, Any], item_offset: int, entry_offset: int
+        ) -> None:
+            more = item_offset < len(items) or entry_offset < len(structure_entries)
+            candidate["has_more"] = more
+            candidate["truncated"] = more
+            candidate["next_cursor"] = (
+                self._cursor(ident, item_offset, entry_offset) if more else None
+            )
+            if "structure" in candidate:
+                candidate["structure_has_more"] = entry_offset < len(structure_entries)
+
+        def size(candidate: dict[str, Any]) -> int:
+            return len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode())
+
+        # Include the final cursor when testing whether an entry fits.
+        set_page_state(page, offset, structure_offset)
+        page_size = size(page)
         structure_index = structure_offset
         while structure_index < len(structure_entries):
             entry = structure_entries[structure_index]
@@ -468,9 +486,8 @@ class HTMLExtractor:
                 candidate["structure"]["metadata"][entry[1]] = entry[2]
             else:
                 candidate["structure"]["headings"].append(entry[1])
-            candidate_size = len(
-                json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode()
-            )
+            set_page_state(candidate, offset, structure_index + 1)
+            candidate_size = size(candidate)
             if candidate_size > max_bytes:
                 if structure_index == structure_offset:
                     raise ValueError(
@@ -478,15 +495,42 @@ class HTMLExtractor:
                     )
                 break
             page = candidate
-            size = candidate_size
+            page_size = candidate_size
             structure_index += 1
-        if "structure" in page:
-            page["structure_has_more"] = structure_index < len(structure_entries)
+        set_page_state(page, offset, structure_index)
         index = offset
         while index < len(items):
             item = items[index]
-            item_size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode())
-            if size + item_size + 2 > max_bytes:
+            old_cursor = page["next_cursor"]
+            old_has_more = page["has_more"]
+            old_truncated = page["truncated"]
+            if item["kind"] == "text":
+                page["text"] += item["text"]
+            else:
+                page["links"].append({"url": item["url"], "text": item["text"]})
+            set_page_state(page, index + 1, structure_index)
+            # The item representation contains at least the same escaped text
+            # as the page representation, plus its kind and object delimiters.
+            # Use that conservative delta so paging remains linear for large
+            # extracted documents; the final serialization below is exact.
+            item_size = (
+                len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode()) + 2
+            )
+            old_values = (old_cursor, old_has_more, old_truncated)
+            new_values = (page["next_cursor"], page["has_more"], page["truncated"])
+            metadata_delta = sum(
+                len(json.dumps(new, ensure_ascii=False).encode())
+                - len(json.dumps(old, ensure_ascii=False).encode())
+                for old, new in zip(old_values, new_values, strict=True)
+            )
+            estimated_size = page_size + item_size + metadata_delta
+            if estimated_size > max_bytes:
+                if item["kind"] == "text":
+                    if item["text"]:
+                        page["text"] = page["text"][: -len(item["text"])]
+                else:
+                    page["links"].pop()
+                set_page_state(page, index, structure_index)
                 if index == offset:
                     if structure_index == structure_offset:
                         raise ValueError(
@@ -495,19 +539,10 @@ class HTMLExtractor:
                         )
                     break
                 break
-            if item["kind"] == "text":
-                page["text"] += item["text"]
-            else:
-                page["links"].append({"url": item["url"], "text": item["text"]})
-            size += item_size + 2
+            page_size = estimated_size
             index += 1
-        more = index < len(items) or structure_index < len(structure_entries)
-        page["has_more"] = more
-        page["truncated"] = more
-        page["next_cursor"] = (
-            self._cursor(ident, index, structure_index) if more else None
-        )
-        if len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
+        set_page_state(page, index, structure_index)
+        if size(page) > max_bytes:
             raise HTMLToolError("HTML result page exceeded its byte limit")
         return page
 

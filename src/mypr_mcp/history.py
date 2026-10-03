@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import secrets
 import sqlite3
 import threading
@@ -19,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .client_ids import ADJECTIVES, ANIMALS
+from .file_io import read_bytes
 from .history_maintenance import vacuum_if_worthwhile
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
@@ -27,6 +30,7 @@ _MAX_PAYLOAD_BYTES = 64 * 1024
 _MAX_HISTORY_WARNINGS = 8
 _MAX_WARNING_TEXT = 256
 _MAX_HISTORY_GC_ITEMS = 1000
+_MAX_EXECUTION_RECORD_BYTES = 16 * 1024 * 1024
 _DAY = 24 * 60 * 60
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
 _BULKY_ENTITY_FIELDS = {"code", "output", "events"}
@@ -629,6 +633,7 @@ class History:
         pruned_bytes = 0
         skipped: list[dict[str, Any]] = []
         max_seq = 0
+        compacted_json: list[str] = []
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -675,6 +680,8 @@ class History:
                         "UPDATE entities SET data=? WHERE id=?", (new_data, ident)
                     )
                     compacted += 1
+                    if row["kind"] == "execution":
+                        compacted_json.append(ident)
                     pruned_bytes += max(0, old_size - len(new_data.encode("utf-8")))
                 for item in events:
                     if not isinstance(item, Mapping) or not isinstance(item.get("seq"), int):
@@ -724,10 +731,15 @@ class History:
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
+            json_compacted, json_errors = self._compact_execution_records(
+                compacted_json, now
+            )
             vacuum = self._vacuum_after_history_commit(now)
         watermark = int(self._meta_value("pruned_through_seq") or 0)
         return {
             "entities": compacted,
+            "json_compacted": json_compacted,
+            **({"json_compaction_errors": json_errors} if json_errors else {}),
             "events": deleted_events,
             "pruned_bytes": pruned_bytes,
             "reclaimed_bytes": int(vacuum.get("reclaimed_bytes", 0)),
@@ -737,6 +749,70 @@ class History:
             "pruned_through_seq": watermark,
             "vacuum": vacuum,
         }
+
+    def _compact_execution_records(
+        self, records: list[str], timestamp: float
+    ) -> tuple[int, list[dict[str, str]]]:
+        compacted = 0
+        errors: list[dict[str, str]] = []
+        for ident in records:
+            if not ident or Path(ident).name != ident or ident in {".", ".."}:
+                continue
+            path = self.root / ".mypr" / "runs" / f"{ident}.json"
+            try:
+                payload = json.loads(
+                    read_bytes(
+                        path,
+                        max_bytes=_MAX_EXECUTION_RECORD_BYTES,
+                        follow_symlinks=False,
+                    ).decode("utf-8")
+                )
+                if not isinstance(payload, dict) or payload.get("id", ident) != ident:
+                    continue
+                if payload.get("state") not in _TERMINAL_STATES:
+                    continue
+                if not any(field in payload for field in _BULKY_ENTITY_FIELDS):
+                    continue
+                code = payload.get("code")
+                compact = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in _BULKY_ENTITY_FIELDS
+                }
+                if isinstance(code, str):
+                    compact["code_sha256"] = _sha256_text(code)
+                compact["body_evicted"] = True
+                compact["body_evicted_at"] = timestamp
+                temporary = path.with_suffix(path.suffix + ".tmp")
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        descriptor = -1
+                        stream.write(_dump(compact).encode("utf-8"))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, path)
+                    directory = os.open(
+                        path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    )
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                finally:
+                    if descriptor != -1:
+                        os.close(descriptor)
+                    temporary.unlink(missing_ok=True)
+                compacted += 1
+            except FileNotFoundError:
+                continue
+            except (OSError, TypeError, ValueError, UnicodeError) as exc:
+                errors.append({"id": ident, "error": f"{type(exc).__name__}: {exc}"})
+        return compacted, errors
 
     def _vacuum_after_history_commit(self, now: float) -> dict[str, Any]:
         last = self._meta_value("last_vacuum_at")
@@ -781,7 +857,7 @@ class History:
                     record, warning = _decode_entity(row)
                     if warning is not None:
                         continue
-                    if record.get("state") not in {"succeeded", "failed", "cancelled", "lost"}:
+                    if record.get("state") not in _TERMINAL_STATES:
                         continue
                     kind = record.get("kind")
                     ident = record.get("id")
@@ -849,6 +925,8 @@ class History:
         event: str | None = None,
         *,
         entity_id: str | None = None,
+        updated_at: float | None = None,
+        preserve_updated: bool = False,
     ) -> dict[str, Any]:
         """Merge an entity update and optionally append its lifecycle event."""
         self._ensure_open()
@@ -864,14 +942,24 @@ class History:
         storage_id = ident if entity_id is None else entity_id
         if not isinstance(storage_id, str) or not storage_id:
             raise ValueError("entity_id must be a non-empty string")
+        if type(preserve_updated) is not bool:
+            raise TypeError("preserve_updated must be a boolean")
         if storage_id != ident:
             record = {**record, "history_id": storage_id}
-        now = time.time()
+        now = time.time() if updated_at is None else updated_at
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(now)
+        ):
+            raise TypeError("updated_at must be a number or None")
+        now = float(now)
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 row = self._db.execute(
-                    "SELECT entity_seq, kind, data FROM entities WHERE id = ?", (storage_id,)
+                    "SELECT entity_seq, kind, updated, data FROM entities WHERE id = ?",
+                    (storage_id,),
                 ).fetchone()
                 if row is None:
                     merged = dict(record)
@@ -883,6 +971,8 @@ class History:
                         (storage_id, kind, now, now, _dump(merged)),
                     )
                 else:
+                    if preserve_updated:
+                        now = float(row["updated"])
                     if row["kind"] != kind:
                         raise ValueError(f"entity {storage_id!r} already has kind {row['kind']!r}")
                     try:
@@ -892,6 +982,15 @@ class History:
                             f"cannot update corrupt history entity {storage_id!r}"
                         ) from exc
                     merged = {**previous, **record}
+                    if previous.get("body_evicted") is True:
+                        merged = {
+                            key: value
+                            for key, value in merged.items()
+                            if key not in _BULKY_ENTITY_FIELDS
+                        }
+                        merged["body_evicted"] = True
+                        if "body_evicted_at" in previous:
+                            merged["body_evicted_at"] = previous["body_evicted_at"]
                     merged["id"] = ident
                     merged.setdefault("kind", kind)
                     self._db.execute(

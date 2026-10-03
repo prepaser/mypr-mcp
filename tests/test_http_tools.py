@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import os
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 import pytest
@@ -254,6 +255,49 @@ async def test_shared_namespace_and_reconfiguration(tools: HTTPTools, http_serve
     await tools.close()
     replacement = await tools.client(timeout=1)
     assert replacement is not client
+    await tools.aclose()
+
+
+async def test_client_snapshots_mutable_options_without_copying_native_objects(tools: HTTPTools):
+    import httpx2
+
+    headers = {"X-Test": "before"}
+    transport = httpx2.MockTransport(lambda _request: httpx2.Response(200))
+    query = httpx2.QueryParams({"q": "before"})
+    options = {"headers": headers, "transport": transport}
+    snapshot = tools._snapshot_options({**options, "params": query})
+    assert snapshot["headers"].items == (("X-Test", "before"),)
+    assert snapshot["headers"] is not headers
+    assert snapshot["params"].items == (("q", "before"),)
+    assert snapshot["transport"] is transport
+    repeated_headers = httpx2.Headers([("X-Test", "one"), ("X-Test", "two")])
+    first_headers = tools._snapshot_options({"headers": repeated_headers})["headers"]
+    repeated_headers.update({"X-Test": "three"})
+    second_headers = tools._snapshot_options({"headers": repeated_headers})["headers"]
+    assert first_headers != second_headers
+    assert first_headers.items == (("x-test", "one"), ("x-test", "two"))
+    assert tools._snapshot_options(
+        {"headers": httpx2.Headers([("X-Test", "two"), ("X-Test", "one")])}
+    )["headers"] == first_headers
+    cookies = httpx2.Cookies()
+    cookies.set("sid", "one", domain="one.example")
+    cookies.set("sid", "two", domain="two.example")
+    first_cookies = tools._snapshot_options({"cookies": cookies})["cookies"]
+    cookies.set("sid", "changed", domain="two.example")
+    assert first_cookies != tools._snapshot_options({"cookies": cookies})["cookies"]
+    await tools.client("cookies", cookies=cookies, transport=transport)
+    backing = {"key": "before"}
+    first_proxy = tools._snapshot_options({"headers": MappingProxyType(backing)})["headers"]
+    backing["key"] = "after"
+    second_proxy = tools._snapshot_options({"headers": MappingProxyType(backing)})["headers"]
+    assert first_proxy != second_proxy
+
+    headers["X-Test"] = "before"
+    assert snapshot["headers"].items == (("X-Test", "before"),)
+    await tools.client("mutable", **options)
+    headers["X-Test"] = "after"
+    with pytest.raises(RuntimeError, match="already exists with different options"):
+        await tools.client("mutable", **options)
     await tools.aclose()
 
 

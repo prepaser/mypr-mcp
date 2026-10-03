@@ -139,9 +139,8 @@ class Search:
             names.append("rga")
             adapters = options.get("adapters")
             adapter_values = [adapters] if isinstance(adapters, str) else adapters or []
-            if adapters is None or any(
-                str(value).lower() == "pandoc" for value in adapter_values
-            ):
+            selected = ",".join(str(value) for value in adapter_values).lower()
+            if not selected.startswith("-") and "pandoc" in selected.removeprefix("+").split(","):
                 names.append("pandoc")
         elif backend == "ast":
             names = ["ast-grep"]
@@ -502,9 +501,7 @@ class Search:
                 )
             if backend == "ast":
                 executable = (
-                    executables.get("ast-grep")
-                    or shutil.which("ast-grep")
-                    or shutil.which("sg")
+                    executables.get("ast-grep") or shutil.which("ast-grep") or shutil.which("sg")
                 )
                 if executable is None:
                     raise RuntimeError(

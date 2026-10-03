@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 
@@ -20,6 +21,12 @@ def _age_database(root, *, entity_id: str, event_seq: int, age: float = 90 * 864
 
 def test_history_gc_preview_apply_compacts_body_and_reports_watermark(tmp_path):
     history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "old.json").write_text(
+        '{"id":"old","state":"succeeded","generation":"g1",'
+        '"code":"print(\\"old\\")","output":[{"text":"body"}]}'
+    )
     history.record(
         "execution",
         {
@@ -56,6 +63,11 @@ def test_history_gc_preview_apply_compacts_body_and_reports_watermark(tmp_path):
     assert "code" not in compacted
     assert "output" not in compacted
     assert "events" not in compacted
+    persisted = json.loads((runs / "old.json").read_text())
+    assert persisted["body_evicted"] is True
+    assert persisted["code_sha256"] == hashlib.sha256(b'print("old")').hexdigest()
+    assert "code" not in persisted
+    assert "output" not in persisted
 
     current = history.append("execution", "output", {"id": "new", "text": "new"})
     logs = history.logs(cursor=0)
@@ -164,6 +176,107 @@ def test_history_gc_candidate_limit_ignores_malformed_ids(tmp_path, monkeypatch)
         database.commit()
     plan = history.storage_history_snapshot(retention_days=30)
     assert [item["id"] for item in plan["entities"]] == ["eligible"]
+    history.close()
+
+
+def test_storage_eviction_marks_all_terminal_states(tmp_path):
+    history = History(tmp_path)
+    states = ("reset", "complete", "completed")
+    for index, state in enumerate(states):
+        history.record("shell", {"id": f"job-{index}", "state": state})
+
+    paths = [f".mypr/jobs/job-{index}.jsonl" for index in range(len(states))]
+    assert history.mark_storage_evicted(paths) == paths
+    assert all(history.get(f"job-{index}")["output_evicted"] for index in range(len(states)))
+    history.close()
+
+
+def test_recovery_does_not_restore_evicted_body_or_refresh_age(tmp_path):
+    history = History(tmp_path)
+    ident = "a" * 32
+    history.record(
+        "execution",
+        {
+            "id": ident,
+            "state": "succeeded",
+            "generation": "old",
+            "code": "old source",
+            "finished": 10,
+        },
+    )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        database.execute("UPDATE entities SET updated=10 WHERE id=?", (ident,))
+        database.commit()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / f"{ident}.json").write_text(
+        '{"id":"' + ident + '","generation":"old","state":"succeeded",'
+        '"code":"restored source","finished":10}'
+    )
+
+    from mypr_mcp.runtime import _recover_runs
+
+    _recover_runs(tmp_path, history)
+    recovered = history.get(ident)
+    updated = sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3").execute(
+        "SELECT updated FROM entities WHERE id=?", (ident,)
+    ).fetchone()[0]
+    assert recovered["code"] == "old source"
+    assert updated == 10
+    history.close()
+
+
+def test_recovery_preserves_compaction_marker_when_lifecycle_finishes(tmp_path):
+    history = History(tmp_path)
+    ident = "b" * 32
+    history.record(
+        "execution",
+        {"id": ident, "state": "lost", "body_evicted": True, "body_evicted_at": 5},
+    )
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / f"{ident}.json").write_text(
+        '{"id":"' + ident + '","generation":"old","state":"succeeded",'
+        '"code":"restored source","finished":42}'
+    )
+
+    from mypr_mcp.runtime import _recover_runs
+
+    _recover_runs(tmp_path, history)
+    recovered = history.get(ident)
+    assert recovered["state"] == "succeeded"
+    assert recovered["body_evicted"] is True
+    assert "code" not in recovered
+    assert recovered["body_evicted_at"] == 5
+    history.close()
+
+
+def test_recovery_repairs_legacy_evicted_body_without_refreshing_age(tmp_path):
+    history = History(tmp_path)
+    ident = "c" * 32
+    history.record(
+        "execution",
+        {"id": ident, "state": "succeeded", "body_evicted": True, "code": "stale body"},
+    )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        database.execute("UPDATE entities SET updated=10 WHERE id=?", (ident,))
+        database.commit()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / f"{ident}.json").write_text(
+        '{"id":"' + ident + '","generation":"old","state":"succeeded"}'
+    )
+
+    from mypr_mcp.runtime import _recover_runs
+
+    _recover_runs(tmp_path, history)
+    recovered = history.get(ident)
+    updated = sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3").execute(
+        "SELECT updated FROM entities WHERE id=?", (ident,)
+    ).fetchone()[0]
+    assert "code" not in recovered
+    assert recovered["body_evicted"] is True
+    assert updated == 10
     history.close()
 
 
