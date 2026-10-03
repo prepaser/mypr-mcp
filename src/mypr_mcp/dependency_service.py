@@ -16,6 +16,7 @@ from typing import Any
 from .dependency_store import DependencyStore
 from .diagnostics import RPCError, safe_error
 from .python_dependencies import (
+    CORE_PACKAGES,
     PYTHON_PACKAGE_REQUIREMENTS,
     PYTHON_PACKAGES,
     uv_diagnostics,
@@ -303,7 +304,7 @@ class DependencyService:
         return {"items": items}
 
     def _check_install(self, name: str, automatic: bool) -> None:
-        if automatic and not self.config["auto_install"]:
+        if automatic and not self.config["auto_install"] and name not in CORE_PACKAGES:
             raise RPCError(
                 f"{name} is missing and dependencies.auto_install is false; "
                 f"run await ws.dependencies.ensure({name!r}) to install it explicitly.",

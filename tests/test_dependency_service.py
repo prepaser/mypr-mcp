@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from mypr_mcp.bootstrap import prepare_core
 from mypr_mcp.dependency_service import DependencyService
 from mypr_mcp.diagnostics import RPCError
+from mypr_mcp.python_dependencies import CORE_PACKAGES
 
 
 class FakeStore:
@@ -102,6 +104,43 @@ async def test_automatic_missing_is_blocked_but_explicit_ensure_bypasses_policy(
     assert result["items"][0]["status"] == "installed"
     assert store.ensure_calls == ["rg"]
     await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_install", [False, True])
+async def test_core_preparation_keeps_optional_install_policy(tmp_path, monkeypatch, auto_install):
+    installed = set()
+    calls = []
+
+    async def install(names, context):
+        calls.append((tuple(names), context))
+        installed.update(names)
+
+    service = _service(tmp_path, FakeStore(tmp_path), install_packages=install)
+    service.apply_config({"auto_install": auto_install})
+
+    async def packages(names):
+        return {
+            name: {"name": name, "status": "installed" if name in installed else "missing"}
+            for name in names
+        }
+
+    monkeypatch.setattr(service, "_packages", packages)
+    try:
+        for _ in range(2):
+            result = await prepare_core(service)
+            assert all(item["status"] == "installed" for item in result["items"])
+        assert calls == [(CORE_PACKAGES, {"bootstrap": True})]
+        assert installed == set(CORE_PACKAGES)
+        assert service.config["auto_install"] is auto_install
+        if not auto_install:
+            with pytest.raises(RPCError) as failure:
+                await service.ensure(["pillow"], automatic=True)
+            assert failure.value.code == "dependency_missing"
+            assert failure.value.details["name"] == "pillow"
+            assert len(calls) == 1
+    finally:
+        await service.close()
 
 
 @pytest.mark.asyncio

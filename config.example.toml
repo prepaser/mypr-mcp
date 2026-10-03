@@ -23,7 +23,8 @@
 
 # Built-in features prepare registered dependencies when needed. Binary tools
 # and OCR models are shared under XDG_DATA_HOME/mypr; Python packages use the
-# workspace .mypr environment. Set false to require ws.dependencies.ensure().
+# workspace .mypr environment. Core kernel packages are always prepared.
+# Set false to require ws.dependencies.ensure() for optional dependencies.
 # [dependencies]
 # auto_install = true
 # Optional uv cache and install-link settings. Paths are absolute or begin with

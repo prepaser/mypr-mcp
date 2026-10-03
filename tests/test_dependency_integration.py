@@ -109,15 +109,20 @@ async def test_workspace_python_dependency_environments_are_independent(
     workspace, monkeypatch, tmp_path
 ):
     _configure_local_index(monkeypatch, tmp_path)
+    (workspace / ".mypr").mkdir()
+    (workspace / ".mypr" / "config.toml").write_text(
+        "[dependencies]\nauto_install = false\n"
+    )
     other = workspace.parent / "other-workspace"
     other.mkdir()
     try:
         async with mcp_session(workspace) as first:
             disabled = await execute(
                 first,
-                "await ws.config.set('dependencies.auto_install', False)\nawait ws.config.reload()",
+                "(await ws.dependencies.list(kind='python'))['auto_install']",
             )
             assert disabled["state"] == "succeeded", result_text(disabled)
+            assert result_text(disabled).strip() == "False"
             installed = await execute(
                 first,
                 "await ws.dependencies.ensure('cssselect')",
