@@ -137,6 +137,16 @@ Draft and send are separate. await ws.mail.draft(account=..., to=..., cc=..., bc
 
 await ws.mail.watch(account=None, mailbox="INBOX") creates a per-client subscription. Watch state and cursors survive reset, disconnect, and manager restart; one manager connection is shared by clients. New arrivals appear automatically as bounded mail previews on later init, execute, and poll calls, and can wake their wait. Use notifications(limit=20, cursor=None) for cached pages and ack(notification_ids) after handling them. A notification preview or acknowledgment never marks its message read. await ws.mail.unwatch(watch_id) removes a subscription; await ws.mail.watches() reports sync and error state. The mail field is absent when there are no cached notifications, pending or uncertain sends, or reportable watch issues, so its absence does not prove that a mailbox is empty.""",
     ),
+    "web": (
+        "Search the web and extract bounded content through configured providers.",
+        """ws.web uses manager-owned API clients for Kagi, Brave, and Tavily. Configure API keys with environment-variable names under the global or workspace [web.providers] tables; key values never enter Python RPC payloads or results. await ws.web.providers() reports configured providers, supported operations, and readiness without making a search request.
+
+await ws.web.search(query, provider=None, limit=10, options=None, max_bytes=32768) returns normalized title, URL, and snippet records. The common limit accepts 1–1024 results; the selected provider may enforce a lower limit. The provider is selected explicitly, then from web.default_provider, then from the only enabled provider. It never silently falls back or queries multiple providers. Provider-specific options are validated by the manager before a request; use ws.help("web.search") for the live signature.
+
+await ws.web.context(query, provider=None, limit=10, max_tokens=4096, options=None, max_bytes=32768) requests bounded source excerpts from a provider that supports contextual search. The common limit accepts 1–50 sources and the selected provider may enforce a lower limit. await ws.web.extract(urls, provider=None, options=None, max_bytes=32768) extracts content from one or more URLs where the selected provider supports it. Use await ws.http.read_html(url) when you want direct local HTTP fetching and HTML extraction, including cookies or browser-rendered page.content().
+
+Search and extraction responses are immutable client-owned snapshots. Read a returned page with await ws.web.page(cursor, max_bytes=...) without making another network request; page_cursor replays the current page with a different budget and next_cursor advances the snapshot. Additional provider result pages require a new search call. Content fragments repeat source metadata and include Unicode character offsets. Normal pages set truncated=False; use has_more and next_cursor for continuation. If the initial page budget cannot fit its metadata, follow error_info.details.page_cursor with a larger max_bytes instead of repeating the provider request. Inspect failed_results and provider usage before assuming a response is complete. The manager enforces request timeouts, concurrency, response size, and five-minute snapshot retention. Authentication, quota, rate-limit, timeout, and provider errors remain distinct from an empty result.""",
+    ),
     "locks": (
         "Coordinate cooperating Python tasks with named async locks.",
         """Use a task-scoped cooperative lock:
@@ -310,6 +320,11 @@ _METHOD_NOTES = {
     "doctor": "Returns readiness checks for runtime, packages, tools, LSP, browser, OCR, MCP configuration, and storage without installing or changing anything.",
     "dependencies.list": "Returns a paged dependency inventory without installing anything.",
     "dependencies.ensure": "Prepares registered dependencies and waits for completion; explicit ensure bypasses dependencies.auto_install.",
+    "web.providers": "Lists provider readiness and capabilities without making a billable web request.",
+    "web.search": "Returns a bounded normalized result snapshot. Provider-specific options are checked by the manager; no provider fallback or implicit additional page request occurs.",
+    "web.context": "Returns bounded source excerpts where the selected provider supports contextual search. Check content fragments, has_more, and usage.",
+    "web.extract": "Extracts bounded content from one or more URLs through a selected provider. Partial failures appear in failed_results and are not treated as an empty result.",
+    "web.page": "Reads a client-owned web snapshot without another network request. The cursor expires with the snapshot and cannot be shared across clients.",
 }
 _WORKSPACE_METHODS = {"help", "inspect", "status", "performance", "doctor", "reset", "restart"}
 

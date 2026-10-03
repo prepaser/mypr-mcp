@@ -6,7 +6,13 @@ import asyncio
 import copy
 
 from .async_utils import wait_owned
-from .config import ConfigStore, _validate_dependencies, parse_path, validate_mail_config
+from .config import (
+    ConfigStore,
+    _validate_dependencies,
+    parse_path,
+    validate_mail_config,
+    validate_web_config,
+)
 from .diagnostics import safe_error
 
 HOT_LIMITS = ("response_bytes", "completed_records", "cache_bytes")
@@ -87,6 +93,13 @@ class RuntimeConfig:
                 configured = self.applied.get("mail")
             if isinstance(configured, dict):
                 values["mail"] = copy.deepcopy(configured)
+        web = getattr(self.runtime, "web", None)
+        if web is not None:
+            configured = getattr(web, "applied_config", None)
+            if configured is None:
+                configured = self.applied.get("web")
+            if isinstance(configured, dict):
+                values["web"] = copy.deepcopy(configured)
         dependencies = getattr(self.runtime, "dependencies", None)
         if dependencies is not None:
             configured = getattr(dependencies, "config", None)
@@ -231,6 +244,17 @@ class RuntimeConfig:
                     result["errors"]["mail"] = mail_result["errors"]
             except Exception as exc:
                 result["errors"]["mail"] = safe_error(exc)
+            try:
+                web_result = await self._apply_web(values["web"], force=force)
+                self._record_web_application(web_result)
+                if web_result.get("applied") is not None:
+                    result["applied"]["web"] = web_result.get("applied")
+                if web_result.get("deferred"):
+                    result["deferred"]["web"] = web_result["deferred"]
+                if web_result.get("errors"):
+                    result["errors"]["web"] = web_result["errors"]
+            except Exception as exc:
+                result["errors"]["web"] = safe_error(exc)
             if not runtime.healthy:
                 result["deferred"]["lsp"] = "Kernel is unavailable"
             else:
@@ -277,6 +301,24 @@ class RuntimeConfig:
             raise RuntimeError("Mail service returned an invalid configuration result")
         return copy.deepcopy(response)
 
+    async def _apply_web(self, desired, *, force: bool) -> dict:
+        """Ask the manager-owned web service to apply a validated snapshot."""
+
+        service = getattr(self.runtime, "web", None)
+        if service is None:
+            if desired == self.applied.get("web", {}):
+                return {"applied": {}}
+            return {"deferred": "Web service is unavailable"}
+        apply_config = getattr(service, "apply_config", None)
+        if not callable(apply_config):
+            if desired == self.applied.get("web", {}):
+                return {"applied": {}}
+            return {"deferred": "Web service cannot reload configuration"}
+        response = await apply_config(copy.deepcopy(desired), force=force)
+        if not isinstance(response, dict):
+            raise RuntimeError("Web service returned an invalid configuration result")
+        return copy.deepcopy(response)
+
     def _apply_dependencies(self, desired) -> dict:
         """Apply dependency policy to the manager-owned service synchronously."""
 
@@ -314,6 +356,19 @@ class RuntimeConfig:
             return
         if normalized == applied_config:
             self.applied["mail"] = copy.deepcopy(normalized)
+
+    def _record_web_application(self, result: dict) -> None:
+        """Record only the normalized configuration confirmed by the service."""
+
+        applied_config = result.get("applied_config")
+        if not isinstance(applied_config, dict):
+            return
+        try:
+            normalized = validate_web_config(applied_config)
+        except Exception:
+            return
+        if normalized == applied_config:
+            self.applied["web"] = copy.deepcopy(normalized)
 
     async def _apply_lsp(self, snapshot, generation, force, *, starting=False):
         runtime = self.runtime

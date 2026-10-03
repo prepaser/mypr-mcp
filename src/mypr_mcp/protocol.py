@@ -57,6 +57,7 @@ CAPABILITIES = [
     "config",
     "timers",
     "mail",
+    "web",
     "dependencies",
 ]
 LEGACY_INSTRUCTIONS = """This workspace uses the legacy 0.9.0 runtime.

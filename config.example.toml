@@ -27,6 +27,26 @@
 # [dependencies]
 # auto_install = true
 
+# Web providers use environment-variable names for API keys. The manager reads
+# these variables; values are never stored in TOML or returned to Python.
+# [web]
+# default_provider = "kagi"
+# timeout_seconds = 30
+# max_concurrency = 4
+#
+# [web.providers.kagi]
+# api_key_env = "KAGI_API_KEY"
+#
+# [web.providers.brave]
+# api_key_env = "BRAVE_SEARCH_API_KEY"
+#
+# [web.providers.tavily]
+# api_key_env = "TAVILY_API_KEY"
+#
+# Disable an inherited provider with an entry containing only enabled = false.
+# [web.providers.kagi]
+# enabled = false
+
 # Mail accounts use environment-variable names for passwords. The manager resolves
 # those variables when it opens a connection; values are never stored in TOML.
 # [mail]

@@ -37,6 +37,7 @@ _PYTHON_PACKAGES = {
 }
 _BINARIES = ("uv", "rg", "rga", "ast-grep", "sg", "tesseract", "pandoc", "pdftotext")
 _SEARCH_BINARIES = ("rg", "rga", "ast-grep", "sg")
+_WEB_PROVIDERS = ("kagi", "brave", "tavily")
 _MAX_PROBE_STDOUT = 64 * 1024
 _MAX_PROBE_STDERR = 8 * 1024
 
@@ -249,6 +250,34 @@ def _mail_readiness(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _web_readiness(config: dict[str, Any]) -> dict[str, Any]:
+    configured = config.get("providers", {})
+    providers = {}
+    for name in _WEB_PROVIDERS:
+        definition = configured.get(name, {}) if isinstance(configured, dict) else {}
+        enabled = (
+            isinstance(definition, dict)
+            and bool(definition)
+            and definition.get("enabled", True) is not False
+        )
+        variable = definition.get("api_key_env") if enabled else None
+        available = bool(variable and variable in os.environ)
+        providers[name] = {
+            "configured": enabled,
+            "credentials": {
+                "source": variable,
+                "available": available,
+            } if variable else {},
+            "ready": available,
+        }
+    return {
+        "configured": any(item["configured"] for item in providers.values()),
+        "default_provider": config.get("default_provider") or None,
+        "providers": providers,
+        "network_checked": False,
+    }
+
+
 async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) -> dict[str, Any]:
     """Return local readiness information without repairing or starting anything."""
 
@@ -270,6 +299,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         "lsp": {},
         "mcp": {},
         "mail": {},
+        "web": {},
         "dependencies": {},
         "warnings": [],
     }
@@ -283,6 +313,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         snapshot = config_store.load()
         dependency_config = snapshot.values.get("dependencies", dependency_config)
         result["mail"] = _mail_readiness(snapshot.values.get("mail", {}))
+        result["web"] = _web_readiness(snapshot.values.get("web", {}))
         result["config"].update(
             valid=True,
             revision=snapshot.revision,
@@ -350,6 +381,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result["mcp"] = await _service_status(ws, "mcp", "list_servers")
     if ws is not None:
         result["mail"]["service"] = await _service_status(ws, "mail", "status")
+        result["web"]["service"] = await _service_status(ws, "web", "providers")
         result["dependencies"]["service"] = await _service_status(ws, "dependencies", "list")
     result["ready"] = bool(
         result["config"]["valid"]

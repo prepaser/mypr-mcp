@@ -1,6 +1,7 @@
 import copy
 import fcntl
 import hashlib
+import math
 import os
 import re
 import stat
@@ -19,9 +20,11 @@ from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
 MAX_RESPONSE_BYTES = 1024 * 1024
-MANAGED_SECTIONS = frozenset({"limits", "storage", "mcp", "lsp", "mail", "dependencies"})
+MANAGED_SECTIONS = frozenset(
+    {"limits", "storage", "mcp", "lsp", "mail", "web", "dependencies"}
+)
 _SERVER_SECTIONS = frozenset({"mcp", "lsp"})
-_NAMED_SECTIONS = frozenset({"mail"})
+_NAMED_SECTIONS = frozenset({"mail", "web"})
 _MAX_CONFIG_BYTES = 16 * 1024 * 1024
 
 
@@ -79,9 +82,20 @@ DEFAULT_MAIL = {
     "default_account": "",
     "accounts": {},
 }
+DEFAULT_WEB = {
+    "default_provider": "",
+    "timeout_seconds": 30,
+    "max_concurrency": 4,
+    "providers": {},
+}
 DEFAULT_DEPENDENCIES = {
     "auto_install": True,
 }
+
+_WEB_PROVIDERS = frozenset({"kagi", "brave", "tavily"})
+_WEB_FIELDS = frozenset(
+    {"default_provider", "timeout_seconds", "max_concurrency", "providers"}
+)
 
 _MAIL_SECURITY = frozenset({"ssl", "starttls", "plain"})
 _MAIL_ACCOUNT_FIELDS = frozenset({"from", "imap", "smtp", "sent_mailbox"})
@@ -431,6 +445,99 @@ def validate_mail_config(value: Any) -> dict[str, Any]:
     return result
 
 
+def _validate_web_provider_name(name: Any, path: str) -> str:
+    if not isinstance(name, str) or name not in _WEB_PROVIDERS:
+        raise _field_error(path, "must be one of kagi, brave, or tavily")
+    return name
+
+
+def _validate_web_providers(value: Any, path: str, *, normalize: bool) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _field_error(path, "must be a table")
+    result: dict[str, Any] = {}
+    for name, definition in value.items():
+        provider_path = f"{path}.{name}"
+        _validate_web_provider_name(name, provider_path)
+        if isinstance(definition, Mapping) and definition == {"enabled": False}:
+            result[name] = {"enabled": False}
+            continue
+        if not isinstance(definition, Mapping):
+            raise _field_error(provider_path, "must be a table")
+        unknown = set(definition) - {"api_key_env"}
+        if unknown:
+            raise _field_error(
+                provider_path, f"unknown fields: {', '.join(sorted(unknown))}"
+            )
+        if "api_key_env" not in definition:
+            raise _field_error(f"{provider_path}.api_key_env", "is required")
+        api_key_env = _mail_env_name(
+            definition["api_key_env"], f"{provider_path}.api_key_env"
+        )
+        result[name] = {"api_key_env": api_key_env} if normalize else copy.deepcopy(definition)
+    return result
+
+
+def _validate_web_layer(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise _field_error("web", "must be a table")
+    result = copy.deepcopy(dict(value))
+    unknown = set(value) - _WEB_FIELDS
+    if unknown:
+        raise _field_error("web", f"unknown fields: {', '.join(sorted(unknown))}")
+    if "default_provider" in value:
+        default = value["default_provider"]
+        if not isinstance(default, str) or default not in {"", *_WEB_PROVIDERS}:
+            raise _field_error(
+                "web.default_provider", "must be empty or one of kagi, brave, or tavily"
+            )
+    if "timeout_seconds" in value:
+        timeout = value["timeout_seconds"]
+        try:
+            valid_timeout = (
+                type(timeout) in {int, float}
+                and math.isfinite(timeout)
+                and 1 <= timeout <= 120
+            )
+        except (OverflowError, ValueError):
+            valid_timeout = False
+        if not valid_timeout:
+            raise _field_error("web.timeout_seconds", "must be a finite number between 1 and 120")
+    if "max_concurrency" in value:
+        concurrency = value["max_concurrency"]
+        if type(concurrency) is not int or not 1 <= concurrency <= 32:
+            raise _field_error("web.max_concurrency", "must be an integer between 1 and 32")
+    if "providers" in value:
+        result["providers"] = _validate_web_providers(
+            value["providers"], "web.providers", normalize=False
+        )
+    return result
+
+
+def validate_web_config(value: Any) -> dict[str, Any]:
+    """Validate and normalize the effective ``web`` configuration."""
+
+    layer = _validate_web_layer(value)
+    result = copy.deepcopy(DEFAULT_WEB)
+    for key in ("default_provider", "timeout_seconds", "max_concurrency"):
+        if key in layer:
+            result[key] = layer[key]
+    if "providers" in layer:
+        result["providers"] = _validate_web_providers(
+            layer["providers"], "web.providers", normalize=True
+        )
+    default = result["default_provider"]
+    if default and (
+        default not in result["providers"]
+        or result["providers"][default] == {"enabled": False}
+    ):
+        raise _field_error(
+            "web.default_provider", "must refer to an active configured provider"
+        )
+    return result
+
+
 def validate_config(values):
     """Validate known configuration sections while preserving future sections."""
 
@@ -446,6 +553,7 @@ def validate_config(values):
     result["dependencies"] = _validate_dependencies(result.get("dependencies"))
     result["lsp"] = _validate_lsp(result.get("lsp"))
     result["mail"] = validate_mail_config(result.get("mail"))
+    result["web"] = validate_web_config(result.get("web"))
     mcp = result.get("mcp")
     if mcp is None:
         result["mcp"] = {"servers": {}}
@@ -529,6 +637,8 @@ def _validate_layer(values: Any, path: Path) -> dict:
             _validate_server_layer(section, servers)
     if "mail" in result:
         _validate_mail_layer(result["mail"])
+    if "web" in result:
+        _validate_web_layer(result["web"])
     return result
 
 
@@ -616,6 +726,22 @@ def _merge_layers(global_value: Mapping, workspace_value: Mapping) -> dict:
             workspace_mail.get("accounts") if isinstance(workspace_mail, Mapping) else None,
         )
     merged["mail"] = mail_value
+    global_web = global_value.get("web", {})
+    workspace_web = workspace_value.get("web", {})
+    web_value = merged.get("web", {})
+    if not isinstance(web_value, Mapping):
+        web_value = {}
+    web_value = copy.deepcopy(dict(web_value))
+    if (
+        isinstance(global_web, Mapping) and "providers" in global_web
+    ) or (
+        isinstance(workspace_web, Mapping) and "providers" in workspace_web
+    ):
+        web_value["providers"] = _merge_named(
+            global_web.get("providers") if isinstance(global_web, Mapping) else None,
+            workspace_web.get("providers") if isinstance(workspace_web, Mapping) else None,
+        )
+    merged["web"] = web_value
     return merged
 
 
@@ -704,7 +830,7 @@ def _lookup(values: Any, parts: tuple[str, ...]) -> tuple[bool, Any]:
 
 def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for section in ("limits", "storage", "dependencies", "mcp", "lsp", "mail"):
+    for section in ("limits", "storage", "dependencies", "mcp", "lsp", "mail", "web"):
         value = values.get(section)
         if not isinstance(value, Mapping):
             continue
@@ -728,6 +854,13 @@ def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
             result[section] = {
                 "default_account": copy.deepcopy(value.get("default_account", "")),
                 "accounts": copy.deepcopy(value.get("accounts", {})),
+            }
+        elif section == "web":
+            result[section] = {
+                "default_provider": copy.deepcopy(value.get("default_provider", "")),
+                "timeout_seconds": copy.deepcopy(value.get("timeout_seconds", 30)),
+                "max_concurrency": copy.deepcopy(value.get("max_concurrency", 4)),
+                "providers": copy.deepcopy(value.get("providers", {})),
             }
     return result
 
@@ -753,6 +886,14 @@ def _validate_public_path(parts: tuple[str, ...]) -> None:
         if len(parts) == 2 and parts[1] == "accounts":
             return
         if len(parts) == 3 and parts[1] == "accounts":
+            return
+    if section == "web":
+        if len(parts) == 2 and parts[1] in {
+            "default_provider", "timeout_seconds", "max_concurrency", "providers",
+        }:
+            return
+        if len(parts) == 3 and parts[1] == "providers":
+            _validate_web_provider_name(parts[2], ".".join(parts))
             return
     raise ConfigError("unknown managed configuration field", path=".".join(parts))
 
@@ -939,6 +1080,8 @@ class ConfigStore:
             raise ConfigError("use unset() to remove a value", path=path)
         if parts[0] in _SERVER_SECTIONS and len(parts) >= 3 and len(parts) != 3:
             raise ConfigError("server definitions must be replaced as a whole", path=path)
+        if parts[0] == "web" and len(parts) >= 4:
+            raise ConfigError("web provider definitions must be replaced as a whole", path=path)
         return self._mutate(
             path,
             scope,
@@ -956,6 +1099,8 @@ class ConfigStore:
         _validate_public_path(parts)
         if parts[0] in _SERVER_SECTIONS and len(parts) >= 3 and len(parts) != 3:
             raise ConfigError("server definitions must be removed as a whole", path=path)
+        if parts[0] == "web" and len(parts) >= 4:
+            raise ConfigError("web provider definitions must be removed as a whole", path=path)
 
         return self._mutate(
             path,

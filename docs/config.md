@@ -1,10 +1,10 @@
 # Layered configuration
 
-`ws.config` controls the managed configuration for the current workspace. It exposes the global defaults and the workspace overrides without making Python code edit TOML directly. The known managed sections are `mcp`, `lsp`, `mail`, `limits`, `storage`, and `dependencies`; unrelated TOML data remains outside this API.
+`ws.config` controls the managed configuration for the current workspace. It exposes the global defaults and the workspace overrides without making Python code edit TOML directly. The known managed sections are `mcp`, `lsp`, `mail`, `web`, `limits`, `storage`, and `dependencies`; unrelated TOML data remains outside this API.
 
 ## Create a configuration file
 
-[config.example.toml](../config.example.toml) lists every supported field, the built-in limits and storage defaults, and examples for stdio MCP, HTTP MCP, LSP, mail accounts, and disabled inherited entries. Everything is commented out: copying it preserves inheritance and built-in defaults. Uncomment the relevant table header and only the fields you want to override. Server commands and URLs are examples to replace, not preconfigured services.
+[config.example.toml](../config.example.toml) lists every supported field, the built-in limits and storage defaults, and examples for web providers, stdio MCP, HTTP MCP, LSP, mail accounts, and disabled inherited entries. Everything is commented out: copying it preserves inheritance and built-in defaults. Uncomment the relevant table header and only the fields you want to override. Server commands and URLs are examples to replace, not preconfigured services.
 
 From a repository checkout, copy the example to the default global location:
 
@@ -120,6 +120,43 @@ Each account requires a sender address, an IMAP endpoint, and an SMTP endpoint. 
 The manager resolves password variables from its own environment when a connection opens. Status reports source availability and cached connection state without contacting a provider. Missing variables and connection failures are reported lazily when a mailbox or send operation opens a connection, and values are never returned by `ws.config` or written to history. Changing a client process environment does not change an already-running manager.
 
 Mail settings apply through `await ws.config.reload()`. Reload keeps existing connections when their account definition is unchanged. A busy account is reported under `deferred` until its current send or mailbox operation settles, including when `force=True`; this prevents a configuration reload from interrupting an SMTP transaction. The applied configuration reported by `ws.config.explain()` reflects only accounts that the manager has actually reconfigured.
+
+### Web providers
+
+Web search and provider extraction are configured under `[web]` and `[web.providers.<name>]`. No provider is enabled by default. API key fields name environment variables in the manager process; they never contain literal key values.
+
+| Field under `[web]` | Default | Allowed value / behavior |
+| --- | --- | --- |
+| `default_provider` | `""` | `kagi`, `brave`, `tavily`, or empty; empty selects the only enabled provider |
+| `timeout_seconds` | `30` | Number from `1` to `120` |
+| `max_concurrency` | `4` | Integer from `1` to `32` |
+
+Each provider entry is a complete definition by name across the global and workspace layers. A workspace entry replaces the matching global entry. An entry containing only `enabled = false` disables an inherited provider.
+
+| Field under `[web.providers.<name>]` | Required | Allowed value / behavior |
+| --- | --- | --- |
+| `api_key_env` | Active provider | Non-empty environment-variable name read by the manager |
+| `enabled` | No | Boolean; `false` is only valid for a disabled inherited entry |
+
+The fixed provider names are `kagi`, `brave`, and `tavily`. `ws.web.providers()` reports whether the configured environment variable is present without returning its value. Provider-specific request options are passed through `ws.web.search()`, `ws.web.context()`, or `ws.web.extract()` and validated before a network request.
+
+```toml
+[web]
+default_provider = "kagi"
+timeout_seconds = 30
+max_concurrency = 4
+
+[web.providers.kagi]
+api_key_env = "KAGI_API_KEY"
+
+[web.providers.brave]
+api_key_env = "BRAVE_SEARCH_API_KEY"
+
+[web.providers.tavily]
+api_key_env = "TAVILY_API_KEY"
+```
+
+Persist changes with `ws.config.set()` and apply them with `await ws.config.reload()`. A running manager reads its own environment, so changing a client's environment does not change an existing manager. Web requests use manager-owned HTTP clients and close during manager shutdown. See [web search and extraction](web.md) for provider features, paging, output limits, and errors.
 
 ### MCP servers
 

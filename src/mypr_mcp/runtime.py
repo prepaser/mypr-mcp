@@ -46,6 +46,7 @@ from .task_results import load_result, store_result
 from .timers import TimerStore
 from .timings import Timings
 from .transport import MAX_MESSAGE, socket_path, workspace_id
+from .web_service import WebService
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
 MCP_MUTATIONS = {"configure", "remove", "restart", "reload"}
@@ -86,6 +87,7 @@ TIMING_OPS = {
     "shell_cancel",
     "mcp",
     "mail",
+    "web",
     "packages_add",
     "dependencies",
     "task_event",
@@ -208,6 +210,7 @@ class Runtime:
         self.messages = None
         self.timers = None
         self.mail = None
+        self.web = None
         self.dependencies = None
         self.persistence = None
         self._admission_lock = asyncio.Lock()
@@ -453,6 +456,7 @@ class Runtime:
             self.notify_message, self.connected_client_ids,
         )
         await self.mail.start()
+        self.web = WebService(self.config.get("web", {}), self._record_web)
         self.storage = Storage(
             self.workspace, history=self.history, mail=self.mail,
             active_ids=self.storage_active_ids,
@@ -1586,7 +1590,7 @@ class Runtime:
     async def _dispatch_handlers(self, op, req, context):
         for handler in (
             self._dispatch_execution, self._dispatch_messages, self._dispatch_timers,
-            self._dispatch_mail, self._dispatch_storage,
+            self._dispatch_mail, self._dispatch_web, self._dispatch_storage,
             self._dispatch_dependencies,
             self._dispatch_tasks, self._dispatch_scan, self._dispatch_tools,
             self._dispatch_shell, self._dispatch_mcp, self._dispatch_lifecycle,
@@ -1657,6 +1661,7 @@ class Runtime:
                     ),
                     "storage_maintenance": dict(self.storage_maintenance),
                     "mail": self.mail.status() if self.mail is not None else None,
+                    "web": self.web.status() if self.web is not None else None,
                     "dependencies": (
                         self.dependencies.status() if getattr(self, "dependencies", None) else None
                     ),
@@ -1710,6 +1715,7 @@ class Runtime:
                 ),
                 "storage_maintenance": dict(self.storage_maintenance),
                 "mail": self.mail.status() if self.mail is not None else None,
+                "web": self.web.status() if self.web is not None else None,
                 "dependencies": (
                     self.dependencies.status() if getattr(self, "dependencies", None) else None
                 ),
@@ -2002,6 +2008,44 @@ class Runtime:
                         "Configuration reload is in progress; retry after it completes"
                     )
                 operation = asyncio.create_task(self.mail.dispatch(method, client, params))
+                await asyncio.sleep(0)
+            return await await_completion(operation)
+
+        return await await_completion(asyncio.create_task(run()))
+
+    async def _record_web(self, method, fields):
+        await self.io(self.history.append, "web", method, fields)
+
+    async def _dispatch_web(
+        self, op, req, *, client, connection_id, connection,
+        requested_client, generation,
+    ):
+        if op != "web":
+            return _UNHANDLED
+        if not connection or not connection["client_id"]:
+            raise RuntimeError("Web requires a connected, initialized client")
+        method, params = req.get("method"), req.get("params", {})
+        if not isinstance(method, str) or not isinstance(params, dict):
+            raise ValueError("Web requires a method and parameter object")
+
+        async def run():
+            async with self._admission_lock:
+                if (
+                    self.stopping.is_set() or self.resetting or self.restarting
+                    or (generation and generation != self.generation)
+                ):
+                    raise RuntimeError("Workspace manager is stopping or restarting")
+                if self.clients.get(connection_id) is not connection:
+                    raise RuntimeError("Web client disconnected")
+                if self.settings.applying:
+                    raise RuntimeError(
+                        "Configuration reload is in progress; retry after it completes"
+                    )
+                if self.web is None:
+                    raise RPCError(
+                        "Workspace web service is unavailable", code="service_unavailable"
+                    )
+                operation = asyncio.create_task(self.web.dispatch(method, client, params))
                 await asyncio.sleep(0)
             return await await_completion(operation)
 
@@ -2462,7 +2506,10 @@ class Runtime:
                     raise RuntimeError("Reset already in progress")
                 if self.restarting:
                     raise RuntimeError("Workspace restart/reset already in progress")
-                if not req.get("force", False) and (busy or python_busy or self.shells.active):
+                if not req.get("force", False) and (
+                    busy or python_busy or self.shells.active
+                    or (self.web is not None and self.web.active_count)
+                ):
                     raise RuntimeError("Workspace has active work; pass force=True to reset")
                 self.resetting = True
             if from_kernel:
@@ -2499,6 +2546,7 @@ class Runtime:
                         )
                         or self.shells.active
                         or (self.mail is not None and self.mail.active_count)
+                        or (self.web is not None and self.web.active_count)
                     )
                 ):
                     raise RuntimeError("Workspace has active work; pass --force")
@@ -2608,6 +2656,7 @@ class Runtime:
             )
             or self.shells.active
             or (getattr(self, "mail", None) is not None and self.mail.active_count)
+            or (getattr(self, "web", None) is not None and self.web.active_count)
             or (getattr(self, "dependencies", None) is not None and self.dependencies.active_count)
         ):
             raise RuntimeError("Workspace has active work; pass force=True to restart")
@@ -2720,6 +2769,8 @@ class Runtime:
                 for rec in list(self.execs.values()):
                     if rec is not current and rec["state"] not in TERMINAL:
                         await self.finish(rec, "cancelled", "Workspace reset")
+                if self.web is not None:
+                    await self.web.reset()
                 await self.close_kernel()
                 await self.lose_python_tasks("Workspace reset", state="cancelled")
                 await self.close_shells()
@@ -2762,6 +2813,8 @@ class Runtime:
                             "cancelled" if self.restarting else "lost",
                             "Workspace restarted" if self.restarting else "Manager stopped",
                         )
+            if self.web is not None:
+                await self.web.close()
             await self.close_kernel()
             with contextlib.suppress(Exception):
                 await self.lose_python_tasks("Manager stopped")
@@ -2989,8 +3042,13 @@ class Runtime:
             await writer.drain()
             await reader.read(1)
         finally:
-            self.clients.pop(connection_id, None)
-            self.attachments.pop(connection_id, None)
+            async with self._initialize_lock:
+                async with self._admission_lock:
+                    self.clients.pop(connection_id, None)
+                    self.attachments.pop(connection_id, None)
+                if self.web is not None and info.get("client_id") is not None:
+                    with contextlib.suppress(Exception):
+                        await self.web.drop_client(info["client_id"])
             if self.mail is not None:
                 with contextlib.suppress(Exception):
                     await self.mail.client_changed()
@@ -3222,6 +3280,10 @@ class Runtime:
             for writer in list(self.attachments.values()):
                 writer.close()
             self.socket.unlink(missing_ok=True)
+            if self.web is not None:
+                with contextlib.suppress(Exception):
+                    await self.web.close()
+                self.web = None
             if self.mail is not None:
                 with contextlib.suppress(Exception):
                     await self.mail.close()

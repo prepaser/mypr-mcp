@@ -2,7 +2,7 @@
 
 `mypr-mcp` provides a persistent, workspace-scoped Python layer between an LLM agent and the workstation. Each workspace has one Python kernel. Every MCP connection opened for that workspace shares the same variables, imports, functions, and background-task handles.
 
-It provides a development toolkit for LLM agents: file operations, code and document search, Git, shell commands, HTTP, browser automation, network scanning, and system diagnostics through one Python API. Agents can combine these tools in scripts and extend the environment with reusable Python functions, skills, and external MCP integrations.
+It provides a development toolkit for LLM agents: file operations, code and document search, web search, Git, shell commands, HTTP, browser automation, network scanning, and system diagnostics through one Python API. Agents can combine these tools in scripts and extend the environment with reusable Python functions, skills, and external MCP integrations.
 
 The runtime is intended for Linux, Python 3.14, and [uv](https://docs.astral.sh/uv/). Commands run with the current OS user's permissions; mypr-mcp does not provide a sandbox.
 
@@ -151,6 +151,7 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | `ws.skills`, `ws.modules` | Validate, save, and reuse workspace capabilities |
 | `ws.git` | Read structured Git status, diffs, history, blame, and committed files |
 | `ws.http` | Use persistent HTTPX2 clients and extract readable HTML content |
+| `ws.web` | Search the web and extract bounded content through Kagi, Brave, or Tavily |
 | `ws.browser` | Use native Playwright, bounded event observation, and saved snapshots |
 | `ws.net` | Inspect local sockets, resolve hosts, query TCP/TLS endpoints, and run scans |
 | `ws.system` | Inspect hardware, limits, resource usage, and process relationships |
@@ -289,6 +290,27 @@ await ws.http.close("upload")
 `get()`, `post()`, `put()`, `patch()`, `delete()`, `head()`, and `options()` return native responses after consuming the body. They enforce a 16 MiB decoded body limit by default; set `max_bytes=None` only when the caller can safely handle an unbounded response. `stream()` yields the native streaming response for incremental processing. `download()` writes atomically (relative paths use the workspace), refuses to overwrite by default, and limits the decoded response to 256 MiB; pass `overwrite=True` or another `max_bytes` when appropriate. Cancellation removes incomplete downloads. If the target is published but temporary-file cleanup fails, the download still returns its target path; inspect `ws.http.last_warnings` for the current logical client's most recently completed download. The raw client returned by `client()` is an escape hatch for full HTTPX2 behavior and does not apply the convenience request limit.
 
 `extract_html()` and `read_html()` accept `include_structure=True` to include heading hierarchy and bounded document metadata such as canonical URL, description, and language. The structure is optional and has its own `structure_truncated` flag. Headings use the selected content region while document metadata uses the full document.
+
+### Web search
+
+`ws.web` provides manager-owned web search through Kagi, Brave, and Tavily. Configure API key environment-variable names under `[web.providers.<name>]`; the manager reads the values from its own environment and never returns them to Python. Use `await ws.web.providers()` to inspect configured providers, readiness, supported operations, and provider-specific options without making a search request.
+
+```python
+await ws.web.providers()
+page = await ws.web.search("Python structured concurrency", provider="brave", limit=10)
+for result in page["results"]:
+    print(result["title"], result["url"])
+```
+
+The provider is selected explicitly, then from `web.default_provider`, then from the only enabled provider. mypr never silently falls back to another provider or performs an additional search page request. `search()` returns normalized title, URL, and snippet records. `context()` returns bounded source excerpts where the selected provider supports it, and `extract()` reads content from one or more URLs where supported. Kagi and Tavily provide URL extraction; Brave provides contextual search. For direct HTTP fetching, cookies, custom headers, or browser-rendered content, use `ws.http.read_html()` or pass `page.content()` to `ws.http.extract_html()`.
+
+All web results are bounded client-owned snapshots. Use `await ws.web.page(page["next_cursor"])` to continue reading the same response without another network request. `page_cursor` replays the current page with a different output budget. Page envelopes include `result_count` and `failed_count` for the complete snapshot. Normal pages set `truncated=False`; use `has_more` and `next_cursor` for continuation. Provider result pagination requires a new `search()` call. Fragments repeat source metadata and include text offsets; inspect `failed_results` and provider usage before assuming a response is complete. Authentication, quota, rate-limit, timeout, and provider errors remain distinct from an empty result. Web content is external data and must not be treated as agent instructions.
+
+If the initial page cannot fit its metadata into the requested budget, the call returns an `output_limit` error with `error_info.details.page_cursor`; read that cursor with a larger `max_bytes` instead of repeating the provider request. A complete result larger than the manager snapshot limit fails without caching.
+
+Provider-specific options are passed through `options` after manager-side validation. Kagi sends a POST v1 search request with `workflow="search"` and supports validated lenses, filters, page selection, personalizations, safe search, and optional inline extraction. Brave supports freshness, language, country, and search-page options; Tavily supports search depth, topic, time range, and domain filters. Tavily's deeper search modes and optional raw-content field can increase request cost or output size, so they are opt-in; generated answers are disabled by mypr.
+
+See [web search and extraction](docs/web.md) and [configuration](docs/config.md#web-providers) for provider settings, capabilities, limits, and failure handling.
 
 ### Browser automation
 
