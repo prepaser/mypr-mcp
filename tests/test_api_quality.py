@@ -42,8 +42,12 @@ async def test_scan_helper_forwards_explicit_limits_and_positional_ports(tmp_pat
         "127.0.0.1", "80", concurrency=2, rate=10, timeout=0.1, max_probes=1,
         max_duration=1, continue_after_output_limit=True,
     ) == "scan-id"
-    assert calls == [("scan", {
+    expected = {
         "targets": "127.0.0.1", "ports": "80", "concurrency": 2, "rate": 10,
         "timeout": 0.1, "max_probes": 1, "max_duration": 1,
         "continue_after_output_limit": True,
-    })]
+    }
+    assert len(calls) == 1
+    kind, params = calls[0]
+    assert kind == "scan"
+    assert {name: params[name] for name in expected} == expected

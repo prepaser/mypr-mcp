@@ -36,32 +36,37 @@ async def test_reset_registration_failure_removes_prior_generation(tmp_path, mon
     import mypr_mcp.runtime as module
     import mypr_mcp.runtime_registry as registry
 
+    monkeypatch.setenv("MYPR_GLOBAL_CONFIG", str(tmp_path / "config.toml"))
     runtime = Runtime(tmp_path)
-    await runtime._register_manager()
-    old = runtime.generation
-    assert list_managers(runtime.config_store.global_path)[0]["generation"] == old
+    try:
+        await runtime._register_manager()
+        old = runtime.generation
+        assert list_managers(runtime.config_store.global_path)[0]["generation"] == old
 
-    async def noop(*args, **kwargs):
-        return None
+        async def noop(*args, **kwargs):
+            return None
 
-    def unavailable(*args, **kwargs):
-        raise PermissionError("registry unavailable")
+        def unavailable(*args, **kwargs):
+            raise PermissionError("registry unavailable")
 
-    runtime.close_kernel = noop
-    runtime.start_kernel = noop
-    runtime.lose_python_tasks = noop
-    runtime.close_shells = noop
-    runtime.new_shells = lambda: object()
-    runtime.mcp = SimpleNamespace(close=noop)
-    monkeypatch.setattr(module, "MCPBridge", lambda *args, **kwargs: runtime.mcp)
-    monkeypatch.setattr(module, "ScanService", lambda *args: object())
-    monkeypatch.setattr(registry, "register", unavailable)
+        runtime.close_kernel = noop
+        runtime.start_kernel = noop
+        runtime.lose_python_tasks = noop
+        runtime.close_shells = noop
+        runtime.new_shells = lambda: object()
+        runtime.mcp = SimpleNamespace(close=noop)
+        monkeypatch.setattr(module, "MCPBridge", lambda *args, **kwargs: runtime.mcp)
+        monkeypatch.setattr(module, "ScanService", lambda *args: object())
+        with monkeypatch.context() as patch:
+            patch.setattr(registry, "register", unavailable)
 
-    await runtime.reset(None)
+            await runtime.reset(None)
 
-    assert runtime.generation != old
-    assert runtime.registry_error.endswith("PermissionError: registry unavailable")
-    assert list_managers(runtime.config_store.global_path) == []
+            assert runtime.generation != old
+            assert runtime.registry_error.endswith("PermissionError: registry unavailable")
+            assert list_managers(runtime.config_store.global_path) == []
+    finally:
+        await runtime._unregister_manager()
 
 
 async def test_registry_cleanup_retries_recorded_generation_after_permission_recovery(
@@ -69,24 +74,26 @@ async def test_registry_cleanup_retries_recorded_generation_after_permission_rec
 ):
     import mypr_mcp.runtime_registry as registry
 
+    monkeypatch.setenv("MYPR_GLOBAL_CONFIG", str(tmp_path / "config.toml"))
     runtime = Runtime(tmp_path)
-    await runtime._register_manager()
-    old = runtime.generation
-    runtime.generation = "new"
-    original = registry.unregister
+    try:
+        await runtime._register_manager()
+        old = runtime.generation
+        runtime.generation = "new"
 
-    def unavailable(*args, **kwargs):
-        raise PermissionError("registry unavailable")
+        def unavailable(*args, **kwargs):
+            raise PermissionError("registry unavailable")
 
-    monkeypatch.setattr(registry, "register", unavailable)
-    monkeypatch.setattr(registry, "unregister", unavailable)
-    await runtime._register_manager()
-    assert list_managers(runtime.config_store.global_path)[0]["generation"] == old
-    monkeypatch.setattr(registry, "unregister", original)
+        with monkeypatch.context() as patch:
+            patch.setattr(registry, "register", unavailable)
+            patch.setattr(registry, "unregister", unavailable)
+            await runtime._register_manager()
+            assert list_managers(runtime.config_store.global_path)[0]["generation"] == old
 
-    await runtime._unregister_manager()
-
-    assert list_managers(runtime.config_store.global_path) == []
+        await runtime._unregister_manager()
+        assert list_managers(runtime.config_store.global_path) == []
+    finally:
+        await runtime._unregister_manager()
 
 
 async def test_browser_auto_install_uses_dependency_events_and_active_count(tmp_path):

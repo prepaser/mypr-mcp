@@ -54,10 +54,13 @@ async def test_shutdown_closes_kernel_started_by_in_progress_reset(tmp_path, mon
         tasks = [reset]
         if shutdown is not None:
             tasks.append(shutdown)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        finally:
+            await runtime._unregister_manager()
 
     assert events == ["reset-close", "start-kernel", "shutdown-close"]
 

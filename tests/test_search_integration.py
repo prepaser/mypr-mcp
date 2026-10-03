@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shlex
 import shutil
 import zipfile
 from io import BytesIO
@@ -252,11 +254,46 @@ async def test_search_backends_reports_real_mcp_capabilities(workspace: Path):
         assert result["backends"]["ast"]["available"] is True
 
 
-@pytest.mark.skipif(
-    shutil.which("rga") is None or shutil.which("pandoc") is not None,
-    reason="requires rga without its pandoc converter",
-)
-async def test_rga_missing_converter_returns_partial_result(workspace: Path):
+@pytest.mark.skipif(shutil.which("rga") is None, reason="ripgrep-all required")
+async def test_rga_failed_converter_returns_partial_result(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_rga = shutil.which("rga")
+    real_rg = shutil.which("rg")
+    assert real_rga is not None and real_rg is not None
+    tool_dir = tmp_path / "tools"
+    tool_dir.mkdir()
+    marker = tmp_path / "pandoc-invoked"
+    # Keep dependency version checks from masking the converter failure.
+    (tool_dir / "rg").write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = "--version" ]; then\n'
+        "  printf 'ripgrep 14.0.0\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        f'exec {shlex.quote(real_rg)} "$@"\n',
+        encoding="utf-8",
+    )
+    (tool_dir / "rga").write_text(
+        f'#!/bin/sh\nexec {shlex.quote(real_rga)} "$@"\n', encoding="utf-8"
+    )
+    (tool_dir / "pandoc").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        "  printf 'pandoc 2.9.0\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        f"printf 'converter invoked\\n' > {shlex.quote(str(marker))}\n"
+        "printf 'forced converter failure\\n' >&2\n"
+        "exit 127\n",
+        encoding="utf-8",
+    )
+    for executable in (tool_dir / "rg", tool_dir / "rga", tool_dir / "pandoc"):
+        executable.chmod(0o755)
+    config = workspace / ".mypr" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("[dependencies]\nauto_install = false\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(tool_dir), os.environ["PATH"])))
     (workspace / "fixture.docx").write_bytes(_docx_bytes("converter-only needle"))
     async with mcp_session(workspace) as session:
         result = await _json_cell(
@@ -264,6 +301,7 @@ async def test_rga_missing_converter_returns_partial_result(workspace: Path):
             "print(json.dumps(await ws.fs.search_docs('converter-only needle', "
             "paths='fixture.docx', adapters=['pandoc'], mode='matches', cache=True)))",
         )
+    assert marker.exists()
     assert result["backend"] == "rga"
     assert result["matches"] == []
     assert result["complete"] is False
