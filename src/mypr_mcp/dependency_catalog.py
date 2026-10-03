@@ -1,15 +1,20 @@
-"""Pinned artifacts used by the shared dependency store.
+"""Dependency descriptors and explicit latest-release resolution.
 
-The catalog is deliberately data-only.  Network access and installation are
-implemented by :mod:`dependency_store`, so inspecting this module never
-creates files or contacts an upstream service.
+Importing this module is side-effect free. Descriptors identify official
+upstreams, while :func:`resolve_artifact` contacts GitHub only when an
+installation needs a concrete release asset.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import os
+import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Final
+from urllib.parse import quote, urlsplit
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,105 +28,114 @@ class Artifact:
     executables: tuple[str, ...] = ()
     max_bytes: int = 64 * 1024 * 1024
     source: str = "official"
+    repository: str | None = None
+    asset_patterns: tuple[str, ...] = ()
+    git_sha1: str | None = None
 
 
-_LINUX = "linux"
+class CatalogResolutionError(ValueError):
+    """The upstream did not provide a usable current artifact."""
+
+
 _X86_64 = "x86_64"
 _AARCH64 = "aarch64"
+_GITHUB_API = "https://api.github.com"
+_MAX_METADATA_BYTES = 4 * 1024 * 1024
+_MAX_CHECKSUM_BYTES = 2 * 1024 * 1024
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 
 
-# GitHub release asset hashes are the SHA-256 digests returned by the release
-# API.  rga's x86_64 release is musl-linked and runs on supported glibc hosts.
+def _binary_descriptor(
+    name: str,
+    repository: str,
+    patterns: tuple[str, ...],
+    archive: str,
+    executables: tuple[str, ...],
+    max_bytes: int,
+) -> Artifact:
+    return Artifact(
+        name,
+        "binary",
+        "",
+        "",
+        None,
+        archive,
+        executables,
+        max_bytes,
+        "official",
+        repository,
+        patterns,
+    )
+
+
 _BINARY_ASSETS: Final[dict[str, dict[str, Artifact]]] = {
     "rg": {
-        _X86_64: Artifact(
+        _X86_64: _binary_descriptor(
             "rg",
-            "binary",
-            "15.2.0",
-            "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/"
-            "ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
-            "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
+            "BurntSushi/ripgrep",
+            (r"^ripgrep-.+-x86_64-unknown-linux-musl\.tar\.gz$",),
             "tar.gz",
             ("rg",),
             16 * 1024 * 1024,
         ),
-        _AARCH64: Artifact(
+        _AARCH64: _binary_descriptor(
             "rg",
-            "binary",
-            "15.2.0",
-            "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/"
-            "ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
-            "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
+            "BurntSushi/ripgrep",
+            (r"^ripgrep-.+-aarch64-unknown-linux-musl\.tar\.gz$",),
             "tar.gz",
             ("rg",),
             16 * 1024 * 1024,
         ),
     },
     "ast-grep": {
-        _X86_64: Artifact(
+        _X86_64: _binary_descriptor(
             "ast-grep",
-            "binary",
-            "0.45.3",
-            "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/"
-            "app-x86_64-unknown-linux-gnu.zip",
-            "f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8",
+            "ast-grep/ast-grep",
+            (r"^app-x86_64-unknown-linux-gnu\.zip$",),
             "zip",
             ("ast-grep", "sg"),
             32 * 1024 * 1024,
         ),
-        _AARCH64: Artifact(
+        _AARCH64: _binary_descriptor(
             "ast-grep",
-            "binary",
-            "0.45.3",
-            "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/"
-            "app-aarch64-unknown-linux-gnu.zip",
-            "b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f",
+            "ast-grep/ast-grep",
+            (r"^app-aarch64-unknown-linux-gnu\.zip$",),
             "zip",
             ("ast-grep", "sg"),
             32 * 1024 * 1024,
         ),
     },
     "rga": {
-        _X86_64: Artifact(
+        _X86_64: _binary_descriptor(
             "rga",
-            "binary",
-            "0.10.10",
-            "https://github.com/phiresky/ripgrep-all/releases/download/v0.10.10/"
-            "ripgrep_all-v0.10.10-x86_64-unknown-linux-musl.tar.gz",
-            "a969c25b182ac84aa672518313b5f741091decf7d93d03a020bcfe517b9ff4e8",
+            "phiresky/ripgrep-all",
+            (r"^ripgrep_all-v.+-x86_64-unknown-linux-musl\.tar\.gz$",),
             "tar.gz",
             ("rga", "rga-preproc"),
             32 * 1024 * 1024,
         ),
-        _AARCH64: Artifact(
+        _AARCH64: _binary_descriptor(
             "rga",
-            "binary",
-            "0.10.10",
-            "https://github.com/phiresky/ripgrep-all/releases/download/v0.10.10/"
-            "ripgrep_all-v0.10.10-aarch64-unknown-linux-gnu.tar.gz",
-            "2cd875ab6c78b27e4830b5bca92c570a8a8dcfb368bc71b189b65ac01fbc3020",
+            "phiresky/ripgrep-all",
+            (r"^ripgrep_all-v.+-aarch64-unknown-linux-gnu\.tar\.gz$",),
             "tar.gz",
             ("rga", "rga-preproc"),
             32 * 1024 * 1024,
         ),
     },
     "pandoc": {
-        _X86_64: Artifact(
+        _X86_64: _binary_descriptor(
             "pandoc",
-            "binary",
-            "3.12",
-            "https://github.com/jgm/pandoc/releases/download/3.12/pandoc-3.12-linux-amd64.tar.gz",
-            "67d7d011fed8c8543306022b985b9b2499ab9b74818df91d8727c7e9ebc5ba06",
+            "jgm/pandoc",
+            (r"^pandoc-.+-linux-amd64\.tar\.gz$",),
             "tar.gz",
             ("pandoc",),
             96 * 1024 * 1024,
         ),
-        _AARCH64: Artifact(
+        _AARCH64: _binary_descriptor(
             "pandoc",
-            "binary",
-            "3.12",
-            "https://github.com/jgm/pandoc/releases/download/3.12/pandoc-3.12-linux-arm64.tar.gz",
-            "6cefcf710e23a99447c26f89d1ff5b253f3407fcef99a9e27ae06f3ed16cb82",
+            "jgm/pandoc",
+            (r"^pandoc-.+-linux-arm64\.tar\.gz$",),
             "tar.gz",
             ("pandoc",),
             96 * 1024 * 1024,
@@ -130,10 +144,6 @@ _BINARY_ASSETS: Final[dict[str, dict[str, Artifact]]] = {
 }
 
 
-_TESSDATA_COMMIT = "65727574dfcd264acbb0c3e07860e4e9e9b22185"
-_TESSDATA_VERSION = "4.1.0"
-
-# The names are the complete top-level model set in the pinned 4.1.0 tree.
 _MODEL_NAMES: Final[tuple[str, ...]] = (
     "afr",
     "amh",
@@ -262,148 +272,21 @@ _MODEL_NAMES: Final[tuple[str, ...]] = (
     "yor",
 )
 
-# GitHub's contents API exposes git-object IDs rather than SHA-256.  The
-# pinned commit makes the remaining model URLs immutable; SHA-256 values are
-# recorded for every model and checked before publication or use.
-_MODEL_SHA256: Final[dict[str, str]] = {
-    "afr": "126d480bfae95be2a911ed4916465e27bde75fea2da631e21b96762e5f239646",
-    "amh": "3ec3311833a108e07d58a1152b00c0cf1848752e4f85769d46e8ca2b718a2ccc",
-    "ara": "e3206d3dc87fd50c24a0fb9f01838615911d25168f4e64415244b67d2bb3e729",
-    "asm": "299c7f6135ac72ca4820d4c39e3cf65b32b24127fc78c4938d11153adbb9fa77",
-    "aze": "a365310848aecb739f19369cb3831d4660fcd9345d798e91a3042455f9ccc9f0",
-    "aze_cyrl": "2e96ab67817819e14a3a2d6250261130457c8e78dde3077841ab391fe003551c",
-    "bel": "9c6668a0b202f3dcfe074b64620d108e1902ca7498a40b5a11b4a3da6112d58f",
-    "ben": "31163084c279aaebd376216f0c3d5c17ad4b5fee8db49dae79c20000b5de5964",
-    "bod": "1aab1db8dae337dfc8fa0f94a1c137c47e4c7857c3e6b30093ec726cef912a0b",
-    "bos": "6cc8cc87cf1afbfa6a41febb725dbadb14bed96a46685906440a6eb8a7892f04",
-    "bre": "db8b31f76b986d63b82dfff9e84e252bf5f7dc53d9128167aaab18b3ec96dd49",
-    "bul": "aebc9b0fcc8cfaf8a9f38a02bb7b85052bd850744696a2c11cf0081820e5b21e",
-    "cat": "250db73cd5b380d2798581295dc12f20d0828cdb335a65d833d12dfdbf57117d",
-    "ceb": "346a39de801495c93ece6656d018d7d19d298af7db42d82ebae99dfe8ee14961",
-    "ces": "934bcaf97ef3348413263331131c9fa7f55f30db333c711929c124fb635f7e1b",
-    "chi_sim": "a5fcb6f0db1e1d6d8522f39db4e848f05984669172e584e8d76b6b3141e1f730",
-    "chi_sim_vert": "20590de84725bab69cde93bd6e8ed360a13cc5421a7e7364ddeb93e9af53d6da",
-    "chi_tra": "529c5b5797d64b126065cd55f2bb4c7fd7b15790798091b1ff259941a829330b",
-    "chi_tra_vert": "1df02a4b210e5c217b783819538b63e9dfe6904e2b5e53b62664f1b9f7a989d0",
-    "chr": "a4da60d844ebb9dbaeb8843a92290083c1fd275b167fc9c9686d790ccd311fab",
-    "cos": "018952d1b4b3d4fd6ee5ebbacf90603c9cef6221951359937c274fe1f190f8d3",
-    "cym": "7f6ee3374749645a7c92dfe773f5c3d6492194d371712ecfd775edc53c363fb4",
-    "dan": "acb1fd074487a31d1294fcdfd7d7c673467ffd8aeacb2ccd61ebcbf04eb4e2fa",
-    "deu": "19d219bbb6672c869d20a9636c6816a81eb9a71796cb93ebe0cb1530e2cdb22d",
-    "div": "06051412588963b34b663cc59a468dbf10753329f015ccd574ee711e8c6b84c3",
-    "dzo": "364d244fad3f8d4438c9f7ee7642b9b876a4620cf76c0115619b979d6bfef1fa",
-    "ell": "4fba8a0b461038d51f1c20d043d4f2ac38c4e778f1b90830847f7bd8fa3ba726",
-    "eng": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
-    "enm": "d312ab5aafc9f99a78082c75e035b0873d2da6cb6d95cde03e219c1b26750034",
-    "epo": "71181a6a07af3812aeedfa1aa993623424f4b8a6aac3e271b36ec11774e674d9",
-    "equ": "8f660323d8a7b7a0e8d2fae1a3439e6e470222bfbb990b2ab7fe9e1fb4791c0b",
-    "est": "515d4a773682b286369511e83fe412bcff16a92a886f99c761c1d760a7e30456",
-    "eus": "40e7418296c355d9fd9ca843d115c51e740089e576e887443e61704823cd6624",
-    "fao": "0ed46203c283c952b7de0530d1c6e6ac9a25a79773fb89cadd149275ffea9a80",
-    "fas": "db1c0a91208aff00d3cf1ed2c1d23f76419afd5f024688b4f71adc3f2ce4a505",
-    "fil": "2b17f68014ab44b88b5e2334ebcd0ce0090d9af7c6fbef6fab22e0bbd9a934dd",
-    "fin": "61a04cd62b507c3d9ae0e1cda399e6715ebf49dea9df47897c8acdcd3bd3e13c",
-    "fra": "ced037562e8c80c13122dece28dd477d399af80911a28791a66a63ac1e3445ca",
-    "frk": "7cd1b541e9d3884b9546a7d292c4f349cdb45ff646b4b43166dfc5099a8ad1a1",
-    "frm": "3fe6eed7108136a85dbbf53baf23d9fb435afe1262323f5fba7711b6c6048728",
-    "fry": "7c9dbc47ef3848e33b623d1b927dd4d998ed39ff750fbc0f14aeb0f627b5da15",
-    "gla": "cb7b206d9f56b601d1666683ea8a516c8bb9c04362dbb874fc9665b339b72adf",
-    "gle": "2fe9ba6119aac7e2a20d6cfb69ed91afe9520f41bc7e3a903f84280f2663858d",
-    "glg": "7947619c5544d86849f563bd737ad90dbea9f5319fbd838c4747a7a1cd40b260",
-    "grc": "57b735557eeb67503803cf9f99786dd0b62417931352601952a0b1a23b6c4759",
-    "guj": "fa69658614b4946a9afae8853d67e0689838803dfa3d12c2e35ec53ee6f8df34",
-    "hat": "842e489a0e0eb12c72b5cb12e9e6624aae5928de1d097d76445474c263ce8b5a",
-    "heb": "11f9e43ab227f786352a50f75c94c2e9906f1baba86d93276da19da7ce0904db",
-    "hin": "4c73ffc59d497c186b19d1e90f5d721d678ea6b2e277b719bee4e2af12271825",
-    "hrv": "9e515d9832ce259dbab550b1cc6b998f8b929faf2edacaaca981b05adb130571",
-    "hun": "35067e7cfe102dcdc953f9a758fdfaa6296b17a1ee6d874ee780fa306430b9fb",
-    "hye": "b701d0d95799a716143dedb0197504e56f27a1bb133d6607ff5778c6988cb67c",
-    "iku": "81ef16ee0fa0a3548c8a2d1ff10786e3278b6720e51cefd9a81a506f52660223",
-    "ind": "69786901da87ab8766c1ea7fbb10b28f2110c14da3f6c8f2735df131fba95d88",
-    "isl": "5ec828c363f3f0062c3caf08216677cf5f3c0c981b05fab445123a16b98f10a9",
-    "ita": "b8f89e1e785118dac4d51ae042c029a64edb5c3ee42ef73027a6d412748d8827",
-    "ita_old": "ee85de25acf70d5eeefdb3012424814a18ab368183099cc2c3f2fe2d3dce3b02",
-    "jav": "46107b6bed3bf2d9617e5e192e52524e368242543fead1a7175c363dddd400f2",
-    "jpn": "1f5de9236d2e85f5fdf4b3c500f2d4926f8d9449f28f5394472d9e8d83b91b4d",
-    "jpn_vert": "bf1e2640954691797e2dc14f38533e601b59ee37958698ae0f0b81dc6f09c71b",
-    "kan": "bd31e6b6ae93271e3bcf5383d306d8eefbb91542937cd6d735a5930c970e61d8",
-    "kat": "557abb6f1c68bc1b286f1bdd00bb6b82f85a427a91899807dab6c2f6c7986731",
-    "kat_old": "7b77290303d5d88db6adc5b679d1eb876e3c62f64c8999e919bcb4608af379bc",
-    "kaz": "fcc01eed3815a42b9c6321c4c9d3606f39b166cbf95ade98b7d8d12063eae53d",
-    "khm": "47f110575341b322052f3becbefee61a3ecf1ef549352b5d4d33d28afe30d099",
-    "kir": "9777956300900b528d26932cf80693f95e75143433fb851d567194bcc38a31ae",
-    "kmr": "a3ef2daa828399ca8d6ae69edfa21ed21aa5abb3f868e2024d3235406312e7b6",
-    "kor": "6b85e11d9bbf07863b97b3523b1b112844c43e713df8b66418a081fd1060b3b2",
-    "kor_vert": "c28f19dee36927baba5215fb793a3c00fff3ef2cfbcaa100122401d8f4374869",
-    "lao": "20124962e93e68121e02c49a949d1f9df5db87dd62e5e4aa578362ca532444f8",
-    "lat": "3859d8ba60404f4b79830622625bbc76fb4ee2808eac1ad360ffa77f0a533328",
-    "lav": "7d9eaf22254b381f18b806cd6cb647862a397a7221adbce3e22cc421793a8847",
-    "lit": "1e383df5b055583bc01cb5764ecdf74c540753f2cb3f8205e7105361da4bc989",
-    "ltz": "5516a78efa30c050da7eb0727fec3de59670c19735c00678a67fdad98e4b3ec1",
-    "mal": "bd05cbf1b197e7810d2903419aedb06f9ef77bfedf50b358673c1d18d707cdb4",
-    "mar": "0ba3f2d116972e72fe9e176bc84c38e81dfb6670f4ed1f7f6c8e16a27da7cb61",
-    "mkd": "58622bf154830fa62103359938564aeb8112b929759e22a48224f3ecfaac34c6",
-    "mlt": "3040b443d5d49e4183da0eaaf58d1033c3a616153d35d2342a56777f9bbb31c7",
-    "mon": "a151a3806d61ac43619cd383896d551ba5c3b07388ffec6fc83c8c604d677570",
-    "mri": "8552be985e8fa0210d6d815d736151d645089b590a56f2d92391fb864e8bf9c9",
-    "msa": "e41a3e5febfec50c90371eb1cbb17a48b10cad387900e3420b1f134c1b766cba",
-    "mya": "02aa6c25cfe9e583fa7b5d4131eac948f962308983f0f397df077dea58212b03",
-    "nep": "280ba9450b4f21afbf5985e0de87857b75a972577c50ef0603c141ddde4f1cb8",
-    "nld": "ced0e5e046a84c908a6aa7accbef9a232c4a5d9a8276691b81c6ee64d02963f6",
-    "nor": "0451eb4f8049ae78196806bf878a389a2f40f1386fe038568cf4441226ba6ef2",
-    "oci": "747b9be4c5b80b4c730ce4f426a3b85060a1bb0de54cd566fcbdcb7f407940c9",
-    "ori": "36f3135e61d501a3acfad41f5fe60b8e791274fff4c5375c969fdcca980cdbac",
-    "osd": "9cf5d576fcc47564f11265841e5ca839001e7e6f38ff7f7aacf46d15a96b00ff",
-    "pan": "1ec0907fc3534065ea9ae190c6bb7ec9e5c74fd9d2fa996aaec7407f11ad8131",
-    "pol": "c4476cdbc0e33d898d32345122b7be1cbf85ace15f920f06c7714756e1ef79b2",
-    "por": "c4932b937207a9514b7514d518b931a99938c02a28a5a5a553f8599ed58b7deb",
-    "pus": "f15550bfe3a20ca781cf5afb7b2af6ee769c6521cf4bb990848e72856b484600",
-    "que": "9a3f78b010254ae237a7ca89e65e6d0c349221e437ac1575df1877e63a76bf57",
-    "ron": "9adfde6b51ba4b97efd10ea37c3070fd3fc2bad7815e81f5c3c198cd96216cc9",
-    "rus": "e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225",
-    "san": "a399958921c64e7d2319369ade1e74b4db2577744ac5bfeabd16663cf743b91c",
-    "sin": "bc75c6df2375a30c9f7e759fa7d4b58ae3ecf9ce72668a702d01acb13e551422",
-    "slk": "fbcc400a9c74c6a13d922fcb1211b655d1b165387b675ed75cd2dbd756b974a5",
-    "slv": "b937632c17ce5fdf20535d25feec044da10a0c4c8234f4302d5606fd671cf60d",
-    "snd": "f25cae3b325b0a6dc4dd5d8aeb3ac40b129a18bdd92666317022ee198f7878a7",
-    "spa": "6f2e04d02774a18f01bed44b1111f2cd7f3ba7ac9dc4373cd3f898a40ea6b464",
-    "spa_old": "11d89a6763ff134ef8f7e41b995974d36fba5d1a807156d3202d7bf991bb1823",
-    "sqi": "1d89621d9afe8ddf35b403ecf8951edea52c3a960d241f287b1a7b2c5ba8daac",
-    "srp": "aa41ae3d9cc705e60d398ab38a5c3cc8b772c0d420c7d4f0859beb13d0e321b6",
-    "srp_latn": "54b2e001bd8a336bdffc249c1487b8b7cb712f0a031f2551930ba050ebefa2a0",
-    "sun": "fa939213b005b3477a1032b7222f63cd0b0ac486f83fd9554caf653d6e6c6ffe",
-    "swa": "395439d1ec308535066cbaea9b15e0e4cc81f8609170af76ab7e7e8d3ec42f3e",
-    "swe": "f7304988d41f833efebcc2d529df54b1903ecebbc3da1faabd19a0fddd4fe586",
-    "syr": "7435b43466da8343619bdc43c4da8dc8581f21aab3337fa1bd22ed8a8c10af04",
-    "tam": "d02fbec24be4b07e32e80d0ccfc3b6b67a3c5d61c9d0a7c8532677990912c6ec",
-    "tat": "7ad946d753f4b9688e4e4bcf525a931f486da4aaa9020e32b6a7262718bdf093",
-    "tel": "d10691fddd5b67802e1c12800ebb321d3b8bcd8d24a2ac3ff206f93188c04ab5",
-    "tgk": "7b32ed1374649b9b44b9a20ed07f1e86c1e1004c3bd11ce182496a47a18cb321",
-    "tha": "294227cc2d1292b0acb28d61d4115c88252b96d466ca90b417cf4cf0c67bf07c",
-    "tir": "73d7430c22a062b061f603a2c1d70c4ea4aa092f7a932a97921926e15b4fdb3d",
-    "ton": "23d36448a3c59499da59502419ffcaa279056fa369a0fa2c798e066321d01bd1",
-    "tur": "7393381111e1152420fc4092cb44eef4237580d21b92bf30d7d221aad192c6b7",
-    "uig": "163b360268c39fc69e0c0dc9299c06dfe7a6c51ef8f33766da75022217b69b22",
-    "ukr": "d59e53e2bded32f4445f124b4b00240fcac7e8044c003ab822ccb94f0b3db59b",
-    "urd": "62e8250ce2a994106e313a82e26a516a39e2cf159d0ce3c5b5008387fd0d555f",
-    "uzb": "0e39021eefe692906b50d9bd22e580fa57fe43fa35db6846ad8b6369ddc21ea8",
-    "uzb_cyrl": "a2fe0b3f0eb4a5e46252470160ad51cc5f3c4c0f390ba67d1911beb0dbe80cc8",
-    "vie": "79df64caf7bcfb2a27df5042ecb6121e196eada34da774956995747636d5bfa1",
-    "yid": "f9a3d74076460a505dc0c6b59a0f5bd1108c6436d570954223b3695988d1666d",
-    "yor": "17ab3855f1ba9056183759a84e4c11cebf417a7d3c8c2cdcc37537d7fbffba3d",
-}
-
 
 def _models() -> dict[str, Artifact]:
     return {
         f"tessdata:{name}": Artifact(
             f"tessdata:{name}",
             "model",
-            _TESSDATA_VERSION,
-            f"https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/"
-            f"{_TESSDATA_COMMIT}/{name}.traineddata",
-            _MODEL_SHA256.get(name),
-            max_bytes=32 * 1024 * 1024,
+            "",
+            "",
+            None,
+            None,
+            (),
+            32 * 1024 * 1024,
+            "official",
+            "tesseract-ocr/tessdata_fast",
+            (rf"^{re.escape(name)}\.traineddata$",),
         )
         for name in _MODEL_NAMES
     }
@@ -417,13 +300,256 @@ MODEL_NAMES: Final[tuple[str, ...]] = tuple(f"tessdata:{name}" for name in _MODE
 
 
 def artifact_for(name: str, *, system: str | None = None) -> Artifact | None:
-    """Return the catalog artifact for a logical name and platform key."""
+    """Return a side-effect-free descriptor for a logical dependency."""
 
     if name.startswith("tessdata:"):
         return CATALOG.get(name)
     if system is None:
-        return None
+        return CATALOG.get(name)
     return _BINARY_ASSETS.get(name, {}).get(system)
 
 
-__all__ = ["Artifact", "BINARY_NAMES", "MODEL_NAMES", "CATALOG", "artifact_for"]
+Fetch = Callable[[str, int], Awaitable[bytes]]
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "mypr-mcp",
+    }
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def _read_url(url: str, maximum: int) -> bytes:
+    parsed = urlsplit(url)
+    if parsed.scheme != "https":
+        raise CatalogResolutionError("dependency metadata requires HTTPS")
+    headers = (
+        _github_headers()
+        if parsed.netloc.lower() == "api.github.com"
+        else {"User-Agent": "mypr-mcp"}
+    )
+    received = 0
+    chunks: list[bytes] = []
+    try:
+        import httpx2
+
+        async with httpx2.AsyncClient(
+            follow_redirects=True, timeout=30.0, headers=headers
+        ) as client:
+            async with client.stream("GET", url) as response:
+                if response.url.scheme != "https":
+                    raise CatalogResolutionError("dependency metadata redirect is not HTTPS")
+                response.raise_for_status()
+                length = response.headers.get("content-length")
+                if length is not None and int(length) > maximum:
+                    raise CatalogResolutionError("dependency metadata exceeds its size limit")
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    received += len(chunk)
+                    if received > maximum:
+                        raise CatalogResolutionError("dependency metadata exceeds its size limit")
+                    chunks.append(chunk)
+    except CatalogResolutionError:
+        raise
+    except Exception as exc:
+        raise CatalogResolutionError(f"failed to fetch dependency metadata: {exc}") from exc
+    return b"".join(chunks)
+
+
+async def _fetch(url: str, maximum: int, fetcher: Fetch | None) -> bytes:
+    if fetcher is not None:
+        data = await fetcher(url, maximum)
+        if len(data) > maximum:
+            raise CatalogResolutionError("dependency metadata exceeds its size limit")
+        return data
+    return await _read_url(url, maximum)
+
+
+async def _fetch_json(url: str, fetcher: Fetch | None) -> dict[str, object]:
+    try:
+        value = json.loads(await _fetch(url, _MAX_METADATA_BYTES, fetcher))
+    except (CatalogResolutionError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        if isinstance(exc, CatalogResolutionError):
+            raise
+        raise CatalogResolutionError("GitHub returned invalid dependency metadata") from exc
+    if not isinstance(value, dict):
+        raise CatalogResolutionError("GitHub dependency metadata is not an object")
+    return value
+
+
+def _release_url(repository: str) -> str:
+    return f"{_GITHUB_API}/repos/{repository}/releases/latest"
+
+
+def _release_tag(payload: dict[str, object]) -> str:
+    tag = payload.get("tag_name")
+    if not isinstance(tag, str) or len(tag) > 128 or re.fullmatch(r"v?\d+(?:\.\d+)+", tag) is None:
+        raise CatalogResolutionError("GitHub release has no usable tag")
+    return tag
+
+
+def _release_assets(payload: dict[str, object]) -> list[dict[str, object]]:
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise CatalogResolutionError("GitHub release has no asset list")
+    return [
+        asset for asset in assets if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    ]
+
+
+def _asset_for(assets: list[dict[str, object]], patterns: tuple[str, ...]) -> dict[str, object]:
+    matches = [
+        asset
+        for asset in assets
+        if any(re.search(pattern, str(asset["name"]), re.IGNORECASE) for pattern in patterns)
+    ]
+    if len(matches) != 1:
+        names = ", ".join(str(asset["name"]) for asset in matches[:4])
+        detail = f" ({names})" if names else ""
+        raise CatalogResolutionError(f"could not select one release asset{detail}")
+    return matches[0]
+
+
+def _download_url(repository: str, tag: str, name: str) -> str:
+    return (
+        f"https://github.com/{repository}/releases/download/"
+        f"{quote(tag, safe='')}/{quote(name, safe='')}"
+    )
+
+
+def _sha256_from_asset(asset: dict[str, object]) -> str | None:
+    digest = asset.get("digest")
+    if not isinstance(digest, str) or not digest.lower().startswith("sha256:"):
+        return None
+    value = digest.partition(":")[2]
+    return value.lower() if _HEX64_RE.fullmatch(value) else None
+
+
+def _checksum_asset(assets: list[dict[str, object]], selected: str) -> dict[str, object] | None:
+    candidates = []
+    for asset in assets:
+        name = str(asset["name"])
+        lowered = name.lower()
+        if name == selected or ("sha256" not in lowered and "checksum" not in lowered):
+            continue
+        if any(lowered.endswith(suffix) for suffix in (".sig", ".asc", ".pem")):
+            continue
+        candidates.append(asset)
+    return (
+        sorted(candidates, key=lambda asset: str(asset["name"]).lower())[0] if candidates else None
+    )
+
+
+def _path_name(value: str) -> str:
+    return value.strip().replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _checksum_for(text: bytes, selected: str) -> str | None:
+    try:
+        lines = text.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError:
+        return None
+    for line in lines[:10000]:
+        match = re.match(r"^\s*([0-9a-f]{64})\s+[*]?(.+?)\s*$", line, re.IGNORECASE)
+        if match and _path_name(match.group(2)) == selected:
+            return match.group(1).lower()
+        match = re.match(r"^\s*(.+?)\s+([0-9a-f]{64})\s*$", line, re.IGNORECASE)
+        if match and _path_name(match.group(1)) == selected:
+            return match.group(2).lower()
+    return None
+
+
+async def _resolve_binary(
+    descriptor: Artifact,
+    fetcher: Fetch | None,
+) -> Artifact:
+    if descriptor.repository is None:
+        raise CatalogResolutionError(f"{descriptor.name} has no official repository")
+    payload = await _fetch_json(_release_url(descriptor.repository), fetcher)
+    tag = _release_tag(payload)
+    assets = _release_assets(payload)
+    asset = _asset_for(assets, descriptor.asset_patterns)
+    asset_name = str(asset["name"])
+    digest = _sha256_from_asset(asset)
+    if digest is None:
+        checksum = _checksum_asset(assets, asset_name)
+        if checksum is not None:
+            checksum_url = _download_url(descriptor.repository, tag, str(checksum["name"]))
+            digest = _checksum_for(
+                await _fetch(checksum_url, _MAX_CHECKSUM_BYTES, fetcher), asset_name
+            )
+    return replace(
+        descriptor,
+        version=tag.removeprefix("v"),
+        url=_download_url(descriptor.repository, tag, asset_name),
+        sha256=digest,
+    )
+
+
+async def _resolve_model(
+    descriptor: Artifact,
+    model_name: str,
+    fetcher: Fetch | None,
+) -> Artifact:
+    if descriptor.repository is None:
+        raise CatalogResolutionError(f"{descriptor.name} has no official repository")
+    payload = await _fetch_json(_release_url(descriptor.repository), fetcher)
+    tag = _release_tag(payload)
+    filename = f"{model_name}.traineddata"
+    raw_url = (
+        f"https://raw.githubusercontent.com/{descriptor.repository}/"
+        f"{quote(tag, safe='')}/{quote(filename, safe='')}"
+    )
+    contents_url = (
+        f"{_GITHUB_API}/repos/{descriptor.repository}/contents/"
+        f"{quote(filename, safe='')}?ref={quote(tag, safe='')}"
+    )
+    contents = await _fetch_json(contents_url, fetcher)
+    value = contents.get("sha")
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value, re.IGNORECASE) is None:
+        raise CatalogResolutionError(f"GitHub has no usable digest for {descriptor.name}")
+    git_sha1 = value.lower()
+    return replace(
+        descriptor,
+        version=tag.removeprefix("v"),
+        url=raw_url,
+        git_sha1=git_sha1,
+    )
+
+
+async def resolve_artifact(
+    name: str,
+    *,
+    system: str | None = None,
+    fetcher: Fetch | None = None,
+) -> Artifact:
+    """Resolve a descriptor against the current official GitHub release.
+
+    ``fetcher`` is intended for tests and callers that already provide a
+    bounded HTTP transport. It receives ``(url, maximum_bytes)`` and must
+    return the response body.
+    """
+
+    descriptor = artifact_for(name, system=system)
+    if descriptor is None:
+        raise CatalogResolutionError(f"unsupported dependency: {name}")
+    if descriptor.kind == "binary":
+        if system is None:
+            raise CatalogResolutionError(f"a platform is required for {name}")
+        return await _resolve_binary(descriptor, fetcher)
+    return await _resolve_model(descriptor, name.removeprefix("tessdata:"), fetcher)
+
+
+__all__ = [
+    "Artifact",
+    "BINARY_NAMES",
+    "MODEL_NAMES",
+    "CATALOG",
+    "CatalogResolutionError",
+    "artifact_for",
+    "resolve_artifact",
+]

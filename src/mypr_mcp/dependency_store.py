@@ -1,4 +1,4 @@
-"""Shared storage for pinned tool artifacts.
+"""Shared storage for tools resolved from official releases.
 
 The store is intentionally independent from a workspace.  Construction and
 inspection are read-only; directories are created only by an installation.
@@ -21,6 +21,7 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ from .dependency_catalog import (
     CATALOG,
     MODEL_NAMES,
     Artifact,
-    artifact_for,
+    resolve_artifact,
 )
 
 _INSTALL_TIMEOUT = 300.0
@@ -110,18 +111,12 @@ def _display_version(text: str) -> str:
     return ".".join(part for part in match.groups() if part) if match else text[:64]
 
 
-def _compatible(version: str | None, required: str, *, allow_newer_minor: bool = False) -> bool:
+def _compatible(version: str | None, required: str) -> bool:
     if version is None:
         return False
     actual = _version_tuple(version)
     expected = _version_tuple(required)
     if actual is None or expected is None:
-        return False
-    # Keep a major-version CLI contract.  For 0.x tools, the minor version is
-    # part of the compatibility contract as well.
-    if actual[0] != expected[0] or (actual[0] == 0 and actual[1] < expected[1]):
-        return False
-    if actual[0] == 0 and not allow_newer_minor and actual[1] != expected[1]:
         return False
     return actual >= expected
 
@@ -273,7 +268,7 @@ def _close_lock(stream) -> None:
 
 
 class DependencyStore:
-    """Resolve and install fixed global artifacts shared by workspaces."""
+    """Resolve official releases and share installations across workspaces."""
 
     def __init__(
         self,
@@ -323,7 +318,7 @@ class DependencyStore:
                 "status": "unsupported",
                 "version": None,
                 "path": None,
-                "reason": "dependency is not in the fixed catalog",
+                "reason": "dependency is not in the catalog",
             }
         if artifact.kind == "binary" and self._platform is None:
             return self._state(
@@ -341,7 +336,7 @@ class DependencyStore:
 
     async def ensure(self, name: str) -> dict[str, Any]:
         state = await self.inspect(name)
-        if state["status"] == "installed":
+        if state["status"] == "installed" and not self._needs_model_copy(state):
             return state
         if state["status"] == "unsupported":
             raise UnsupportedDependency(state.get("reason") or f"unsupported dependency: {name}")
@@ -383,7 +378,7 @@ class DependencyStore:
     async def _install(self, name: str) -> dict[str, Any]:
         artifact = CATALOG.get(name)
         if artifact is None:
-            raise UnsupportedDependency(f"dependency is not in the fixed catalog: {name}")
+            raise UnsupportedDependency(f"dependency is not in the catalog: {name}")
         if artifact.kind == "binary" and self._platform is None:
             raise UnsupportedDependency("requires Linux glibc x86_64/aarch64")
         try:
@@ -407,8 +402,27 @@ class DependencyStore:
                         )
                     )
                     if current["source"] == "shared" and current["status"] == "installed":
+                        if self._needs_model_copy(current):
+                            destination = (
+                                self.model_root / "tessdata_fast" / Path(current["path"]).name
+                            )
+                            await wait_owned(
+                                asyncio.to_thread(
+                                    _publish_model,
+                                    Path(current["path"]),
+                                    destination,
+                                    replace(artifact, version=current["version"]),
+                                )
+                            )
+                            return await asyncio.to_thread(self._inspect_model, artifact)
                         return current
                     async with self._network:
+                        try:
+                            artifact = await resolve_artifact(name, system=self._platform)
+                        except (ValueError, OSError) as exc:
+                            raise DependencyError(
+                                str(exc), code="dependency_download_failed"
+                            ) from exc
                         if artifact.kind == "model":
                             await self._install_model(artifact)
                         else:
@@ -436,9 +450,7 @@ class DependencyStore:
 
     async def _install_binary(self, artifact: Artifact) -> None:
         assert self._platform is not None
-        asset = artifact_for(artifact.name, system=self._platform)
-        if asset is None:
-            raise UnsupportedDependency(f"no {artifact.name} artifact for {self._platform}")
+        asset = artifact
         await wait_owned(asyncio.to_thread(self._tools_root.mkdir, parents=True, exist_ok=True))
         temporary_download = await self._download_to_cache(asset)
         temporary_root_raw, root_cancelled = await finish_owned(
@@ -523,11 +535,13 @@ class DependencyStore:
 
     async def _install_model(self, artifact: Artifact) -> None:
         model_dir = self._model_dir(artifact)
+        if model_dir.is_symlink():
+            raise DependencyError("model directory is unsafe")
         temporary = await self._download_to_cache(artifact)
         try:
             await wait_owned(asyncio.to_thread(model_dir.mkdir, parents=True, exist_ok=True))
             destination = model_dir / f"{artifact.name.removeprefix('tessdata:')}.traineddata"
-            await wait_owned(asyncio.to_thread(_publish_model, temporary, destination))
+            await wait_owned(asyncio.to_thread(_publish_model, temporary, destination, artifact))
         finally:
             with contextlib.suppress(FileNotFoundError):
                 await wait_owned(
@@ -561,6 +575,13 @@ class DependencyStore:
                 raise DependencyError(
                     f"SHA-256 mismatch for {artifact.name}", code="dependency_integrity_error"
                 )
+            if artifact.git_sha1 is not None:
+                blob_digest = await wait_owned(asyncio.to_thread(_git_sha1, temporary))
+                if blob_digest != artifact.git_sha1:
+                    raise DependencyError(
+                        f"Git blob digest mismatch for {artifact.name}",
+                        code="dependency_integrity_error",
+                    )
             keep = True
             return temporary
         except DependencyError:
@@ -642,7 +663,6 @@ class DependencyStore:
             if not _compatible(
                 result,
                 _SYSTEM_MINIMUMS.get(artifact.name, artifact.version),
-                allow_newer_minor=True,
             ):
                 return self._state(
                     artifact,
@@ -658,27 +678,41 @@ class DependencyStore:
 
     def _inspect_shared_binary(self, artifact: Artifact) -> dict[str, Any]:
         assert self._platform is not None
-        target = self._tools_root / artifact.name / artifact.version / self._platform
+        if artifact.version:
+            targets = [self._tools_root / artifact.name / artifact.version / self._platform]
+        else:
+            root = self._tools_root / artifact.name
+            if not root.is_dir() or root.is_symlink():
+                return self._state(artifact, "missing")
+            targets = [
+                path / self._platform
+                for path in sorted(
+                    root.iterdir(),
+                    key=lambda path: _version_tuple(path.name) or (0, 0, 0),
+                    reverse=True,
+                )
+                if _version_tuple(path.name) is not None
+            ]
+        problem = None
+        for target in targets:
+            state = self._inspect_binary_target(artifact, target)
+            if state["status"] == "installed":
+                return state
+            if state["status"] == "unusable" and problem is None:
+                problem = state
+        return problem or self._state(artifact, "missing")
+
+    def _inspect_binary_target(self, artifact: Artifact, target: Path) -> dict[str, Any]:
         if not target.exists():
             return self._state(artifact, "missing")
-        if target.is_symlink() or not target.is_dir():
+        if (
+            target.is_symlink()
+            or target.parent.is_symlink()
+            or not target.is_dir()
+            or not _inside(target.resolve(), self._tools_root)
+        ):
             return self._state(
                 artifact, "unusable", source="shared", reason="managed artifact path is unsafe"
-            )
-        paths = {
-            name: next(
-                (
-                    path
-                    for path in target.rglob(name)
-                    if path.is_file() and not path.is_symlink() and os.access(path, os.X_OK)
-                ),
-                None,
-            )
-            for name in artifact.executables
-        }
-        if any(path is None for path in paths.values()):
-            return self._state(
-                artifact, "unusable", source="shared", reason="managed artifact is incomplete"
             )
         marker = target / ".mypr-complete.json"
         if not marker.is_file() or marker.is_symlink():
@@ -688,12 +722,14 @@ class DependencyStore:
         try:
             metadata = json.loads(marker.read_text(encoding="utf-8"))
             if (
-                metadata.get("name") != artifact.name
-                or metadata.get("version") != artifact.version
+                not isinstance(metadata, dict)
+                or metadata.get("name") != artifact.name
+                or metadata.get("version") != target.parent.name
                 or metadata.get("platform") != self._platform
                 or not isinstance(metadata.get("files"), dict)
             ):
                 raise ValueError
+            paths = {}
             for name in artifact.executables:
                 item = metadata["files"][name]
                 relative = _safe_relative(item["path"])
@@ -701,11 +737,13 @@ class DependencyStore:
                 if (
                     not path.is_file()
                     or path.is_symlink()
+                    or not path.resolve().is_relative_to(target.resolve())
                     or not os.access(path, os.X_OK)
                     or _sha256(path) != item["sha256"]
                 ):
                     raise ValueError
-        except OSError, KeyError, TypeError, ValueError:
+                paths[name] = path
+        except OSError, KeyError, TypeError, ValueError, DependencyError:
             return self._state(
                 artifact,
                 "unusable",
@@ -722,7 +760,9 @@ class DependencyStore:
                 source="shared",
                 reason="managed tool failed its version probe",
             )
-        if not _compatible(version, artifact.version):
+        if not _compatible(version, metadata["version"]) or not _compatible(
+            version, _SYSTEM_MINIMUMS[artifact.name]
+        ):
             return self._state(
                 artifact,
                 "unusable",
@@ -733,7 +773,8 @@ class DependencyStore:
 
     def _inspect_model(self, artifact: Artifact) -> dict[str, Any]:
         model_dir = self._model_dir(artifact)
-        path = model_dir / f"{artifact.name.removeprefix('tessdata:')}.traineddata"
+        language = artifact.name.removeprefix("tessdata:")
+        path = model_dir / f"{language}.traineddata"
         if model_dir.is_symlink():
             return self._state(
                 artifact,
@@ -744,6 +785,37 @@ class DependencyStore:
             )
         if not path.is_file() or path.is_symlink():
             return self._state(artifact, "missing", model_dir=model_dir)
+        marker = model_dir / f".{language}.mypr-complete.json"
+        version = artifact.version or _display_version(model_dir.name)
+        if marker.exists() or marker.is_symlink():
+            try:
+                if marker.is_symlink():
+                    raise ValueError
+                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("name") != artifact.name
+                    or not isinstance(metadata.get("version"), str)
+                    or _sha256(path) != metadata.get("sha256")
+                ):
+                    raise ValueError
+                version = metadata["version"]
+            except OSError, TypeError, ValueError:
+                return self._state(
+                    artifact,
+                    "unusable",
+                    source="shared",
+                    model_dir=model_dir,
+                    reason="model digest verification failed",
+                )
+        elif model_dir.name == "tessdata_fast":
+            return self._state(
+                artifact,
+                "unusable",
+                source="shared",
+                model_dir=model_dir,
+                reason="managed model is unverified",
+            )
         if artifact.sha256 is not None and _sha256(path) != artifact.sha256:
             return self._state(
                 artifact,
@@ -752,10 +824,41 @@ class DependencyStore:
                 model_dir=model_dir,
                 reason="model hash mismatch",
             )
-        return self._state(artifact, "installed", source="shared", path=path, model_dir=model_dir)
+        return self._state(
+            replace(artifact, version=version),
+            "installed",
+            source="shared",
+            path=path,
+            model_dir=model_dir,
+        )
 
     def _model_dir(self, artifact: Artifact) -> Path:
-        return self.model_root / f"tessdata_fast-{artifact.version}-65727574dfcd"
+        current = self.model_root / "tessdata_fast"
+        if current.is_symlink():
+            return current
+        legacy = sorted(
+            (
+                path
+                for path in self.model_root.glob("tessdata_fast-*")
+                if path.is_dir() and not path.is_symlink() and _version_tuple(path.name) is not None
+            ),
+            key=lambda path: _version_tuple(path.name) or (0, 0, 0),
+            reverse=True,
+        )
+        filename = f"{artifact.name.removeprefix('tessdata:')}.traineddata"
+        for directory in (current, *legacy):
+            if (directory / filename).is_file() and not (directory / filename).is_symlink():
+                return directory
+        return current if current.exists() or not legacy else legacy[0]
+
+    def _needs_model_copy(self, state: dict[str, Any]) -> bool:
+        current = self.model_root / "tessdata_fast"
+        return (
+            state["kind"] == "model"
+            and current.is_dir()
+            and not current.is_symlink()
+            and state.get("model_dir") != str(current.resolve())
+        )
 
     @staticmethod
     def _state(
@@ -818,7 +921,7 @@ def _lock_name(name: str) -> str:
     return name.replace(":", "-")
 
 
-def _publish_model(source: Path, destination: Path) -> None:
+def _publish_model(source: Path, destination: Path, artifact: Artifact) -> None:
     temporary = None
     try:
         with (
@@ -832,6 +935,26 @@ def _publish_model(source: Path, destination: Path) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, destination)
+        metadata = {
+            "name": artifact.name,
+            "version": artifact.version,
+            "url": artifact.url,
+            "sha256": _sha256(destination),
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(metadata, output, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination.parent / f".{destination.stem}.mypr-complete.json")
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -864,6 +987,14 @@ def _run_version(path: Path) -> str:
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_sha1(path: Path) -> str:
+    digest = hashlib.sha1(f"blob {path.stat().st_size}\0".encode(), usedforsecurity=False)
     with path.open("rb") as stream:
         while chunk := stream.read(_CHUNK_SIZE):
             digest.update(chunk)

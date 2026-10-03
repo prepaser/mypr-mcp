@@ -3,16 +3,53 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import os
 import tarfile
 import threading
 import time
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from mypr_mcp.dependency_store import DependencyError, DependencyStore
+
+
+@pytest.fixture(autouse=True)
+def block_unexpected_artifact_resolution(monkeypatch):
+    from mypr_mcp import dependency_store
+
+    async def resolve(name: str, system: str | None = None):
+        raise AssertionError(f"unexpected artifact resolution: {name} ({system})")
+
+    monkeypatch.setattr(dependency_store, "resolve_artifact", resolve)
+
+
+def _patch_resolver(monkeypatch, *artifacts):
+    from mypr_mcp import dependency_store
+
+    resolved = {artifact.name: artifact for artifact in artifacts}
+
+    async def resolve(name: str, system: str | None = None):
+        try:
+            return resolved[name]
+        except KeyError as exc:
+            raise AssertionError(f"unexpected artifact resolution: {name} ({system})") from exc
+
+    monkeypatch.setattr(dependency_store, "resolve_artifact", resolve)
+
+
+def _fixture_artifact(name: str, *, version: str, url: str, sha256: str | None):
+    from mypr_mcp import dependency_store
+
+    return replace(
+        dependency_store.CATALOG[name],
+        version=version,
+        url=url,
+        sha256=sha256,
+    )
 
 
 def _archive(path: Path, kind: str, files: dict[str, bytes]) -> None:
@@ -48,6 +85,7 @@ async def test_store_defaults_are_absolute_and_inspection_is_read_only(tmp_path,
     assert store.cache_root == (tmp_path / "cache" / "mypr").resolve()
     state = await store.inspect("rg")
     assert state["status"] in {"installed", "missing", "unusable"}
+    await store.list("binary")
     assert not (tmp_path / "data").exists()
     assert not (tmp_path / "cache").exists()
     await store.close()
@@ -65,29 +103,12 @@ async def test_catalog_has_all_binary_and_model_names(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_binary_install_extracts_and_publishes_aliases(tmp_path):
-    from mypr_mcp import dependency_store
-
+async def test_binary_install_extracts_and_publishes_aliases(tmp_path, monkeypatch):
     archive = tmp_path / "rg.tar.gz"
     _archive(archive, "tar.gz", {"rg-15.2.0/rg": b"#!/bin/sh\necho rg 15.2.0\n"})
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    original = dependency_store.CATALOG["rg"]
-    patched = original.__class__(
-        original.name,
-        original.kind,
-        original.version,
-        "fixture://rg",
-        digest,
-        original.archive,
-        original.executables,
-        original.max_bytes,
-        original.source,
-    )
-    catalog = dict(dependency_store.CATALOG)
-    catalog["rg"] = patched
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(dependency_store, "CATALOG", catalog)
-    monkeypatch.setattr(dependency_store, "artifact_for", lambda _name, system=None: patched)
+    patched = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=digest)
+    _patch_resolver(monkeypatch, patched)
 
     async def download(_url: str, destination: Path, _maximum: int) -> None:
         data = await asyncio.to_thread(archive.read_bytes)
@@ -102,12 +123,18 @@ async def test_binary_install_extracts_and_publishes_aliases(tmp_path):
     assert (store.bin_root / "rg").is_symlink()
     assert os.access(store.bin_root / "rg", os.X_OK)
     await store.close()
-    monkeypatch.undo()
 
 
 @pytest.mark.asyncio
-async def test_model_install_verifies_hash_and_returns_model_dir(tmp_path):
+async def test_model_install_verifies_hash_and_returns_model_dir(tmp_path, monkeypatch):
     data = b"fake traineddata"
+    artifact = _fixture_artifact(
+        "tessdata:eng",
+        version="4.2.0",
+        url="fixture://eng",
+        sha256=hashlib.sha256(b"different traineddata").hexdigest(),
+    )
+    _patch_resolver(monkeypatch, artifact)
 
     # Keep this test independent of a network and the production digest by
     # exercising the bounded downloader and hash failure path directly.
@@ -121,31 +148,18 @@ async def test_model_install_verifies_hash_and_returns_model_dir(tmp_path):
         await store.install("tessdata:eng")
     state = await store.inspect("tessdata:eng")
     assert state["status"] == "missing"
-    assert state["model_dir"].endswith("tessdata_fast-4.1.0-65727574dfcd")
+    assert Path(state["model_dir"]).name == "tessdata_fast"
     await store.close()
 
 
 @pytest.mark.asyncio
 async def test_concurrent_model_ensure_shares_one_download(tmp_path, monkeypatch):
-    from mypr_mcp import dependency_store
-
     data = b"fake traineddata"
     digest = hashlib.sha256(data).hexdigest()
-    original = dependency_store.CATALOG["tessdata:eng"]
-    artifact = original.__class__(
-        original.name,
-        original.kind,
-        original.version,
-        "fixture://eng",
-        digest,
-        original.archive,
-        original.executables,
-        original.max_bytes,
-        original.source,
+    artifact = _fixture_artifact(
+        "tessdata:eng", version="4.2.0", url="fixture://eng", sha256=digest
     )
-    catalog = dict(dependency_store.CATALOG)
-    catalog[artifact.name] = artifact
-    monkeypatch.setattr(dependency_store, "CATALOG", catalog)
+    _patch_resolver(monkeypatch, artifact)
     calls = 0
 
     async def download(_url: str, destination: Path, _maximum: int) -> None:
@@ -165,28 +179,44 @@ async def test_concurrent_model_ensure_shares_one_download(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_corrupt_managed_binary_is_repaired_without_running_it(tmp_path, monkeypatch):
-    from mypr_mcp import dependency_store
+async def test_model_git_digest_and_local_marker_detect_corruption(tmp_path, monkeypatch):
+    data = b"model fixture"
+    digest = hashlib.sha1(f"blob {len(data)}\0".encode() + data, usedforsecurity=False).hexdigest()
+    artifact = replace(
+        _fixture_artifact("tessdata:eng", version="4.2.0", url="fixture://eng", sha256=None),
+        git_sha1=digest,
+    )
+    _patch_resolver(monkeypatch, replace(artifact, git_sha1="0" * 40))
+    store = DependencyStore(
+        tmp_path / "data",
+        tmp_path / "cache",
+        downloader=_fake_downloader({"fixture://eng": data}),
+        platform_key="x86_64",
+    )
+    try:
+        with pytest.raises(DependencyError, match="Git blob digest mismatch"):
+            await store.ensure("tessdata:eng")
+        assert (await store.inspect("tessdata:eng"))["status"] == "missing"
+        _patch_resolver(monkeypatch, artifact)
+        installed = await store.ensure("tessdata:eng")
+        assert installed["version"] == "4.2.0"
+        path = Path(installed["path"])
+        await asyncio.to_thread(path.write_bytes, b"corrupt model")
+        assert (await store.inspect("tessdata:eng"))["status"] == "unusable"
+        repaired = await store.ensure("tessdata:eng")
+        assert repaired["status"] == "installed"
+        assert await asyncio.to_thread(path.read_bytes) == data
+    finally:
+        await store.close()
 
+
+@pytest.mark.asyncio
+async def test_corrupt_managed_binary_is_repaired_without_running_it(tmp_path, monkeypatch):
     archive = tmp_path / "rg.tar.gz"
     _archive(archive, "tar.gz", {"rg-15.2.0/rg": b"#!/bin/sh\necho rg 15.2.0\n"})
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    original = dependency_store.CATALOG["rg"]
-    artifact = original.__class__(
-        original.name,
-        original.kind,
-        original.version,
-        "fixture://rg",
-        digest,
-        original.archive,
-        original.executables,
-        original.max_bytes,
-        original.source,
-    )
-    catalog = dict(dependency_store.CATALOG)
-    catalog["rg"] = artifact
-    monkeypatch.setattr(dependency_store, "CATALOG", catalog)
-    monkeypatch.setattr(dependency_store, "artifact_for", lambda _name, system=None: artifact)
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=digest)
+    _patch_resolver(monkeypatch, artifact)
 
     async def download(_url: str, destination: Path, _maximum: int) -> None:
         await asyncio.to_thread(
@@ -325,28 +355,87 @@ async def test_valid_shared_tool_wins_over_incompatible_system_tool(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_same_data_root_different_caches_share_install_lock(tmp_path, monkeypatch):
+async def test_system_binary_newer_than_minimum_is_reused(tmp_path, monkeypatch):
     from mypr_mcp import dependency_store
 
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    monkeypatch.setattr(
+        dependency_store.shutil,
+        "which",
+        lambda name: "/usr/bin/rg" if name == "rg" else None,
+    )
+    monkeypatch.setattr(dependency_store, "_run_version", lambda _path: "ripgrep 15.2.0")
+    result = await store.inspect("rg")
+    assert result["source"] == "system"
+    assert result["status"] == "installed"
+    assert result["version"] == "15.2.0"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_managed_metadata_is_unusable(tmp_path, monkeypatch):
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    target = store._tools_root / "rg" / "15.2.0" / "x86_64"
+    target.mkdir(parents=True)
+    executable = target / "rg"
+    executable.write_text("#!/bin/sh\necho rg 15.2.0\n")
+    executable.chmod(0o755)
+    (target / ".mypr-complete.json").write_text("{malformed")
+    monkeypatch.setattr(store, "_inspect_system", lambda _artifact: None)
+    result = await store.inspect("rg")
+    assert result["source"] == "shared"
+    assert result["status"] == "unusable"
+    assert "metadata" in result["reason"] or "digest" in result["reason"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize("with_current", [False, True])
+async def test_legacy_model_directory_is_preserved(tmp_path, with_metadata, with_current):
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    legacy = store.model_root / "tessdata_fast-4.1.0-65727574dfcd"
+    legacy.mkdir(parents=True)
+    data = b"legacy model"
+    model = legacy / "eng.traineddata"
+    model.write_bytes(data)
+    metadata = {
+        "name": "tessdata:eng",
+        "version": "4.1.0",
+        "url": "https://example.invalid/eng.traineddata",
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    marker = legacy / ".eng.mypr-complete.json"
+    if with_metadata:
+        marker.write_text(json.dumps(metadata))
+    current = store.model_root / "tessdata_fast"
+    if with_current:
+        current.mkdir()
+    inspected = await store.inspect("tessdata:eng")
+    assert inspected["status"] == "installed"
+    assert Path(inspected["model_dir"]) == legacy
+    assert not (current / "eng.traineddata").exists()
+    result = await store.ensure("tessdata:eng")
+    assert result["status"] == "installed"
+    assert result["version"] == "4.1.0"
+    assert Path(result["model_dir"]) == (current if with_current else legacy)
+    if with_current:
+        assert await asyncio.to_thread((current / "eng.traineddata").read_bytes) == data
+    assert model.read_bytes() == data
+    if with_metadata:
+        assert json.loads(marker.read_text()) == metadata
+    else:
+        assert not marker.exists()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_same_data_root_different_caches_share_install_lock(tmp_path, monkeypatch):
     archive = tmp_path / "rg.tar.gz"
     _archive(archive, "tar.gz", {"rg-15.2.0/rg": b"#!/bin/sh\necho rg 15.2.0\n"})
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    original = dependency_store.CATALOG["rg"]
-    artifact = original.__class__(
-        original.name,
-        original.kind,
-        original.version,
-        "fixture://rg",
-        digest,
-        original.archive,
-        original.executables,
-        original.max_bytes,
-        original.source,
-    )
-    catalog = dict(dependency_store.CATALOG)
-    catalog["rg"] = artifact
-    monkeypatch.setattr(dependency_store, "CATALOG", catalog)
-    monkeypatch.setattr(dependency_store, "artifact_for", lambda _name, system=None: artifact)
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=digest)
+    _patch_resolver(monkeypatch, artifact)
     calls = 0
 
     async def download(_url: str, destination: Path, _maximum: int) -> None:
@@ -377,6 +466,8 @@ async def test_same_data_root_different_caches_share_install_lock(tmp_path, monk
 async def test_cancellation_while_waiting_for_lock_does_not_leak_lock(tmp_path, monkeypatch):
     from mypr_mcp import dependency_store
 
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=None)
+    _patch_resolver(monkeypatch, artifact)
     store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
     monkeypatch.setattr(store, "_inspect_system", lambda _artifact: None)
     store._locks_root.mkdir(parents=True)
@@ -404,22 +495,8 @@ async def test_cancellation_after_temp_directory_creation_cleans_directory(tmp_p
     archive = tmp_path / "rg.tar.gz"
     _archive(archive, "tar.gz", {"rg-15.2.0/rg": b"#!/bin/sh\necho rg 15.2.0\n"})
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    original = dependency_store.CATALOG["rg"]
-    artifact = original.__class__(
-        original.name,
-        original.kind,
-        original.version,
-        "fixture://rg",
-        digest,
-        original.archive,
-        original.executables,
-        original.max_bytes,
-        original.source,
-    )
-    catalog = dict(dependency_store.CATALOG)
-    catalog["rg"] = artifact
-    monkeypatch.setattr(dependency_store, "CATALOG", catalog)
-    monkeypatch.setattr(dependency_store, "artifact_for", lambda _name, system=None: artifact)
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=digest)
+    _patch_resolver(monkeypatch, artifact)
 
     async def download(_url: str, destination: Path, _maximum: int) -> None:
         await asyncio.to_thread(
@@ -466,24 +543,17 @@ def test_empty_or_relative_xdg_roots_do_not_depend_on_workspace(tmp_path, monkey
 @pytest.mark.asyncio
 async def test_model_publication_handles_separate_cache_filesystem(tmp_path, monkeypatch):
     import errno
-    from dataclasses import replace
-
-    from mypr_mcp import dependency_store
 
     data = b"model fixture"
-    artifact = replace(
-        dependency_store.CATALOG["tessdata:eng"],
+    artifact = _fixture_artifact(
+        "tessdata:eng",
+        version="4.2.0",
         url="fixture://model",
         sha256=hashlib.sha256(data).hexdigest(),
     )
-    monkeypatch.setattr(
-        dependency_store,
-        "CATALOG",
-        {
-            **dependency_store.CATALOG,
-            "tessdata:eng": artifact,
-        },
-    )
+    _patch_resolver(monkeypatch, artifact)
+    from mypr_mcp import dependency_store
+
     cache = tmp_path / "cache"
     original_replace = dependency_store.os.replace
 
@@ -502,6 +572,14 @@ async def test_model_publication_handles_separate_cache_filesystem(tmp_path, mon
         result = await store.ensure("tessdata:eng")
         assert result["status"] == "installed"
         assert await asyncio.to_thread(Path(result["path"]).read_bytes) == data
+        assert Path(result["model_dir"]).name == "tessdata_fast"
+        marker = Path(result["model_dir"]) / ".eng.mypr-complete.json"
+        assert json.loads(marker.read_text()) == {
+            "name": "tessdata:eng",
+            "version": "4.2.0",
+            "url": "fixture://model",
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
         assert not list(cache.rglob("*.tmp"))
         assert not list(store.model_root.rglob(".*.tmp"))
     finally:
