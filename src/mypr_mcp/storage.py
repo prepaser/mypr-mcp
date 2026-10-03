@@ -85,6 +85,18 @@ class _Entry:
 
 
 @dataclass(frozen=True, slots=True)
+class _UsageFile:
+    path: Path
+    relative: str
+    category: str | None
+    size: int
+    allocated_bytes: int
+    device: int
+    inode: int
+    hardlink: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _Record:
     ident: str
     state: str | None
@@ -278,6 +290,151 @@ class Storage:
             }
         return result
 
+    def _database_snapshot(self, options: Mapping[str, Any]) -> dict[str, Any]:
+        """Ask the history adapter for an exact, bounded database prune set.
+
+        History owns the schema and decides which rows are safe to remove.  A
+        missing adapter is deliberately treated as an unavailable optional
+        capability, rather than as permission to inspect or delete SQLite
+        rows from this module.
+        """
+        empty = {
+            "available": False,
+            "selected_ids": [],
+            "selected": [],
+            "count": 0,
+            "bytes": 0,
+            "truncated": False,
+            "error": None,
+        }
+        method = getattr(self.history, "storage_history_snapshot", None)
+        if not callable(method):
+            return empty
+        try:
+            raw = method(retention_days=options["older_than_days"])
+        except Exception as exc:
+            return {**empty, "available": True, "error": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(raw, Mapping):
+            return {**empty, "available": True, "error": "database snapshot was not an object"}
+        entities = raw.get("entities", ())
+        events = raw.get("events", ())
+        if not isinstance(entities, list) or not isinstance(events, list):
+            return {**empty, "available": True, "error": "database snapshot lists are invalid"}
+        entity_values = list(islice(entities, _MAX_PLAN_CANDIDATES + 1))
+        event_values = list(islice(events, _MAX_PLAN_CANDIDATES + 1))
+        truncated = (
+            len(entity_values) > _MAX_PLAN_CANDIDATES
+            or len(event_values) > _MAX_PLAN_CANDIDATES
+        )
+        if any(not isinstance(item, Mapping) for item in entity_values + event_values):
+            return {
+                **empty,
+                "available": True,
+                "error": "database snapshot records are invalid",
+            }
+        entity_values = entity_values[:_MAX_PLAN_CANDIDATES]
+        event_values = event_values[:_MAX_PLAN_CANDIDATES]
+        if len(entity_values) + len(event_values) > _MAX_PLAN_CANDIDATES:
+            truncated = True
+            event_values = event_values[: max(0, _MAX_PLAN_CANDIDATES - len(entity_values))]
+        if any(not isinstance(item.get("id"), str) for item in entity_values):
+            return {**empty, "available": True, "error": "database entity IDs are invalid"}
+        if any(
+            not isinstance(item.get("seq"), int) or isinstance(item.get("seq"), bool)
+            for item in event_values
+        ):
+            return {**empty, "available": True, "error": "database event sequences are invalid"}
+        selected_entities = entity_values[:_MAX_PLAN_CANDIDATES]
+        selected_events = event_values[:_MAX_PLAN_CANDIDATES]
+        ids = [
+            item["id"] for item in selected_entities if isinstance(item.get("id"), str)
+        ] + [
+            item["seq"]
+            for item in selected_events
+            if isinstance(item.get("seq"), int) and not isinstance(item.get("seq"), bool)
+        ]
+        count = raw.get("count", len(ids))
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            count = len(ids)
+        value = raw.get("bytes", 0)
+        size = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+        return {
+            "available": True,
+            "selected_ids": ids,
+            "entities": [dict(item) for item in selected_entities],
+            "events": [dict(item) for item in selected_events],
+            "plan": {
+                "entities": [dict(item) for item in selected_entities],
+                "events": [dict(item) for item in selected_events],
+                "retention_days": options["older_than_days"],
+                **({"cutoff": raw["cutoff"]} if "cutoff" in raw else {}),
+            },
+            "count": count,
+            "bytes": size,
+            "truncated": truncated or bool(raw.get("truncated")),
+            "error": raw.get("error") if isinstance(raw.get("error"), str) else None,
+        }
+
+    def _database_apply(
+        self, database: Mapping[str, Any], options: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Apply a history-owned database maintenance selection.
+
+        The history adapter rechecks every selected record in its own SQLite
+        transaction.
+        """
+        result: dict[str, Any] = {
+            "available": bool(database.get("available")),
+            "selected_ids": list(database.get("selected_ids", ())),
+            "pruned_count": 0,
+            "pruned_bytes": 0,
+            "checkpoint": None,
+            "vacuum": None,
+            "reclaimed_bytes": 0,
+            "errors": [],
+        }
+        if not result["available"]:
+            return result
+        method = getattr(self.history, "storage_history_apply", None)
+        if not callable(method):
+            result["errors"] = ["database maintenance adapter is unavailable"]
+            return result
+        try:
+            raw = method(
+                database.get(
+                    "plan",
+                    {
+                        "entities": database.get("entities", []),
+                        "events": database.get("events", []),
+                        "retention_days": options["older_than_days"],
+                    },
+                )
+            )
+        except Exception as exc:
+            result["errors"] = [f"{type(exc).__name__}: {exc}"]
+            return result
+        if not isinstance(raw, Mapping):
+            result["errors"] = ["database maintenance result was not an object"]
+            return result
+        if "pruned_count" not in raw:
+            entity_count = raw.get("entities", 0)
+            event_count = raw.get("events", 0)
+            if isinstance(entity_count, int) and isinstance(event_count, int):
+                result["pruned_count"] = max(0, entity_count) + max(0, event_count)
+        for key in ("pruned_count", "pruned_bytes", "reclaimed_bytes"):
+            value = raw.get(key, result[key])
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                result[key] = value
+        for key in ("checkpoint", "vacuum"):
+            if key in raw:
+                result[key] = raw[key]
+        errors = raw.get("errors", raw.get("error", ()))
+        if isinstance(errors, str):
+            errors = [errors]
+        if isinstance(errors, Iterable) and not isinstance(errors, (str, bytes)):
+            result["errors"] = [str(value)[:512] for value in errors if value is not None][:8]
+        return result
+
     def _mail_snapshot(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "protected_paths": set(),
@@ -400,18 +557,21 @@ class Storage:
     def _usage_sync(self) -> dict[str, Any]:
         with StorageLock(self.lock_path):
             entries, truncated = self._entries()
-        return self._usage(entries, truncated)
+            files, files_truncated = self._usage_files()
+        return self._usage(entries, truncated, files, files_truncated)
 
     def _plan_sync(self, options: dict[str, Any], active_ids: set[str]) -> dict[str, Any]:
         with StorageLock(self.lock_path):
             entries, truncated = self._entries()
             history_state = self._history_snapshot()
             history_state["mail"] = self._mail_snapshot()
+            database_state = self._database_snapshot(options)
             active = active_ids | set(history_state["active_ids"])
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
             candidates = self._candidates(entries, records, protected, options, history_state)
-            usage = self._usage(entries, truncated)
+            files, files_truncated = self._usage_files()
+            usage = self._usage(entries, truncated, files, files_truncated)
             selected = self._select(candidates, usage["total_bytes"], options["max_bytes"])
             revision_prunable = self._revision_prune_preview(entries, options["revision_keep"])
             selected, candidate_truncated = self._limit_candidates(selected)
@@ -450,12 +610,23 @@ class Storage:
                 "tombstones": tombstones,
                 "protected": protected,
                 "mail": self._public_mail_state(history_state["mail"]),
+                "database": database_state,
             }
 
     def _apply_sync(self, plan: dict[str, Any], acknowledged: set[str]) -> dict[str, Any]:
         deleted: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         mail_cleanup_error: str | None = None
+        database_result = {
+            "available": bool(plan.get("database", {}).get("available")),
+            "selected_ids": list(plan.get("database", {}).get("selected_ids", ())),
+            "pruned_count": 0,
+            "pruned_bytes": 0,
+            "checkpoint": None,
+            "vacuum": None,
+            "reclaimed_bytes": 0,
+            "errors": [],
+        }
         with StorageLock(self.lock_path):
             if plan.get("workspace_id") != self._workspace_identity():
                 return {
@@ -464,6 +635,7 @@ class Storage:
                     "skipped": [{"path": "", "reason": "workspace_identity_changed"}],
                     "deleted_bytes": 0,
                     "tombstones_required": plan["tombstones"],
+                    "database": database_result,
                 }
             entries, scan_truncated = self._entries()
             history_state = self._history_snapshot()
@@ -482,6 +654,7 @@ class Storage:
                     "revision_pruned": [],
                     "scan_truncated": scan_truncated,
                     "tombstones_required": plan["tombstones"],
+                    "database": database_result,
                 }
             try:
                 revision_pruned = self._prune_revision_indexes(plan["options"]["revision_keep"])
@@ -498,6 +671,7 @@ class Storage:
                     "revision_pruned": [],
                     "error": f"{type(exc).__name__}: {exc}",
                     "tombstones_required": plan["tombstones"],
+                    "database": database_result,
                 }
             active = self._active_ids() | set(history_state["active_ids"])
             records = self._records(entries, active)
@@ -629,6 +803,9 @@ class Storage:
                     skipped.append({**item, "reason": f"delete_failed: {type(exc).__name__}"})
                 else:
                     deleted.append(item)
+            database_result = self._database_apply(
+                plan.get("database", {}), plan["options"]
+            )
         mail_after = getattr(self.mail, "storage_gc_after_delete", None)
         deleted_mail = [item for item in deleted if item["category"] == "mail"]
         if callable(mail_after):
@@ -653,6 +830,7 @@ class Storage:
                 and remaining_usage["total_bytes"] > plan["options"]["max_bytes"]
             ),
             "mail_cleanup_error": mail_cleanup_error,
+            "database": database_result,
         }
 
     def _entries(self) -> tuple[list[_Entry], bool]:
@@ -1269,17 +1447,98 @@ class Storage:
             remaining -= candidate["size"]
         return [item for unit in selected for item in unit["items"]]
 
-    def _usage(self, entries: list[_Entry], truncated: bool) -> dict[str, Any]:
+    def _usage_files(self) -> tuple[list[_UsageFile], bool]:
+        """Scan every regular file below ``.mypr`` using metadata only."""
+        if not self.root.is_dir():
+            return [], False
+        files: list[_UsageFile] = []
+        truncated = False
+        for directory, dirnames, filenames in os.walk(self.root, followlinks=False):
+            dirnames[:] = [name for name in dirnames if name not in {".", ".."}]
+            for name in filenames:
+                if len(files) >= _MAX_FILES:
+                    truncated = True
+                    break
+                path = Path(directory) / name
+                try:
+                    info = path.lstat()
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                        continue
+                    relative = path.relative_to(self.workspace).as_posix()
+                except (OSError, ValueError):
+                    continue
+                blocks = getattr(info, "st_blocks", 0)
+                allocated = (
+                    blocks * 512
+                    if isinstance(blocks, int) and blocks >= 0
+                    else info.st_size
+                )
+                files.append(
+                    _UsageFile(
+                        path,
+                        relative,
+                        self._category(relative),
+                        info.st_size,
+                        allocated,
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_nlink > 1,
+                    )
+                )
+            if truncated:
+                break
+        return files, truncated
+
+    @staticmethod
+    def _usage_summary(files: Iterable[_UsageFile], *, truncated: bool = False) -> dict[str, Any]:
+        selected = list(files)
+        identities = {(item.device, item.inode) for item in selected}
+        allocated_by_inode: dict[tuple[int, int], int] = {}
+        for item in selected:
+            allocated_by_inode.setdefault((item.device, item.inode), item.allocated_bytes)
+        hardlink_count = sum(1 for item in selected if item.hardlink)
+        logical_bytes = sum(item.size for item in selected)
+        allocated_bytes = sum(allocated_by_inode.values())
+        return {
+            "files": len(selected),
+            "bytes": logical_bytes,
+            "logical_bytes": logical_bytes,
+            "allocated_bytes": allocated_bytes,
+            "unique_inodes": len(identities),
+            "hardlinks": hardlink_count,
+            "has_hardlinks": hardlink_count > 0,
+            "truncated": truncated,
+        }
+
+    def _usage(
+        self,
+        entries: list[_Entry],
+        truncated: bool,
+        files: list[_UsageFile] | None = None,
+        files_truncated: bool = False,
+    ) -> dict[str, Any]:
         categories: dict[str, dict[str, int]] = defaultdict(lambda: {"files": 0, "bytes": 0})
         for entry in entries:
             item = categories[entry.category]
             item["files"] += 1
             item["bytes"] += entry.size
+        if files is None:
+            files, files_truncated = self._usage_files()
+        managed_files = [item for item in files if item.category is not None]
+        protected_files = [item for item in files if item.category is None]
+        managed = self._usage_summary(
+            managed_files, truncated=truncated or files_truncated
+        )
+        protected = self._usage_summary(protected_files, truncated=files_truncated)
+        workspace = self._usage_summary(files, truncated=files_truncated)
         return {
             "total_files": len(entries),
             "total_bytes": sum(item["bytes"] for item in categories.values()),
             "truncated": truncated,
             "categories": dict(categories),
+            "managed": managed,
+            "protected": protected,
+            "workspace": workspace,
         }
 
     @staticmethod
@@ -1379,12 +1638,36 @@ class Storage:
         protected["paths"] = paths[:_MAX_PUBLIC_ITEMS]
         protected["references"] = dict(list(references.items())[:_MAX_PUBLIC_ITEMS])
         result["protected"] = protected
+        database = dict(result.get("database", {}))
+        database_ids = list(database.get("selected_ids", ()))
+        database_items = list(database.get("selected", ()))
+        database["selected_ids"] = database_ids[:_MAX_PUBLIC_ITEMS]
+        database["selected"] = database_items[:_MAX_PUBLIC_ITEMS]
+        database_entity_values = list(database.get("entities", ()))
+        database_event_values = list(database.get("events", ()))
+        database["entities"] = database_entity_values[:_MAX_PUBLIC_ITEMS]
+        database["events"] = database_event_values[:_MAX_PUBLIC_ITEMS]
+        database["plan"] = {
+            "entities": list(database.get("entities", ())),
+            "events": list(database.get("events", ())),
+            "retention_days": database.get("plan", {}).get("retention_days")
+            if isinstance(database.get("plan"), Mapping)
+            else None,
+        }
+        database["public_truncated"] = (
+            len(database_ids) > _MAX_PUBLIC_ITEMS
+            or len(database_items) > _MAX_PUBLIC_ITEMS
+            or len(database_entity_values) > _MAX_PUBLIC_ITEMS
+            or len(database_event_values) > _MAX_PUBLIC_ITEMS
+        )
+        result["database"] = database
         result["public_truncated"] = any(
             (
                 len(candidates) > _MAX_PUBLIC_ITEMS,
                 len(tombstones) > _MAX_PUBLIC_ITEMS,
                 len(paths) > _MAX_PUBLIC_ITEMS,
                 len(references) > _MAX_PUBLIC_ITEMS,
+                database["public_truncated"],
             )
         )
         return result

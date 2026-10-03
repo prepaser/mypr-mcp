@@ -15,7 +15,12 @@ from typing import Any
 
 from .dependency_store import DependencyStore
 from .diagnostics import RPCError, safe_error
-from .package_worker import PYTHON_PACKAGES
+from .python_dependencies import (
+    PYTHON_PACKAGE_REQUIREMENTS,
+    PYTHON_PACKAGES,
+    uv_diagnostics,
+    version_satisfies,
+)
 
 _KINDS = {"binary", "python", "model", "browser"}
 _BROWSERS = ("chromium", "firefox", "webkit")
@@ -43,14 +48,30 @@ for name, module in json.loads(sys.argv[1]).items():
         result[name] = {'status': 'unusable', 'version': version, 'reason': str(exc)[:512]}
 print(json.dumps(result))
 """
-_BROWSER_PROBE = """import importlib.metadata, json, os, sys
-from playwright.sync_api import sync_playwright
+_BROWSER_PROBE = """import importlib.metadata, json, os
 result = {}
-with sync_playwright() as p:
-    for name in json.loads(sys.argv[1]):
-        path = getattr(p, name).executable_path
-        result[name] = {'path': path, 'status': 'installed' if os.path.isfile(path) else 'missing',
-                        'version': importlib.metadata.version('playwright')}
+names = json.loads(__import__('sys').argv[1])
+try:
+    version = importlib.metadata.version('playwright')
+except importlib.metadata.PackageNotFoundError:
+    for name in names:
+        result[name] = {'path': None, 'status': 'missing', 'version': None,
+                        'reason': 'playwright package is missing'}
+else:
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            for name in names:
+                path = getattr(p, name).executable_path
+                result[name] = {
+                    'path': path,
+                    'status': 'installed' if os.path.isfile(path) else 'missing',
+                    'version': version,
+                }
+    except Exception as exc:
+        for name in names:
+            result[name] = {'path': None, 'status': 'unusable', 'version': version,
+                            'reason': str(exc)[:512]}
 print(json.dumps(result))
 """
 
@@ -84,19 +105,28 @@ class DependencyService:
         return sum(not task.done() for task in self._jobs.values())
 
     def status(self) -> dict[str, Any]:
+        uv = uv_diagnostics(self.config, self.workspace)
         return {
             **self.config,
             "active_count": self.active_count,
             "data_root": str(self.store.data_root),
             "bin_root": str(self.store.bin_root),
             "cache_root": str(self.store.cache_root),
+            "uv": uv,
         }
 
     def apply_config(self, config: Mapping[str, Any]) -> None:
         value = config.get("auto_install", True)
         if type(value) is not bool:
             raise ValueError("dependencies.auto_install must be a boolean")
-        self.config = {"auto_install": value}
+        values: dict[str, Any] = {"auto_install": value}
+        for key in ("uv_cache_dir", "uv_link_mode"):
+            if key in config:
+                item = config[key]
+                if item is not None and (not isinstance(item, str) or not item):
+                    raise ValueError(f"dependencies.{key} must be a non-empty string")
+                values[key] = item
+        self.config = values
 
     async def close(self) -> None:
         self._closed = True
@@ -190,6 +220,8 @@ class DependencyService:
         names = list(dict.fromkeys(names))
         context = dict(context or {})
         packages = [name for name in names if name in PYTHON_PACKAGES]
+        if any(name.startswith("browser:") for name in names) and "playwright" not in packages:
+            packages.append("playwright")
         inventory = await self._packages(packages) if packages else {}
         pending = []
         missing = []
@@ -233,6 +265,12 @@ class DependencyService:
             if name.startswith("browser:"):
                 browser = name.split(":", 1)[1]
                 item = (await self._browsers([browser]))[browser]
+                if item["status"] == "unusable":
+                    raise RPCError(
+                        f"playwright is installed but unusable: {item.get('reason')}",
+                        code="dependency_unusable",
+                        details={"name": "playwright", "reason": item.get("reason")},
+                    )
                 if item["status"] != "installed":
                     self._check_install(name, automatic)
                     task = self._start(
@@ -315,6 +353,17 @@ class DependencyService:
 
     async def _packages(self, names) -> dict[str, dict[str, Any]]:
         values = await self._probe(_PACKAGE_PROBE, {name: PYTHON_PACKAGES[name] for name in names})
+        for name, value in values.items():
+            if not isinstance(value, dict):
+                continue
+            requirement = PYTHON_PACKAGE_REQUIREMENTS[name]
+            version = value.get("version")
+            value["requirement"] = requirement
+            if value.get("status") == "installed" and not version_satisfies(version, requirement):
+                value["status"] = "unusable"
+                value["reason"] = (
+                    f"installed version {version!r} does not satisfy {requirement!r}"
+                )
         return {
             name: {
                 "name": name,
@@ -322,6 +371,7 @@ class DependencyService:
                 "scope": "workspace",
                 "source": "workspace" if value["status"] != "missing" else None,
                 "path": str(self.python),
+                "requirement": PYTHON_PACKAGE_REQUIREMENTS[name],
                 **value,
             }
             for name, value in values.items()
@@ -329,12 +379,21 @@ class DependencyService:
 
     async def _browsers(self, names) -> dict[str, dict[str, Any]]:
         values = await self._probe(_BROWSER_PROBE, names)
+        requirement = PYTHON_PACKAGE_REQUIREMENTS["playwright"]
+        for value in values.values():
+            version = value.get("version")
+            if version is not None and not version_satisfies(version, requirement):
+                value["status"] = "unusable"
+                value["reason"] = (
+                    f"installed version {version!r} does not satisfy {requirement!r}"
+                )
         return {
             name: {
                 "name": f"browser:{name}",
                 "kind": "browser",
                 "scope": "global",
                 "source": "shared" if value["status"] == "installed" else None,
+                "requirement": requirement,
                 **value,
             }
             for name, value in values.items()

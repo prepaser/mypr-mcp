@@ -31,6 +31,24 @@ async def test_invalid_measurement_never_launches_helpers(tmp_path, kwargs, monk
         await tools.usage(**kwargs)
 
 
+async def test_dependency_preparation_is_limited_to_psutil_collectors(tmp_path, monkeypatch):
+    calls = []
+
+    async def ensure(*names, automatic=False):
+        calls.append((names, automatic))
+
+    tools = api.SystemTools(tmp_path, ensure_dependencies=ensure)
+
+    async def probe(section, request):
+        return {"devices": []} if section.startswith("gpu:") else {}
+
+    monkeypatch.setattr(tools, "_probe", probe)
+    await tools.gpus()
+    assert calls == []
+    await tools.info()
+    assert calls == [(('psutil',), True)]
+
+
 async def test_probes_are_bounded_across_concurrent_calls_and_fail_independently(
     tmp_path, monkeypatch
 ):

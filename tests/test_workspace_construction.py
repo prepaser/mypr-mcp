@@ -12,12 +12,15 @@ async def test_workspace_helpers_share_one_graph_and_factory_has_no_global_tasks
         pass
 
     monkeypatch.setattr(api, "_rpc", rpc)
+    monkeypatch.setenv("MYPR_SOCKET", "/tmp/mypr-construction.sock")
     first = api.create_workspace(tmp_path)
     assert first.code.fs is first.fs
     assert first.modules.fs is first.fs
     assert first.fs._shell is first.shell
     assert first.shell._tasks is first.tasks
     assert first.net.tasks is first.tasks
+    assert first.net._system._ensure_dependencies is first.system._ensure_dependencies
+    assert first.system._ensure_dependencies.__self__ is first.dependencies
     await first._close_resources()
 
     second = api.create_workspace(tmp_path)

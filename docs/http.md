@@ -1,6 +1,6 @@
 # HTTP clients and HTML extraction
 
-`ws.http` keeps named `httpx2.AsyncClient` instances in the workspace kernel. A client name preserves cookies and connection settings across calls for the same mypr client. Set `shared=True` only when callers should deliberately use the same client and cookie jar. The native client remains available through `ws.http.client()`; requests made through it do not use the bounded response body limit.
+`ws.http` keeps named `httpx2.AsyncClient` instances in the workspace kernel. A client name preserves cookies and connection settings across calls for the same mypr client. Set `shared=True` only when callers should deliberately use the same client and cookie jar. The native client remains available through `await ws.http.client()`; this first prepares `httpx2` when needed. Requests made through it do not use the bounded response body limit.
 
 `await ws.http.download(url, path, overwrite=False)` streams a successful response into a temporary file and atomically publishes the target, returning its `Path`. Errors before publication leave the target unchanged. If publication succeeds but temporary-file cleanup fails, the target is returned and `ws.http.last_warnings` contains a `download_cleanup_failed` warning. Warnings belong to the current logical client and describe its most recently completed download; concurrent downloads keep separate warning lists. At most four warnings per client and 32 client records are retained.
 

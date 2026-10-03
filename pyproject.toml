@@ -6,7 +6,7 @@ readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
-dependencies = ["mcp>=2.2,<3", "ipykernel>=7.3,<8", "jupyter-client>=8.10,<9", "pyyaml>=6,<7", "tomlkit>=0.15,<1", "httpx2[http2,socks]>=2.12,<3", "playwright>=1.58,<2", "packaging>=26,<27", "psutil>=7.2,<8"]
+dependencies = ["mcp>=2.2,<3", "jupyter-client>=8.10,<9", "tomlkit>=0.15,<1", "httpx2[http2,socks]>=2.12,<3", "packaging>=26,<27"]
 
 [project.scripts]
 mypr-mcp = "mypr_mcp.cli:main"
@@ -16,7 +16,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12"]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "ipykernel>=7.3,<8", "pyyaml>=6,<7", "playwright>=1.58,<2", "psutil>=7.2,<8"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

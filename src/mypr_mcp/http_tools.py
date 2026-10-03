@@ -59,6 +59,11 @@ def _check_limit(max_bytes: int | None) -> None:
         raise ValueError("max_bytes must be non-negative")
 
 
+def _check_url(url: str) -> None:
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("url must be a non-empty string")
+
+
 class HTTPTools:
     """Manage named native HTTPX2 clients for one workspace kernel."""
 
@@ -201,7 +206,81 @@ class HTTPTools:
         result.setdefault("timeout", DEFAULT_TIMEOUT)
         return result
 
-    def client(
+    @staticmethod
+    def _needs_socksio(options: Mapping[str, Any]) -> bool:
+        for key in ("proxy", "proxies"):
+            value = options.get(key)
+            values = value.values() if isinstance(value, Mapping) else (value,)
+            for item in values:
+                if isinstance(item, str) and item.lower().split(":", 1)[0] in {
+                    "socks4",
+                    "socks4a",
+                    "socks5",
+                    "socks5h",
+                }:
+                    return True
+                scheme = getattr(item, "scheme", None)
+                if scheme is None:
+                    scheme = getattr(getattr(item, "url", None), "scheme", None)
+                if isinstance(scheme, str) and scheme.lower() in {
+                    "socks4",
+                    "socks4a",
+                    "socks5",
+                    "socks5h",
+                }:
+                    return True
+        proxy = options.get("proxy")
+        if (
+            options.get("trust_env", True)
+            and proxy is None
+            and options.get("transport") is None
+        ):
+            try:
+                from urllib.request import getproxies
+
+                proxies = getproxies()
+            except (OSError, ValueError):
+                proxies = {}
+            if not isinstance(proxies, Mapping):
+                proxies = {}
+            for key, value in proxies.items():
+                if key.lower() in {"no", "no_proxy"} or not isinstance(value, str):
+                    continue
+                scheme = value.strip().split(":", 1)[0].lower()
+                if scheme in {"socks4", "socks4a", "socks5", "socks5h"}:
+                    return True
+        return False
+
+    async def _prepare_client_dependencies(self, options: Mapping[str, Any]) -> None:
+        names = ["httpx2"]
+        if options.get("http2") is True:
+            names.append("h2")
+        if self._needs_socksio(options):
+            names.append("socksio")
+        await self._ensure(*names)
+
+    def _existing_client(
+        self,
+        key: tuple[str, str, str],
+        name: str,
+        requested: Mapping[str, Any],
+        has_options: bool,
+    ) -> Any | None:
+        existing = self._clients.get(key)
+        if existing is not None and existing.is_closed:
+            self._clients.pop(key, None)
+            self._options.pop(key, None)
+            existing = None
+        if existing is not None:
+            if has_options and self._options[key] != requested:
+                raise RuntimeError(
+                    f"HTTP client {name!r} already exists with different options; "
+                    "await ws.http.close(...) before reconfiguring it"
+                )
+            return existing
+        return None
+
+    async def client(
         self,
         name: str = "default",
         *,
@@ -216,36 +295,32 @@ class HTTPTools:
 
         if self._closed:
             raise RuntimeError("HTTP service is closed")
-        import httpx2
-
-        key = self._key(name, shared)
         requested = self._options_with_defaults(options)
-        existing = self._clients.get(key)
-        if existing is not None and existing.is_closed:
-            self._clients.pop(key, None)
-            self._options.pop(key, None)
-            existing = None
+        key = self._key(name, shared)
+        existing = self._existing_client(key, name, requested, bool(options))
         if existing is not None:
-            if options and self._options[key] != requested:
-                raise RuntimeError(
-                    f"HTTP client {name!r} already exists with different options; "
-                    "await ws.http.close(...) before reconfiguring it"
-                )
-            else:
-                return existing
+            return existing
+
+        await self._prepare_client_dependencies(requested)
+        if self._closed:
+            raise RuntimeError("HTTP service is closed")
+        existing = self._existing_client(key, name, requested, bool(options))
+        if existing is not None:
+            return existing
+        import httpx2
 
         created = httpx2.AsyncClient(**requested)
         self._clients[key] = created
         self._options[key] = requested
         return created
 
-    def _get_client(
+    async def _get_client(
         self,
         name: str,
         shared: bool,
         options: Mapping[str, Any] | None = None,
     ) -> httpx2.AsyncClient:
-        return self.client(name, shared=shared, **(dict(options) if options else {}))
+        return await self.client(name, shared=shared, **(dict(options) if options else {}))
 
     async def request(
         self,
@@ -259,8 +334,9 @@ class HTTPTools:
     ) -> httpx2.Response:
         """Send a request and return a fully read native response."""
 
+        _check_url(url)
         _check_limit(max_bytes)
-        client = self._get_client(name, shared)
+        client = await self._get_client(name, shared)
         async with client.stream(method, url, **kwargs) as response:
             body = bytearray()
             async for chunk in response.aiter_bytes():
@@ -305,7 +381,8 @@ class HTTPTools:
     ) -> AsyncIterator[httpx2.Response]:
         """Yield a native streaming response owned by the context manager."""
 
-        client = self._get_client(name, shared)
+        _check_url(url)
+        client = await self._get_client(name, shared)
         async with client.stream(method, url, **kwargs) as response:
             yield response
 
@@ -322,6 +399,7 @@ class HTTPTools:
     ) -> Path:
         """Stream a response into an atomically committed workspace file."""
 
+        _check_url(url)
         _check_limit(max_bytes)
         warning_client_id = _client_id(self._identity)
         warnings: list[dict[str, str]] = []
@@ -332,7 +410,7 @@ class HTTPTools:
 
         temporary: Path | None = None
         try:
-            client = self._get_client(name, shared)
+            client = await self._get_client(name, shared)
             async with client.stream("GET", url, **kwargs) as response:
                 response.raise_for_status()
                 with tempfile.NamedTemporaryFile(

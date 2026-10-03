@@ -139,6 +139,22 @@ async def test_managed_context_isolated_by_client_and_singleflight(tmp_path, fak
 
 
 @pytest.mark.asyncio
+async def test_driver_prepares_playwright_on_first_use(tmp_path, fake_playwright):
+    calls = []
+
+    async def ensure(*names, automatic=False):
+        calls.append((names, automatic))
+
+    async def rpc(op, **fields):
+        return {"endpoint": "ws://127.0.0.1:1234/pw"}
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc, ensure_dependencies=ensure)
+    await tools.context()
+    assert calls == [(('playwright',), True)]
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
 async def test_shared_context_uses_explicit_namespace_and_requires_close(tmp_path, fake_playwright):
     identity = {"value": "shared"}
 

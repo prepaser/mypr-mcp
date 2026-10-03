@@ -190,13 +190,20 @@ async def _resolve_worker(
 class NetworkTools:
     """Async DNS, native scan and TLS helpers plus managed scan delegation."""
 
-    def __init__(self, workspace: str | os.PathLike[str], tasks: Any = None, rpc: Any = None):
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str],
+        tasks: Any = None,
+        rpc: Any = None,
+        *,
+        ensure_dependencies: Any = None,
+    ):
         self.workspace = Path(workspace).resolve()
         self.tasks = tasks
         self._rpc = rpc
         from .system_tools import SystemTools
 
-        self._system = SystemTools(self.workspace)
+        self._system = SystemTools(self.workspace, ensure_dependencies=ensure_dependencies)
 
     async def sockets(
         self,

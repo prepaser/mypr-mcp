@@ -39,6 +39,7 @@ from .skill_tools import (
     _bounded_metadata,
     _fit_skill_item,
     _front_matter,
+    _front_matter_body,
     _json_bytes,
     _mark_skill_list_truncated,
     _metadata_errors,
@@ -963,7 +964,8 @@ class TaskManager:
             raise RPCError("invalid persisted task record")
         if record.get("corrupt"):
             raise RPCError(
-                "Saved task metadata is corrupt", code="history_corrupt",
+                "Saved task metadata is corrupt",
+                code="history_corrupt",
                 details={"history_id": task_id, "outcome_unknown": True},
             )
         kind = record.get("kind")
@@ -1776,9 +1778,13 @@ class Skills(SkillsWriting):
             raise ValueError("skill path escapes workspace") from exc
         return candidate
 
-    @staticmethod
-    def _metadata(path: Path, max_bytes: int) -> dict[str, Any]:
-        prefix, truncated = _read_prefix(path, max_bytes)
+    async def _metadata(
+        self,
+        path: Path,
+        max_bytes: int,
+        ensure_yaml: Any = None,
+    ) -> dict[str, Any]:
+        prefix, truncated = await asyncio.to_thread(_read_prefix, path, max_bytes)
         try:
             text = _read_metadata_prefix(prefix)
         except UnicodeDecodeError:
@@ -1788,6 +1794,10 @@ class Skills(SkillsWriting):
             }
         if text is None:
             return {}
+        if ensure_yaml is None:
+            await self._ensure_yaml(text)
+        else:
+            await ensure_yaml(text)
         front = _front_matter(text)
         if isinstance(front, str):
             result: dict[str, Any] = {"error": front}
@@ -1815,7 +1825,7 @@ class Skills(SkillsWriting):
             result["error"] = "; ".join(errors)
         return result
 
-    def list(
+    async def list(
         self,
         *,
         limit: int = DEFAULT_LIST_LIMIT,
@@ -1841,6 +1851,16 @@ class Skills(SkillsWriting):
         if not self.root.is_dir():
             return []
         found = []
+        yaml_ready = False
+
+        async def ensure_yaml_once(text: str) -> None:
+            nonlocal yaml_ready
+            body = _front_matter_body(text)
+            if yaml_ready or body is None or not body.strip():
+                return
+            await self._ensure_yaml(text)
+            yaml_ready = True
+
         paths = sorted(self.root.rglob("*/SKILL.md"))
         for index, path in enumerate(paths[:limit]):
             name = path.parent.relative_to(self.root).as_posix()
@@ -1849,7 +1869,7 @@ class Skills(SkillsWriting):
             except OSError, ValueError:
                 continue
             try:
-                item = self._metadata(resolved, max_metadata_bytes)
+                item = await self._metadata(resolved, max_metadata_bytes, ensure_yaml_once)
             except (OSError, UnicodeError, ValueError) as exc:
                 detail = str(exc).strip() or exc.__class__.__name__
                 item = {"error": f"Unable to read skill: {detail}"}
@@ -1958,12 +1978,20 @@ class Workspace:
         self.http = HTTPTools(
             self.workspace, lambda: self.client, ensure_dependencies=ensure_dependencies
         )
-        self.net = NetworkTools(self.workspace, self.tasks, _rpc)
-        self.system = SystemTools(self.workspace)
+        self.net = NetworkTools(
+            self.workspace, self.tasks, _rpc, ensure_dependencies=ensure_dependencies
+        )
+        self.system = SystemTools(self.workspace, ensure_dependencies=ensure_dependencies)
         self.timers = TimerAPI(_rpc, _client_context)
         self.mail = MailAPI(_rpc, _client_context)
         self.web = WebAPI(_rpc, _client_context)
-        self.browser = BrowserTools(self.workspace, self._lock_identity, _rpc, self.fs)
+        self.browser = BrowserTools(
+            self.workspace,
+            self._lock_identity,
+            _rpc,
+            self.fs,
+            ensure_dependencies=ensure_dependencies,
+        )
         self.code = CodeTools(
             self.workspace,
             self.fs,
@@ -2107,7 +2135,7 @@ class Workspace:
         """Return topic guidance or a method's live signature and documentation."""
         return workspace_help(topic, workspace=self)
 
-    def inspect(self) -> dict[str, Any]:
+    async def inspect(self) -> dict[str, Any]:
         namespace = self._namespace.items() if self._namespace is not None else ()
         values = {
             name: type(value).__name__
@@ -2127,7 +2155,7 @@ class Workspace:
             ),
             "variables": values,
             "tasks": self.tasks.list(),
-            "skills": self.skills.list(),
+            "skills": await self.skills.list(),
         }
 
 

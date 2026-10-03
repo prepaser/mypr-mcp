@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import secrets
@@ -71,11 +72,13 @@ class BrowserTools:
         identity: Callable[[], Any],
         rpc: Callable[..., Awaitable[Any]],
         fs: Any = None,
+        ensure_dependencies: Callable[..., Any] | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self._identity = identity
         self._rpc = rpc
         self._fs = fs
+        self._ensure_dependencies = ensure_dependencies
         self._playwright: Any = None
         self._driver_task: asyncio.Task[Any] | None = None
         self._start_lock = asyncio.Lock()
@@ -110,6 +113,10 @@ class BrowserTools:
             raise
 
     async def _start_driver(self) -> Any:
+        if self._ensure_dependencies is not None:
+            result = self._ensure_dependencies("playwright", automatic=True)
+            if inspect.isawaitable(result):
+                await result
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:

@@ -19,12 +19,17 @@ from pathlib import Path
 from typing import Any
 
 from .client_ids import ADJECTIVES, ANIMALS
+from .history_maintenance import vacuum_if_worthwhile
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
 _MAX_PAYLOAD_BYTES = 64 * 1024
 _MAX_HISTORY_WARNINGS = 8
 _MAX_WARNING_TEXT = 256
+_MAX_HISTORY_GC_ITEMS = 1000
+_DAY = 24 * 60 * 60
+_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
+_BULKY_ENTITY_FIELDS = {"code", "output", "events"}
 
 
 def _python_history_id(record: Mapping[str, Any]) -> str | None:
@@ -67,6 +72,10 @@ class History:
                 """
                 CREATE TABLE IF NOT EXISTS client_ids (
                     id TEXT PRIMARY KEY NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS history_meta (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS entities (
                     entity_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +130,95 @@ class History:
                 if column not in columns:
                     self._db.execute(f"ALTER TABLE client_ids ADD COLUMN {column} REAL")
             self._repair_json_indexes()
+            self._ensure_mail_send_seq()
+
+    def _meta_value(self, key: str) -> str | None:
+        row = self._db.execute(
+            "SELECT value FROM history_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def _set_meta(self, key: str, value: Any) -> None:
+        self._db.execute(
+            "INSERT INTO history_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+
+    def _ensure_mail_send_seq(self) -> None:
+        """Give mail sends a stable cursor independent of SQLite's hidden rowid."""
+        table = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mail_sends'"
+        ).fetchone()
+        if table is None:
+            self._set_meta("mail_send_seq_migrated", 1)
+            return
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(mail_sends)").fetchall()
+        }
+        if "send_seq" in columns:
+            self._set_meta("mail_send_seq_migrated", 1)
+            return
+        required = {
+            "id", "draft_id", "client_id", "request_id", "state", "accepted",
+            "rejected", "rejected_details", "stage", "error", "warning", "created",
+            "updated",
+        }
+        missing = required - columns
+        if missing:
+            self._set_meta("mail_send_seq_migrated", 0)
+            return
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(
+                """
+                CREATE TABLE mail_sends_new (
+                    send_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    draft_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    request_id TEXT,
+                    state TEXT NOT NULL,
+                    accepted TEXT NOT NULL DEFAULT '[]',
+                    rejected TEXT NOT NULL DEFAULT '[]',
+                    rejected_details TEXT NOT NULL DEFAULT '[]',
+                    stage TEXT,
+                    error TEXT,
+                    warning TEXT,
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    UNIQUE(draft_id, request_id)
+                )
+                """
+            )
+            self._db.execute(
+                """
+                INSERT INTO mail_sends_new(
+                    send_seq,id,draft_id,client_id,request_id,state,accepted,rejected,
+                    rejected_details,stage,error,warning,created,updated
+                )
+                SELECT rowid,id,draft_id,client_id,request_id,state,accepted,rejected,
+                    rejected_details,stage,error,warning,created,updated
+                FROM mail_sends ORDER BY rowid
+                """
+            )
+            self._db.execute("DROP TABLE mail_sends")
+            self._db.execute("ALTER TABLE mail_sends_new RENAME TO mail_sends")
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS mail_sends_client_idx "
+                "ON mail_sends(client_id, created)"
+            )
+            self._set_meta("mail_send_seq_migrated", 1)
+            self._db.execute("COMMIT")
+        except BaseException:
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            self._set_meta("mail_send_seq_migrated", 0)
+
+    def _mail_send_seq_migrated(self) -> bool:
+        return self._meta_value("mail_send_seq_migrated") == "1"
 
     def _repair_json_indexes(self) -> None:
         indexes = {
@@ -356,7 +454,9 @@ class History:
             )
         return paths
 
-    def storage_gc_snapshot(self) -> dict[str, Any]:
+    def storage_gc_snapshot(self, *, retention_days: int = 30) -> dict[str, Any]:
+        if type(retention_days) is not int or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer")
         active, protected, references, tombstones = set(), set(), {}, {}
         warnings: list[dict[str, str]] = []
         uncertain = False
@@ -406,7 +506,258 @@ class History:
             "references": references, "tombstones": tombstones,
             "uncertain": uncertain, "warnings": warnings,
             "warnings_truncated": warnings_truncated,
+            "history": self.storage_history_snapshot(retention_days=retention_days),
         }
+
+    def storage_history_snapshot(self, *, retention_days: int = 30) -> dict[str, Any]:
+        """Build an immutable, bounded plan for compacting old history bodies."""
+        self._ensure_open()
+        if type(retention_days) is not int or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer")
+        cutoff = time.time() - retention_days * _DAY
+        entities: list[dict[str, Any]] = []
+        body_bytes = 0
+        terminal_marks = ",".join("?" for _ in _TERMINAL_STATES)
+        terminal_values = tuple(sorted(_TERMINAL_STATES))
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT entity_seq,id,kind,updated,data FROM entities "
+                "WHERE json_valid(data) AND json_type(data)='object' "
+                "AND json_type(data,'$.id')='text' "
+                f"AND json_extract(data,'$.state') IN ({terminal_marks}) "
+                "AND updated <= ? "
+                "AND COALESCE(json_extract(data,'$.body_evicted'),0) != 1 "
+                "AND (json_type(data,'$.code') IS NOT NULL "
+                "OR json_type(data,'$.output') IS NOT NULL "
+                "OR json_type(data,'$.events') IS NOT NULL) "
+                "ORDER BY updated,entity_seq LIMIT ?",
+                (*terminal_values, cutoff, _MAX_HISTORY_GC_ITEMS),
+            ).fetchall()
+            for row in rows:
+                try:
+                    record = _load(row["data"])
+                except (TypeError, ValueError, UnicodeError):
+                    continue
+                state = record.get("state")
+                ident = record.get("id")
+                if not isinstance(ident, str) or not isinstance(state, str):
+                    continue
+                terminal = state in _TERMINAL_STATES
+                if (
+                    not terminal
+                    or float(row["updated"] or 0) > cutoff
+                    or record.get("body_evicted") is True
+                    or not _BULKY_ENTITY_FIELDS.intersection(record)
+                ):
+                    continue
+                entities.append(
+                    {
+                        "id": str(row["id"]),
+                        "entity_seq": int(row["entity_seq"]),
+                        "kind": str(row["kind"]),
+                        "updated": float(row["updated"]),
+                        "data_sha256": _sha256_text(row["data"]),
+                    }
+                )
+                body_bytes += len(str(row["data"]).encode("utf-8"))
+                if len(entities) >= _MAX_HISTORY_GC_ITEMS:
+                    break
+            events: list[dict[str, Any]] = []
+            owner_sql = (
+                "CASE WHEN json_valid(e.data) AND json_type(e.data)='object' "
+                "AND json_type(e.data,'$.history_id')='text' "
+                "THEN json_extract(e.data,'$.history_id') ELSE e.id END"
+            )
+            event_rows = self._db.execute(
+                "SELECT e.seq,e.time,e.id,e.data," + owner_sql + " AS owner "
+                "FROM events e JOIN entities owner ON owner.id=" + owner_sql + " "
+                "WHERE e.time <= ? AND (e.data IS NULL OR json_valid(e.data)) "
+                "AND json_valid(owner.data) AND json_type(owner.data)='object' "
+                f"AND json_extract(owner.data,'$.state') IN ({terminal_marks}) "
+                "AND owner.updated <= ? ORDER BY e.seq LIMIT ?",
+                (cutoff, *terminal_values, cutoff, _MAX_HISTORY_GC_ITEMS),
+            ).fetchall()
+            for row in event_rows:
+                owner = _event_owner(row)
+                if owner is None or owner != row["owner"]:
+                    continue
+                events.append(
+                    {
+                        "seq": int(row["seq"]),
+                        "time": float(row["time"]),
+                        "id": row["id"],
+                        "owner": owner,
+                        "data_sha256": _sha256_optional_text(row["data"]),
+                    }
+                )
+                body_bytes += len(str(row["data"] or "").encode("utf-8"))
+                if len(events) >= _MAX_HISTORY_GC_ITEMS:
+                    break
+            watermark = int(self._meta_value("pruned_through_seq") or 0)
+            last_vacuum = self._meta_value("last_vacuum_at")
+        return {
+            "retention_days": retention_days,
+            "cutoff": cutoff,
+            "entities": entities,
+            "events": events,
+            "pruned_through_seq": watermark,
+            "history_truncated": watermark > 0,
+            "last_vacuum_at": float(last_vacuum) if last_vacuum else None,
+            "mail_send_seq_migrated": self._mail_send_seq_migrated(),
+            "bytes": body_bytes,
+        }
+
+    def storage_history_apply(self, plan: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply an unchanged history plan, compacting at most 1000 rows per kind."""
+        self._ensure_open()
+        entities = plan.get("entities", ())
+        events = plan.get("events", ())
+        if isinstance(entities, (str, bytes)) or not isinstance(entities, list):
+            raise TypeError("history plan entities must be a list")
+        if isinstance(events, (str, bytes)) or not isinstance(events, list):
+            raise TypeError("history plan events must be a list")
+        if len(entities) > _MAX_HISTORY_GC_ITEMS or len(events) > _MAX_HISTORY_GC_ITEMS:
+            raise ValueError("history GC batches are limited to 1000 entities and events")
+        now = time.time()
+        cutoff = plan.get("cutoff")
+        if cutoff is None and isinstance(plan.get("retention_days"), int):
+            cutoff = now - int(plan["retention_days"]) * _DAY
+        if not isinstance(cutoff, (int, float)) or isinstance(cutoff, bool):
+            raise ValueError("history plan cutoff is invalid")
+        compacted = 0
+        deleted_events = 0
+        pruned_bytes = 0
+        skipped: list[dict[str, Any]] = []
+        max_seq = 0
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                for item in entities:
+                    if not isinstance(item, Mapping):
+                        skipped.append({"reason": "invalid_entity_plan"})
+                        continue
+                    ident = item.get("id")
+                    if not isinstance(ident, str):
+                        skipped.append({"id": ident, "reason": "invalid_entity_id"})
+                        continue
+                    row = self._db.execute(
+                        "SELECT entity_seq,kind,updated,data FROM entities WHERE id=?", (ident,)
+                    ).fetchone()
+                    if (
+                        row is None
+                        or float(row["updated"]) > float(cutoff)
+                        or not _history_entity_matches(row, item)
+                    ):
+                        skipped.append({"id": ident, "reason": "changed_since_plan"})
+                        continue
+                    try:
+                        record = _load(row["data"])
+                    except (TypeError, ValueError, UnicodeError):
+                        skipped.append({"id": ident, "reason": "corrupt"})
+                        continue
+                    if record.get("state") not in _TERMINAL_STATES:
+                        skipped.append({"id": ident, "reason": "active_or_ambiguous"})
+                        continue
+                    compact = {
+                        key: value for key, value in record.items()
+                        if key not in _BULKY_ENTITY_FIELDS
+                    }
+                    code = record.get("code")
+                    if code is not None:
+                        compact["code_sha256"] = _sha256_text(
+                            code if isinstance(code, str) else _dump(code)
+                        )
+                    compact["body_evicted"] = True
+                    compact["body_evicted_at"] = now
+                    old_size = len(str(row["data"]).encode("utf-8"))
+                    new_data = _dump(compact)
+                    self._db.execute(
+                        "UPDATE entities SET data=? WHERE id=?", (new_data, ident)
+                    )
+                    compacted += 1
+                    pruned_bytes += max(0, old_size - len(new_data.encode("utf-8")))
+                for item in events:
+                    if not isinstance(item, Mapping) or not isinstance(item.get("seq"), int):
+                        skipped.append({"reason": "invalid_event_plan"})
+                        continue
+                    seq = int(item["seq"])
+                    row = self._db.execute(
+                        "SELECT seq,time,id,data FROM events WHERE seq=?", (seq,)
+                    ).fetchone()
+                    if (
+                        row is None
+                        or float(row["time"]) > float(cutoff)
+                        or not _history_event_matches(row, item)
+                    ):
+                        skipped.append({"seq": seq, "reason": "changed_since_plan"})
+                        continue
+                    owner = _event_owner(row)
+                    if owner is None or owner != item.get("owner"):
+                        skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                        continue
+                    owner_row = self._db.execute(
+                        "SELECT kind,updated,data FROM entities WHERE id=?", (owner,)
+                    ).fetchone()
+                    if owner_row is None:
+                        skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                        continue
+                    try:
+                        owner_record = _load(owner_row["data"])
+                    except (TypeError, ValueError, UnicodeError):
+                        skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                        continue
+                    if (
+                        owner_record.get("state") not in _TERMINAL_STATES
+                        or float(owner_row["updated"]) > float(cutoff)
+                    ):
+                        skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                        continue
+                    self._db.execute("DELETE FROM events WHERE seq=?", (seq,))
+                    deleted_events += 1
+                    pruned_bytes += len(str(row["data"] or "").encode("utf-8"))
+                    max_seq = max(max_seq, seq)
+                watermark = int(self._meta_value("pruned_through_seq") or 0)
+                if max_seq:
+                    watermark = max(watermark, max_seq)
+                    self._set_meta("pruned_through_seq", watermark)
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            vacuum = self._vacuum_after_history_commit(now)
+        watermark = int(self._meta_value("pruned_through_seq") or 0)
+        return {
+            "entities": compacted,
+            "events": deleted_events,
+            "pruned_bytes": pruned_bytes,
+            "reclaimed_bytes": int(vacuum.get("reclaimed_bytes", 0)),
+            "checkpoint": vacuum.get("checkpoint"),
+            "skipped": skipped,
+            "history_truncated": watermark > 0,
+            "pruned_through_seq": watermark,
+            "vacuum": vacuum,
+        }
+
+    def _vacuum_after_history_commit(self, now: float) -> dict[str, Any]:
+        last = self._meta_value("last_vacuum_at")
+        return vacuum_if_worthwhile(
+            self._db,
+            self.db_path,
+            last_vacuum=float(last) if last else None,
+            now=now,
+            mail_migrated=self._mail_send_seq_migrated,
+            save_last_vacuum=self._save_vacuum_time,
+        )
+
+    def _save_vacuum_time(self, value: float) -> None:
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._set_meta("last_vacuum_at", value)
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
 
     def storage_gc_before_delete(self, candidates) -> list[str]:
         snapshot = self.storage_gc_snapshot()
@@ -739,6 +1090,7 @@ class History:
             raise TypeError("client_id must be a string or None")
         with self._lock:
             high = int(self._db.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0])
+            watermark = int(self._meta_value("pruned_through_seq") or 0)
             if cursor_value is None:
                 if client_id is None:
                     rows = self._db.execute(
@@ -773,6 +1125,8 @@ class History:
             events.append(event)
             warnings_truncated |= _append_warning(warnings, warning)
         result = {"events": events, "cursor": next_cursor}
+        result["history_truncated"] = watermark > 0
+        result["pruned_through_seq"] = watermark
         _attach_warnings(result, warnings, warnings_truncated)
         return result
 
@@ -962,6 +1316,44 @@ def _decode_entity(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, str] | N
 
 def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_optional_text(value: Any) -> str | None:
+    return None if value is None else _sha256_text(str(value))
+
+
+def _event_owner(row: sqlite3.Row) -> str | None:
+    data = row["data"]
+    if data is not None:
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        if isinstance(payload, Mapping) and isinstance(payload.get("history_id"), str):
+            return payload["history_id"]
+    ident = row["id"]
+    return str(ident) if ident is not None else None
+
+
+def _history_entity_matches(row: sqlite3.Row, item: Mapping[str, Any]) -> bool:
+    return (
+        int(row["entity_seq"]) == item.get("entity_seq")
+        and str(row["kind"]) == item.get("kind")
+        and float(row["updated"]) == float(item.get("updated"))
+        and _sha256_text(str(row["data"])) == item.get("data_sha256")
+    )
+
+
+def _history_event_matches(row: sqlite3.Row, item: Mapping[str, Any]) -> bool:
+    return (
+        float(row["time"]) == float(item.get("time"))
+        and row["id"] == item.get("id")
+        and _sha256_optional_text(row["data"]) == item.get("data_sha256")
+    )
 
 
 def _bounded(value: Any) -> Any:

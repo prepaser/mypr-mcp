@@ -164,7 +164,7 @@ print(ws.help("shell.run"))  # Live method signature, defaults, and return guida
 | `await ws.doctor()` | Check runtime, package, tool, and configuration readiness |
 | `await ws.performance()` | Read recent timing summaries |
 | `ws.help()`, `ws.help("topic")` | Read the topic index or API guidance from the running kernel |
-| `ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
+| `await ws.inspect()`, `await ws.status()` | Inspect Python state and runtime health |
 | `await ws.reset()` | Reset shared Python memory; see [Reset and lifecycle](#reset-and-lifecycle) |
 | `await ws.restart()` | Replace the manager and kernel with this installation; see [Reset and lifecycle](#reset-and-lifecycle) |
 
@@ -174,9 +174,11 @@ For language-server setup and coordinate semantics, see [code navigation](docs/c
 
 mypr prepares registered dependencies when a built-in feature needs them. `dependencies.auto_install` defaults to `true` and can be overridden globally or per workspace. Set it to `false` to require explicit preparation; `await ws.dependencies.ensure("name")` still installs a registered dependency when requested. `await ws.dependencies.list(kind=None, limit=50, cursor=None)` only inspects the inventory and returns `items`, `has_more`, `next_cursor`, and `auto_install`.
 
-Binary tools and OCR models are shared across workspaces under `$XDG_DATA_HOME/mypr` (`~/.local/share/mypr` by default), with download temporary files under `$XDG_CACHE_HOME/mypr` (`~/.cache/mypr` by default). When a registered binary or OCR model is missing, mypr resolves the latest official stable release available for the platform and downloads it. Downloads are checked against SHA-256 metadata from the official release when available. Existing usable installations are reused and are not upgraded automatically. OCR models use the latest `tessdata_fast` release. Python packages are installed only into the current workspace's `.mypr/venv`, while uv's download cache remains global. Existing Python packages are preserved if their modules import successfully.
+Binary tools and OCR models are shared across workspaces under `$XDG_DATA_HOME/mypr` (`~/.local/share/mypr` by default), with download temporary files under `$XDG_CACHE_HOME/mypr` (`~/.cache/mypr` by default). When a registered binary or OCR model is missing, mypr resolves the latest official stable release available for the platform and downloads it. Downloads are checked against SHA-256 metadata from the official release when available. Existing usable installations are reused and are not upgraded automatically. OCR models use the latest `tessdata_fast` release. Python packages are installed only into the current workspace's `.mypr/venv`, while uv's download cache remains global by default. Existing Python packages are preserved if they import successfully and satisfy their registered version requirements.
 
-Built-in automatic Python packages are `pillow`, `pymupdf`, `trafilatura`, `cssselect` when a selector is used, `python-docx`, `python-pptx`, and `openpyxl`. Use `ws.packages.add(...)` for arbitrary packages; importing an arbitrary missing module never triggers an install. Playwright uses its existing SDK and browser cache through the same policy. Tesseract, FFmpeg, Poppler, Git, LSP servers, and external services remain manual dependencies. `doctor`, dependency listing, status, and cached-page reads never install anything.
+Built-in automatic Python packages include `ipykernel`, `tomlkit`, `httpx2`, `h2`, `socksio`, `playwright`, `psutil`, `pyyaml`, `pillow`, `pymupdf`, `trafilatura`, `cssselect` when a selector is used, `python-docx`, `python-pptx`, and `openpyxl`. Each package is prepared when the first feature that declares it runs. Use `ws.packages.add(...)` for arbitrary packages; importing an arbitrary missing module never triggers an install. Playwright uses its existing SDK and browser cache through the same policy. Set `dependencies.uv_cache_dir` to an absolute path, `~`, or a `~/`-prefixed path and `dependencies.uv_link_mode` to `clone`, `hardlink`, or `copy` to control later installs; `UV_CACHE_DIR` and `UV_LINK_MODE` take precedence. Existing environments are not moved or reinstalled. Tesseract, FFmpeg, Poppler, Git, LSP servers, and external services remain manual dependencies. `doctor`, dependency listing, status, and cached-page reads never install anything.
+
+`mypr-mcp prepare` prepares the core workspace packages explicitly from the target workspace while its manager is stopped and overrides `auto_install=false` for that request. It does not accept a workspace selector.
 
 Most workspace queries return bounded pages. `ws.pages.iter(method, *args, max_pages=100, **kwargs)` is an async iterator for consuming them without resubmitting the query:
 
@@ -282,7 +284,7 @@ These are read-only commands with paging, color, external diff programs, and tex
 response = await ws.http.get("https://example.com/api", name="api")
 response.status_code, response.json()
 
-client = ws.http.client("upload", base_url="https://example.com", timeout=10)
+client = await ws.http.client("upload", base_url="https://example.com", timeout=10)
 response = await client.post("/files", content=b"data")
 await ws.http.close("upload")
 ```
@@ -676,11 +678,11 @@ Watch cursors and notifications survive disconnects, reset, and manager restart.
 Workspace skills live at `.mypr/skills/<name>/SKILL.md`. Discover and read them with:
 
 ```python
-ws.skills.list()
+await ws.skills.list()
 ws.skills.read("review")
 ```
 
-`list(limit=100, max_metadata_bytes=65536, max_response_bytes=65536)` discovers nested names such as `group/review` and returns bounded YAML metadata plus each file's `path`. The item limit, per-skill metadata budget, and aggregate response byte budget are enforced; a response that stops early marks its last item with `list_truncated` and `omitted`. The returned `name` is always its relative directory path and can be passed directly to `read()`. A different front-matter name is preserved as `declared_name`. Malformed YAML, invalid metadata types, and front matter exceeding the inspection budget are reported on that item through an `error` field while other skills remain available. Metadata shortened to fit structural or response limits is marked with `metadata_truncated`. Files resolving outside `.mypr/skills` are skipped. Internal links to skill files or leaf skill directories work; directory symlinks are not recursively expanded. `read(name, max_bytes=1048576)` returns bounded Markdown; pass `max_bytes=None` explicitly to read the whole file. Both read from disk, so edits are visible on the next call without a reload.
+`await ws.skills.list(limit=100, max_metadata_bytes=65536, max_response_bytes=65536)` discovers nested names such as `group/review` and returns bounded YAML metadata plus each file's `path`. The item limit, per-skill metadata budget, and aggregate response byte budget are enforced; a response that stops early marks its last item with `list_truncated` and `omitted`. The returned `name` is always its relative directory path and can be passed directly to `read()`. A different front-matter name is preserved as `declared_name`. Malformed YAML, invalid metadata types, and front matter exceeding the inspection budget are reported on that item through an `error` field while other skills remain available. Metadata shortened to fit structural or response limits is marked with `metadata_truncated`. Files resolving outside `.mypr/skills` are skipped. Internal links to skill files or leaf skill directories work; directory symlinks are not recursively expanded. `read(name, max_bytes=1048576)` returns bounded Markdown; pass `max_bytes=None` explicitly to read the whole file. Both read from disk, so edits are visible on the next call without a reload.
 
 Validate and edit a skill through the revision-aware helpers:
 
@@ -729,11 +731,11 @@ The installation uses `uv pip` and writes the resulting freeze to `.mypr/require
 
 Built-in features use the dependency service for the registered optional packages listed in [Dependencies](#dependencies). Those packages are prepared automatically when `dependencies.auto_install` is true, and existing compatible versions are preserved. Use `await ws.dependencies.ensure("pymupdf")` to prepare one explicitly; `ws.packages.add(...)` remains the API for arbitrary package requirements.
 
-`ws.inspect()` returns the workspace path, kernel generation, visible variable names and types, task summaries, and discovered skills. `await ws.status()` returns compact manager health and counts; pass `detail=True` for connection records, active and queued execution IDs, and manager instructions.
+`await ws.inspect()` returns the workspace path, kernel generation, visible variable names and types, task summaries, and discovered skills. `await ws.status()` returns compact manager health and counts; pass `detail=True` for connection records, active and queued execution IDs, and manager instructions.
 
 `await ws.doctor()` checks whether the workspace is ready for the requested workflow: Python packages, registered dependency tools and models, search backends, configured LSP servers, browser engine, OCR language data, MCP configuration, runtime workers, and storage. Checks are reported as ready, missing, invalid, or unknown with a bounded reason. Doctor does not install packages or dependency artifacts or modify configuration. The same check is available before a manager starts with `uvx mypr-mcp doctor`.
 
-`await ws.storage.usage()` reports managed disk use by category through a metadata-only scan; it does not hash or read file contents. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Set the policy as global defaults or workspace overrides, then apply it with `await ws.config.reload()`:
+`await ws.storage.usage()` reports managed, protected, and whole-workspace disk summaries through a metadata-only scan; it does not hash or read file contents. The legacy `total_bytes`, `total_files`, and `categories` fields cover logical bytes in known managed categories. Each summary also reports `logical_bytes`, `allocated_bytes`, `unique_inodes`, `hardlinks`, `has_hardlinks`, and `truncated`; logical bytes count paths, while allocated bytes count each device/inode once within the summary. Hard-linked paths can therefore make logical totals larger than physical allocation, and adding managed and protected allocation can double-count a cross-group hardlink. Use `await ws.storage.gc(dry_run=True)` to create a deletion plan and `await ws.storage.gc_apply(plan_id)` to apply that exact plan. Automatic GC runs periodically and removes expired data using the 30-day policy; when managed data exceeds the soft 1 GiB target, it also selects the oldest eligible recent data until the target is reached. Active jobs, current files, the latest `revision_keep` revisions per resource (50 by default), and referenced shared blobs are protected. Set the policy as global defaults or workspace overrides, then apply it with `await ws.config.reload()`:
 
 ```toml
 [storage]
@@ -743,6 +745,8 @@ max_bytes = 1073741824
 revision_keep = 50
 gc_interval_seconds = 300
 ```
+
+GC can also compact old history bodies and events. Terminal records past the retention cutoff lose bulky code, output, and event bodies while retaining entity IDs, request-deduplication fields, and a `code_sha256` for removed source. Each pass plans and applies at most 1,000 entities and 1,000 events, revalidating hashes and timestamps. `ws.history.logs()` reports `history_truncated` and a monotonic `pruned_through_seq` watermark when earlier event rows were removed, and cursors continue across the pruned range. Mail send cursors use a stable `send_seq` column; startup migrates legacy rowids before compaction so existing cursors survive. VACUUM is rate-limited to once per day and requires a completed mail cursor migration, a database of at least 16 MiB, at least 4 MiB and 25% free pages, a successful WAL checkpoint, and sufficient filesystem space. Message, timer, client, mail reference, watch, and send identity rows remain outside this history-body compaction; mail's own retention rules still govern eligible MIME files and acknowledged notifications.
 
 `await ws.status()` includes `storage_maintenance` with `running`, `last_run`, `last_deleted_bytes`, and `last_error` for the automatic pass.
 

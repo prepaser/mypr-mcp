@@ -16,25 +16,15 @@ from typing import Any
 
 from .config import ConfigError, ConfigStore
 from .dependency_store import DependencyStore
+from .python_dependencies import (
+    PYTHON_PACKAGE_REQUIREMENTS,
+    PYTHON_PACKAGES,
+    uv_diagnostics,
+    version_satisfies,
+)
 from .startup import read_startup_failure
 
-_PYTHON_PACKAGES = {
-    "ipykernel": "ipykernel",
-    "pyyaml": "yaml",
-    "tomlkit": "tomlkit",
-    "httpx2": "httpx2",
-    "h2": "h2",
-    "socksio": "socksio",
-    "playwright": "playwright",
-    "psutil": "psutil",
-    "trafilatura": "trafilatura",
-    "cssselect": "cssselect",
-    "python-docx": "docx",
-    "openpyxl": "openpyxl",
-    "python-pptx": "pptx",
-    "pymupdf": "fitz",
-    "pillow": "PIL",
-}
+_PYTHON_PACKAGES = dict(PYTHON_PACKAGES)
 _BINARIES = ("uv", "rg", "rga", "ast-grep", "sg", "tesseract", "pandoc", "pdftotext")
 _SEARCH_BINARIES = ("rg", "rga", "ast-grep", "sg")
 _WEB_PROVIDERS = ("kagi", "brave", "tavily")
@@ -63,16 +53,30 @@ async def _probe_python(python: Path) -> dict[str, Any]:
     if not available:
         return {"path": str(python), "available": False, "packages": {}}
     script = """import importlib.metadata as m
+import importlib.util
 import json
 import platform
 import sys
 names = json.loads(sys.argv[1])
 result = {}
-for name in names:
+for name, module in names.items():
     try:
-        result[name] = m.version(name)
+        version = m.version(name)
     except m.PackageNotFoundError:
-        result[name] = None
+        result[name] = {'version': None, 'imported': False, 'error': None}
+        continue
+    try:
+        spec = importlib.util.find_spec(module)
+        if spec is None:
+            result[name] = {'version': version, 'imported': False,
+                            'error': 'module is unavailable'}
+            continue
+        __import__(module)
+    except BaseException as exc:
+        result[name] = {'version': version, 'imported': False,
+                        'error': f'{type(exc).__name__}: {exc}'[:512]}
+    else:
+        result[name] = {'version': version, 'imported': True, 'error': None}
 print(json.dumps({'version': platform.python_version(), 'packages': result}))
 """
     process = await asyncio.create_subprocess_exec(
@@ -80,7 +84,7 @@ print(json.dumps({'version': platform.python_version(), 'packages': result}))
         "-I",
         "-c",
         script,
-        json.dumps(list(_PYTHON_PACKAGES)),
+        json.dumps(_PYTHON_PACKAGES),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -133,9 +137,35 @@ print(json.dumps({'version': platform.python_version(), 'packages': result}))
         "version": result.get("version"),
         "output_truncated": stdout_truncated,
         "packages": {
-            name: {"available": packages.get(name) is not None, "version": packages.get(name)}
-            for name in _PYTHON_PACKAGES
+            name: _package_status(name, packages.get(name)) for name in _PYTHON_PACKAGES
         },
+    }
+
+
+def _package_status(name: str, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {"version": value, "imported": value is not None, "error": None}
+    version = value.get("version")
+    imported = value.get("imported") is True
+    compatible = version_satisfies(version, PYTHON_PACKAGE_REQUIREMENTS[name])
+    if imported and compatible:
+        status = "installed"
+    elif version is None:
+        status = "missing"
+    else:
+        status = "unusable"
+    error = value.get("error")
+    if status == "unusable" and not error:
+        error = (
+            f"installed version {version!r} does not satisfy "
+            f"{PYTHON_PACKAGE_REQUIREMENTS[name]!r}"
+        )
+    return {
+        "available": status == "installed",
+        "status": status,
+        "version": version,
+        "requirement": PYTHON_PACKAGE_REQUIREMENTS[name],
+        "error": error,
     }
 
 
@@ -353,6 +383,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         result["dependencies"] = {
             **dependency_config, "data_root": str(store.data_root),
             "cache_root": str(store.cache_root), "items": items,
+            "uv": uv_diagnostics(dependency_config, path),
         }
     finally:
         await store.close()
@@ -386,7 +417,10 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result["ready"] = bool(
         result["config"]["valid"]
         and result["python"].get("available")
-        and result["python"].get("packages", {}).get("ipykernel", {}).get("available")
+        and all(
+            result["python"].get("packages", {}).get(name, {}).get("available")
+            for name in ("ipykernel", "tomlkit")
+        )
     )
     return result
 

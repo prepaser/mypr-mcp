@@ -41,6 +41,18 @@ class ConnectionBridge:
         return (self._state or {}).get("generation")
 
     async def start(self):
+        if (
+            self._task is not None
+            and self._task.done()
+            and not self._stopped
+            and self.client_id is None
+            and isinstance(self._error, RPCError)
+            and self._error.code == "dependency_missing"
+            and self._error.details.get("prepare_command")
+        ):
+            self._task = None
+            self._error = None
+            self._ready.clear()
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="mypr-manager-bridge")
 
@@ -144,7 +156,9 @@ class ConnectionBridge:
             or (self.attachment is not None and self.attachment.closed.is_set())
         ):
             recorded = await self._poll_restart(
-                fields["exec_id"], fields.get("cursor") or 0, fields.get("wait_ms", 0),
+                fields["exec_id"],
+                fields.get("cursor") or 0,
+                fields.get("wait_ms", 0),
                 fields.get("max_bytes"),
             )
             if recorded is not None:
@@ -166,7 +180,10 @@ class ConnectionBridge:
                 and origin.get("request_id") == fields.get("request_id")
             ):
                 result = await self._poll_restart(
-                    origin["exec_id"], 0, 0, fields.get("max_bytes"),
+                    origin["exec_id"],
+                    0,
+                    0,
+                    fields.get("max_bytes"),
                 )
                 if result is not None:
                     return self._decorate(result)
@@ -265,9 +282,7 @@ class ConnectionBridge:
                 self._ready.set()
                 return
             origin = asyncio.current_task()
-            cleanup = asyncio.create_task(
-                self._close_owned(origin), name="mypr:bridge-close"
-            )
+            cleanup = asyncio.create_task(self._close_owned(origin), name="mypr:bridge-close")
             self._close_task = cleanup
 
             def clear_cleanup(task: asyncio.Task[None]) -> None:
@@ -288,7 +303,7 @@ class ConnectionBridge:
             if context is not None:
                 try:
                     await context.__aexit__(None, None, None)
-                except (ConnectionError, OSError):
+                except ConnectionError, OSError:
                     pass
                 else:
                     if self._context is context:

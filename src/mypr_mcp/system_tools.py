@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import math
 import os
@@ -87,8 +88,9 @@ async def _finish(task):
 
 
 class SystemTools:
-    def __init__(self, workspace):
+    def __init__(self, workspace, ensure_dependencies=None):
         self.workspace = Path(workspace).resolve()
+        self._ensure_dependencies = ensure_dependencies
         self.reference_pid = os.getpid()
         self._slots = asyncio.Semaphore(4)
         self._socket_snapshots = DiagnosticSnapshots()
@@ -260,6 +262,13 @@ class SystemTools:
         **options,  # noqa: ASYNC109
     ):  # noqa: ASYNC109
         _, timeout = self._validate(None, timeout)
+        if self._ensure_dependencies is not None and any(
+            section in {"info", "base_usage", "processes", "process_detail", "sockets", "disks"}
+            for section in sections
+        ):
+            result = self._ensure_dependencies("psutil", automatic=True)
+            if inspect.isawaitable(result):
+                await result
         started = time.monotonic()
         deadline = started + timeout
         result = {

@@ -10,7 +10,12 @@ class StorageAPI:
         self._rpc = rpc
 
     async def usage(self) -> dict[str, Any]:
-        """Inspect managed disk data and the most recent automatic cleanup."""
+        """Inspect managed data plus protected and total ``.mypr`` usage.
+
+        Legacy ``total_bytes``, ``total_files``, and ``categories`` describe
+        GC-managed files.  ``managed``, ``protected``, and ``workspace`` also
+        report logical and allocated bytes, unique inodes, and hardlinks.
+        """
         return await self._rpc("storage_usage")
 
     async def gc(
@@ -21,7 +26,11 @@ class StorageAPI:
         max_bytes: int | None = None,
         revision_keep: int | None = None,
     ) -> dict[str, Any]:
-        """Preview cleanup using workspace policy, or explicitly apply it."""
+        """Preview cleanup using workspace policy, or explicitly apply it.
+
+        The preview includes an exact database history selection when the
+        history adapter supports retention maintenance.
+        """
         args = {"dry_run": dry_run}
         if older_than_days is not None:
             args["older_than_days"] = older_than_days
@@ -32,5 +41,5 @@ class StorageAPI:
         return await self._rpc("storage_gc", **args)
 
     async def gc_apply(self, plan_id: str) -> dict[str, Any]:
-        """Apply a cleanup plan after rechecking live work and references."""
+        """Apply a cleanup plan after rechecking files and database records."""
         return await self._rpc("storage_gc_apply", plan_id=plan_id)

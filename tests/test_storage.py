@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import mypr_mcp.storage as storage_module
 from mypr_mcp.storage import Storage
 
 
@@ -54,6 +55,116 @@ async def test_usage_excludes_workspace_code_and_venv(tmp_path: Path):
 
     assert result["total_bytes"] == 2
     assert result["categories"]["snapshots"]["files"] == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_reports_protected_files_and_hardlinks_without_double_counting(
+    tmp_path: Path,
+):
+    managed = tmp_path / ".mypr" / "searches" / "one.json"
+    protected = tmp_path / ".mypr" / "venv" / "package.bin"
+    managed.parent.mkdir(parents=True)
+    protected.parent.mkdir(parents=True)
+    managed.write_bytes(b"managed")
+    protected.write_bytes(b"protected")
+    link = tmp_path / ".mypr" / "venv" / "package-link.bin"
+    link.hardlink_to(protected)
+
+    result = await Storage(tmp_path).usage()
+
+    assert result["managed"]["logical_bytes"] == len(b"managed")
+    assert result["protected"]["logical_bytes"] == len(b"protected") * 2
+    assert result["protected"]["unique_inodes"] == 2
+    assert result["protected"]["allocated_bytes"] == protected.stat().st_blocks * 512
+    assert result["protected"]["has_hardlinks"] is True
+    assert result["workspace"]["files"] == 4
+
+
+@pytest.mark.asyncio
+async def test_usage_marks_managed_summary_truncated_when_protected_files_hit_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    protected = tmp_path / ".mypr" / "config.toml"
+    managed = tmp_path / ".mypr" / "searches" / "one.json"
+    protected.parent.mkdir(parents=True)
+    managed.parent.mkdir(parents=True)
+    protected.write_text("[workspace]\n", encoding="utf-8")
+    managed.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(storage_module, "_MAX_FILES", 1)
+
+    result = await Storage(tmp_path).usage()
+
+    assert result["managed"]["files"] == 0
+    assert result["managed"]["truncated"] is True
+    assert result["workspace"]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_database_gc_is_previewed_by_id_and_applied_only_after_revalidation(
+    tmp_path: Path,
+):
+    calls: list[tuple[str, object]] = []
+
+    class History:
+        def storage_history_snapshot(self, **kwargs):
+            calls.append(("snapshot", kwargs))
+            return {
+                "entities": [{"id": "entity-1", "data_sha256": "digest"}],
+                "events": [],
+                "count": 1,
+                "bytes": 32,
+            }
+
+        def storage_history_apply(self, plan):
+            calls.append(("apply", plan))
+            return {
+                "entities": 1,
+                "events": 0,
+                "pruned_bytes": 32,
+                "checkpoint": {"busy": False},
+                "vacuum": {"performed": False},
+                "reclaimed_bytes": 0,
+            }
+
+    storage = Storage(tmp_path, history=History())
+    plan = await storage.gc(max_bytes=None)
+
+    assert plan["database"]["selected_ids"] == ["entity-1"]
+    assert [kind for kind, _ in calls] == ["snapshot"]
+
+    result = await storage.gc_apply(plan["plan_id"])
+
+    assert [kind for kind, _ in calls] == ["snapshot", "apply"]
+    assert result["database"]["pruned_count"] == 1
+    assert result["database"]["selected_ids"] == ["entity-1"]
+
+
+@pytest.mark.asyncio
+async def test_history_database_plan_uses_exact_entity_and_event_records(tmp_path: Path):
+    calls: list[tuple[str, object]] = []
+
+    class History:
+        def storage_history_snapshot(self, *, retention_days):
+            calls.append(("snapshot", retention_days))
+            return {
+                "entities": [{"id": "entity-1", "entity_seq": 4}],
+                "events": [{"seq": 7, "time": 1.0, "id": "entity-1"}],
+            }
+
+        def storage_history_apply(self, plan):
+            calls.append(("apply", plan))
+            return {"entities": 1, "events": 1, "vacuum": {"performed": False}}
+
+    storage = Storage(tmp_path, history=History())
+    plan = await storage.gc(max_bytes=None, older_than_days=4)
+    assert plan["database"]["selected_ids"] == ["entity-1", 7]
+    assert plan["database"]["entities"][0]["entity_seq"] == 4
+    assert plan["database"]["events"][0]["seq"] == 7
+    assert [kind for kind, _ in calls] == ["snapshot"]
+
+    result = await storage.gc_apply(plan["plan_id"])
+    assert result["database"]["pruned_count"] == 2
+    assert [kind for kind, _ in calls] == ["snapshot", "apply"]
 
 
 @pytest.mark.asyncio

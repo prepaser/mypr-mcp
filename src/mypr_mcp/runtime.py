@@ -22,7 +22,7 @@ from jupyter_client.kernelspec import KernelSpec
 
 from . import __version__
 from .async_utils import wait_owned
-from .bootstrap import ensure_runtime
+from .bootstrap import install_core, prepare_core, run_command
 from .browser_service import BrowserService, validate_launch_options
 from .config import ConfigStore
 from .config_runtime import RuntimeConfig
@@ -37,6 +37,7 @@ from .managed_commands import ManagedCommands
 from .messages import MessageStore
 from .persistence import PersistenceUnavailable, PersistenceWorker, await_completion
 from .protocol import descriptor, runtime_info
+from .python_dependencies import package_environment
 from .restart_records import poll_restart
 from .scan_service import ScanService
 from .search import Search
@@ -501,7 +502,6 @@ class Runtime:
         py = self.root / "venv/bin/python"
         if not py.exists():
             await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
-        await ensure_runtime(py, self.command)
         self.py = py
         self.dependencies = DependencyService(
             self.workspace, self.py, self.config.get("dependencies", {}),
@@ -593,52 +593,8 @@ class Runtime:
     def task_lock(self, ident):
         return self._task_locks.setdefault(ident, asyncio.Lock())
 
-    async def command(self, *args):
-        guard = Path(__file__).with_name("process_guard.py")
-        launch = asyncio.create_task(
-            asyncio.create_subprocess_exec(
-                sys.executable,
-                str(guard),
-                "--parent-pid",
-                str(os.getpid()),
-                "--tree",
-                "--",
-                *args,
-                stdout=sys.stderr,
-                stderr=sys.stderr,
-                start_new_session=True,
-            )
-        )
-        proc = None
-        try:
-            async with asyncio.timeout(COMMAND_TIMEOUT):
-                proc = await asyncio.shield(launch)
-                returncode = await proc.wait()
-        except BaseException:
-            if proc is None:
-                proc = await self._finish_command_launch(launch)
-            if proc.returncode is None:
-                cleanup = asyncio.create_task(self._stop_command(proc))
-                await self._finish_command_launch(cleanup)
-            raise
-        if returncode:
-            raise RuntimeError(f"Command failed: {args[0]}")
-
-    @staticmethod
-    async def _finish_command_launch(task):
-        return await wait_owned(task, propagate=False)
-
-    @staticmethod
-    async def _stop_command(proc):
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            async with asyncio.timeout(10):
-                await proc.wait()
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            await proc.wait()
+    async def command(self, *args, env=None):
+        await run_command(*args, env=env, timeout_seconds=COMMAND_TIMEOUT)
 
     def check_persistence(self):
         if self.persistence is not None and not self.persistence.available:
@@ -648,6 +604,8 @@ class Runtime:
 
     async def start_kernel(self):
         self.check_persistence()
+        if self.dependencies is not None:
+            await prepare_core(self.dependencies)
         self.settings.reset_lsp_generation(self.generation)
         env = dict(
             os.environ,
@@ -1383,7 +1341,21 @@ class Runtime:
             if self.stopping.is_set() or self.resetting or self.restarting or not self.healthy:
                 raise RuntimeError("Kernel unavailable; use CLI reset")
             if old is not None:
-                if old["code"] != code:
+                original = old.get("code")
+                stored_digest = old.get("code_sha256")
+                if not isinstance(original, str) and (
+                    not isinstance(stored_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", stored_digest) is None
+                ):
+                    raise RPCError(
+                        "Cannot verify request deduplication: execution source is unavailable",
+                        code="history_corrupt", details={"exec_id": old["id"]},
+                    )
+                matches = (
+                    original == code if isinstance(original, str)
+                    else stored_digest == hashlib.sha256(code.encode()).hexdigest()
+                )
+                if not matches:
                     raise ValueError("request_id already used for different code")
                 return {"duplicate": True, "id": old["id"]}
             ident = uuid.uuid4().hex
@@ -2114,6 +2086,10 @@ class Runtime:
             await self.io(self.history.append, "dependency", state, fields, critical=True)
 
     async def _install_dependency_packages(self, names, context):
+        if context.get("bootstrap"):
+            return await install_core(
+                self.py, self.root, names, self.dependencies.config, self.command,
+            )
         async with self._admission_lock:
             self._check_dispatch_admission("packages_add")
             if context.get("generation") and context["generation"] != self.generation:
@@ -2145,7 +2121,9 @@ class Runtime:
         if automatic:
             command.append("--automatic")
         launch = asyncio.create_task(self.shells.start(
-            command, str(self.workspace), dict(os.environ), kind="package",
+            command, str(self.workspace),
+            package_environment(self.dependencies.config if self.dependencies else {}),
+            kind="package",
         ))
         cancelled = False
         try:

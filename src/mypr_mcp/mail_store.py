@@ -119,7 +119,8 @@ class MailStore:
                 CREATE INDEX IF NOT EXISTS mail_drafts_client_idx
                     ON mail_drafts(client_id, created);
                 CREATE TABLE IF NOT EXISTS mail_sends (
-                    id TEXT PRIMARY KEY NOT NULL,
+                    send_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
                     draft_id TEXT NOT NULL,
                     client_id TEXT NOT NULL,
                     request_id TEXT,
@@ -143,12 +144,35 @@ class MailStore:
             }
             if "warning" not in send_columns:
                 self._db.execute("ALTER TABLE mail_sends ADD COLUMN warning TEXT")
+            if "error" not in send_columns:
+                self._db.execute("ALTER TABLE mail_sends ADD COLUMN error TEXT")
+            if "accepted" not in send_columns:
+                self._db.execute(
+                    "ALTER TABLE mail_sends ADD COLUMN accepted TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "rejected" not in send_columns:
+                self._db.execute(
+                    "ALTER TABLE mail_sends ADD COLUMN rejected TEXT NOT NULL DEFAULT '[]'"
+                )
             if "rejected_details" not in send_columns:
                 self._db.execute(
                     "ALTER TABLE mail_sends ADD COLUMN rejected_details TEXT NOT NULL DEFAULT '[]'"
                 )
             if "stage" not in send_columns:
                 self._db.execute("ALTER TABLE mail_sends ADD COLUMN stage TEXT")
+            send_columns = {
+                row[1] for row in self._db.execute("PRAGMA table_info(mail_sends)").fetchall()
+            }
+            if "send_seq" not in send_columns:
+                self._migrate_send_seq()
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS history_meta "
+                "(key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+            )
+            self._db.execute(
+                "INSERT INTO history_meta(key,value) VALUES ('mail_send_seq_migrated','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
             columns = {
                 row[1] for row in self._db.execute("PRAGMA table_info(mail_refs)").fetchall()
             }
@@ -156,6 +180,7 @@ class MailStore:
                 self._db.execute(
                     "ALTER TABLE mail_refs ADD COLUMN endpoint_identity TEXT NOT NULL DEFAULT ''"
                 )
+
             watch_columns = {
                 row[1] for row in self._db.execute("PRAGMA table_info(mail_watches)").fetchall()
             }
@@ -257,6 +282,52 @@ class MailStore:
                         ON mail_refs(account, mailbox, uidvalidity, uid);
                     """
                 )
+
+    def _migrate_send_seq(self) -> None:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute(
+                """
+                CREATE TABLE mail_sends_new (
+                    send_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    draft_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    request_id TEXT,
+                    state TEXT NOT NULL,
+                    accepted TEXT NOT NULL DEFAULT '[]',
+                    rejected TEXT NOT NULL DEFAULT '[]',
+                    rejected_details TEXT NOT NULL DEFAULT '[]',
+                    stage TEXT,
+                    error TEXT,
+                    warning TEXT,
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    UNIQUE(draft_id, request_id)
+                )
+                """
+            )
+            self._db.execute(
+                """
+                INSERT INTO mail_sends_new(
+                    send_seq,id,draft_id,client_id,request_id,state,accepted,rejected,
+                    rejected_details,stage,error,warning,created,updated
+                )
+                SELECT rowid,id,draft_id,client_id,request_id,state,accepted,rejected,
+                    rejected_details,stage,error,warning,created,updated
+                FROM mail_sends ORDER BY rowid
+                """
+            )
+            self._db.execute("DROP TABLE mail_sends")
+            self._db.execute("ALTER TABLE mail_sends_new RENAME TO mail_sends")
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS mail_sends_client_idx "
+                "ON mail_sends(client_id, created)"
+            )
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
 
     @property
     def available(self) -> bool:
@@ -926,8 +997,8 @@ class MailStore:
         with self._lock:
             rows = self._db.execute(
                 (
-                    "SELECT rowid AS seq,* FROM mail_sends WHERE client_id=? AND "
-                    "(? IS NULL OR rowid>?) ORDER BY rowid LIMIT "
+                    "SELECT send_seq AS seq,* FROM mail_sends WHERE client_id=? AND "
+                    "(? IS NULL OR send_seq>?) ORDER BY send_seq LIMIT "
                     "?"
                 ),
                 (client_id, cursor, cursor, limit + 1),

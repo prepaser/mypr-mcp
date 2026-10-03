@@ -37,7 +37,7 @@ def test_packaged_kernel_boot_keeps_workspace_dependencies_first(tmp_path: Path)
 
     boot = package_root / "kernel_boot.py"
     probe = (
-        "import json, runpy, sys\n"
+        "import asyncio, json, runpy, sys\n"
         f"runpy.run_path({str(boot)!r}, run_name='kernel_boot_probe')\n"
         "print(json.dumps({'mypr': sys.modules['mypr_mcp'].__file__, "
         "'ipython': sys.modules['IPython'].__file__}))\n"
@@ -96,14 +96,14 @@ def test_wheel_kernel_boot_uses_workspace_runtime(tmp_path: Path):
 
     boot = manager_root / "mypr_mcp" / "kernel_boot.py"
     probe = (
-        "import json, runpy, sys\n"
+        "import asyncio, json, runpy, sys\n"
         f"namespace = runpy.run_path({str(boot)!r}, run_name='kernel_boot_probe')\n"
         f"workspace = namespace['create_workspace']({str(tmp_path)!r}, {{}})\n"
         "kernel_class = namespace['_kernel_class']()\n"
         "import IPython, ipykernel, yaml\n"
         "print(json.dumps({'mypr': sys.modules['mypr_mcp'].__file__, "
         "'version': sys.modules['mypr_mcp'].__version__, "
-        "'workspace': workspace.inspect()['workspace'], "
+        "'workspace': asyncio.run(workspace.inspect())['workspace'], "
         "'ipython': IPython.__file__, 'ipykernel': ipykernel.__file__, "
         "'yaml': yaml.__file__, 'kernel': kernel_class.__name__}))\n"
     )

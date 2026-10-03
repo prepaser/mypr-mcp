@@ -1,50 +1,49 @@
-import json
-
 import pytest
 
 from mypr_mcp import bootstrap
+from mypr_mcp.diagnostics import RPCError
 
 
-async def test_bootstrap_checks_packages_without_version_bump(tmp_path, monkeypatch):
-    python = tmp_path / "venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    monkeypatch.setattr(bootstrap.importlib.metadata, "version", lambda name: "1.0")
-    installed = {"ipykernel": "1.0", "pyyaml": "1.0"}
-    commands = []
+async def test_bootstrap_prepares_only_core_packages():
+    calls = []
 
-    async def versions(_python):
-        return dict(installed)
+    class Service:
+        async def ensure(self, names, **kwargs):
+            calls.append((tuple(names), kwargs))
+            return {"items": [{"name": name, "status": "installed"} for name in names]}
 
-    async def command(*args):
-        commands.append(args)
-        installed.update({name: "1.0" for name in bootstrap.RUNTIME_PACKAGES})
-
-    monkeypatch.setattr(bootstrap, "runtime_versions", versions)
-    await bootstrap.ensure_runtime(python, command)
-    assert len(commands) == 1
-    assert "playwright==1.0" in commands[0]
-    assert "psutil==1.0" in commands[0]
-    await bootstrap.ensure_runtime(python, command)
-    assert len(commands) == 1
-    installed.pop("httpx2")
-    await bootstrap.ensure_runtime(python, command)
-    assert len(commands) == 2
-    marker = json.loads((python.parent.parent / ".mypr-runtime.json").read_text())
-    assert marker == {name: "1.0" for name in bootstrap.RUNTIME_PACKAGES}
+    result = await bootstrap.prepare_core(Service())
+    assert [item["name"] for item in result["items"]] == ["ipykernel", "tomlkit"]
+    assert calls == [
+        (("ipykernel", "tomlkit"), {"automatic": True, "context": {"bootstrap": True}})
+    ]
 
 
-async def test_bootstrap_failure_does_not_write_ready_marker(tmp_path, monkeypatch):
-    python = tmp_path / "venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    monkeypatch.setattr(bootstrap.importlib.metadata, "version", lambda name: "1.0")
+async def test_bootstrap_missing_core_explains_manual_preparation():
+    class Service:
+        async def ensure(self, names, **kwargs):
+            raise RPCError("ipykernel is missing", code="dependency_missing")
 
-    async def versions(_python):
-        return {}
+    with pytest.raises(RPCError, match="uvx mypr-mcp prepare") as failure:
+        await bootstrap.prepare_core(Service())
+    assert failure.value.code == "dependency_missing"
+    assert failure.value.details["required"] == ["ipykernel", "tomlkit"]
 
-    async def command(*args):
-        raise RuntimeError("install failed")
 
-    monkeypatch.setattr(bootstrap, "runtime_versions", versions)
-    with pytest.raises(RuntimeError, match="install failed"):
-        await bootstrap.ensure_runtime(python, command)
-    assert not (python.parent.parent / ".mypr-runtime.json").exists()
+async def test_bootstrap_explicit_preparation_bypasses_auto_install():
+    class Service:
+        async def ensure(self, names, **kwargs):
+            assert kwargs["automatic"] is False
+            return {"items": []}
+
+    assert await bootstrap.prepare_core(Service(), automatic=False) == {"items": []}
+
+
+async def test_bootstrap_propagates_install_failure():
+    class Service:
+        async def ensure(self, names, **kwargs):
+            raise RPCError("install failed", code="dependency_install_failed")
+
+    with pytest.raises(RPCError, match="install failed") as failure:
+        await bootstrap.prepare_core(Service())
+    assert failure.value.code == "dependency_install_failed"

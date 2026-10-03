@@ -166,7 +166,7 @@ async def test_skill_and_module_reload(workspace: Path):
             "skill = Path('.mypr/skills/reload')\n"
             "skill.mkdir(parents=True, exist_ok=True)\n"
             "(skill / 'SKILL.md').write_text('---\\ndescription: test\\n---\\n# Reload\\n')\n"
-            "(ws.skills.list(), ws.skills.read('reload'), ws_lib.reloadable.value())",
+            "(await ws.skills.list(), ws.skills.read('reload'), ws_lib.reloadable.value())",
         )
         assert "reload" in result_text(payload)
         assert "1" in result_text(payload)

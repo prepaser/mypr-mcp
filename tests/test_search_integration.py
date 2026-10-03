@@ -293,6 +293,9 @@ async def test_rga_failed_converter_returns_partial_result(
     config = workspace / ".mypr" / "config.toml"
     config.parent.mkdir(parents=True)
     config.write_text("[dependencies]\nauto_install = false\n", encoding="utf-8")
+    from mypr_mcp.bootstrap import prepare_workspace
+
+    await prepare_workspace(workspace)
     monkeypatch.setenv("PATH", os.pathsep.join((str(tool_dir), os.environ["PATH"])))
     (workspace / "fixture.docx").write_bytes(_docx_bytes("converter-only needle"))
     async with mcp_session(workspace) as session:

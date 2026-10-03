@@ -258,3 +258,75 @@ async def test_install_that_leaves_package_missing_reports_unusable(tmp_path, mo
         await service.ensure(["pillow"], automatic=True)
     assert failure.value.code == "dependency_unusable"
     await service.close()
+
+
+@pytest.mark.parametrize("engine_status", ["installed", "missing"])
+async def test_browser_requires_compatible_sdk_even_with_existing_engine(
+    tmp_path, monkeypatch, engine_status
+):
+    service = _service(tmp_path, FakeStore(tmp_path))
+
+    async def probe(_script, names):
+        if isinstance(names, dict):
+            return {name: {"status": "installed", "version": "1.0"} for name in names}
+        return {name: {"status": engine_status, "version": "1.0"} for name in names}
+
+    monkeypatch.setattr(service, "_probe", probe)
+    try:
+        with pytest.raises(RPCError) as failure:
+            await service.ensure(["browser:chromium"], automatic=True)
+        assert failure.value.code == "dependency_unusable"
+        assert failure.value.details["name"] == "playwright"
+        inventory = await service.list(kind="browser")
+        assert all(item["status"] == "unusable" for item in inventory["items"])
+    finally:
+        await service.close()
+
+
+async def test_browser_prepares_sdk_before_engine_and_respects_auto_install(tmp_path, monkeypatch):
+    service = _service(tmp_path, FakeStore(tmp_path))
+    installed = set()
+    calls = []
+
+    async def probe(_script, names):
+        if isinstance(names, dict):
+            return {
+                name: {
+                    "status": "installed" if name in installed else "missing",
+                    "version": "1.58.0" if name in installed else None,
+                }
+                for name in names
+            }
+        return {
+            name: {
+                "status": "installed" if name in installed else "missing",
+                "version": "1.58.0" if "playwright" in installed else None,
+            }
+            for name in names
+        }
+
+    async def install_packages(names, _context):
+        calls.append(tuple(names))
+        installed.update(names)
+
+    async def install_browser(name, _context):
+        assert "playwright" in installed
+        calls.append(name)
+        installed.add(name)
+
+    monkeypatch.setattr(service, "_probe", probe)
+    service._install_packages = install_packages
+    service._install_browser = install_browser
+    service.apply_config({"auto_install": False})
+    try:
+        with pytest.raises(RPCError) as failure:
+            await service.ensure(["browser:chromium"], automatic=True)
+        assert failure.value.code == "dependency_missing"
+        assert calls == []
+        result = await service.ensure(["browser:chromium"])
+        assert calls == [("playwright",), "chromium"]
+        assert [(item["name"], item["status"]) for item in result["items"]] == [
+            ("browser:chromium", "installed")
+        ]
+    finally:
+        await service.close()

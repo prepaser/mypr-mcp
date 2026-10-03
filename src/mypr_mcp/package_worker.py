@@ -16,21 +16,34 @@ import time
 from pathlib import Path
 from typing import Any
 
+try:
+    from .python_dependencies import (
+        PYTHON_PACKAGE_REQUIREMENTS,
+        PYTHON_PACKAGES,
+        version_satisfies,
+    )
+except ImportError:
+    import importlib.util
+
+    _catalogue_path = Path(__file__).with_name("python_dependencies.py")
+    _catalogue_spec = importlib.util.spec_from_file_location(
+        "mypr_mcp_python_dependencies", _catalogue_path
+    )
+    if _catalogue_spec is None or _catalogue_spec.loader is None:
+        raise ImportError(f"unable to load package catalogue: {_catalogue_path}") from None
+    _catalogue = importlib.util.module_from_spec(_catalogue_spec)
+    sys.modules[_catalogue_spec.name] = _catalogue
+    _catalogue_spec.loader.exec_module(_catalogue)
+    PYTHON_PACKAGE_REQUIREMENTS = _catalogue.PYTHON_PACKAGE_REQUIREMENTS
+    PYTHON_PACKAGES = _catalogue.PYTHON_PACKAGES
+    version_satisfies = _catalogue.version_satisfies
+
 _MAX_FREEZE_BYTES = 16 * 1024 * 1024
 _PROBE_TIMEOUT = 30
 
 # Automatic installation is deliberately limited to packages used by built-in
 # features. Manual ``ws.packages.add`` remains the escape hatch for everything
-# else.
-PYTHON_PACKAGES = {
-    "pillow": "PIL",
-    "pymupdf": "pymupdf",
-    "trafilatura": "trafilatura",
-    "cssselect": "cssselect",
-    "python-docx": "docx",
-    "python-pptx": "pptx",
-    "openpyxl": "openpyxl",
-}
+# else. These aliases are kept for callers importing the old module constants.
 AUTO_PACKAGE_MODULES = PYTHON_PACKAGES
 
 
@@ -74,6 +87,13 @@ def _validate_automatic_specs(specs: list[str]) -> list[str]:
             )
         normalized.append(key)
     return normalized
+
+
+def _package_requirement(name: str) -> str:
+    try:
+        return PYTHON_PACKAGE_REQUIREMENTS[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown automatic package: {name}") from exc
 
 
 def _probe_environment(python: Path, modules: list[str]) -> dict[str, Any]:
@@ -232,7 +252,14 @@ def install_packages(
                         error = import_state.get("error", "import failed")
                         unusable.append(f"{spec} ({module}: {error})")
                     elif distribution is not None and import_state.get("ok") is True:
-                        already_satisfied.append(spec)
+                        version = distribution.get("version")
+                        requirement = _package_requirement(spec)
+                        if not version_satisfies(version, requirement):
+                            unusable.append(
+                                f"{spec} ({version!r} does not satisfy {requirement!r})"
+                            )
+                        else:
+                            already_satisfied.append(spec)
                     else:
                         missing.append(spec)
                 if unusable:
@@ -260,7 +287,8 @@ def install_packages(
                     os.fsync(stream.fileno())
                 install_command = [
                     executable, "pip", "install", "--python", str(python_path),
-                    "--constraint", str(constraint_path), *missing,
+                    "--constraint", str(constraint_path),
+                    *[_package_requirement(name) for name in missing],
                 ]
             else:
                 install_command = [
@@ -302,6 +330,13 @@ def install_packages(
                             else "distribution or module is missing"
                         )
                         unusable.append(f"{spec} ({module}: {detail})")
+                    elif not version_satisfies(
+                        distribution.get("version"), _package_requirement(spec)
+                    ):
+                        unusable.append(
+                            f"{spec} ({distribution.get('version')!r} does not satisfy "
+                            f"{_package_requirement(spec)!r})"
+                        )
                 if unusable:
                     raise RuntimeError(
                         "automatic package could not be verified: " + ", ".join(unusable)

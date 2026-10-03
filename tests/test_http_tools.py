@@ -111,6 +111,118 @@ async def test_clients_isolate_cookies_and_follow_redirects(tools: HTTPTools, ht
     await tools.aclose()
 
 
+async def test_client_dependency_preparation_follows_options(tools: HTTPTools):
+    calls = []
+
+    async def ensure(*names, automatic=False):
+        calls.append((names, automatic))
+
+    tools._ensure_dependencies = ensure
+    await tools._prepare_client_dependencies(
+        {"http2": True, "proxy": "socks5://127.0.0.1:1080"}
+    )
+    assert calls == [(('httpx2', 'h2', 'socksio'), True)]
+
+
+def test_socks_proxy_detection_includes_environment(monkeypatch):
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: {"https": "socks5://127.0.0.1:1080", "no": "socks5://ignored"},
+    )
+    assert HTTPTools._needs_socksio({"trust_env": True})
+    assert not HTTPTools._needs_socksio({"trust_env": False})
+    assert not HTTPTools._needs_socksio({"trust_env": True, "proxy": "http://proxy"})
+    assert HTTPTools._needs_socksio({"trust_env": True, "proxy": None})
+    assert HTTPTools._needs_socksio({"trust_env": True, "mounts": {"all://": object()}})
+    assert not HTTPTools._needs_socksio({"trust_env": True, "transport": object()})
+
+
+def test_socks_proxy_detection_ignores_no_proxy_environment(monkeypatch):
+    monkeypatch.setattr(
+        "urllib.request.getproxies", lambda: {"no": "socks5://127.0.0.1:1080"}
+    )
+    assert not HTTPTools._needs_socksio({"trust_env": True})
+
+
+async def test_concurrent_client_creation_is_singleflight_without_a_lock(tools: HTTPTools):
+    calls = 0
+    entered = asyncio.Event()
+    all_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def ensure(*names, automatic=False):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        if calls == 2:
+            all_entered.set()
+        await release.wait()
+
+    tools._ensure_dependencies = ensure
+    first = asyncio.create_task(tools.client("race", trust_env=False))
+    await entered.wait()
+    second = asyncio.create_task(tools.client("race", trust_env=False))
+    await all_entered.wait()
+    release.set()
+    left, right = await asyncio.gather(first, second)
+    assert left is right
+    assert len(tools._clients) == 1
+    await tools.aclose()
+
+
+async def test_concurrent_client_creation_reports_option_conflict(tools: HTTPTools):
+    entered = asyncio.Event()
+    all_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    calls = 0
+
+    async def ensure(*names, automatic=False):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        if calls == 2:
+            all_entered.set()
+        await release.wait()
+
+    tools._ensure_dependencies = ensure
+    first = asyncio.create_task(tools.client("race", trust_env=False, timeout=1))
+    await entered.wait()
+    second = asyncio.create_task(tools.client("race", trust_env=False, timeout=2))
+    await all_entered.wait()
+    release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert sum(isinstance(result, RuntimeError) for result in results) == 1
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    await tools.aclose()
+
+
+async def test_client_creation_after_close_during_dependency_prep_fails(tools: HTTPTools):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def ensure(*names, automatic=False):
+        entered.set()
+        await release.wait()
+
+    tools._ensure_dependencies = ensure
+    task = asyncio.create_task(tools.client(trust_env=False))
+    await entered.wait()
+    await tools.aclose()
+    release.set()
+    with pytest.raises(RuntimeError, match="HTTP service is closed"):
+        await task
+
+
+async def test_invalid_url_does_not_prepare_dependencies(tmp_path):
+    async def forbidden(*names, automatic=False):
+        raise AssertionError("invalid URL must not prepare dependencies")
+
+    tools = HTTPTools(tmp_path, ensure_dependencies=forbidden)
+    with pytest.raises(ValueError, match="non-empty string"):
+        await tools.get(" ")
+
+
 async def test_request_upload_auth_and_body_limit(tools: HTTPTools, http_server: str):
     response = await tools.post(
         f"{http_server}/auth-upload",
@@ -134,13 +246,13 @@ async def test_request_preserves_native_gzip_metadata(tools: HTTPTools, http_ser
 
 async def test_shared_namespace_and_reconfiguration(tools: HTTPTools, http_server: str):
     tools._identity = lambda: "shared"
-    client = tools.client()
-    shared = tools.client(shared=True)
+    client = await tools.client()
+    shared = await tools.client(shared=True)
     assert client is not shared
     with pytest.raises(RuntimeError, match="await ws.http.close"):
-        tools.client(timeout=1)
+        await tools.client(timeout=1)
     await tools.close()
-    replacement = tools.client(timeout=1)
+    replacement = await tools.client(timeout=1)
     assert replacement is not client
     await tools.aclose()
 
@@ -149,7 +261,7 @@ async def test_aclose_prevents_late_client_creation(tools: HTTPTools):
     await tools.aclose()
     await tools.aclose()
     with pytest.raises(RuntimeError, match="HTTP service is closed"):
-        tools.client()
+        await tools.client()
 
 
 async def test_stream_is_native_response(tools: HTTPTools, http_server: str):
@@ -231,9 +343,9 @@ async def test_download_warnings_are_scoped_to_overlapping_clients(
 
 
 async def test_manually_closed_native_client_is_replaced(tools: HTTPTools):
-    old = tools.client()
+    old = await tools.client()
     await old.aclose()
-    replacement = tools.client()
+    replacement = await tools.client()
     assert replacement is not old
     assert not replacement.is_closed
     await tools.aclose()

@@ -13,10 +13,6 @@ async def test_storage_worker_failure_remains_fatal_during_reset(tmp_path, monke
     python.parent.mkdir(parents=True)
     python.touch()
 
-    async def dependencies_already_present(*args):
-        pass
-
-    monkeypatch.setattr(runtime_module, "ensure_runtime", dependencies_already_present)
     await runtime.prepare()
     runtime.healthy = True
     runtime.resetting = True

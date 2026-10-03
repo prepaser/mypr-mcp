@@ -38,7 +38,18 @@ class SkillsWriting:
                 text = path.read_text(encoding="utf-8")
         if not isinstance(text, str):
             raise TypeError("text must be a string or None")
+        await self._ensure_yaml(text)
         return _validate_skill(name, path, text, self.root)
+
+    async def _ensure_yaml(self, text: str) -> None:
+        """Prepare PyYAML only when *text* contains a YAML front matter body."""
+
+        body = _front_matter_body(text)
+        if body is None or not body.strip() or self._fs is None:
+            return
+        ensure = getattr(self._fs, "_ensure", None)
+        if callable(ensure):
+            await ensure("pyyaml")
 
     async def write(
         self,
@@ -453,25 +464,22 @@ def _metadata_errors(metadata: Mapping[str, Any]) -> list[str]:
 
 
 def _front_matter(text: str) -> dict[str, Any] | str | None:
-    if not text.startswith("---"):
-        return None
-    lines = text.splitlines(keepends=True)
-    if not lines or lines[0].rstrip("\r\n") != "---":
-        return "YAML front matter must start with ---"
-    closing = None
-    for index, line in enumerate(lines[1:], start=1):
-        if line.rstrip("\r\n") == "---":
-            closing = index
-            break
-    if closing is None:
+    body = _front_matter_body(text)
+    if body is None:
+        if not text.startswith("---"):
+            return None
+        lines = text.splitlines(keepends=True)
+        if not lines or lines[0].rstrip("\r\n") != "---":
+            return "YAML front matter must start with ---"
         return "YAML front matter is missing its closing ---"
-    body = "".join(lines[1:closing])
+    if not body.strip():
+        return {}
     try:
         import yaml
-
-        parsed = yaml.safe_load(body)
     except ImportError:
-        parsed = _minimal_yaml(body)
+        return "PyYAML is required to parse YAML front matter"
+    try:
+        parsed = yaml.safe_load(body)
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
         return f"Invalid YAML front matter: {detail}"
@@ -482,16 +490,16 @@ def _front_matter(text: str) -> dict[str, Any] | str | None:
     return dict(parsed)
 
 
-def _minimal_yaml(body: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in body.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if ":" not in line:
-            raise ValueError("expected key: value")
-        key, value = line.split(":", 1)
-        values[key.strip()] = value.strip().strip("'\"")
-    return values
+def _front_matter_body(text: str) -> str | None:
+    if not text.startswith("---"):
+        return None
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.rstrip("\r\n") == "---":
+            return "".join(lines[1:index])
+    return None
 
 
 _MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)")

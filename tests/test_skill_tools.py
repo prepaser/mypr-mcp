@@ -24,6 +24,45 @@ async def test_validate_accepts_legacy_and_reports_missing_markdown(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_yaml_preparation_is_deferred_until_front_matter(tmp_path: Path):
+    calls = []
+
+    async def ensure(*names, automatic=False):
+        calls.append((names, automatic))
+
+    value = Skills(tmp_path, Filesystem(tmp_path, ensure_dependencies=ensure))
+    await value.validate("legacy", "# Legacy\n")
+    await value.validate("empty", "---\n \n---\n# Empty\n")
+    assert calls == []
+    await value.validate("yaml", "---\nname: yaml\n---\n# YAML\n")
+    assert calls == [(('pyyaml',), True)]
+
+
+@pytest.mark.asyncio
+async def test_list_prepares_yaml_once_per_call(tmp_path: Path):
+    calls = []
+
+    async def ensure(*names, automatic=False):
+        calls.append((names, automatic))
+
+    root = tmp_path / ".mypr" / "skills"
+    root.joinpath("first").mkdir(parents=True)
+    root.joinpath("first", "SKILL.md").write_text(
+        "---\nname: first\n---\n# First\n", encoding="utf-8"
+    )
+    root.joinpath("second").mkdir()
+    root.joinpath("second", "SKILL.md").write_text(
+        "---\nname: second\n---\n# Second\n", encoding="utf-8"
+    )
+    value = Skills(tmp_path, Filesystem(tmp_path, ensure_dependencies=ensure))
+
+    await value.list()
+    assert calls == [(('pyyaml',), True)]
+    await value.list()
+    assert calls == [(('pyyaml',), True), (('pyyaml',), True)]
+
+
+@pytest.mark.asyncio
 async def test_write_rejects_bad_yaml_and_supports_cas(tmp_path: Path):
     value = skills(tmp_path)
     with pytest.raises(ValueError, match="Invalid skill"):

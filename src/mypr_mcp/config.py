@@ -91,6 +91,7 @@ DEFAULT_WEB = {
 DEFAULT_DEPENDENCIES = {
     "auto_install": True,
 }
+_DEPENDENCY_LINK_MODES = frozenset({"clone", "hardlink", "copy"})
 
 _WEB_PROVIDERS = frozenset({"kagi", "brave", "tavily"})
 _WEB_FIELDS = frozenset(
@@ -262,6 +263,25 @@ def _validate_dependencies(value):
         if key == "auto_install":
             if type(item) is not bool:
                 raise _field_error("dependencies.auto_install", "must be a boolean")
+            result[key] = item
+        elif key == "uv_cache_dir":
+            if (
+                not isinstance(item, str)
+                or not item
+                or "\x00" in item
+                or not (item == "~" or item.startswith("~/") or Path(item).is_absolute())
+            ):
+                raise _field_error(
+                    "dependencies.uv_cache_dir",
+                    "must be an absolute path, ~, or a path beginning with ~/",
+                )
+            result[key] = item
+        elif key == "uv_link_mode":
+            if not isinstance(item, str) or item not in _DEPENDENCY_LINK_MODES:
+                raise _field_error(
+                    "dependencies.uv_link_mode",
+                    "must be one of clone, hardlink, or copy",
+                )
             result[key] = item
         else:
             result[key] = copy.deepcopy(item)
@@ -624,8 +644,7 @@ def _validate_layer(values: Any, path: Path) -> dict:
     if dependencies is not None:
         if not isinstance(dependencies, Mapping):
             raise _field_error("dependencies", "must be a table")
-        if "auto_install" in dependencies and type(dependencies["auto_install"]) is not bool:
-            raise _field_error("dependencies.auto_install", "must be a boolean")
+        _validate_dependencies(dependencies)
     for section in _SERVER_SECTIONS:
         table = result.get(section)
         if table is None:
@@ -845,7 +864,7 @@ def _public_values(values: Mapping[str, Any]) -> dict[str, Any]:
         elif section == "dependencies":
             result[section] = {
                 key: copy.deepcopy(value[key])
-                for key in DEFAULT_DEPENDENCIES
+                for key in (*DEFAULT_DEPENDENCIES, "uv_cache_dir", "uv_link_mode")
                 if key in value
             }
         elif section in _SERVER_SECTIONS:
@@ -875,6 +894,9 @@ def _validate_public_path(parts: tuple[str, ...]) -> None:
             "storage": DEFAULT_STORAGE,
             "dependencies": DEFAULT_DEPENDENCIES,
         }[section]
+        dependency_fields = {"auto_install", "uv_cache_dir", "uv_link_mode"}
+        if section == "dependencies":
+            allowed = dependency_fields
         if len(parts) > 2 or (len(parts) == 2 and parts[1] not in allowed):
             raise ConfigError("unknown managed configuration field", path=".".join(parts))
         return

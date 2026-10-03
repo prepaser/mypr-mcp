@@ -26,6 +26,11 @@
 # workspace .mypr environment. Set false to require ws.dependencies.ensure().
 # [dependencies]
 # auto_install = true
+# Optional uv cache and install-link settings. Paths are absolute or begin with
+# ~; the values are applied to new package installations only. When omitted,
+# uv uses its normal global cache and link-mode selection.
+# uv_cache_dir = "~/.cache/mypr/uv"
+# uv_link_mode = "hardlink"  # clone, hardlink, or copy
 
 # Web providers use environment-variable names for API keys. The manager reads
 # these variables; values are never stored in TOML or returned to Python.

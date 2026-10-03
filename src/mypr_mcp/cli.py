@@ -875,6 +875,7 @@ def main():
             "status",
             "logs",
             "doctor",
+            "prepare",
             "reset",
             "restart",
             "stop",
@@ -907,6 +908,10 @@ def main():
             asyncio.run(serve(workspace))
         elif args.command == "_manager":
             asyncio.run(run_manager(workspace))
+        elif args.command == "prepare":
+            from .bootstrap import prepare_workspace
+
+            _print_json(asyncio.run(prepare_workspace(workspace)))
         elif args.command == "config":
             result = asyncio.run(
                 _config_command(
