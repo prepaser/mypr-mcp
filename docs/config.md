@@ -195,7 +195,7 @@ args = ["--stdio"]
 REPORTS_TOKEN = "REPORTS_TOKEN"
 ```
 
-Reload applies saved server definitions without starting new connections. Added and changed servers connect lazily on their next call; unchanged connections remain open. Busy affected connections defer the MCP component unless `force=True` permits interruption. See [MCP services](../README.md#mcp-services) for discovery, calls, and server restart.
+Reload applies saved server definitions without starting new connections. Added and changed servers connect lazily on their next call; unchanged connections remain open. Busy affected connections defer the MCP component unless `force=True` permits interruption. See [MCP services](workspace-api.md#mcp-services) for discovery, calls, and server restart.
 
 ### LSP servers
 
