@@ -112,6 +112,7 @@ def _dispatch_runtime():
     runtime.resetting = False
     runtime.stopping = asyncio.Event()
     runtime.generation = "generation"
+    runtime.workspace_available = lambda: True
     runtime._admission_lock = asyncio.Lock()
 
     async def no_history(op, req):

@@ -77,6 +77,162 @@ def test_history_gc_preview_apply_compacts_body_and_reports_watermark(tmp_path):
     history.close()
 
 
+def test_history_gc_retries_failed_execution_json_compaction(tmp_path, monkeypatch):
+    history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "retry.json").write_text(
+        '{"id":"retry","state":"succeeded","code":"print(1)",'
+        '"output":"body"}'
+    )
+    history.record(
+        "execution",
+        {"id": "retry", "state": "succeeded", "code": "print(1)", "output": "body"},
+    )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        cutoff = time.time() - 90 * 86400
+        database.execute("UPDATE entities SET updated=? WHERE id='retry'", (cutoff,))
+        database.commit()
+
+    def fail_replace(*args):
+        raise OSError("temporary filesystem failure")
+
+    monkeypatch.setattr("mypr_mcp.history.os.replace", fail_replace)
+    first = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+    assert first["json_compacted"] == 0
+    assert first["json_compaction_errors"][0]["id"] == "retry"
+    pending = history.get("retry")
+    assert pending["body_evicted"] is True
+    assert pending["json_compaction_pending"] is True
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        pending_updated = database.execute(
+            "SELECT updated FROM entities WHERE id='retry'"
+        ).fetchone()[0]
+    retry_plan = history.storage_history_snapshot(retention_days=30)
+    assert [item["id"] for item in retry_plan["entities"]] == ["retry"]
+
+    monkeypatch.undo()
+    second = history.storage_history_apply(retry_plan)
+    assert second["json_compacted"] == 1
+    compacted = history.get("retry")
+    assert compacted["body_evicted"] is True
+    assert "json_compaction_pending" not in compacted
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        assert database.execute(
+            "SELECT updated FROM entities WHERE id='retry'"
+        ).fetchone()[0] == pending_updated
+    persisted = json.loads((runs / "retry.json").read_text())
+    assert persisted["body_evicted_at"] == pending["body_evicted_at"]
+    assert persisted["body_evicted_at"] == compacted["body_evicted_at"]
+    assert persisted["body_evicted"] is True
+    assert "output" not in persisted
+    history.close()
+
+
+def test_history_gc_keeps_pending_for_unsettled_execution_json(tmp_path):
+    history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    payloads = {
+        "broken": "{not-json",
+        "wrong": '{"id":"other","state":"succeeded","code":"x"}',
+        "running": '{"id":"running","state":"running","code":"x"}',
+    }
+    for ident, payload in payloads.items():
+        (runs / f"{ident}.json").write_text(payload)
+        history.record(
+            "execution", {"id": ident, "state": "succeeded", "code": "x"}
+        )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        database.execute(
+            "UPDATE entities SET updated=? WHERE kind='execution'",
+            (time.time() - 90 * 86400,),
+        )
+        database.commit()
+
+    result = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+    assert {item["id"] for item in result["json_compaction_errors"]} == set(payloads)
+    assert all(history.get(ident)["json_compaction_pending"] for ident in payloads)
+    for ident in payloads:
+        (runs / f"{ident}.json").write_text(
+            json.dumps({"id": ident, "state": "succeeded", "code": "x"})
+        )
+    retry = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+    assert retry["json_compacted"] == len(payloads)
+    assert all("json_compaction_pending" not in history.get(ident) for ident in payloads)
+    history.close()
+
+
+def test_history_gc_reserves_retry_capacity_for_fresh_candidates(tmp_path, monkeypatch):
+    monkeypatch.setattr("mypr_mcp.history._MAX_HISTORY_GC_ITEMS", 4)
+    history = History(tmp_path)
+    for index in range(4):
+        history.record(
+            "execution",
+            {
+                "id": f"pending-{index}",
+                "state": "succeeded",
+                "body_evicted": True,
+                "json_compaction_pending": True,
+            },
+        )
+        history.record(
+            "execution",
+            {"id": f"fresh-{index}", "state": "succeeded", "code": "x"},
+        )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        database.execute(
+            "UPDATE entities SET updated=?",
+            (time.time() - 90 * 86400,),
+        )
+        database.commit()
+
+    plan = history.storage_history_snapshot(retention_days=30)
+    assert [item["id"] for item in plan["entities"]] == [
+        "fresh-0",
+        "fresh-1",
+        "fresh-2",
+        "pending-0",
+    ]
+    history.close()
+
+
+def test_history_gc_rotates_permanently_failed_json_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr("mypr_mcp.history._MAX_HISTORY_GC_ITEMS", 2)
+    history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "bad.json").write_text("{not-json")
+    (runs / "good.json").write_text(
+        '{"id":"good","state":"succeeded","code":"x"}'
+    )
+    history.record(
+        "execution",
+        {"id": "bad", "state": "succeeded", "body_evicted": True, "json_compaction_pending": True},
+    )
+    history.record(
+        "execution",
+        {"id": "good", "state": "succeeded", "body_evicted": True, "json_compaction_pending": True},
+    )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        cutoff = time.time() - 90 * 86400
+        database.execute("UPDATE entities SET updated=?", (cutoff,))
+        database.commit()
+
+    first_plan = history.storage_history_snapshot(retention_days=30)
+    assert [item["id"] for item in first_plan["entities"]] == ["bad"]
+    first = history.storage_history_apply(first_plan)
+    assert first["json_compacted"] == 0
+    assert history.get("bad")["json_compaction_pending"] is True
+    second_plan = history.storage_history_snapshot(retention_days=30)
+    assert [item["id"] for item in second_plan["entities"]] == ["good"]
+    second = history.storage_history_apply(second_plan)
+    assert second["json_compacted"] == 1
+    assert "json_compaction_pending" not in history.get("good")
+    assert history.get("bad")["json_compaction_pending"] is True
+    history.close()
+
+
 def test_history_gc_revalidates_and_protects_active_or_corrupt_rows(tmp_path):
     history = History(tmp_path)
     history.record("execution", {"id": "active", "state": "running", "code": "x"})

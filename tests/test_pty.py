@@ -52,7 +52,7 @@ async def test_pty_is_a_controlling_terminal_and_merges_output(tmp_path):
         output = "".join(event["text"] for event in result["output"])
         assert "True True /dev/pts/" in output
         assert "stderr" in output
-        assert [event["stream"] for event in result["output"]] == ["stdout"]
+        assert {event["stream"] for event in result["output"]} == {"stdout"}
     finally:
         await shells.close()
 

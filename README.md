@@ -650,6 +650,8 @@ message = await ws.mail.read(page["items"][0]["id"])
 
 Search returns bounded header pages with opaque message references. `read()` fetches a bounded parsed body and attachment metadata without marking the message as seen. Use `ws.mail.download_attachment(message_id, attachment_id, path)` for a workspace file with overwrite protection. Message references are tied to the account's IMAP namespace and become invalid after a UIDVALIDITY or account identity change. `mark_read()` and `mark_unread()` change server flags explicitly.
 
+Outgoing addresses preserve display names and convert international domain names to IDNA. Mailbox local parts must be ASCII; drafts with international local parts are rejected because SMTPUTF8 is not supported.
+
 Create a draft before sending. Drafts are immutable and are validated and persisted before any network delivery:
 
 ```python

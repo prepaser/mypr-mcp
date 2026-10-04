@@ -17,9 +17,11 @@ from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from email import policy
 from email.parser import BytesParser
-from email.utils import parseaddr
+from email.utils import getaddresses, parseaddr
 from pathlib import Path
 from typing import Any
+
+from .mail_content import MailContentError, normalize_mailbox
 
 MAX_MESSAGE_BYTES = 25 * 1024 * 1024
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -364,24 +366,31 @@ class MailTransport:
             raise TypeError("mime must be bytes")
         if len(mime) > MAX_MESSAGE_BYTES:
             raise MailTransportError("message exceeds the 25 MiB limit", code="size_limit")
-        addresses = [_address(value) for value in recipients]
+        account = self.account(name)
+        try:
+            addresses = [_address(value) for value in recipients]
+        except (MailContentError, ValueError) as exc:
+            raise MailTransportError(
+                f"SMTP recipient is invalid: {exc}", code="configuration_error", stage="mail"
+            ) from exc
         if not addresses:
             raise ValueError("at least one recipient is required")
-        account = self.account(name)
-        conn, lock = self._get_smtp(name, account)
         if sender is None:
             try:
                 sender = parseaddr(
                     BytesParser(policy=policy.default).parsebytes(mime).get("From", "")
                 )[1]
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 sender = ""
         sender = sender or str(account.get("from") or account.get("from_address") or "")
-        sender = parseaddr(sender)[1] or sender
-        if not sender:
+        parsed_sender = parseaddr(sender)[1] or sender
+        try:
+            sender = normalize_mailbox(parsed_sender, "sender")
+        except MailContentError as exc:
             raise MailTransportError(
-                "mail account from address is required", code="configuration_error"
-            )
+                f"SMTP sender is invalid: {exc}", code="configuration_error", stage="mail"
+            ) from exc
+        conn, lock = self._get_smtp(name, account)
         stage = "mail"
         accepted: list[str] = []
         rejected: list[str] = []
@@ -448,6 +457,25 @@ class MailTransport:
             except smtplib.SMTPDataError as exc:
                 _reset_smtp(conn)
                 return {"accepted": [], "rejected": addresses, "stage": "data", "error": str(exc)}
+            except UnicodeError as exc:
+                if stage == "data":
+                    self._drop_smtp(name, conn)
+                    raise MailTransportError(
+                        f"SMTP transaction outcome is unknown: {exc}",
+                        code="outcome_unknown",
+                        ambiguous=True,
+                        stage=stage,
+                        accepted=accepted,
+                        rejected=rejected,
+                        rejected_details=rejected_details,
+                    ) from exc
+                _reset_smtp(conn)
+                return {
+                    "accepted": [],
+                    "rejected": addresses,
+                    "stage": stage,
+                    "error": f"SMTP address or message encoding failed: {exc}",
+                }
             except _NETWORK_ERRORS + (smtplib.SMTPServerDisconnected,) as exc:
                 self._drop_smtp(name, conn)
                 raise MailTransportError(
@@ -1190,9 +1218,15 @@ def _has_capability(conn: Any, name: str) -> bool:
 
 
 def _address(value: Any) -> str:
-    if not isinstance(value, str) or not value or any(char in value for char in "\r\n\x00"):
+    if not isinstance(value, str):
         raise ValueError("recipient address is invalid")
-    return value
+    parsed = getaddresses([value])
+    if len(parsed) != 1 or not parsed[0][1]:
+        raise ValueError("recipient address is invalid")
+    try:
+        return normalize_mailbox(parsed[0][1], "recipient")
+    except MailContentError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _smtp_message(value: Any) -> str:

@@ -1,11 +1,14 @@
 import asyncio
 import os
 import threading
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 import mypr_mcp.runtime as runtime_module
+from mypr_mcp.dependency_service import DependencyService
+from mypr_mcp.dependency_store import DependencyStore
 from mypr_mcp.history import History
 from mypr_mcp.persistence import PersistenceWorker
 from mypr_mcp.runtime import Runtime
@@ -113,3 +116,88 @@ async def test_stop_waits_for_pending_admission_then_rejects_active_work(
     with pytest.raises(RuntimeError, match="active work"):
         await stop_task
     assert not runtime.stopping.is_set()
+
+
+async def _pending_binary(runtime, monkeypatch):
+    store = DependencyStore(runtime.workspace / "data", runtime.workspace / "cache")
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def inspect(_name):
+        return {"status": "missing"}
+
+    async def install(_name):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(store, "inspect", inspect)
+    monkeypatch.setattr(store, "_install", install)
+    service = DependencyService(
+        runtime.workspace, runtime.root / "venv/bin/python", {}, None, None, store=store
+    )
+    runtime.dependencies = service
+    caller = asyncio.create_task(service.ensure(["rg"]))
+    await asyncio.wait_for(entered.wait(), 2)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    return service, cancelled
+
+
+@pytest.mark.parametrize("op", ["reset", "stop"])
+async def test_lifecycle_rejects_dependency_install_after_caller_exit(tmp_path, monkeypatch, op):
+    runtime = Runtime(tmp_path)
+    service, cancelled = await _pending_binary(runtime, monkeypatch)
+    try:
+        assert service.active_count == 1
+        assert not runtime.shells.active
+        with pytest.raises(RuntimeError, match="active work"):
+            await runtime._dispatch({"op": op})
+        assert not runtime.resetting and not runtime.stopping.is_set()
+        assert not cancelled.is_set()
+    finally:
+        await service.close()
+
+
+async def test_forced_reset_settles_dependency_store_before_new_kernel(tmp_path, monkeypatch):
+    runtime = Runtime(tmp_path)
+    service, cancelled = await _pending_binary(runtime, monkeypatch)
+    replacement = object()
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def start_kernel():
+        assert cancelled.is_set()
+        assert not service.active_count
+        assert runtime.dependencies is replacement
+
+    runtime.mcp = SimpleNamespace(close=noop)
+    monkeypatch.setattr(runtime, "close_kernel", noop)
+    monkeypatch.setattr(runtime, "lose_python_tasks", noop)
+    monkeypatch.setattr(runtime, "close_shells", noop)
+    monkeypatch.setattr(runtime, "start_kernel", start_kernel)
+    monkeypatch.setattr(runtime, "_register_manager", noop)
+    monkeypatch.setattr(runtime, "new_dependencies", lambda config: replacement)
+    monkeypatch.setattr(runtime_module, "MCPBridge", lambda *args, **kwargs: runtime.mcp)
+    try:
+        assert (await runtime._dispatch({"op": "reset", "force": True}))["reset"]
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("op", ["shell_start", "scan_start", "search", "git"])
+async def test_new_work_rejects_replaced_workspace(tmp_path, op):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = Runtime(workspace)
+    runtime.healthy = True
+    workspace.rename(tmp_path / "moved")
+    workspace.mkdir()
+
+    assert not runtime.workspace_available()
+    with pytest.raises(RuntimeError, match="workspace moved"):
+        await runtime._dispatch({"op": op})

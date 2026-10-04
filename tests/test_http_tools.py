@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import gzip
 import os
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import urlsplit
 
 import pytest
 
-from mypr_mcp.http_tools import BodyTooLarge, HTTPTools
+from mypr_mcp.http_tools import BodyTooLarge, HTTPTools, _cookie_snapshot
 
 
 async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -298,6 +299,16 @@ async def test_client_snapshots_mutable_options_without_copying_native_objects(t
     headers["X-Test"] = "after"
     with pytest.raises(RuntimeError, match="already exists with different options"):
         await tools.client("mutable", **options)
+    await tools.aclose()
+
+
+async def test_client_rejects_cookie_jar_with_different_policy(tools: HTTPTools):
+    first = CookieJar()
+    second = CookieJar(policy=DefaultCookiePolicy(blocked_domains=("example.test",)))
+    assert _cookie_snapshot(first) != _cookie_snapshot(second)
+    await tools.client("policy", cookies=first, trust_env=False)
+    with pytest.raises(RuntimeError, match="already exists with different options"):
+        await tools.client("policy", cookies=second, trust_env=False)
     await tools.aclose()
 
 

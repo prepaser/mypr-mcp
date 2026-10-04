@@ -289,6 +289,7 @@ async def test_shell_start_rpc_preserves_environment_mode(rpc_fields, expected_i
     manager._admission_lock = asyncio.Lock()
     manager.clients = {}
     manager.workspace = "/workspace"
+    manager.workspace_available = lambda: True
     manager.shells = ShellService()
     manager.tracked = []
 

@@ -336,11 +336,15 @@ class DependencyStore:
 
     async def ensure(self, name: str) -> dict[str, Any]:
         state = await self.inspect(name)
+        if self._closed:
+            raise RuntimeError("Dependency store is closed")
         if state["status"] == "installed" and not self._needs_model_copy(state):
             return state
         if state["status"] == "unsupported":
             raise UnsupportedDependency(state.get("reason") or f"unsupported dependency: {name}")
         async with self._guard:
+            if self._closed:
+                raise RuntimeError("Dependency store is closed")
             task = self._inflight.get(name)
             if task is None:
                 task = asyncio.create_task(self._install(name), name=f"mypr-install:{name}")
@@ -355,9 +359,13 @@ class DependencyStore:
 
     async def install(self, name: str) -> dict[str, Any]:
         state = await self.inspect(name)
+        if self._closed:
+            raise RuntimeError("Dependency store is closed")
         if state["status"] == "unsupported":
             raise UnsupportedDependency(state.get("reason") or f"unsupported dependency: {name}")
         async with self._guard:
+            if self._closed:
+                raise RuntimeError("Dependency store is closed")
             task = self._inflight.get(name)
             if task is None:
                 task = asyncio.create_task(self._install(name), name=f"mypr-install:{name}")

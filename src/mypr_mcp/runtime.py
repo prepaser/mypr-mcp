@@ -434,6 +434,14 @@ class Runtime:
             cache_bytes=self.cache_bytes // 2,
         )
 
+    def new_dependencies(self, config=None):
+        return DependencyService(
+            self.workspace, self.py,
+            self.config.get("dependencies", {}) if config is None else config,
+            self._install_dependency_packages, self._install_dependency_browser,
+            self._record_dependency,
+        )
+
     def retain_completed(self, kind, rec):
         key = (kind, rec.get("generation"), rec["id"])
         size = len(json.dumps(self.public_record(rec), ensure_ascii=False).encode())
@@ -553,11 +561,7 @@ class Runtime:
         if not py.exists():
             await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
         self.py = py
-        self.dependencies = DependencyService(
-            self.workspace, self.py, self.config.get("dependencies", {}),
-            self._install_dependency_packages, self._install_dependency_browser,
-            self._record_dependency,
-        )
+        self.dependencies = self.new_dependencies()
         bin_root = str(self.dependencies.store.bin_root)
         search_path = os.environ.get("PATH", os.defpath).split(os.pathsep)
         if bin_root not in search_path:
@@ -1641,6 +1645,8 @@ class Runtime:
                 self._check_dispatch_admission(op)
                 if generation and generation != self.generation:
                     raise RuntimeError("Expired kernel generation")
+                if op in {"shell_start", "scan_start"} and not self.workspace_available():
+                    raise RuntimeError("The workspace moved; stop its manager and reconnect")
                 return await self._dispatch_handlers(op, req, context)
         return await self._dispatch_handlers(op, req, context)
 
@@ -2366,6 +2372,8 @@ class Runtime:
         if op in {"search", "git"}:
             if self.stopping.is_set():
                 raise RuntimeError("Workspace manager is stopping")
+            if not self.workspace_available():
+                raise RuntimeError("The workspace moved; stop its manager and reconnect")
             runner = ManagedCommands(self, client, connection_id, req.get("exec_id"))
             args = req.get("args", {})
             if not isinstance(args, dict):
@@ -2573,6 +2581,8 @@ class Runtime:
                 if not req.get("force", False) and (
                     busy or python_busy or self.shells.active
                     or (self.web is not None and self.web.active_count)
+                    or (getattr(self, "dependencies", None) is not None
+                        and self.dependencies.active_count)
                 ):
                     raise RuntimeError("Workspace has active work; pass force=True to reset")
                 self.resetting = True
@@ -2611,6 +2621,8 @@ class Runtime:
                         or self.shells.active
                         or (self.mail is not None and self.mail.active_count)
                         or (self.web is not None and self.web.active_count)
+                        or (getattr(self, "dependencies", None) is not None
+                            and self.dependencies.active_count)
                     )
                 ):
                     raise RuntimeError("Workspace has active work; pass --force")
@@ -2835,6 +2847,9 @@ class Runtime:
                         await self.finish(rec, "cancelled", "Workspace reset")
                 if self.web is not None:
                     await self.web.reset()
+                dependencies = getattr(self, "dependencies", None)
+                if dependencies is not None:
+                    await dependencies.close()
                 await self.close_kernel()
                 await self.lose_python_tasks("Workspace reset", state="cancelled")
                 await self.close_shells()
@@ -2846,6 +2861,8 @@ class Runtime:
                 )
                 self.shells = self.new_shells()
                 self.scans = ScanService(self.workspace, self.shells, self.track_shell)
+                if dependencies is not None:
+                    self.dependencies = self.new_dependencies(dependencies.config)
                 self.queue = asyncio.Queue()
                 self._registry_generation = (
                     getattr(self, "_registry_generation", None) or self.generation

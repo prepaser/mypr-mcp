@@ -242,6 +242,27 @@ def test_smtp_data_rejection_is_known_failure():
     assert result["stage"] == "data"
 
 
+def test_smtp_encoding_failure_before_data_is_known_failure():
+    class SMTP:
+        def mail(self, sender):
+            raise UnicodeEncodeError("ascii", sender, 0, len(sender), "test")
+
+        def rset(self):
+            self.reset = True
+
+    transport = _smtp_transport(1)
+    connection = SMTP()
+    transport._get_smtp = lambda *_: (connection, threading.RLock())
+    try:
+        result = transport.send("test", b"Subject: test\r\n\r\nbody\r\n", ["good@example.test"])
+    finally:
+        transport.close()
+    assert result["stage"] == "mail"
+    assert result["accepted"] == []
+    assert result["rejected"] == ["good@example.test"]
+    assert connection.reset is True
+
+
 def test_imap_socket_cleanup_never_issues_close_or_expunge():
     from mypr_mcp.mail_transport import _close_quietly
 

@@ -196,7 +196,34 @@ def test_build_mime_rejects_forward_with_omitted_attachments():
 
 def test_normalize_addresses_rejects_invalid_values_and_limits():
     assert normalize_addresses("A <a@example.test>", "to") == ["a@example.test"]
+    assert normalize_addresses('"foo@bar"@example.test', "to") == [
+        '"foo@bar"@example.test'
+    ]
+    assert normalize_addresses("A <user@도메인.test>", "to") == [
+        "user@xn--hq1bm8jm9l.test"
+    ]
     with pytest.raises(MailContentError):
         normalize_addresses("not-an-address", "to")
     with pytest.raises(MailContentError):
         normalize_addresses(["a@example.test"] * 257, "to")
+
+
+def test_build_mime_preserves_display_names_after_idna_normalization():
+    raw, recipients, _ = build_mime(
+        sender="보내는 사람 <sender@도메인.test>",
+        to="받는 사람 <user@도메인.test>",
+        text="body",
+    )
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    assert recipients == ["user@xn--hq1bm8jm9l.test"]
+    assert str(message["From"]) == "보내는 사람 <sender@xn--hq1bm8jm9l.test>"
+    assert str(message["To"]) == "받는 사람 <user@xn--hq1bm8jm9l.test>"
+
+
+def test_build_mime_rejects_international_localparts_before_queueing():
+    with pytest.raises(MailContentError, match="SMTPUTF8"):
+        build_mime(
+            sender="sender@example.test",
+            to="δοκιμή@example.test",
+            text="body",
+        )

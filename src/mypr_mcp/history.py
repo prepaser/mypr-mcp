@@ -30,6 +30,7 @@ _MAX_PAYLOAD_BYTES = 64 * 1024
 _MAX_HISTORY_WARNINGS = 8
 _MAX_WARNING_TEXT = 256
 _MAX_HISTORY_GC_ITEMS = 1000
+_MAX_HISTORY_JSON_RETRIES = 64
 _MAX_EXECUTION_RECORD_BYTES = 16 * 1024 * 1024
 _DAY = 24 * 60 * 60
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
@@ -524,19 +525,45 @@ class History:
         terminal_marks = ",".join("?" for _ in _TERMINAL_STATES)
         terminal_values = tuple(sorted(_TERMINAL_STATES))
         with self._lock:
-            rows = self._db.execute(
+            entity_sql = (
                 "SELECT entity_seq,id,kind,updated,data FROM entities "
                 "WHERE json_valid(data) AND json_type(data)='object' "
                 "AND json_type(data,'$.id')='text' "
                 f"AND json_extract(data,'$.state') IN ({terminal_marks}) "
                 "AND updated <= ? "
-                "AND COALESCE(json_extract(data,'$.body_evicted'),0) != 1 "
+            )
+            retry_limit = (
+                min(_MAX_HISTORY_JSON_RETRIES, max(1, _MAX_HISTORY_GC_ITEMS // 10))
+                if _MAX_HISTORY_GC_ITEMS > 1
+                else 0
+            )
+            normal_limit = _MAX_HISTORY_GC_ITEMS - retry_limit
+            normal_rows = self._db.execute(
+                entity_sql
+                + "AND COALESCE(json_extract(data,'$.body_evicted'),0) != 1 "
                 "AND (json_type(data,'$.code') IS NOT NULL "
                 "OR json_type(data,'$.output') IS NOT NULL "
                 "OR json_type(data,'$.events') IS NOT NULL) "
                 "ORDER BY updated,entity_seq LIMIT ?",
-                (*terminal_values, cutoff, _MAX_HISTORY_GC_ITEMS),
+                (*terminal_values, cutoff, normal_limit),
             ).fetchall()
+            retry_rows = []
+            if retry_limit or not normal_rows:
+                retry_rows = self._db.execute(
+                    entity_sql
+                    + "AND kind = 'execution' "
+                    "AND json_extract(data,'$.json_compaction_pending') = 1 "
+                    "ORDER BY CASE "
+                    "WHEN json_type(data,'$.json_compaction_attempted_at') IN ('integer','real') "
+                    "THEN json_extract(data,'$.json_compaction_attempted_at') "
+                    "ELSE 0 END, updated,entity_seq LIMIT ?",
+                    (
+                        *terminal_values,
+                        cutoff,
+                        retry_limit or _MAX_HISTORY_GC_ITEMS,
+                    ),
+                ).fetchall()
+            rows = [*normal_rows, *retry_rows]
             for row in rows:
                 try:
                     record = _load(row["data"])
@@ -547,11 +574,15 @@ class History:
                 if not isinstance(ident, str) or not isinstance(state, str):
                     continue
                 terminal = state in _TERMINAL_STATES
+                retry_json = (
+                    str(row["kind"]) == "execution"
+                    and record.get("json_compaction_pending") is True
+                )
                 if (
                     not terminal
                     or float(row["updated"] or 0) > cutoff
-                    or record.get("body_evicted") is True
-                    or not _BULKY_ENTITY_FIELDS.intersection(record)
+                    or (record.get("body_evicted") is True and not retry_json)
+                    or (not retry_json and not _BULKY_ENTITY_FIELDS.intersection(record))
                 ):
                     continue
                 entities.append(
@@ -634,6 +665,7 @@ class History:
         skipped: list[dict[str, Any]] = []
         max_seq = 0
         compacted_json: list[str] = []
+        compacted_json_timestamps: dict[str, Any] = {}
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -663,6 +695,14 @@ class History:
                     if record.get("state") not in _TERMINAL_STATES:
                         skipped.append({"id": ident, "reason": "active_or_ambiguous"})
                         continue
+                    retry_json = (
+                        row["kind"] == "execution"
+                        and record.get("json_compaction_pending") is True
+                    )
+                    if retry_json:
+                        compacted_json.append(ident)
+                        compacted_json_timestamps[ident] = record.get("body_evicted_at")
+                        continue
                     compact = {
                         key: value for key, value in record.items()
                         if key not in _BULKY_ENTITY_FIELDS
@@ -674,6 +714,9 @@ class History:
                         )
                     compact["body_evicted"] = True
                     compact["body_evicted_at"] = now
+                    if row["kind"] == "execution":
+                        compact["json_compaction_pending"] = True
+                        compacted_json_timestamps[ident] = now
                     old_size = len(str(row["data"]).encode("utf-8"))
                     new_data = _dump(compact)
                     self._db.execute(
@@ -731,9 +774,13 @@ class History:
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
-            json_compacted, json_errors = self._compact_execution_records(
-                compacted_json, now
+            json_compacted, json_errors, failed_json = self._compact_execution_records(
+                compacted_json, now, timestamps=compacted_json_timestamps
             )
+            self._clear_json_compaction_pending(
+                ident for ident in compacted_json if ident not in failed_json
+            )
+            self._mark_json_compaction_failed(failed_json, now)
             vacuum = self._vacuum_after_history_commit(now)
         watermark = int(self._meta_value("pruned_through_seq") or 0)
         return {
@@ -751,12 +798,26 @@ class History:
         }
 
     def _compact_execution_records(
-        self, records: list[str], timestamp: float
-    ) -> tuple[int, list[dict[str, str]]]:
+        self,
+        records: list[str],
+        timestamp: float,
+        *,
+        timestamps: Mapping[str, Any] | None = None,
+    ) -> tuple[int, list[dict[str, str]], set[str]]:
         compacted = 0
         errors: list[dict[str, str]] = []
+        failed: set[str] = set()
+        timestamps = timestamps or {}
+
+        def mark_failed(ident: str, error: str) -> None:
+            failed.add(ident)
+            if len(errors) < _MAX_HISTORY_WARNINGS:
+                errors.append({"id": ident, "error": error[:_MAX_WARNING_TEXT]})
+
         for ident in records:
             if not ident or Path(ident).name != ident or ident in {".", ".."}:
+                if isinstance(ident, str) and ident:
+                    mark_failed(ident, "execution ID cannot be used as a run filename")
                 continue
             path = self.root / ".mypr" / "runs" / f"{ident}.json"
             try:
@@ -767,9 +828,14 @@ class History:
                         follow_symlinks=False,
                     ).decode("utf-8")
                 )
-                if not isinstance(payload, dict) or payload.get("id", ident) != ident:
+                if not isinstance(payload, dict):
+                    mark_failed(ident, "execution JSON is not an object")
+                    continue
+                if payload.get("id", ident) != ident:
+                    mark_failed(ident, "execution JSON ID does not match its history ID")
                     continue
                 if payload.get("state") not in _TERMINAL_STATES:
+                    mark_failed(ident, "execution JSON is not terminal")
                     continue
                 if not any(field in payload for field in _BULKY_ENTITY_FIELDS):
                     continue
@@ -782,7 +848,14 @@ class History:
                 if isinstance(code, str):
                     compact["code_sha256"] = _sha256_text(code)
                 compact["body_evicted"] = True
-                compact["body_evicted_at"] = timestamp
+                persisted_at = timestamps.get(ident, timestamp)
+                if (
+                    isinstance(persisted_at, bool)
+                    or not isinstance(persisted_at, (int, float))
+                    or not math.isfinite(persisted_at)
+                ):
+                    persisted_at = timestamp
+                compact["body_evicted_at"] = persisted_at
                 temporary = path.with_suffix(path.suffix + ".tmp")
                 descriptor = os.open(
                     temporary,
@@ -811,8 +884,44 @@ class History:
             except FileNotFoundError:
                 continue
             except (OSError, TypeError, ValueError, UnicodeError) as exc:
-                errors.append({"id": ident, "error": f"{type(exc).__name__}: {exc}"})
-        return compacted, errors
+                mark_failed(ident, f"{type(exc).__name__}: {exc}")
+        return compacted, errors, failed
+
+    def _clear_json_compaction_pending(self, records) -> None:
+        values = [(ident,) for ident in records if isinstance(ident, str)]
+        if not values:
+            return
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.executemany(
+                "UPDATE entities SET data=json_remove("
+                "data, '$.json_compaction_pending', '$.json_compaction_attempted_at') "
+                "WHERE id=? AND json_valid(data) "
+                "AND json_extract(data, '$.json_compaction_pending') = 1",
+                values,
+            )
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def _mark_json_compaction_failed(self, records, timestamp: float) -> None:
+        values = [(timestamp, ident) for ident in records if isinstance(ident, str)]
+        if not values:
+            return
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.executemany(
+                "UPDATE entities SET data=json_set("
+                "data, '$.json_compaction_attempted_at', ?) "
+                "WHERE id=? AND json_valid(data) "
+                "AND json_extract(data, '$.json_compaction_pending') = 1",
+                values,
+            )
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
 
     def _vacuum_after_history_commit(self, now: float) -> dict[str, Any]:
         last = self._meta_value("last_vacuum_at")

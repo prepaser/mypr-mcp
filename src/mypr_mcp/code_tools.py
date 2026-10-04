@@ -2886,22 +2886,28 @@ class CodeTools:
         if type(persist) is not bool:
             raise TypeError("persist must be a boolean")
         report_applied = False
+        operation_cancelled = False
         async with self._lock:
             server = self._servers.get(key)
             exists = key in self._definitions or server is not None
             if persist and key in self._definitions:
-                await self._persist_definition(key, None)
+                _, persist_cancelled = await finish_owned(
+                    self._persist_definition(key, None)
+                )
                 report_applied = self._config_rpc is not None
+                operation_cancelled = operation_cancelled or persist_cancelled
             if server is not None:
                 self._servers.pop(key, None)
-                await server.aclose()
+                _, close_cancelled = await finish_owned(server.aclose())
+                operation_cancelled = operation_cancelled or close_cancelled
             removed = exists if persist else server is not None
         if not exists:
             raise CodeError(f"language server {key!r} is not configured")
         if report_applied:
             _, report_cancelled = await finish_owned(self._report_applied_lsp())
-            if report_cancelled:
-                raise asyncio.CancelledError
+            operation_cancelled = operation_cancelled or report_cancelled
+        if operation_cancelled:
+            raise asyncio.CancelledError
         return {
             "name": key,
             "removed": removed,

@@ -68,7 +68,22 @@ class _MappingSnapshot:
         return True
 
 
-def _cookie_snapshot(value: Any) -> _MappingSnapshot | None:
+class _CookieSnapshot:
+    __slots__ = ("items", "policy")
+
+    def __init__(self, items: tuple[Any, ...], policy: Any):
+        self.items = items
+        self.policy = policy
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _CookieSnapshot)
+            and self.policy is other.policy
+            and _MappingSnapshot(self.items) == _MappingSnapshot(other.items)
+        )
+
+
+def _cookie_snapshot(value: Any) -> _CookieSnapshot | None:
     if isinstance(value, CookieJar):
         jar = value
     else:
@@ -101,7 +116,7 @@ def _cookie_snapshot(value: Any) -> _MappingSnapshot | None:
                 cookie.rfc2109,
             )
         )
-    return _MappingSnapshot(tuple(records))
+    return _CookieSnapshot(tuple(records), getattr(jar, "_policy", None))
 
 
 def _client_id(identity: Callable[[], Any] | None) -> str:

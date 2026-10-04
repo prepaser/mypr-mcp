@@ -584,3 +584,31 @@ async def test_model_publication_handles_separate_cache_filesystem(tmp_path, mon
         assert not list(store.model_root.rglob(".*.tmp"))
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize("method", ["ensure", "install"])
+async def test_close_rejects_install_waiting_for_admission(tmp_path, monkeypatch, method):
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache")
+    inspected = asyncio.Event()
+
+    async def inspect(_name):
+        inspected.set()
+        return {"status": "missing"}
+
+    async def unexpected(_name):
+        raise AssertionError("installation must not start after close")
+
+    monkeypatch.setattr(store, "inspect", inspect)
+    monkeypatch.setattr(store, "_install", unexpected)
+    async with store._guard:
+        request = asyncio.create_task(getattr(store, method)("rg"))
+        await asyncio.wait_for(inspected.wait(), 2)
+        closing = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+    try:
+        with pytest.raises(RuntimeError, match="store is closed"):
+            await request
+        await closing
+        assert not store._inflight
+    finally:
+        await asyncio.gather(request, closing, return_exceptions=True)

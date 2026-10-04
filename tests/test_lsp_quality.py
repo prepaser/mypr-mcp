@@ -255,6 +255,47 @@ async def test_reused_lsp_cancel_after_persist_commits_runtime_timeout(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_remove_lsp_cancellation_finishes_persistence_and_cleanup(tmp_path):
+    command = ("fake-lsp",)
+    definitions = {
+        "fake": {"command": list(command), "languages": ["python"], "timeout": 10.0}
+    }
+    durable = definitions.copy()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def config_rpc(method, candidate=None, **_options):
+        if method == "set_lsp":
+            durable.clear()
+            durable.update(candidate)
+            entered.set()
+            await release.wait()
+            return {"servers": dict(durable), "revision": "new"}
+        assert method == "applied_lsp"
+
+    code = CodeTools(tmp_path, config_rpc=config_rpc)
+    server = _running_server(command)
+    code._servers["fake"] = server
+    code._definitions = definitions.copy()
+    code._config_revision = "old"
+    task = asyncio.create_task(code.remove("fake"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert durable == {}
+        assert code._definitions == {}
+        assert code._config_revision == "new"
+        assert code._servers == {}
+        assert server.closed is True
+    finally:
+        release.set()
+        await code.aclose()
+
+
+@pytest.mark.asyncio
 async def test_replacement_lsp_cancel_after_persist_publishes_and_closes_old(
     tmp_path, monkeypatch
 ):

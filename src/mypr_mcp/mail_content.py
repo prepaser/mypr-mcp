@@ -9,7 +9,7 @@ from email import policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
-from email.utils import formatdate, getaddresses, make_msgid
+from email.utils import formataddr, formatdate, getaddresses, make_msgid
 from pathlib import Path
 from typing import Any
 
@@ -47,18 +47,51 @@ def _header_text(value: Any, name: str) -> str:
     return value
 
 
-def _parse_addresses(value: str, name: str) -> list[str]:
+def _normalize_mailbox(value: str, name: str) -> str:
+    value = value.strip()
+    if (
+        not value
+        or any(char in value for char in "\r\n\x00")
+        or "@" not in value
+        or value.startswith(".")
+        or value.endswith(".")
+    ):
+        raise MailContentError(f"{name} contains an invalid recipient: {value!r}")
+    local, domain = value.rsplit("@", 1)
+    if not local or not domain or any(char.isspace() for char in domain):
+        raise MailContentError(f"{name} contains an invalid recipient: {value!r}")
+    if domain.startswith(".") or domain.endswith(".") or ".." in domain:
+        raise MailContentError(f"{name} contains an invalid recipient: {value!r}")
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise MailContentError(f"{name} contains an invalid recipient: {value!r}") from exc
+    return f"{local}@{domain}"
+
+
+def normalize_mailbox(value: str, name: str = "address") -> str:
+    """Validate one mailbox and encode its domain with IDNA."""
+    if not isinstance(value, str):
+        raise MailContentError(f"{name} contains an invalid recipient")
+    parsed = getaddresses([value])
+    if len(parsed) != 1 or not parsed[0][1]:
+        raise MailContentError(f"{name} contains an invalid recipient")
+    return _normalize_mailbox(parsed[0][1], name)
+
+
+def _address_items(value: str, name: str) -> list[tuple[str, str]]:
     _header_text(value, name)
     parsed = getaddresses([value])
     if not parsed or any(not address for _, address in parsed):
         raise MailContentError(f"{name} contains an invalid recipient")
-    result: list[str] = []
-    for _, address in parsed:
-        address = address.strip()
-        if "@" not in address or address.startswith(".") or address.endswith("."):
-            raise MailContentError(f"{name} contains an invalid recipient: {address!r}")
-        result.append(address)
+    result = []
+    for display, address in parsed:
+        result.append((display, _normalize_mailbox(address, name)))
     return result
+
+
+def _parse_addresses(value: str, name: str) -> list[str]:
+    return [address for _, address in _address_items(value, name)]
 
 
 def normalize_addresses(value: str | Iterable[str] | None, name: str) -> list[str]:
@@ -83,11 +116,35 @@ def normalize_addresses(value: str | Iterable[str] | None, name: str) -> list[st
     return result
 
 
-def _single_address(value: str, name: str) -> str:
-    values = _parse_addresses(value, name)
-    if len(values) != 1:
-        raise MailContentError(f"{name} must contain exactly one address")
-    return values[0]
+def _format_addresses(
+    value: str | Iterable[str] | None, name: str
+) -> tuple[list[str], list[str]]:
+    if value is None:
+        return [], []
+    if isinstance(value, str):
+        values = [value]
+    else:
+        try:
+            values = list(value)
+        except TypeError as exc:
+            raise MailContentError(f"{name} must be a string or list of strings") from exc
+    if len(values) > MAX_RECIPIENTS or any(not isinstance(item, str) for item in values):
+        raise MailContentError(f"{name} has too many recipients or contains an invalid recipient")
+    headers: list[str] = []
+    addresses: list[str] = []
+    for item in values:
+        parsed = _address_items(item, name)
+        if any(not address.rsplit("@", 1)[0].isascii() for _, address in parsed):
+            raise MailContentError(
+                f"{name} contains an international local part; SMTPUTF8 is not supported"
+            )
+        headers.extend(
+            formataddr((display, address), charset="utf-8") for display, address in parsed
+        )
+        addresses.extend(address for _, address in parsed)
+    if len(addresses) > MAX_RECIPIENTS:
+        raise MailContentError(f"{name} has too many recipients")
+    return headers, addresses
 
 
 def _page_body(
@@ -280,16 +337,19 @@ def build_mime(
                 raise MailContentError("forward attachment_total is invalid")
             if total != len(forward_data):
                 raise MailContentError("forward attachment metadata is incomplete")
-    sender_address = _single_address(sender, "sender")
-    to_values = normalize_addresses(to, "to")
-    cc_values = normalize_addresses(cc, "cc")
-    bcc_values = normalize_addresses(bcc, "bcc")
+    sender_headers, sender_values = _format_addresses(sender, "sender")
+    if len(sender_values) != 1:
+        raise MailContentError("sender must contain exactly one address")
+    sender_address = sender_values[0]
+    to_headers, to_values = _format_addresses(to, "to")
+    cc_headers, cc_values = _format_addresses(cc, "cc")
+    _, bcc_values = _format_addresses(bcc, "bcc")
     reply_headers = reply_to.get("headers", {}) if isinstance(reply_to, Mapping) else {}
     if reply_to is not None and not isinstance(reply_headers, Mapping):
         raise MailContentError("reply_to headers are invalid")
     if reply_to is not None and not to_values:
         target = reply_headers.get("reply_to") or reply_headers.get("from")
-        to_values = normalize_addresses(target, "reply recipient")
+        to_headers, to_values = _format_addresses(target, "reply recipient")
     if not to_values and not cc_values and not bcc_values:
         raise MailContentError("at least one recipient is required")
     if text is not None and not isinstance(text, str):
@@ -316,11 +376,11 @@ def build_mime(
         )
     _header_text(subject, "subject")
     msg = EmailMessage(policy=policy.SMTP)
-    msg["From"] = sender
-    if to_values:
-        msg["To"] = ", ".join(to_values)
-    if cc_values:
-        msg["Cc"] = ", ".join(cc_values)
+    msg["From"] = sender_headers[0]
+    if to_headers:
+        msg["To"] = ", ".join(to_headers)
+    if cc_headers:
+        msg["Cc"] = ", ".join(cc_headers)
     msg["Subject"] = subject[:_HEADER_LIMIT]
     msg["Date"] = formatdate(localtime=False)
     msg["Message-ID"] = make_msgid(domain=sender_address.rsplit("@", 1)[1])
