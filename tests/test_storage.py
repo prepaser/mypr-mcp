@@ -58,6 +58,15 @@ async def test_usage_excludes_workspace_code_and_venv(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_usage_includes_lsp_diagnostic_snapshots(tmp_path: Path):
+    old(tmp_path / ".mypr" / "lsp-diagnostics" / "one.json", "{}")
+
+    result = await Storage(tmp_path).usage()
+
+    assert result["categories"]["snapshots"] == {"files": 1, "bytes": 2}
+
+
+@pytest.mark.asyncio
 async def test_usage_reports_protected_files_and_hardlinks_without_double_counting(
     tmp_path: Path,
 ):
@@ -465,6 +474,33 @@ async def test_gc_migrates_v1_index_and_preserves_absent_current_record(tmp_path
     assert updated["next_sequence"] == 3
     assert updated["revisions"][0]["revision"] == "absent"
     assert not (objects / old_revision).exists()
+
+
+@pytest.mark.asyncio
+async def test_gc_migrates_empty_v1_index(tmp_path: Path):
+    index = tmp_path / ".mypr" / "revisions" / "index" / "files" / "empty.json"
+    index.parent.mkdir(parents=True)
+    index.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "files",
+                "resource": "missing.txt",
+                "count": 0,
+                "revisions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = await Storage(tmp_path).gc(dry_run=False, max_bytes=0)
+    updated = json.loads(index.read_text(encoding="utf-8"))
+
+    assert result["revision_pruned"]
+    assert updated["version"] == 2
+    assert updated["count"] == 0
+    assert updated["next_sequence"] == 1
+    assert updated["pruned_before"] == 0
 
 
 @pytest.mark.asyncio

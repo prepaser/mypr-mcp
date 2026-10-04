@@ -1,6 +1,6 @@
 # Workspace storage
 
-Workspace runtime data lives below `.mypr/`. The manager keeps execution journals, background-job output, search and Git snapshots, document results, browser and scan artifacts, change plans, task results, content-addressed revisions, and immutable mail drafts. Workspace files, the Python environment, skills, modules, configuration, messages, and request-deduplication state are managed separately from the cleanup candidates. Shared dependency binaries and OCR models live under the XDG data directory, and their download cache is outside workspace storage; workspace GC never removes them.
+Workspace runtime data lives below `.mypr/`. The manager keeps execution journals, background-job output, search, Git, and LSP diagnostic snapshots, document results, browser and scan artifacts, change plans, task results, content-addressed revisions, and immutable mail drafts. Workspace files, the Python environment, skills, modules, configuration, messages, and request-deduplication state are managed separately from the cleanup candidates. Shared dependency binaries and OCR models live under the XDG data directory, and their download cache is outside workspace storage; workspace GC never removes them.
 
 Inspect usage before changing retention. The usage scan reads directory metadata only; it does not hash or read file contents. It skips symlinks and stops at its bounded file-count limit. Check each summary's `truncated` flag before treating it as complete; the top-level `truncated` flag belongs to the legacy managed-category scan.
 

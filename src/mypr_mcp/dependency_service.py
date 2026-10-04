@@ -9,10 +9,10 @@ import json
 import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from .async_utils import finish_owned, wait_owned
 from .dependency_store import DependencyStore
 from .diagnostics import RPCError, safe_error
 from .python_dependencies import (
@@ -25,6 +25,8 @@ from .python_dependencies import (
 
 _KINDS = {"binary", "python", "model", "browser"}
 _BROWSERS = ("chromium", "firefox", "webkit")
+_PROBE_CLEANUP_TIMEOUT = 2
+_PROBE_DRAIN_LIMIT = 128 * 1024
 _PACKAGE_PROBE = """import contextlib, importlib, importlib.metadata as m, importlib.util
 import json, os, sys
 result = {}
@@ -98,12 +100,16 @@ class DependencyService:
         self._record = record
         self._jobs: dict[str, asyncio.Task] = {}
         self._python_pending: dict[str, asyncio.Task] = {}
+        self._probes: set[asyncio.Task[Any]] = set()
+        self._probe_processes: set[asyncio.subprocess.Process] = set()
         self._probe_slots = asyncio.Semaphore(2)
         self._closed = False
 
     @property
     def active_count(self) -> int:
-        return sum(not task.done() for task in self._jobs.values())
+        jobs = sum(not task.done() for task in self._jobs.values())
+        probes = sum(not task.done() for task in self._probes)
+        return jobs + probes
 
     def status(self) -> dict[str, Any]:
         uv = uv_diagnostics(self.config, self.workspace)
@@ -130,11 +136,22 @@ class DependencyService:
         self.config = values
 
     async def close(self) -> None:
+        owner = asyncio.current_task()
+        await wait_owned(self._close(owner), propagate=True)
+
+    async def _close(self, owner: asyncio.Task[Any] | None) -> None:
         self._closed = True
-        tasks = tuple(self._jobs.values())
+        tasks = tuple({*self._jobs.values(), *self._probes})
         for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+            if task is not owner:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in tasks if task is not owner), return_exceptions=True
+        )
+        await asyncio.gather(
+            *(self._cleanup_probe_process(process) for process in tuple(self._probe_processes)),
+            return_exceptions=True,
+        )
         await self.store.close()
 
     def _catalog(self, kind: str | None = None) -> list[str]:
@@ -401,24 +418,55 @@ class DependencyService:
         }
 
     async def _probe(self, script: str, arguments: Any) -> dict:
+        if self._closed:
+            raise RuntimeError("Dependency service is closed")
+        task = asyncio.create_task(
+            self._run_probe(script, arguments), name="mypr:dependency-probe"
+        )
+        self._probes.add(task)
+        task.add_done_callback(self._release_probe)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            await wait_owned(task, propagate=False)
+            raise
+
+    def _release_probe(self, task: asyncio.Task[Any]) -> None:
+        self._probes.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _run_probe(self, script: str, arguments: Any) -> dict:
         async with self._probe_slots:
-            process = await asyncio.create_subprocess_exec(
-                str(self.python),
-                "-I",
-                "-c",
-                script,
-                json.dumps(arguments),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
+            process = None
+            readers: tuple[asyncio.Task[bytes], ...] = ()
+            wait_task: asyncio.Task[int] | None = None
             try:
+                launch = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        str(self.python),
+                        "-I",
+                        "-c",
+                        script,
+                        json.dumps(arguments),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    ),
+                    name="mypr:dependency-probe-launch",
+                )
+                process, launch_cancelled = await finish_owned(launch)
+                self._probe_processes.add(process)
+                if launch_cancelled:
+                    raise asyncio.CancelledError
+                readers = (
+                    asyncio.create_task(_read(process.stdout, 128 * 1024)),
+                    asyncio.create_task(_read(process.stderr, 8 * 1024)),
+                )
+                wait_task = asyncio.create_task(process.wait())
                 async with asyncio.timeout(15):
-                    out, err, _ = await asyncio.gather(
-                        _read(process.stdout, 128 * 1024),
-                        _read(process.stderr, 8 * 1024),
-                        process.wait(),
-                    )
+                    out, err, _ = await asyncio.gather(*readers, wait_task)
                 if process.returncode:
                     raise RPCError(
                         f"Dependency probe failed: {err.decode(errors='replace')[:512]}",
@@ -429,11 +477,54 @@ class DependencyService:
                     raise ValueError("invalid dependency probe output")
                 return value
             finally:
-                if process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    await process.wait()
+                if process is not None:
+                    await wait_owned(
+                        self._cleanup_probe_process(process, readers, wait_task),
+                        propagate=False,
+                    )
 
+    async def _cleanup_probe_process(
+        self,
+        process: asyncio.subprocess.Process,
+        readers: tuple[asyncio.Task[bytes], ...] = (),
+        wait_task: asyncio.Task[int] | None = None,
+    ) -> None:
+        try:
+            for task in readers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            kill_error = None
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except BaseException as exc:
+                    kill_error = exc
+            if wait_task is None or wait_task.cancelled():
+                wait_task = asyncio.create_task(process.wait())
+            drains = (
+                asyncio.create_task(_discard(process.stdout, _PROBE_DRAIN_LIMIT)),
+                asyncio.create_task(_discard(process.stderr, _PROBE_DRAIN_LIMIT)),
+            )
+            tasks = (*drains, wait_task)
+            try:
+                async with asyncio.timeout(_PROBE_CLEANUP_TIMEOUT):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            except TimeoutError:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                _close_probe_stream(process.stdout)
+                _close_probe_stream(process.stderr)
+            if kill_error is not None:
+                raise kill_error
+            await wait_owned(process.wait(), propagate=False)
+        finally:
+            self._probe_processes.discard(process)
 
 async def _read(stream: asyncio.StreamReader, limit: int) -> bytes:
     result = bytearray()
@@ -444,3 +535,18 @@ async def _read(stream: asyncio.StreamReader, limit: int) -> bytes:
             )
         result.extend(chunk)
     return bytes(result)
+
+
+async def _discard(stream: asyncio.StreamReader, limit: int) -> None:
+    remaining = limit
+    while remaining:
+        chunk = await stream.read(min(16 * 1024, remaining))
+        if not chunk:
+            return
+        remaining -= len(chunk)
+
+
+def _close_probe_stream(stream: asyncio.StreamReader) -> None:
+    transport = getattr(stream, "_transport", None)
+    if transport is not None:
+        transport.close()

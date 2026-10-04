@@ -19,6 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mypr_mcp.async_utils import finish_owned, wait_owned
+from mypr_mcp.file_io import open_regular
+
 _RESULT_LIMIT = 16 * 1024 * 1024
 _DEFAULT_MAX_PROBES = 1_000_000
 _DEFAULT_MAX_DURATION = 3600.0
@@ -97,7 +100,7 @@ class _Results:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = path.open("ab")
+        self.file = open_regular(path, "ab")
         self.count = 0
         self.bytes = 0
         self.truncated = False
@@ -783,17 +786,23 @@ async def _read_tail(stream: asyncio.StreamReader, limit: int = 64 * 1024) -> by
 
 async def _nmap(config: dict[str, Any], results: _Results) -> int:
     command = ["nmap", *config.get("args", []), "-oX", "-", "--", *config["targets"]]
-    process = await asyncio.create_subprocess_exec(
-        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
     parser = ET.XMLPullParser(["start", "end"])
     stack: list[ET.Element] = []
     parse_error: str | None = None
-    artifact_file = Path(config["artifact_path"]).open("wb")  # noqa: ASYNC230
+    artifact_file = open_regular(Path(config["artifact_path"]), "wb")
     artifact_bytes = 0
     artifact_truncated = False
-    stderr_task = asyncio.create_task(_read_tail(process.stderr))
+    process = None
+    stderr_task = None
     try:
+        process, cancelled = await finish_owned(
+            asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+        stderr_task = asyncio.create_task(_read_tail(process.stderr))
         while True:
             chunk = await process.stdout.read(65536)
             if not chunk:
@@ -862,14 +871,27 @@ async def _nmap(config: dict[str, Any], results: _Results) -> int:
             return 0
         return process.returncode or 0
     finally:
-        artifact_file.close()
         config["artifact_bytes"] = artifact_bytes
         config["artifact_truncated"] = artifact_truncated
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        if not stderr_task.done():
-            stderr_task.cancel()
+        try:
+            await wait_owned(_close_nmap(process, stderr_task))
+        finally:
+            artifact_file.close()
+
+
+async def _close_nmap(process, stderr_task) -> None:
+    try:
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            drains = [_read_tail(process.stdout), process.wait()]
+            if stderr_task is None:
+                drains.append(_read_tail(process.stderr))
+            await asyncio.gather(*drains)
+    finally:
+        if stderr_task is not None:
+            if not stderr_task.done():
+                stderr_task.cancel()
             await asyncio.gather(stderr_task, return_exceptions=True)
 
 

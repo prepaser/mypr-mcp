@@ -48,17 +48,20 @@ def read_bytes(
 def open_regular(path: Path, mode: str = "rb"):
     """Open a persisted regular file after validating its type."""
 
-    if mode not in {"rb", "ab", "r+b"}:
+    if mode not in {"rb", "ab", "r+b", "wb"}:
         raise ValueError("unsupported persisted file mode")
     flags = {
         "rb": os.O_RDONLY,
         "ab": os.O_WRONLY | os.O_APPEND | os.O_CREAT,
         "r+b": os.O_RDWR,
+        "wb": os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
     }[mode] | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise PersistedFileError(f"persisted path is not a regular file: {path}")
+        if mode == "wb":
+            os.ftruncate(descriptor, 0)
         return os.fdopen(descriptor, mode)
     except BaseException:
         os.close(descriptor)

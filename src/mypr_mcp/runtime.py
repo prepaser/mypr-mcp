@@ -288,7 +288,9 @@ class Runtime:
         self.control_waiters = {}
         self.submit_waiters = {}
         self.monitor = None
-        self.config_store = ConfigStore(self.workspace)
+        self.config_store = ConfigStore(
+            self.workspace, workspace_guard=self._ensure_workspace_identity
+        )
         snapshot = self.config_store.load()
         self._kernel_snapshot = snapshot
         self.config = snapshot.values
@@ -390,17 +392,20 @@ class Runtime:
         if method == "get_lsp":
             return await self.mcp.get_lsp()
         if method == "set_lsp":
-            if self.settings.applying:
-                raise RuntimeError("Configuration reload is in progress; retry after it completes")
-            named = (
-                {"name": req["name"], "definition": req.get("definition")}
-                if "name" in req else {}
-            )
-            return await self.mcp.save_lsp(
-                req.get("definitions"),
-                req.get("expected_servers"),
-                **named,
-            )
+            async with self._workspace_config_admission(generation):
+                if self.settings.applying:
+                    raise RuntimeError(
+                        "Configuration reload is in progress; retry after it completes"
+                    )
+                named = (
+                    {"name": req["name"], "definition": req.get("definition")}
+                    if "name" in req else {}
+                )
+                return await self.mcp.save_lsp(
+                    req.get("definitions"),
+                    req.get("expected_servers"),
+                    **named,
+                )
         if method == "applied_lsp":
             from .lsp_config import validate_servers
 
@@ -425,6 +430,21 @@ class Runtime:
                 "sequence": getattr(self.settings, "lsp_sequence", sequence),
             }
         raise ValueError("Unknown workspace configuration operation")
+
+    @contextlib.asynccontextmanager
+    async def _workspace_config_admission(self, generation):
+        async with self._admission_lock:
+            self._check_workspace_config_mutation(generation)
+            yield
+
+    def _check_workspace_config_mutation(self, generation):
+        if generation and generation != self.generation:
+            raise RuntimeError("Expired kernel generation")
+        if self.stopping.is_set() or self.resetting or self.restarting:
+            raise RuntimeError("Workspace is not accepting configuration changes")
+        if not self.workspace_available():
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
+        self.mcp._ensure_workspace_identity()
 
     def new_shells(self):
         return Shells(
@@ -760,6 +780,10 @@ class Runtime:
             return workspace_id(self.workspace) == self.workspace_id
         except OSError:
             return False
+
+    def _ensure_workspace_identity(self):
+        if not self.workspace_available():
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
 
     def write_info(self):
         (self.root / "runtime.json").write_text(
@@ -2370,23 +2394,40 @@ class Runtime:
         requested_client, generation,
     ):
         if op in {"search", "git"}:
-            if self.stopping.is_set():
-                raise RuntimeError("Workspace manager is stopping")
-            if not self.workspace_available():
-                raise RuntimeError("The workspace moved; stop its manager and reconnect")
-            runner = ManagedCommands(self, client, connection_id, req.get("exec_id"))
+            async with self._admission_lock:
+                self._check_dispatch_admission(op)
+                if generation and generation != self.generation:
+                    raise RuntimeError("Expired kernel generation")
+                admission_generation = self.generation
+                self._check_managed_command_admission(
+                    admission_generation, self.shells
+                )
+                shells = self.shells
+                dependency_service = getattr(self, "dependencies", None)
+            runner = ManagedCommands(
+                self,
+                client,
+                connection_id,
+                req.get("exec_id"),
+                shells=shells,
+                generation=admission_generation,
+            )
             args = req.get("args", {})
             if not isinstance(args, dict):
                 raise TypeError("args must be an object")
             if op == "search":
                 callback = None
-                if getattr(self, "dependencies", None) is not None:
+                if dependency_service is not None:
                     async def callback(*names, automatic=True):
-                        return await self.dependencies.ensure(
+                        async with self._admission_lock:
+                            self._check_managed_command_admission(
+                                admission_generation, shells
+                            )
+                        return await dependency_service.ensure(
                             names, automatic=automatic,
                             context={"client_id": client, "connection_id": connection_id,
                                      "exec_id": req.get("exec_id"),
-                                     "generation": self.generation},
+                                     "generation": admission_generation},
                         )
                 return await Search(
                     self.workspace, runner, ensure_dependencies=callback,
@@ -2396,6 +2437,21 @@ class Runtime:
                 raise ValueError("Unknown Git method")
             return await getattr(Git(self.workspace, runner), method)(**args)
         return _UNHANDLED
+
+    def _check_managed_command_admission(self, generation, shells):
+        if generation != self.generation or shells is not self.shells:
+            raise RuntimeError("Expired kernel generation")
+        if self.stopping.is_set() or self.resetting or self.restarting:
+            raise RuntimeError("Workspace is not accepting managed commands")
+        if not self.workspace_available():
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
+
+    async def start_managed_command(
+        self, generation, shells, command, cwd, env, *, input=None
+    ):
+        async with self._admission_lock:
+            self._check_managed_command_admission(generation, shells)
+            return await shells.start(command, cwd, env, input=input)
 
     async def _dispatch_shell(
         self, op, req, *, client, connection_id, connection,
@@ -2475,28 +2531,30 @@ class Runtime:
                 "exec_id": req.get("exec_id"),
                 "server": args.get("server"),
             }
-            await self.io(
-                self.history.append, "mcp", method, dict(event, state="running"), critical=True
-            )
-            try:
-                result = await self.mcp.dispatch(method, args)
-            except Exception as exc:
+            async with self._workspace_config_admission(generation):
+                await self.io(
+                    self.history.append,
+                    "mcp", method, dict(event, state="running"), critical=True
+                )
+                try:
+                    result = await self.mcp.dispatch(method, args)
+                except Exception as exc:
+                    await self.io(
+                        self.history.append,
+                        "mcp",
+                        method,
+                        dict(event, state="failed", error=str(exc)),
+                        critical=True,
+                    )
+                    raise
                 await self.io(
                     self.history.append,
                     "mcp",
                     method,
-                    dict(event, state="failed", error=str(exc)),
+                    dict(event, state="succeeded"),
                     critical=True,
                 )
-                raise
-            await self.io(
-                self.history.append,
-                "mcp",
-                method,
-                dict(event, state="succeeded"),
-                critical=True,
-            )
-            return result
+                return result
         return _UNHANDLED
 
     async def _dispatch_lifecycle(

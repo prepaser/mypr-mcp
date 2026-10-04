@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import mimetypes
 import re
 from collections.abc import Iterable, Mapping
@@ -12,6 +13,8 @@ from email.parser import BytesParser
 from email.utils import formataddr, formatdate, getaddresses, make_msgid
 from pathlib import Path
 from typing import Any
+
+import idna
 
 from .file_io import read_bytes
 
@@ -62,18 +65,44 @@ def _normalize_mailbox(value: str, name: str) -> str:
         raise MailContentError(f"{name} contains an invalid recipient: {value!r}")
     if domain.startswith(".") or domain.endswith(".") or ".." in domain:
         raise MailContentError(f"{name} contains an invalid recipient: {value!r}")
+    if domain.startswith("[") or domain.endswith("]"):
+        if not (domain.startswith("[") and domain.endswith("]")):
+            raise MailContentError(f"{name} contains an invalid recipient: {value!r}")
+        literal = domain[1:-1]
+        if literal.lower().startswith("ipv6:"):
+            try:
+                ipaddress.IPv6Address(literal[5:])
+            except ValueError as exc:
+                raise MailContentError(
+                    f"{name} contains an invalid recipient: {value!r}"
+                ) from exc
+        else:
+            try:
+                ipaddress.IPv4Address(literal)
+            except ValueError as exc:
+                raise MailContentError(
+                    f"{name} contains an invalid recipient: {value!r}"
+                ) from exc
+        return f"{local}@{domain}"
     try:
-        domain = domain.encode("idna").decode("ascii")
-    except UnicodeError as exc:
+        domain = idna.encode(domain, uts46=True, transitional=False).decode("ascii")
+    except (idna.IDNAError, UnicodeError) as exc:
         raise MailContentError(f"{name} contains an invalid recipient: {value!r}") from exc
     return f"{local}@{domain}"
+
+
+def _get_addresses(value: str) -> list[tuple[str, str]]:
+    parsed = getaddresses([value])
+    if any(address for _, address in parsed) or "@[" not in value:
+        return parsed
+    return getaddresses([value], strict=False)
 
 
 def normalize_mailbox(value: str, name: str = "address") -> str:
     """Validate one mailbox and encode its domain with IDNA."""
     if not isinstance(value, str):
         raise MailContentError(f"{name} contains an invalid recipient")
-    parsed = getaddresses([value])
+    parsed = _get_addresses(value)
     if len(parsed) != 1 or not parsed[0][1]:
         raise MailContentError(f"{name} contains an invalid recipient")
     return _normalize_mailbox(parsed[0][1], name)
@@ -81,7 +110,7 @@ def normalize_mailbox(value: str, name: str = "address") -> str:
 
 def _address_items(value: str, name: str) -> list[tuple[str, str]]:
     _header_text(value, name)
-    parsed = getaddresses([value])
+    parsed = _get_addresses(value)
     if not parsed or any(not address for _, address in parsed):
         raise MailContentError(f"{name} contains an invalid recipient")
     result = []

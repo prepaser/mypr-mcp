@@ -208,6 +208,19 @@ def test_normalize_addresses_rejects_invalid_values_and_limits():
         normalize_addresses(["a@example.test"] * 257, "to")
 
 
+def test_normalize_addresses_uses_idna2008_and_preserves_ip_literals():
+    assert normalize_addresses("user@faß.test", "to") == ["user@xn--fa-hia.test"]
+    assert normalize_addresses("user@βόλος.test", "to") == ["user@xn--nxasmm1c.test"]
+    assert normalize_addresses("user@[127.0.0.1]", "to") == ["user@[127.0.0.1]"]
+    assert normalize_addresses("user@[IPv6:::1]", "to") == ["user@[IPv6:::1]"]
+    with pytest.raises(MailContentError):
+        normalize_addresses("user@[::1]", "to")
+    with pytest.raises(MailContentError):
+        normalize_addresses("user@[IPv6:127.0.0.1]", "to")
+    with pytest.raises(MailContentError):
+        normalize_addresses("user@[IPv6:not-an-ip]", "to")
+
+
 def test_build_mime_preserves_display_names_after_idna_normalization():
     raw, recipients, _ = build_mime(
         sender="보내는 사람 <sender@도메인.test>",

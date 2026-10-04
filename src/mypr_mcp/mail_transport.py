@@ -21,6 +21,7 @@ from email.utils import getaddresses, parseaddr
 from pathlib import Path
 from typing import Any
 
+from .async_utils import wait_owned
 from .mail_content import MailContentError, normalize_mailbox
 
 MAX_MESSAGE_BYTES = 25 * 1024 * 1024
@@ -93,13 +94,15 @@ class MailTransport:
             if getattr(function, "__name__", "").startswith("watch_")
             else self._executor
         )
-        return await loop.run_in_executor(executor, lambda: function(*args, **kwargs))
+        return await wait_owned(loop.run_in_executor(executor, lambda: function(*args, **kwargs)))
 
     async def run_watch(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
         if self._closed:
             raise MailTransportError("mail transport is closed", code="service_closed")
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._watch_executor, lambda: function(*args, **kwargs))
+        return await wait_owned(
+            loop.run_in_executor(self._watch_executor, lambda: function(*args, **kwargs))
+        )
 
     def account_names(self) -> list[str]:
         accounts = self.config.get("accounts", self.config)
@@ -377,13 +380,17 @@ class MailTransport:
             raise ValueError("at least one recipient is required")
         if sender is None:
             try:
-                sender = parseaddr(
-                    BytesParser(policy=policy.default).parsebytes(mime).get("From", "")
-                )[1]
+                sender_value = BytesParser(policy=policy.default).parsebytes(mime).get("From", "")
+                sender = parseaddr(sender_value)[1]
+                if not sender and "@[" in sender_value:
+                    sender = parseaddr(sender_value, strict=False)[1]
             except (TypeError, ValueError):
                 sender = ""
         sender = sender or str(account.get("from") or account.get("from_address") or "")
-        parsed_sender = parseaddr(sender)[1] or sender
+        parsed_sender = parseaddr(sender)[1]
+        if "@[" in sender and not parsed_sender:
+            parsed_sender = parseaddr(sender, strict=False)[1] or sender
+        parsed_sender = parsed_sender or sender
         try:
             sender = normalize_mailbox(parsed_sender, "sender")
         except MailContentError as exc:
@@ -1221,6 +1228,8 @@ def _address(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("recipient address is invalid")
     parsed = getaddresses([value])
+    if not any(address for _, address in parsed) and "@[" in value:
+        parsed = getaddresses([value], strict=False)
     if len(parsed) != 1 or not parsed[0][1]:
         raise ValueError("recipient address is invalid")
     try:

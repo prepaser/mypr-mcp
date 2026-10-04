@@ -17,6 +17,7 @@ _MAX_INBOX_BYTES = 4 * 1024
 _MAX_INBOX_MESSAGES = 5
 _MAX_READ_WARNINGS = 4
 _MAX_WARNING_TEXT = 256
+_MAX_ID = (1 << 63) - 1
 
 
 class MessageStore:
@@ -348,16 +349,16 @@ def _validate_limit(value: int) -> int:
 def _validate_after(value: int | None) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("after must be a positive integer or None")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= _MAX_ID:
+        raise ValueError("after must be a positive integer in SQLite's 64-bit range or None")
     return value
 
 
 def _validate_reply_to(value: int | None) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("reply_to must be a positive integer or None")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= _MAX_ID:
+        raise ValueError("reply_to must be a positive integer in SQLite's 64-bit range or None")
     return value
 
 
@@ -379,8 +380,8 @@ def _validate_ids(value: list[int]) -> list[int]:
     result: list[int] = []
     seen: set[int] = set()
     for ident in value:
-        if isinstance(ident, bool) or not isinstance(ident, int) or ident <= 0:
-            raise ValueError("ids must contain only positive integers")
+        if isinstance(ident, bool) or not isinstance(ident, int) or not 0 < ident <= _MAX_ID:
+            raise ValueError("ids must contain only positive integers in SQLite's 64-bit range")
         if ident not in seen:
             seen.add(ident)
             result.append(ident)

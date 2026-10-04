@@ -19,7 +19,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from .file_io import open_regular
+from .file_io import open_regular, read_bytes
 from .persistence import await_completion
 from .revisions import RevisionStore
 
@@ -303,7 +303,7 @@ class ModuleManager:
     def _activate(self, name: str, *, expected_hash: str | None = None) -> ModuleType:
         path = self._module_path(name)
         qualified = self._qualified(name)
-        data = path.read_bytes()
+        data = read_bytes(path)
         revision = _sha256(data)
         if expected_hash is not None and revision != expected_hash:
             raise ValueError(f"Revision mismatch: expected {expected_hash}, got {revision}")

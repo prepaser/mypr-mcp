@@ -36,6 +36,7 @@ from .lsp_config import validate_servers as validate_lsp_servers
 from .terminal import close as close_terminal
 from .terminal import eof_byte
 from .terminal import resize as resize_terminal
+from .transport import workspace_id
 
 _MAX_SHELL_WARNINGS = 4
 _MAX_SHELL_WARNING_TEXT = 256
@@ -1469,9 +1470,18 @@ class MCPBridge:
 
     def __init__(self, workspace: Path, *, global_path=None, snapshot=None):
         self.workspace = Path(workspace).resolve()
-        self._store = ConfigStore(self.workspace, global_path=global_path)
+        self.workspace_id = workspace_id(self.workspace)
+        self._store = ConfigStore(
+            self.workspace,
+            global_path=global_path,
+            workspace_guard=self._ensure_workspace_identity,
+        )
         self.config_store = self._store
-        self.store = MCPConfig(self.workspace, global_path=global_path)
+        self.store = MCPConfig(
+            self.workspace,
+            global_path=global_path,
+            workspace_guard=self._ensure_workspace_identity,
+        )
         self._snapshot = snapshot if snapshot is not None else self._load_snapshot()
         self.config, self._revision = self._snapshot_config(self._snapshot)
         self.config = _copy_configs(self.config)
@@ -1549,6 +1559,7 @@ class MCPBridge:
         async with self._mutation_lock:
             self._ensure_open()
             self._ensure_mutation_allowed()
+            self._ensure_workspace_identity()
             snapshot = await wait_owned(asyncio.to_thread(self._load_snapshot))
             if snapshot.values["mcp"]["servers"] != self.config:
                 raise RuntimeError("MCP configuration changed on disk; call ws.mcp.reload() first")
@@ -1607,6 +1618,7 @@ class MCPBridge:
         async with self._mutation_lock:
             self._ensure_open()
             self._ensure_mutation_allowed()
+            self._ensure_workspace_identity()
             old = self.config.get(server)
             action = "added" if old is None else "unchanged" if old == config else "updated"
             if action == "unchanged":
@@ -1647,6 +1659,7 @@ class MCPBridge:
         async with self._mutation_lock:
             self._ensure_open()
             self._ensure_mutation_allowed()
+            self._ensure_workspace_identity()
             if server not in self.config:
                 raise ValueError(f"unknown MCP server: {server!r}")
             try:
@@ -1678,6 +1691,7 @@ class MCPBridge:
         async with self._mutation_lock:
             self._ensure_open()
             self._ensure_mutation_allowed()
+            self._ensure_workspace_identity()
             if server not in self.config:
                 raise ValueError(f"unknown MCP server: {server!r}")
             try:
@@ -1717,6 +1731,7 @@ class MCPBridge:
         async with self._mutation_lock:
             self._ensure_open()
             self._ensure_mutation_allowed()
+            self._ensure_workspace_identity()
             candidate = (
                 snapshot
                 if snapshot is not None
@@ -1747,6 +1762,7 @@ class MCPBridge:
         self._validate_force(force)
         async with self._mutation_lock:
             self._ensure_open()
+            self._ensure_workspace_identity()
             candidate = snapshot
             servers, revision = self._snapshot_config(candidate)
             servers = _copy_configs(servers)
@@ -1841,6 +1857,14 @@ class MCPBridge:
 
     def _load_snapshot(self):
         return self._store.load()
+
+    def _ensure_workspace_identity(self) -> None:
+        try:
+            current = workspace_id(self.workspace)
+        except OSError as exc:
+            raise RuntimeError("The workspace moved; stop its manager and reconnect") from exc
+        if current != self.workspace_id:
+            raise RuntimeError("The workspace moved; stop its manager and reconnect")
 
     @staticmethod
     def _snapshot_config(snapshot: ConfigSnapshot) -> tuple[dict[str, dict[str, Any]], str | None]:

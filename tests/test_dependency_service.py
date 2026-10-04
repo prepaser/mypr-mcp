@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -297,6 +298,114 @@ async def test_install_that_leaves_package_missing_reports_unusable(tmp_path, mo
         await service.ensure(["pillow"], automatic=True)
     assert failure.value.code == "dependency_unusable"
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_dependency_probe_counts_as_busy_and_close_reaps_process(tmp_path, monkeypatch):
+    import mypr_mcp.dependency_service as dependency_service
+
+    store = FakeStore(tmp_path)
+    service = _service(tmp_path, store)
+    service.python = Path(sys.executable)
+    service._probe_slots = asyncio.Semaphore(1)
+    launched = asyncio.Event()
+    processes = []
+    original = dependency_service.asyncio.create_subprocess_exec
+
+    async def create_process(*args, **kwargs):
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        launched.set()
+        return process
+
+    monkeypatch.setattr(dependency_service.asyncio, "create_subprocess_exec", create_process)
+    probe = asyncio.create_task(
+        service._probe("import time; time.sleep(30); print('{}')", {})
+    )
+    await asyncio.wait_for(launched.wait(), 1)
+    queued = asyncio.create_task(
+        service._probe("import time; time.sleep(30); print('{}')", {})
+    )
+    await asyncio.sleep(0)
+    assert service.active_count == 2
+
+    await service.close()
+    with pytest.raises(asyncio.CancelledError):
+        await probe
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    await asyncio.sleep(0)
+    assert processes[0].returncode is not None
+    assert service.active_count == 0
+    assert not service._probe_processes
+
+
+@pytest.mark.asyncio
+async def test_cancelling_probe_during_launch_still_reaps_process(tmp_path, monkeypatch):
+    import mypr_mcp.dependency_service as dependency_service
+
+    store = FakeStore(tmp_path)
+    service = _service(tmp_path, store)
+    service.python = Path(sys.executable)
+    launching = asyncio.Event()
+    processes = []
+    original = dependency_service.asyncio.create_subprocess_exec
+
+    async def create_process(*args, **kwargs):
+        launching.set()
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(dependency_service.asyncio, "create_subprocess_exec", create_process)
+    probe = asyncio.create_task(
+        service._probe("import time; time.sleep(30); print('{}')", {})
+    )
+    await asyncio.wait_for(launching.wait(), 1)
+    probe.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await probe
+    assert processes
+    assert processes[0].returncode is not None
+    assert service.active_count == 0
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_output_limit_reaps_noisy_process(tmp_path, monkeypatch):
+    import mypr_mcp.dependency_service as dependency_service
+
+    store = FakeStore(tmp_path)
+    service = _service(tmp_path, store)
+    service.python = Path(sys.executable)
+    processes = []
+    original = dependency_service.asyncio.create_subprocess_exec
+
+    async def create_process(*args, **kwargs):
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(dependency_service.asyncio, "create_subprocess_exec", create_process)
+    with pytest.raises(RPCError, match="output exceeded") as failure:
+        await asyncio.wait_for(
+            service._probe("print('x' * 200_000)", {}),
+            3,
+        )
+    assert failure.value.code == "dependency_probe_failed"
+    assert processes[0].returncode is not None
+    assert service.active_count == 0
+    assert not service._probe_processes
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_is_rejected_after_close(tmp_path):
+    service = _service(tmp_path, FakeStore(tmp_path))
+    await service.close()
+
+    with pytest.raises(RuntimeError, match="Dependency service is closed"):
+        await service._probe("print('{}')", {})
 
 
 @pytest.mark.parametrize("engine_status", ["installed", "missing"])

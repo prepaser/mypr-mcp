@@ -116,6 +116,20 @@ def test_validation(store: MessageStore):
         store.inbox("bob")
 
 
+@pytest.mark.parametrize("ident", [1 << 63, 1 << 100])
+def test_message_ids_reject_sqlite_overflow(store: MessageStore, ident):
+    for call in (
+        lambda: store.read("bob", after=ident),
+        lambda: store.read("bob", reply_to=ident),
+        lambda: store.send("alice", "bob", "reply", reply_to=ident),
+        lambda: store.reply("bob", ident, "reply"),
+        lambda: store.ack("bob", [ident]),
+    ):
+        with pytest.raises(ValueError, match="positive integer"):
+            call()
+    assert store.inbox("bob")["unacked"] == 0
+
+
 def test_read_byte_budget_and_escaped_text_validation(store: MessageStore):
     sent = [store.send("alice", "bob", "가" * 5400) for _ in range(3)]
     page = store.read("bob")

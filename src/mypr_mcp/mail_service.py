@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 from .config import validate_mail_config
 from .diagnostics import RPCError, safe_error
 from .file_io import read_bytes as read_persisted_bytes
@@ -676,12 +676,16 @@ class MailService:
                 raise RuntimeError("Mail service stopped before SMTP was attempted")
             await self._persist(self.store.update_send, send_id, state="sending")
             attempted = True
-            outcome = await self.transport.run(
-                self.transport.send,
-                draft["account"],
-                mime,
-                list(draft["recipients"]),
+            outcome, send_cancelled = await finish_owned(
+                self.transport.run(
+                    self.transport.send,
+                    draft["account"],
+                    mime,
+                    list(draft["recipients"]),
+                )
             )
+            if send_cancelled:
+                raise asyncio.CancelledError
             accepted, rejected = outcome["accepted"], outcome["rejected"]
             state = "partial" if accepted and rejected else "accepted" if accepted else "failed"
             await self._persist(

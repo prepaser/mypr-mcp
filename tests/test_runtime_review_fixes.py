@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from mypr_mcp.diagnostics import RPCError
 from mypr_mcp.http_tools import HTTPTools
 from mypr_mcp.runtime import Runtime, _recover_runs
 from mypr_mcp.runtime_registry import list_managers
+from mypr_mcp.services import MCPBridge
 
 
 @pytest.mark.parametrize(
@@ -268,3 +270,99 @@ async def test_attach_rejects_corrupt_history_before_creating_handle(monkeypatch
         await manager.attach("a" * 32)
     assert failed.value.code == "history_corrupt"
     assert manager.list() == []
+
+
+async def test_workspace_config_rejects_replaced_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = Runtime(workspace)
+    runtime.mcp = MCPBridge(workspace, global_path=tmp_path / "global.toml")
+    workspace.rename(tmp_path / "moved")
+    workspace.mkdir()
+    (workspace / ".mypr").mkdir()
+
+    with pytest.raises(RuntimeError, match="workspace moved"):
+        await runtime._dispatch(
+            {
+                "op": "code_config",
+                "method": "set_lsp",
+                "name": "demo",
+                "definition": {"command": ["demo-lsp"], "languages": ["python"]},
+                "definitions": {
+                    "demo": {
+                        "command": ["demo-lsp"], "languages": ["python"], "timeout": 10.0
+                    }
+                },
+                "expected_servers": {},
+            }
+        )
+    assert not (workspace / ".mypr" / "config.toml").exists()
+
+
+async def test_search_does_not_launch_after_reset_generation(monkeypatch, tmp_path):
+    import mypr_mcp.runtime as runtime_module
+
+    class Shell:
+        def __init__(self):
+            self.started = []
+
+        async def start(self, *args, **kwargs):
+            self.started.append((args, kwargs))
+            return {"id": "job"}
+
+        async def read(self, *args, **kwargs):
+            return {"state": "succeeded", "output": [], "has_more": False, "cursor": 0}
+
+        async def cancel(self, ident):
+            return {"id": ident, "state": "cancelled"}
+
+    class Search:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        def __init__(self, workspace, runner, ensure_dependencies=None):
+            self.runner = runner
+
+        async def search(self, **args):
+            self.entered.set()
+            await self.release.wait()
+            return await self.runner.run(["echo", "cross-generation"])
+
+    runtime = Runtime.__new__(Runtime)
+    runtime.workspace = Path(tmp_path)
+    runtime.workspace_id = "same"
+    runtime.workspace_available = lambda: True
+    runtime.stopping = asyncio.Event()
+    runtime.resetting = False
+    runtime.restarting = None
+    runtime.settings = None
+    runtime._admission_lock = asyncio.Lock()
+    runtime.clients = {}
+    runtime.generation = "old"
+    runtime.healthy = True
+    runtime.execs = {}
+    runtime.task_records = {}
+    runtime.web = None
+    runtime.dependencies = None
+    old, new = Shell(), Shell()
+    runtime.shells = old
+    runtime.track_shell = lambda *args, **kwargs: None
+
+    async def reset(current):
+        runtime.shells = new
+        runtime.generation = "new"
+        runtime.resetting = False
+
+    runtime.reset = reset
+    monkeypatch.setattr(runtime_module, "Search", Search)
+    query = asyncio.create_task(
+        runtime._dispatch({"op": "search", "generation": "old", "client_id": "client", "args": {}})
+    )
+    await asyncio.wait_for(Search.entered.wait(), 2)
+    await runtime._dispatch({"op": "reset", "force": True})
+    Search.release.set()
+
+    with pytest.raises(RuntimeError, match="Expired kernel generation"):
+        await asyncio.wait_for(query, 2)
+    assert old.started == []
+    assert new.started == []

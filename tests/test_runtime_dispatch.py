@@ -27,8 +27,16 @@ async def test_history_dispatch_isolated_from_request_context():
 
 
 @pytest.mark.asyncio
-async def test_code_config_uses_bridge_lsp_cas_api():
+async def test_code_config_uses_bridge_lsp_cas_api(tmp_path):
     runtime = Runtime.__new__(Runtime)
+    runtime.workspace = tmp_path
+    from mypr_mcp.transport import workspace_id
+
+    runtime.workspace_id = workspace_id(tmp_path)
+    runtime.stopping = asyncio.Event()
+    runtime.resetting = False
+    runtime.restarting = None
+    runtime._admission_lock = asyncio.Lock()
     runtime.settings = SimpleNamespace(applying=False)
     calls = []
 
@@ -40,7 +48,9 @@ async def test_code_config_uses_bridge_lsp_cas_api():
         calls.append(("save", definitions, expected_servers))
         return {"revision": "next"}
 
-    runtime.mcp = SimpleNamespace(get_lsp=get_lsp, save_lsp=save_lsp)
+    runtime.mcp = SimpleNamespace(
+        get_lsp=get_lsp, save_lsp=save_lsp, _ensure_workspace_identity=lambda: None
+    )
     result = await runtime.code_config(
         {
             "method": "set_lsp",

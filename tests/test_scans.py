@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import shutil
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -167,6 +169,91 @@ print('<nmaprun><host><status state="up"/><address addr="127.0.0.1"/></host></nm
     assert summary["stop_reason"] == "result_size_limit"
     assert summary["error"] is None
     assert summary["artifact_truncated"]
+
+
+async def test_nmap_artifact_open_failure_does_not_launch_child(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.xml"
+    original_open = scan_worker.open_regular
+
+    def open_file(path, *args, **kwargs):
+        if path == artifact:
+            raise OSError(errno.ENOSPC, "artifact disk full")
+        return original_open(path, *args, **kwargs)
+
+    async def launch(*args, **kwargs):
+        pytest.fail("child must not start before its artifact is writable")
+
+    monkeypatch.setattr(scan_worker, "open_regular", open_file)
+    monkeypatch.setattr(scan_worker.asyncio, "create_subprocess_exec", launch)
+    config = {
+        "mode": "nmap", "targets": ["127.0.0.1"],
+        "result_path": str(tmp_path / "results.jsonl"),
+        "artifact_path": str(artifact),
+        "summary_path": str(tmp_path / "summary.json"),
+    }
+    assert await scan_worker.run(config) == 2
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert "artifact disk full" in summary["error"]
+
+
+async def test_nmap_artifact_write_and_close_failures_reap_noisy_child(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.xml"
+    original_open = scan_worker.open_regular
+    original_launch = asyncio.create_subprocess_exec
+    children = []
+
+    class BrokenArtifact:
+        def write(self, _data):
+            raise OSError(errno.ENOSPC, "artifact disk full")
+
+        def close(self):
+            raise OSError(errno.ENOSPC, "artifact flush failed")
+
+    def open_file(path, *args, **kwargs):
+        return BrokenArtifact() if path == artifact else original_open(path, *args, **kwargs)
+
+    async def launch(*args, **kwargs):
+        child = await original_launch(
+            sys.executable, "-c",
+            "import os, time; os.write(1, b'x' * 1048576); time.sleep(30)",
+            **kwargs,
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(scan_worker, "open_regular", open_file)
+    monkeypatch.setattr(scan_worker.asyncio, "create_subprocess_exec", launch)
+    config = {
+        "mode": "nmap", "targets": ["127.0.0.1"],
+        "result_path": str(tmp_path / "results.jsonl"),
+        "artifact_path": str(artifact),
+        "summary_path": str(tmp_path / "summary.json"),
+    }
+    assert await asyncio.wait_for(scan_worker.run(config), 5) == 2
+    assert len(children) == 1 and children[0].returncode is not None
+    assert children[0].stdout.at_eof() and children[0].stderr.at_eof()
+
+
+@pytest.mark.parametrize("kind", ["artifact", "results"])
+async def test_scan_worker_rejects_fifo_output_without_launching(tmp_path, monkeypatch, kind):
+    artifact = tmp_path / "artifact.xml"
+    results = tmp_path / "results.jsonl"
+    os.mkfifo(artifact if kind == "artifact" else results)
+
+    async def launch(*args, **kwargs):
+        pytest.fail("special output files must fail before launch")
+
+    monkeypatch.setattr(scan_worker.asyncio, "create_subprocess_exec", launch)
+    config = {
+        "mode": "nmap", "targets": ["127.0.0.1"],
+        "result_path": str(results),
+        "artifact_path": str(artifact),
+    }
+    if kind == "artifact":
+        assert await scan_worker.run(config) == 2
+    else:
+        with pytest.raises(OSError):
+            await scan_worker.run(config)
 
 
 @pytest.mark.asyncio

@@ -77,6 +77,20 @@ class CodeError(RuntimeError):
     """A language server or code navigation operation failed."""
 
 
+class _DiagnosticOutputLimitError(EditError):
+    """A diagnostic page needs a larger budget to make progress."""
+
+    code = "output_limit"
+
+    def __init__(self, cursor: str) -> None:
+        self.next_cursor = cursor
+        self.page_cursor = cursor
+        self.details = {"page_cursor": cursor}
+        super().__init__(
+            "max_bytes is too small for workspace diagnostic metadata; increase the budget"
+        )
+
+
 @dataclass(slots=True)
 class _Document:
     path: Path
@@ -487,6 +501,8 @@ class _LanguageServer:
         method = message.get("method")
         params = message.get("params", {})
         if method == "textDocument/publishDiagnostics" and isinstance(params, dict):
+            if self._closing or self._closed:
+                return
             uri = params.get("uri")
             if isinstance(uri, str) and uri in self.documents:
                 current = self.documents[uri]
@@ -1002,6 +1018,10 @@ class _LanguageServer:
                 "symbols": [],
                 "truncated": False,
             }
+            if _json_size(result) > max_bytes:
+                raise ValueError(
+                    "max_bytes is too small for workspace symbol metadata; increase the budget"
+                )
             truncated = len(raw) > MAX_RESULTS
             for item in raw[:MAX_RESULTS]:
                 if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -1027,6 +1047,10 @@ class _LanguageServer:
                     truncated = True
                     break
             result["truncated"] = truncated
+            if _json_size(result) > max_bytes:
+                raise ValueError(
+                    "max_bytes is too small for workspace symbol metadata; increase the budget"
+                )
             return result
 
     async def _clean_call_item(self, value: Any, cache: dict[str, str]) -> dict[str, Any] | None:
@@ -1328,6 +1352,7 @@ class _LanguageServer:
             raise ValueError("wait_ms must be an integer between 0 and 30000")
         async with self._operation_lock:
             doc, generation = await self._document(path, language)
+            server_generation = self.generation
             provider = self.capabilities.get("diagnosticProvider")
             if _supports(provider):
                 previous = self.diagnostics_cache.get(doc.uri, {}).get("resultId")
@@ -1335,6 +1360,8 @@ class _LanguageServer:
                 if previous is not None:
                     params["previousResultId"] = previous
                 result = await self._request("textDocument/diagnostic", params)
+                if self._closed or self._closing or self.generation != server_generation:
+                    raise CodeError("language server changed during diagnostics")
                 if isinstance(result, dict) and result.get("kind") == "unchanged":
                     cached = self.diagnostics_cache.get(doc.uri)
                     if cached is None or previous is None:
@@ -1595,6 +1622,11 @@ class _LanguageServer:
         if self._closed:
             return
         self._closing = True
+        self.diagnostics_cache.clear()
+        self._diag_generation.clear()
+        for event in self._diag_events.values():
+            event.set()
+        self._diag_events.clear()
         process = self.process
         if process is not None:
             if process.returncode is None and self.initialized:
@@ -1665,7 +1697,8 @@ class CodeTools:
         self._kernel_generation = os.environ.get("MYPR_GENERATION")
         self._plans = EditPlanStore(self.workspace)
         self._actions: OrderedDict[str, _StoredAction] = OrderedDict()
-        self._workspace_diag_results: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._workspace_diag_results: dict[str, dict[str, dict[str, Any]]] = {}
+        self._workspace_diag_generations: dict[str, str] = {}
         self._diagnostic_snapshots = SnapshotStore(self.workspace / ".mypr", name="lsp-diagnostics")
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -1820,6 +1853,7 @@ class CodeTools:
                             await replacement.aclose()
                         raise
                 self._servers[name] = replacement
+                self._clear_workspace_diagnostics(name)
                 close_cancelled = False
                 if existing is not None:
                     close_cancelled = (await finish_owned(existing.aclose()))[1]
@@ -1841,6 +1875,24 @@ class CodeTools:
         self._config_revision = revision
         self._lsp_apply_sequence += 1
         self._config_error = None
+
+    @staticmethod
+    def _server_generation(server: Any) -> str:
+        generation = getattr(server, "generation", None)
+        if isinstance(generation, str) and generation:
+            return generation
+        return f"object:{id(server)}"
+
+    def _clear_workspace_diagnostics(self, name: str) -> None:
+        self._workspace_diag_results.pop(name, None)
+        self._workspace_diag_generations.pop(name, None)
+
+    def _workspace_diagnostic_cache(self, server: Any) -> dict[str, dict[str, Any]]:
+        generation = self._server_generation(server)
+        if self._workspace_diag_generations.get(server.name) != generation:
+            self._workspace_diag_results.pop(server.name, None)
+            self._workspace_diag_generations[server.name] = generation
+        return self._workspace_diag_results.setdefault(server.name, {})
 
     async def _report_applied_lsp(self) -> None:
         if self._config_rpc is None:
@@ -2622,6 +2674,7 @@ class CodeTools:
         """Read the server's workspace diagnostic report as a bounded snapshot."""
         max_bytes = _result_limit(max_bytes)
         server = await self._get_server(name)
+        server_generation = self._server_generation(server)
         if cursor is not None:
             snapshot, offset = self._diagnostic_snapshots.decode(
                 cursor, expected_kind="workspace-diagnostic"
@@ -2630,19 +2683,25 @@ class CodeTools:
             if not isinstance(query, dict) or query.get("server") != server.name:
                 raise ValueError("cursor belongs to a different language server")
         else:
+            previous_reports = self._workspace_diagnostic_cache(server)
             previous = []
-            for uri, report in self._workspace_diag_results.get(server.name, {}).items():
+            for uri, report in previous_reports.items():
                 result_id = report.get("result_id")
                 if result_id is not None:
                     previous.append({"uri": uri, "value": result_id})
             raw = await server.workspace_diagnostics(previous or None)
+            if (
+                self._servers.get(server.name) is not server
+                or self._server_generation(server) != server_generation
+            ):
+                raise CodeError("language server changed during workspace diagnostics")
             if not isinstance(raw, dict):
                 raise CodeError("language server returned malformed workspace diagnostics")
             reports = raw.get("items", [])
             if not isinstance(reports, list):
                 raise CodeError("language server returned malformed workspace diagnostic items")
-            previous_reports = self._workspace_diag_results.setdefault(server.name, {})
             items: list[dict[str, Any]] = []
+            cache_updates: dict[str, dict[str, Any]] = {}
             for report in reports:
                 if not isinstance(report, dict) or not isinstance(report.get("uri"), str):
                     continue
@@ -2654,11 +2713,18 @@ class CodeTools:
                 if kind == "unchanged":
                     result_id = report.get("resultId")
                     cached = previous_reports.get(uri)
-                    if cached is None:
+                    if cached is None or not isinstance(result_id, str):
                         continue
                     cleaned = copy.deepcopy(cached)
                     cleaned["kind"] = "unchanged"
                     cleaned["result_id"] = result_id
+                    if "version" in report and (
+                        report["version"] is None or type(report["version"]) is int
+                    ):
+                        cleaned["version"] = report["version"]
+                    cached = copy.deepcopy(cleaned)
+                    cached["kind"] = "full"
+                    cache_updates[uri] = cached
                     items.append(cleaned)
                     continue
                 if kind != "full" or not isinstance(report.get("items", []), list):
@@ -2683,10 +2749,18 @@ class CodeTools:
                     "diagnostics": diagnostics,
                     "truncated": len(values) > MAX_DIAGNOSTICS or dropped,
                 }
-                previous_reports[uri] = copy.deepcopy(item)
+                cache_updates[uri] = copy.deepcopy(item)
                 items.append(item)
+            if (
+                self._servers.get(server.name) is not server
+                or self._server_generation(server) != server_generation
+            ):
+                raise CodeError("language server changed during workspace diagnostics")
+            previous_reports.update(cache_updates)
             ident = self._diagnostic_snapshots.create(
-                {"server": server.name}, items, kind="workspace-diagnostic"
+                {"server": server.name, "generation": server_generation},
+                items,
+                kind="workspace-diagnostic",
             )
             snapshot = self._diagnostic_snapshots.load(ident)
             offset = 0
@@ -2721,6 +2795,10 @@ class CodeTools:
                 break
             page_items.append(item)
             index += 1
+        if not page_items and index < len(items):
+            raise _DiagnosticOutputLimitError(
+                self._diagnostic_snapshots.cursor(snapshot["id"], index, "workspace-diagnostic")
+            )
         has_more = index < len(items)
         next_cursor = (
             self._diagnostic_snapshots.cursor(snapshot["id"], index, "workspace-diagnostic")
@@ -2747,7 +2825,9 @@ class CodeTools:
             output["next_cursor"] = next_cursor
             output["truncated"] = True
         if _json_size(output) > max_bytes:
-            raise EditError("workspace diagnostic metadata exceeds max_bytes")
+            raise _DiagnosticOutputLimitError(
+                self._diagnostic_snapshots.cursor(snapshot["id"], index, "workspace-diagnostic")
+            )
         return output
 
     def status(self, name: str | None = None) -> dict[str, Any]:
@@ -2816,6 +2896,8 @@ class CodeTools:
             for name in changed
             if name in self._servers
         ]
+        for name in changed:
+            self._clear_workspace_diagnostics(name)
         self._definitions = definitions
         self._config_revision = revision
         self._lsp_apply_sequence += 1
@@ -2900,6 +2982,7 @@ class CodeTools:
                 self._servers.pop(key, None)
                 _, close_cancelled = await finish_owned(server.aclose())
                 operation_cancelled = operation_cancelled or close_cancelled
+            self._clear_workspace_diagnostics(key)
             removed = exists if persist else server is not None
         if not exists:
             raise CodeError(f"language server {key!r} is not configured")
@@ -2921,10 +3004,13 @@ class CodeTools:
             if name is None:
                 targets = list(self._servers.items())
                 self._servers.clear()
+                self._workspace_diag_results.clear()
+                self._workspace_diag_generations.clear()
             else:
                 key = self._name(name)
                 server = self._servers.pop(key, None)
                 targets = [(key, server)] if server is not None else []
+                self._clear_workspace_diagnostics(key)
             await wait_owned(self._close_servers(targets))
 
     async def aclose(self) -> None:
@@ -2940,6 +3026,7 @@ class CodeTools:
             self._servers.clear()
             self._actions.clear()
             self._workspace_diag_results.clear()
+            self._workspace_diag_generations.clear()
             await self._close_servers(targets)
 
     @staticmethod

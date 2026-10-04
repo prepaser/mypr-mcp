@@ -60,6 +60,7 @@ _CATEGORIES = {
     "searches": "snapshots",
     "git": "snapshots",
     "git-history": "snapshots",
+    "lsp-diagnostics": "snapshots",
     "document-results": "document_results",
     "documents": "document_results",
     "html-results": "document_results",
@@ -1246,17 +1247,20 @@ class Storage:
             updated = dict(payload)
             updated["revisions"] = retained
             updated["count"] = len(retained)
-            first_sequence = min(item["sequence"] for item in retained)
-            removed_before = [
-                item["sequence"] for item in removed if item["sequence"] < first_sequence
-            ]
-            updated["pruned_before"] = min(
-                max(
-                int(payload.get("pruned_before", 0)),
-                max(removed_before, default=0),
-                ),
-                first_sequence - 1,
-            )
+            if retained:
+                first_sequence = min(item["sequence"] for item in retained)
+                removed_before = [
+                    item["sequence"] for item in removed if item["sequence"] < first_sequence
+                ]
+                updated["pruned_before"] = min(
+                    max(
+                        int(payload.get("pruned_before", 0)),
+                        max(removed_before, default=0),
+                    ),
+                    first_sequence - 1,
+                )
+            else:
+                updated["pruned_before"] = int(payload.get("pruned_before", 0))
             self._atomic_json(path, updated)
             pruned.append(
                 {

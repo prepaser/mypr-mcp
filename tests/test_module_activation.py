@@ -119,3 +119,14 @@ def test_failed_parent_import_cleans_nested_modules(tmp_path, module_namespace):
         modules.load("pkg.worker")
     assert "ws_lib.pkg" not in sys.modules
     assert "ws_lib.pkg.worker" not in sys.modules
+
+
+def test_load_rejects_fifo_without_waiting_for_a_writer(tmp_path, module_namespace):
+    modules = manager(tmp_path)
+    path = modules.root / "blocked.py"
+    path.unlink(missing_ok=True)
+    import os
+
+    os.mkfifo(path)
+    with pytest.raises(OSError):
+        modules.load("blocked")

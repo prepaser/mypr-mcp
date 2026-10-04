@@ -180,6 +180,8 @@ Built-in automatic Python packages include `ipykernel`, `tomlkit`, `httpx2`, `h2
 
 `mypr-mcp prepare` prepares the core workspace packages in advance or for recovery while the workspace manager is stopped. Normal kernel startup also prepares these packages regardless of `auto_install`. It does not accept a workspace selector.
 
+Dependency status counts running and queued package probes as active work. Reset and shutdown cancel these probes and collect their subprocesses before releasing the service.
+
 Most workspace queries return bounded pages. `ws.pages.iter(method, *args, max_pages=100, **kwargs)` is an async iterator for consuming them without resubmitting the query:
 
 ```python
@@ -650,7 +652,7 @@ message = await ws.mail.read(page["items"][0]["id"])
 
 Search returns bounded header pages with opaque message references. `read()` fetches a bounded parsed body and attachment metadata without marking the message as seen. Use `ws.mail.download_attachment(message_id, attachment_id, path)` for a workspace file with overwrite protection. Message references are tied to the account's IMAP namespace and become invalid after a UIDVALIDITY or account identity change. `mark_read()` and `mark_unread()` change server flags explicitly.
 
-Outgoing addresses preserve display names and convert international domain names to IDNA. Mailbox local parts must be ASCII; drafts with international local parts are rejected because SMTPUTF8 is not supported.
+Outgoing addresses preserve display names and convert international domain names using IDNA2008 with nontransitional UTS46 processing. Distinct domains such as `faß.test` and `fass.test` remain distinct, and valid IPv4/IPv6 domain literals are preserved. Mailbox local parts must be ASCII; drafts with international local parts are rejected because SMTPUTF8 is not supported.
 
 Create a draft before sending. Drafts are immutable and are validated and persisted before any network delivery:
 
@@ -664,6 +666,8 @@ send = await ws.mail.send(draft["id"], request_id="review-2026-10-02")
 ```
 
 `reply_to` and `forward` create derived drafts using the original message's account unless another account is specified; they cannot be combined. Attachments must resolve inside the workspace. Incoming reads return at most 64 attachment metadata records and include `attachment_total` plus `attachments_truncated` when metadata was omitted. Forwarding attachment data is capped at 32 attachments; forwarding a message whose attachment data is incomplete is rejected, and attachments are preserved as separate parts without deduplication. Draft MIME and individual attachments are limited to 25 MiB. `send()` returns a queued record; inspect `await ws.mail.get_send(send["id"])` until it settles. Omitting `request_id` uses a draft-bound key, and reusing a key returns its existing send record. Retry a definitively `failed` send with a new key. `accepted` means SMTP acceptance, and `partial` lists recipients the server refused. Both prevent resubmitting that draft. `unknown` means acceptance could not be confirmed and also prevents resubmission; verify delivery outside mypr before creating another draft. `sent_mailbox` opts in to an append copy whose failure does not undo SMTP acceptance.
+
+Cancellation waits for blocking mail work to settle before releasing the account's active-work tracking. A confirmed SMTP outcome remains `accepted` or `partial` even when the awaiting task is cancelled; account reconfiguration stays deferred while the underlying operation is running.
 
 Mail watches belong to the current logical client and share manager connections across clients:
 

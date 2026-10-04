@@ -15,11 +15,14 @@ _MAX_WARNINGS = 4
 
 
 class ManagedCommands:
-    def __init__(self, runtime, client_id, connection_id, exec_id):
+    def __init__(self, runtime, client_id, connection_id, exec_id, *, shells=None, generation=None):
         self.runtime = runtime
         self.client_id = client_id
         self.connection_id = connection_id
         self.exec_id = exec_id
+        self.shells = runtime.shells if shells is None else shells
+        self.generation = generation
+        self._pinned = shells is not None or generation is not None
 
     async def run(
         self,
@@ -41,9 +44,11 @@ class ManagedCommands:
             or timeout < 0
         ):
             raise ValueError("timeout must be a finite non-negative number or None")
-        shells = self.runtime.shells
+        shells = self.shells
         launch = asyncio.create_task(
-            shells.start(command, cwd or str(self.runtime.workspace), env, input=input)
+            self._start(
+                shells, command, cwd or str(self.runtime.workspace), env, input=input
+            )
         )
         try:
             job = await asyncio.shield(launch)
@@ -190,10 +195,12 @@ class ManagedCommands:
         if not callable(on_stdout):
             raise TypeError("on_stdout must be callable")
 
-        shells = self.runtime.shells
+        shells = self.shells
         deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
         launch = asyncio.create_task(
-            shells.start(command, cwd or str(self.runtime.workspace), env, input=input)
+            self._start(
+                shells, command, cwd or str(self.runtime.workspace), env, input=input
+            )
         )
         ident: str | None = None
         stderr = bytearray()
@@ -360,6 +367,14 @@ class ManagedCommands:
                 await self._cancel(shells, ident)
             raise
         return ident
+
+    async def _start(self, shells, command, cwd, env, *, input=None):
+        if self._pinned:
+            starter = getattr(self.runtime, "start_managed_command", None)
+            if not callable(starter):
+                raise RuntimeError("Managed command runtime cannot validate its generation")
+            return await starter(self.generation, shells, command, cwd, env, input=input)
+        return await shells.start(command, cwd, env, input=input)
 
     @staticmethod
     async def _cancel(shells, ident):

@@ -998,6 +998,8 @@ class ConfigStore:
         self,
         workspace: str | os.PathLike[str] | None = None,
         global_path: str | os.PathLike[str] | None = None,
+        *,
+        workspace_guard=None,
     ) -> None:
         self.workspace = (
             Path(workspace).expanduser().resolve() if workspace is not None else None
@@ -1010,6 +1012,7 @@ class ConfigStore:
         )
         if self.global_path == self.workspace_path:
             raise ValueError("global and workspace configuration paths must differ")
+        self._workspace_guard = workspace_guard
 
     @property
     def paths(self) -> dict[str, Path]:
@@ -1387,10 +1390,14 @@ class ConfigStore:
             raise ConfigError("writes require global or workspace scope", path="scope")
         if scope == "workspace" and self.workspace_path is None:
             raise ConfigError("workspace scope is unavailable in global-only mode", path="scope")
+        if scope == "workspace" and self._workspace_guard is not None:
+            self._workspace_guard()
         target = self.global_path if scope == "global" else self.workspace_path
         target.parent.mkdir(parents=True, exist_ok=True)
         with self._profile_lock(exclusive=True, create=True):
             with self._locks(create=True, target=target):
+                if scope == "workspace" and self._workspace_guard is not None:
+                    self._workspace_guard()
                 original_global = self._read(self.global_path)
                 original_workspace = self._read(self.workspace_path)
                 current = self._snapshot(original_global, original_workspace)
@@ -1422,6 +1429,8 @@ class ConfigStore:
                 ):
                     raise RuntimeError("configuration changed during save; reload before retrying")
                 if data != (original_global if scope == "global" else original_workspace):
+                    if scope == "workspace" and self._workspace_guard is not None:
+                        self._workspace_guard()
                     self._write(target, data)
                 return updated
 
@@ -1538,9 +1547,13 @@ class MCPConfig:
         self,
         workspace: str | os.PathLike[str],
         global_path: str | os.PathLike[str] | None = None,
+        *,
+        workspace_guard=None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
-        self.core = ConfigStore(self.workspace, global_path)
+        self.core = ConfigStore(
+            self.workspace, global_path, workspace_guard=workspace_guard
+        )
         self.path = self.core.workspace_path
 
     def _raw(self) -> bytes | None:

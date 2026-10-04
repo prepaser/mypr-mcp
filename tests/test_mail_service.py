@@ -112,6 +112,95 @@ async def test_reload_defers_busy_account_even_with_force_and_applies_other(tmp_
         await service.close()
 
 
+async def test_cancelled_request_keeps_account_busy_until_transport_finishes(tmp_path, monkeypatch):
+    service, _ = await make_service(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def list_mailboxes(*args):
+        entered.set()
+        assert release.wait(30)
+        return []
+
+    monkeypatch.setattr(service.transport, "list_mailboxes", list_mailboxes)
+    request = None
+    try:
+        request = asyncio.create_task(
+            service.dispatch("mailboxes", "alice", {"account": "work"})
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        request.cancel()
+        await asyncio.sleep(0)
+        assert service.active_count == 1
+
+        desired = copy.deepcopy(service.config)
+        desired["accounts"]["work"]["smtp"]["port"] = 1234
+        applied = await service.apply_config(desired, force=True)
+        assert applied["deferred"] == {"work": "Account has active mail work"}
+        assert service.config["accounts"]["work"]["smtp"]["port"] == 1
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert service.active_count == 0
+    finally:
+        release.set()
+        if request is not None and not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        await service.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state"),
+    [
+        (
+            {"accepted": ["dest@example.test"], "rejected": [], "stage": "accepted"},
+            "accepted",
+        ),
+        (
+            {
+                "accepted": ["dest@example.test"],
+                "rejected": ["other@example.test"],
+                "stage": "rcpt",
+                "rejected_details": [],
+            },
+            "partial",
+        ),
+    ],
+)
+async def test_cancelled_send_preserves_settled_smtp_outcome(tmp_path, monkeypatch, outcome, state):
+    service, notices = await make_service(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def send(*args):
+        entered.set()
+        assert release.wait(30)
+        return outcome
+
+    monkeypatch.setattr(service.transport, "send", send)
+    try:
+        value = await draft(service)
+        queued = await service.dispatch("send", "alice", {"draft_id": value["id"]})
+        assert await asyncio.to_thread(entered.wait, 5)
+        task = service._send_tasks[queued["id"]]
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        release.set()
+        assert await asyncio.wait_for(notices.get(), 5) == "alice"
+        result = await service.dispatch("get_send", "alice", {"send_id": queued["id"]})
+        assert result["state"] == state
+        assert result["accepted"] == outcome["accepted"]
+        assert result["rejected"] == outcome["rejected"]
+        assert result["warning"] == "Interrupted after SMTP settled"
+    finally:
+        release.set()
+        await service.close()
+
+
 async def test_smtp_data_eof_is_persisted_unknown_and_never_retried(tmp_path):
     with _smtp_server("eof") as port:
         service, notices = await make_service(tmp_path, port=port)

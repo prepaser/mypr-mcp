@@ -6,7 +6,7 @@ readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
-dependencies = ["mcp>=2.2,<3", "jupyter-client>=8.10,<9", "tomlkit>=0.15,<1", "httpx2[http2,socks]>=2.12,<3", "packaging>=26,<27"]
+dependencies = ["mcp>=2.2,<3", "jupyter-client>=8.10,<9", "tomlkit>=0.15,<1", "httpx2[http2,socks]>=2.12,<3", "packaging>=26,<27", "idna>=3,<4"]
 
 [project.scripts]
 mypr-mcp = "mypr_mcp.cli:main"

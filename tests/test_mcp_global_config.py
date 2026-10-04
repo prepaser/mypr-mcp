@@ -17,6 +17,7 @@ def _write(path, text):
 @pytest.mark.asyncio
 async def test_inherited_mcp_mutations_write_workspace_layer_only(tmp_path):
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     global_path = tmp_path / "global.toml"
     _write(global_path, '[mcp.servers.shared]\ncommand = "global-server"\n')
     bridge = MCPBridge(workspace, global_path=global_path)
@@ -42,6 +43,7 @@ async def test_inherited_mcp_mutations_write_workspace_layer_only(tmp_path):
 @pytest.mark.asyncio
 async def test_apply_snapshot_preserves_unchanged_connections_without_file_io(tmp_path):
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     global_path = tmp_path / "global.toml"
     _write(
         global_path,
@@ -119,6 +121,7 @@ async def test_lsp_save_uses_section_compare_and_swap_after_mcp_change(tmp_path)
 @pytest.mark.asyncio
 async def test_named_lsp_save_pins_or_tombstones_one_server(tmp_path):
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     global_path = tmp_path / "global.toml"
     _write(
         global_path,
@@ -151,6 +154,7 @@ async def test_named_lsp_save_pins_or_tombstones_one_server(tmp_path):
 @pytest.mark.asyncio
 async def test_lsp_save_allows_external_lsp_and_unrelated_scalar_changes(tmp_path):
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     global_path = tmp_path / "global.toml"
     bridge = MCPBridge(workspace, global_path=global_path)
     store = ConfigStore(workspace, global_path)
