@@ -214,3 +214,34 @@ def test_restart_output_lookup_waits_for_temporary_database_lock(tmp_path):
     finally:
         release.join()
         connection.close()
+
+
+@pytest.mark.parametrize("override,unstable_config", [(None, False), (0, False), (None, True)])
+async def test_offline_restart_poll_uses_configured_default(
+    tmp_path, monkeypatch, override, unstable_config
+):
+    from mypr_mcp.bridge import ConnectionBridge
+    from mypr_mcp.config import ConfigStore
+
+    ConfigStore(tmp_path).set("limits.poll_wait_ms", 0 if override is None else 30000)
+    bridge = ConnectionBridge(tmp_path)
+    calls = []
+
+    if unstable_config:
+        def load(_self):
+            raise RuntimeError("configuration changed while being read; retry")
+
+        monkeypatch.setattr(ConfigStore, "load", load)
+
+    async def recover(_ident):
+        pass
+
+    def result(*_args):
+        calls.append(True)
+        return {"state": "failed" if unstable_config else "running", "output": []}, None
+
+    monkeypatch.setattr(bridge, "_recover_restart", recover)
+    monkeypatch.setattr(bridge, "_restart_result", result)
+    page = await bridge._poll_restart("a" * 32, 0, override)
+    assert page["state"] == ("failed" if unstable_config else "running")
+    assert calls == [True]

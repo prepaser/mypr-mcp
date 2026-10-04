@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .async_utils import wait_owned
+from .config import DEFAULT_LIMITS, ConfigError, ConfigStore
 from .diagnostics import RPCError
 from .mail_store import MailStore
 from .protocol import check_compatibility, runtime_info, target_installation
@@ -98,6 +99,12 @@ class ConnectionBridge:
 
     async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
         await self._recover_restart(exec_id)
+        if wait_ms is None:
+            try:
+                snapshot = await asyncio.to_thread(ConfigStore(self.workspace).load)
+                wait_ms = snapshot.values["limits"]["poll_wait_ms"]
+            except (ConfigError, OSError, RuntimeError):
+                wait_ms = DEFAULT_LIMITS["poll_wait_ms"]
         deadline = time.monotonic() + min(30000, max(0, wait_ms)) / 1000
         while True:
             result, due_at = await asyncio.to_thread(
@@ -158,7 +165,7 @@ class ConnectionBridge:
             recorded = await self._poll_restart(
                 fields["exec_id"],
                 fields.get("cursor") or 0,
-                fields.get("wait_ms", 0),
+                fields.get("wait_ms"),
                 fields.get("max_bytes"),
             )
             if recorded is not None:

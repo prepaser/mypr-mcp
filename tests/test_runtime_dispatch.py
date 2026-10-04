@@ -68,3 +68,49 @@ def test_dispatch_admission_guards_are_centralized():
     runtime.stopping.set()
     with pytest.raises(RuntimeError, match="stopping"):
         runtime._check_dispatch_admission("shell_start")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["execute", "poll"])
+@pytest.mark.parametrize("override", [None, 0, 10])
+async def test_execution_dispatch_resolves_configured_wait(tmp_path, op, override):
+    runtime = Runtime(tmp_path)
+    runtime.healthy = True
+    runtime.execute_wait_ms = 123
+    runtime.poll_wait_ms = 456
+    connection = {"client_id": "alice"}
+
+    async def admit(*_args):
+        return {"id": "a" * 32}
+
+    async def poll(_ident, _cursor=0, wait_ms=None, **_kwargs):
+        return {"wait_ms": wait_ms}
+
+    runtime.admit_execution = admit
+    runtime.poll = poll
+    request = {"exec_id": "a" * 32}
+    if override is not None:
+        request["wait_ms"] = override
+    result = await runtime._dispatch_execution(
+        op, request, client="alice", connection_id="connection", connection=connection,
+        requested_client=None, generation=None,
+    )
+    expected = getattr(runtime, f"{op}_wait_ms") if override is None else override
+    assert result == {"wait_ms": expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_ms", [-1, 30001, True, "1000"])
+async def test_execute_rejects_invalid_wait_before_submission(tmp_path, wait_ms):
+    runtime = Runtime(tmp_path)
+    runtime.healthy = True
+
+    async def admit(*_args):
+        pytest.fail("invalid wait must not submit Python code")
+
+    runtime.admit_execution = admit
+    with pytest.raises(ValueError, match="wait_ms"):
+        await runtime._dispatch_execution(
+            "execute", {"wait_ms": wait_ms}, client="alice", connection_id="connection",
+            connection={"client_id": "alice"}, requested_client=None, generation=None,
+        )

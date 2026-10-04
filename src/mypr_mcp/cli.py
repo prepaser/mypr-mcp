@@ -22,7 +22,7 @@ from pydantic import Field
 from . import __version__
 from .async_utils import wait_owned
 from .bridge import ConnectionBridge
-from .config import ConfigError, ConfigStore
+from .config import MAX_WAIT_MS, ConfigError, ConfigStore
 from .diagnostics import RPCError, safe_error
 from .doctor import doctor_workspace
 from .instructions import COMMON_INSTRUCTIONS
@@ -551,13 +551,17 @@ async def serve(workspace):
             ),
         ],
         wait_ms: Annotated[
-            int,
+            int | None,
             Field(
                 description="Milliseconds to wait for completion or inbox activity, not an "
                 "execution timeout or total request deadline. Output alone does not end this "
-                "wait; inspect state and has_more."
+                "wait; inspect state and has_more. Omit to use limits.execute_wait_ms "
+                "(1000 by default).",
+                ge=0,
+                le=MAX_WAIT_MS,
+                strict=True,
             ),
-        ] = 1000,
+        ] = None,
         request_id: Annotated[
             str | None,
             Field(
@@ -588,7 +592,7 @@ async def serve(workspace):
         result = await request(
             "execute",
             code=code,
-            wait_ms=wait_ms,
+            **({"wait_ms": wait_ms} if wait_ms is not None else {}),
             request_id=request_id,
             client_id=bound_client,
             max_bytes=max_bytes,
@@ -608,13 +612,16 @@ async def serve(workspace):
             ),
         ] = None,
         wait_ms: Annotated[
-            int,
+            int | None,
             Field(
                 description="Milliseconds to wait for new output, completion, or inbox activity. "
                 "Available output returns immediately. This is not an execution timeout or "
-                "total request deadline."
+                "total request deadline. Omit to use limits.poll_wait_ms (1000 by default).",
+                ge=0,
+                le=MAX_WAIT_MS,
+                strict=True,
             ),
-        ] = 1000,
+        ] = None,
         max_bytes: Annotated[
             int | None,
             Field(
@@ -633,7 +640,7 @@ async def serve(workspace):
             "poll",
             exec_id=exec_id,
             cursor=cursor,
-            wait_ms=wait_ms,
+            **({"wait_ms": wait_ms} if wait_ms is not None else {}),
             max_bytes=max_bytes,
         )
         return await tool_result(result)

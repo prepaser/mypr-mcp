@@ -157,6 +157,50 @@ def test_load_merges_layers_defaults_and_server_tombstones(tmp_path: Path):
     )
 
 
+def test_wait_limits_default_and_layered_override(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_path = tmp_path / "global.toml"
+    global_path.write_text(
+        "[limits]\nexecute_wait_ms = 0\npoll_wait_ms = 2500\n",
+        encoding="utf-8",
+    )
+    store = ConfigStore(workspace, global_path)
+
+    initial = store.load()
+    assert initial.values["limits"]["execute_wait_ms"] == 0
+    assert initial.values["limits"]["poll_wait_ms"] == 2500
+    assert store.get("limits.execute_wait_ms", snapshot=initial) == 0
+    assert store.explain("limits.execute_wait_ms", initial)["source"] == "global"
+
+    workspace_config = workspace / ".mypr" / "config.toml"
+    workspace_config.parent.mkdir()
+    workspace_config.write_text("[limits]\npoll_wait_ms = 30000\n", encoding="utf-8")
+    snapshot = store.load()
+    assert snapshot.values["limits"]["execute_wait_ms"] == 0
+    assert snapshot.values["limits"]["poll_wait_ms"] == 30000
+    assert store.explain("limits.poll_wait_ms", snapshot)["source"] == "workspace"
+
+
+@pytest.mark.parametrize("field", ["execute_wait_ms", "poll_wait_ms"])
+@pytest.mark.parametrize("value", [-1, 30001, True, 1.0, "1000"])
+def test_wait_limits_reject_non_integer_or_out_of_range_values(tmp_path: Path, field, value):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / ".mypr" / "config.toml"
+    path.parent.mkdir()
+    if isinstance(value, str):
+        toml_value = repr(value)
+    elif isinstance(value, bool):
+        toml_value = str(value).lower()
+    else:
+        toml_value = str(value)
+    path.write_text(f"[limits]\n{field} = {toml_value}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=f"limits\\.{field}"):
+        ConfigStore(workspace, tmp_path / "global.toml").load()
+
+
 @pytest.mark.parametrize(
     ("global_text", "workspace_text", "expected"),
     [

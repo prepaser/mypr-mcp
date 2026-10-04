@@ -20,6 +20,7 @@ from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_WAIT_MS = 30_000
 MANAGED_SECTIONS = frozenset(
     {"limits", "storage", "mcp", "lsp", "mail", "web", "dependencies"}
 )
@@ -67,6 +68,8 @@ class ConfigSnapshot:
 DEFAULT_LIMITS = {
     "output_bytes": 16 * 1024 * 1024,
     "response_bytes": 32 * 1024,
+    "execute_wait_ms": 1000,
+    "poll_wait_ms": 1000,
     "completed_tasks": 128,
     "completed_records": 128,
     "cache_bytes": 32 * 1024 * 1024,
@@ -217,6 +220,10 @@ def _positive(value, path: str, *, minimum: int = 1, maximum: int | None = None)
     return value
 
 
+def _validate_wait_ms(value: Any, path: str) -> int:
+    return _positive(value, path, minimum=0, maximum=MAX_WAIT_MS)
+
+
 def _validate_limits(value):
     if value is None:
         return dict(DEFAULT_LIMITS)
@@ -225,6 +232,9 @@ def _validate_limits(value):
     result = dict(DEFAULT_LIMITS)
     for key, item in value.items():
         if key in DEFAULT_LIMITS:
+            if key in {"execute_wait_ms", "poll_wait_ms"}:
+                result[key] = _validate_wait_ms(item, f"limits.{key}")
+                continue
             minimum = 1024 if key in {"output_bytes", "response_bytes", "cache_bytes"} else 1
             maximum = MAX_RESPONSE_BYTES if key == "response_bytes" else None
             result[key] = _positive(item, f"limits.{key}", minimum=minimum, maximum=maximum)
@@ -627,6 +637,9 @@ def _validate_layer(values: Any, path: Path) -> dict:
             raise _field_error("limits", "must be a table")
         for key, value in limits.items():
             if key in DEFAULT_LIMITS:
+                if key in {"execute_wait_ms", "poll_wait_ms"}:
+                    _validate_wait_ms(value, f"limits.{key}")
+                    continue
                 minimum = 1024 if key in {"output_bytes", "response_bytes", "cache_bytes"} else 1
                 maximum = MAX_RESPONSE_BYTES if key == "response_bytes" else None
                 _positive(value, f"limits.{key}", minimum=minimum, maximum=maximum)

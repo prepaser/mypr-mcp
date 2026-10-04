@@ -10,6 +10,8 @@
 # [limits]
 # output_bytes = 16777216
 # response_bytes = 32768
+# execute_wait_ms = 1000
+# poll_wait_ms = 1000
 # completed_tasks = 128
 # completed_records = 128
 # cache_bytes = 33554432

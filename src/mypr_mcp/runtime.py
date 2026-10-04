@@ -24,7 +24,7 @@ from . import __version__
 from .async_utils import wait_owned
 from .bootstrap import install_core, prepare_core, run_command
 from .browser_service import BrowserService, validate_launch_options
-from .config import ConfigStore
+from .config import MAX_WAIT_MS, ConfigStore
 from .config_runtime import RuntimeConfig
 from .dependency_service import DependencyService
 from .diagnostics import RPCError, error_info, error_response, safe_error
@@ -300,6 +300,8 @@ class Runtime:
         limits = self.config.get("limits", {})
         self.output_limit = int(limits.get("output_bytes", 16 * 1024 * 1024))
         self.response_limit = int(limits.get("response_bytes", 32768))
+        self.execute_wait_ms = limits["execute_wait_ms"]
+        self.poll_wait_ms = limits["poll_wait_ms"]
         self.completed_tasks = int(limits.get("completed_tasks", 128))
         self.completed_records = int(limits.get("completed_records", 128))
         self.cache_bytes = int(limits.get("cache_bytes", 32 * 1024 * 1024))
@@ -1190,16 +1192,25 @@ class Runtime:
             raise ValueError("max_bytes must be between 1024 and 1048576 bytes")
         return max_bytes
 
+    @staticmethod
+    def wait_budget(wait_ms, default):
+        if wait_ms is None:
+            wait_ms = default
+        if type(wait_ms) is not int or not 0 <= wait_ms <= MAX_WAIT_MS:
+            raise ValueError(f"wait_ms must be an integer between 0 and {MAX_WAIT_MS}")
+        return wait_ms
+
     async def poll(
         self,
         ident,
         cursor=0,
-        wait_ms=1000,
+        wait_ms=None,
         *,
         max_bytes=None,
         inbox_client=None,
         wake_on_output=True,
     ):
+        wait_ms = self.wait_budget(wait_ms, self.poll_wait_ms)
         explicit_budget = max_bytes is not None
         response_budget = self.response_budget(max_bytes)
         if type(cursor) is not int or cursor < 0:
@@ -1380,7 +1391,7 @@ class Runtime:
             return result, total
 
         result, total = await page()
-        wait_seconds = min(30000, max(0, wait_ms)) / 1000
+        wait_seconds = wait_ms / 1000
         if (
             not cold
             and wait_seconds
@@ -1918,11 +1929,12 @@ class Runtime:
                 raise RuntimeError("Kernel unavailable; use CLI reset")
             if connection is None or connection["client_id"] is None:
                 raise RuntimeError("Call init on an active connection before execute")
+            wait_ms = self.wait_budget(req.get("wait_ms"), self.execute_wait_ms)
             self.response_budget(req.get("max_bytes"))
             rec = await self.admit_execution(client, connection_id, req)
             return await self.poll(
                 rec["id"],
-                wait_ms=req.get("wait_ms", 1000),
+                wait_ms=wait_ms,
                 max_bytes=req.get("max_bytes"),
                 inbox_client=client,
                 wake_on_output=False,
@@ -1931,7 +1943,7 @@ class Runtime:
             return await self.poll(
                 req["exec_id"],
                 req.get("cursor") or 0,
-                req.get("wait_ms", 1000),
+                self.wait_budget(req.get("wait_ms"), self.poll_wait_ms),
                 max_bytes=req.get("max_bytes"),
                 inbox_client=connection["client_id"] if connection else None,
             )

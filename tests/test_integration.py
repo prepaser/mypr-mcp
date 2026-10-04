@@ -18,7 +18,10 @@ async def test_init_execute_and_poll_tools_and_expression_result(workspace: Path
             assert all(prop.get("description") for prop in tool.input_schema["properties"].values())
         assert tools["execute"].input_schema["required"] == ["code"]
         assert tools["poll"].input_schema["required"] == ["exec_id"]
-        assert tools["execute"].input_schema["properties"]["wait_ms"]["default"] == 1000
+        for name in ("execute", "poll"):
+            schema = tools[name].input_schema["properties"]["wait_ms"]
+            assert schema["default"] is None
+            assert f"limits.{name}_wait_ms" in schema["description"]
         assert tools["poll"].input_schema["properties"]["cursor"]["default"] is None
 
         initialized = decode_result(await session.call_tool("init", {}))

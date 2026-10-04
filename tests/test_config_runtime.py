@@ -20,22 +20,37 @@ def configured_runtime(tmp_path, monkeypatch):
     return runtime
 
 
-async def test_config_write_is_pending_until_explicit_reload(configured_runtime):
+@pytest.mark.parametrize(
+    "field,attribute,initial,value",
+    [
+        ("response_bytes", "response_limit", 32768, 65536),
+        ("execute_wait_ms", "execute_wait_ms", 1000, 0),
+        ("poll_wait_ms", "poll_wait_ms", 1000, 5000),
+    ],
+)
+async def test_config_write_is_pending_until_explicit_reload(
+    configured_runtime, field, attribute, initial, value
+):
     runtime = configured_runtime
     saved = await runtime._dispatch({
-        "op": "config", "method": "set", "path": "limits.response_bytes", "value": 65536,
+        "op": "config", "method": "set", "path": f"limits.{field}", "value": value,
     })
     assert saved["saved"] is True
-    assert runtime.response_limit == 32768
+    assert getattr(runtime, attribute) == initial
     explanation = await runtime.settings.dispatch({
-        "method": "explain", "path": "limits.response_bytes",
+        "method": "explain", "path": f"limits.{field}",
     })
-    assert explanation["desired"] == 65536
-    assert explanation["applied"] == 32768
+    assert explanation["desired"] == value
+    assert explanation["applied"] == initial
     assert explanation["pending"] is True
 
     result = await runtime.settings.reload()
-    assert runtime.response_limit == 65536
+    assert getattr(runtime, attribute) == value
+    assert f"limits.{field}" in result["applied"]["manager"]
+    assert result["restart_required"] == []
+    assert (await runtime.settings.dispatch({
+        "method": "explain", "path": f"limits.{field}",
+    }))["pending"] is False
     assert result["errors"] == {}
     assert result["deferred"]["lsp"] == "Kernel is unavailable"
     assert not runtime.settings.applying

@@ -27,7 +27,7 @@ State and concurrency
 - For background jobs, keep the handle in ws.local and use its status/read/result/cancel methods. Poll reads cell output; it does not wait for jobs the cell started and left running. See ws.help("tasks") and ws.help("shell").
 
 Execution and output
-- wait_ms limits notification waiting, not total request latency or execution lifetime. An inbox message, timer, or mail alert may end the wait early; check state before using results.
+- Omit wait_ms to use limits.execute_wait_ms or limits.poll_wait_ms; an explicit value, including 0, overrides the default for that call. wait_ms limits notification waiting, not total request latency or execution lifetime. An inbox message, timer, or mail alert may end the wait early; check state before using results.
 - If state is queued or running, poll the same exec_id with the returned cursor.
 - Even after a terminal state, continue polling with the returned cursor while has_more is true. Once terminal and fully read, evaluate the result and error. Read paged output for tracebacks; error is only a bounded summary. When present, use error_info.code and operation/details to classify failures instead of parsing the error string.
 - Persisted run, shell, history, and message metadata may produce bounded warnings or an unknown outcome when corrupt. Preserve readable fields and inspect warnings before retrying a side effect or treating a query as complete.

@@ -78,8 +78,8 @@ Three tools are exposed to the agent:
 
 - `init(client_id=None)` binds this MCP connection to a logical client. With no argument, it allocates a new readable ID such as `calm-otter`; with an argument, it creates or resumes that ID. The returned ID is bound to the connection, so later calls do not repeat it.
 
-- `execute(code, wait_ms=1000, request_id=None, max_bytes=None)` submits a Python cell and returns its execution state and output. The connection must be initialized first. `wait_ms` only controls how long the MCP call waits; it does not set a Python timeout.
-- `poll(exec_id, cursor=None, wait_ms=1000, max_bytes=None)` reads a submitted cell's state and output. Use the returned cursor to read later output. Polling an existing execution is allowed before `init`, since the execution ID identifies the target. `max_bytes` controls one response page and accepts 1 KiB–1 MiB; when omitted, the workspace's configured response limit is used.
+- `execute(code, wait_ms=None, request_id=None, max_bytes=None)` submits a Python cell and returns its execution state and output. The connection must be initialized first. An omitted `wait_ms` uses `limits.execute_wait_ms` (1,000 ms by default); an explicit value, including `0`, overrides it for that call. `wait_ms` only controls how long the MCP call waits; it does not set a Python timeout.
+- `poll(exec_id, cursor=None, wait_ms=None, max_bytes=None)` reads a submitted cell's state and output. Use the returned cursor to read later output. Polling an existing execution is allowed before `init`, since the execution ID identifies the target. An omitted `wait_ms` uses `limits.poll_wait_ms` (1,000 ms by default); an explicit value, including `0`, overrides it for that call. `max_bytes` controls one response page and accepts 1 KiB–1 MiB; when omitted, the workspace's configured response limit is used.
 
 Tool responses provide readable text in `content` and the complete machine-readable payload in `structuredContent`. The text includes the current output page in full, with execution state, cursor, errors, warnings, and inbox previews. Adjacent fragments of the same stream are combined for display; the structured events and their cursors are unchanged. Initialization and runtime changes also include the running manager's API instructions.
 
@@ -87,7 +87,7 @@ Clients must parse `structuredContent` (the Python MCP SDK exposes `result.struc
 
 When an operation fails, inspect both the bounded `error` string and the optional `error_info` object. `error_info.code` identifies categories such as `conflict`, `dependency_missing`, `timeout`, `invalid_cursor`, `outcome_unknown`, and `python_exception`; `operation` and bounded `details` provide machine-readable context. Branch on the code and inspect the execution or transaction ID before retrying a state-changing operation.
 
-`execute` waits for completion, inbox activity, or its wait deadline so short cells normally need only one call. `poll` returns immediately when the requested output is available or the execution is terminal; otherwise it waits for output, completion, inbox activity, or its wait deadline. `wait_ms` bounds this notification wait, not total request latency or Python execution time. Continue polling running cells, and read remaining pages while `has_more` is true even after execution finishes.
+`execute` waits for completion, inbox activity, or its wait deadline so short cells normally need only one call. `poll` returns immediately when the requested output is available or the execution is terminal; otherwise it waits for output, completion, inbox activity, or its wait deadline. `wait_ms` bounds this notification wait, not total request latency or Python execution time. The configured defaults are `limits.execute_wait_ms` and `limits.poll_wait_ms`, each an integer from 0 through 30,000 milliseconds. Continue polling running cells, and read remaining pages while `has_more` is true even after execution finishes.
 
 The `init`, `execute`, and `poll` responses include small previews of the current client's unacknowledged inbox and expired timers. Message previews contain up to five messages and fit within a 4 KiB JSON budget; timer previews contain up to five alerts in the same budget. Reading a preview or receiving a timer alert does not acknowledge it. Use `ws.messages.read()` and `ws.timers.list()` for full records. Before `init`, `poll` omits the inbox and timer previews.
 
@@ -832,9 +832,13 @@ completed_tasks = 128
 completed_records = 128
 cache_bytes = 33554432
 response_bytes = 32768
+execute_wait_ms = 1000
+poll_wait_ms = 1000
 ```
 
 `response_bytes` controls the default `execute`/`poll` response page and must be between 1 KiB and 1 MiB. A per-call `max_bytes` can lower or raise the page budget within that same range.
+
+`execute_wait_ms` and `poll_wait_ms` control the default notification wait for the corresponding MCP tools. Each accepts an integer from 0 through 30,000 milliseconds. A per-call `wait_ms` overrides the configured value, including with `0` for an immediate response.
 
 The kernel retains the most recently completed `completed_tasks` handles, in addition to all active handles. Older handles disappear from `ws.tasks.list()` and `ws.tasks.get()`; use `await ws.tasks.attach(id)` or `ws.history` for saved records. A handle saved in your own variable or `ws.local` remains usable. These limits release internal cache references, not arbitrary objects retained by Python code.
 

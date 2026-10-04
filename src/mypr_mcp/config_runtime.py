@@ -15,7 +15,9 @@ from .config import (
 )
 from .diagnostics import safe_error
 
-HOT_LIMITS = ("response_bytes", "completed_records", "cache_bytes")
+HOT_LIMITS = (
+    "response_bytes", "execute_wait_ms", "poll_wait_ms", "completed_records", "cache_bytes",
+)
 STARTUP_LIMITS = ("output_bytes", "completed_tasks")
 
 
