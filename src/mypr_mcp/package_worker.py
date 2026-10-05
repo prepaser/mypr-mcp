@@ -18,6 +18,7 @@ from typing import Any
 
 try:
     from .python_dependencies import (
+        CORE_PACKAGES,
         PYTHON_PACKAGE_REQUIREMENTS,
         PYTHON_PACKAGES,
         version_satisfies,
@@ -34,6 +35,7 @@ except ImportError:
     _catalogue = importlib.util.module_from_spec(_catalogue_spec)
     sys.modules[_catalogue_spec.name] = _catalogue
     _catalogue_spec.loader.exec_module(_catalogue)
+    CORE_PACKAGES = _catalogue.CORE_PACKAGES
     PYTHON_PACKAGE_REQUIREMENTS = _catalogue.PYTHON_PACKAGE_REQUIREMENTS
     PYTHON_PACKAGES = _catalogue.PYTHON_PACKAGES
     version_satisfies = _catalogue.version_satisfies
@@ -241,6 +243,7 @@ def install_packages(
                 if not isinstance(distributions, dict) or not isinstance(imports, dict):
                     raise RuntimeError("workspace package probe returned invalid data")
                 unusable = []
+                repairs = []
                 already_satisfied = []
                 missing = []
                 for spec, module in zip(specs, requested_modules, strict=True):
@@ -250,14 +253,22 @@ def install_packages(
                         raise RuntimeError("workspace package probe returned invalid import data")
                     if distribution is not None and import_state.get("ok") is not True:
                         error = import_state.get("error", "import failed")
-                        unusable.append(f"{spec} ({module}: {error})")
+                        if spec in CORE_PACKAGES:
+                            repairs.append(spec)
+                            missing.append(spec)
+                        else:
+                            unusable.append(f"{spec} ({module}: {error})")
                     elif distribution is not None and import_state.get("ok") is True:
                         version = distribution.get("version")
                         requirement = _package_requirement(spec)
                         if not version_satisfies(version, requirement):
-                            unusable.append(
-                                f"{spec} ({version!r} does not satisfy {requirement!r})"
-                            )
+                            if spec in CORE_PACKAGES:
+                                repairs.append(spec)
+                                missing.append(spec)
+                            else:
+                                unusable.append(
+                                    f"{spec} ({version!r} does not satisfy {requirement!r})"
+                                )
                         else:
                             already_satisfied.append(spec)
                     else:
@@ -276,7 +287,12 @@ def install_packages(
                         "automatic": True,
                         "durability": "unchanged",
                     }
-                constraint = _constraint_lines(distributions)
+                constrained = {
+                    name: value
+                    for name, value in distributions.items()
+                    if name not in repairs
+                }
+                constraint = _constraint_lines(constrained)
                 with tempfile.NamedTemporaryFile(
                     mode="w", encoding="utf-8", prefix=".constraints.", suffix=".txt",
                     dir=root_path, delete=False,
@@ -288,6 +304,7 @@ def install_packages(
                 install_command = [
                     executable, "pip", "install", "--python", str(python_path),
                     "--constraint", str(constraint_path),
+                    *[argument for name in repairs for argument in ("--reinstall-package", name)],
                     *[_package_requirement(name) for name in missing],
                 ]
             else:
@@ -310,10 +327,11 @@ def install_packages(
                 for name, value in before["distributions"].items():
                     if after_distributions.get(name) != value:
                         changed.append(name)
-                if changed:
+                unexpected = [name for name in changed if name not in repairs]
+                if unexpected:
                     raise RuntimeError(
                         "automatic package installation changed existing distributions: "
-                        + ", ".join(sorted(changed))
+                        + ", ".join(sorted(unexpected))
                     )
                 unusable = []
                 for spec, module in zip(specs, requested_modules, strict=True):

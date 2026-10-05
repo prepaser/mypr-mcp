@@ -7,8 +7,18 @@ import time
 from pathlib import Path
 
 from .diagnostics import RPCError
+from .file_io import read_bytes
 from .history import History
 from .journal import read_page
+
+_MAX_RECORD_BYTES = 32 * 1024 * 1024
+
+
+def _read_record(path):
+    value = json.loads(read_bytes(path, max_bytes=_MAX_RECORD_BYTES))
+    if not isinstance(value, dict):
+        raise ValueError("persisted execution record must be an object")
+    return value
 
 
 def restart_id_for_execution(workspace, exec_id):
@@ -20,8 +30,8 @@ def restart_id_for_execution(workspace, exec_id):
         return None
     path = Path(workspace) / ".mypr" / "runs" / f"{exec_id}.json"
     try:
-        record = json.loads(path.read_text())
-    except (FileNotFoundError, OSError, ValueError):
+        record = _read_record(path)
+    except (OSError, ValueError, TypeError):
         return None
     ident = record.get("restart_id")
     return ident if isinstance(ident, str) else None
@@ -34,8 +44,8 @@ def finalize_origin(workspace, ticket):
         return
     path = Path(workspace) / ".mypr" / "runs" / f"{ident}.json"
     try:
-        record = json.loads(path.read_text())
-    except FileNotFoundError:
+        record = _read_record(path)
+    except (OSError, ValueError, TypeError):
         return
     if record.get("restart_finalized") == ticket["id"]:
         return
@@ -80,8 +90,8 @@ def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None):
         raise ValueError("Invalid output cursor")
     path = Path(workspace) / ".mypr" / "runs" / f"{exec_id}.json"
     try:
-        record = json.loads(path.read_text())
-    except FileNotFoundError:
+        record = _read_record(path)
+    except (OSError, ValueError, TypeError):
         return None
     ident = record.get("restart_id")
     if not ident:

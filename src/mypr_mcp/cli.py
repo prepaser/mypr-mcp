@@ -25,6 +25,7 @@ from .bridge import ConnectionBridge
 from .config import MAX_WAIT_MS, ConfigError, ConfigStore
 from .diagnostics import RPCError, safe_error
 from .doctor import doctor_workspace
+from .file_io import open_regular, read_bytes
 from .instructions import COMMON_INSTRUCTIONS
 from .instructions import INSTRUCTIONS as INSTRUCTIONS
 from .startup import (
@@ -42,7 +43,7 @@ async def ensure(workspace, *, locked=False):
     root = workspace / ".mypr"
     root.mkdir(exist_ok=True)
     path = socket_path(workspace)
-    lock = None if locked else (root / "startup.lock").open("a")
+    lock = None if locked else open_regular(root / "startup.lock", "ab")
     proc = None
     try:
         if lock is not None:
@@ -90,7 +91,7 @@ async def ensure(workspace, *, locked=False):
                 error_type=type(exc).__name__,
             ) from exc
         clear_startup_failure(root)
-        log = (root / "manager.log").open("ab")
+        log = open_regular(root / "manager.log", "ab")
         try:
             launch = asyncio.create_task(
                 asyncio.to_thread(
@@ -467,11 +468,17 @@ async def stop_runtime(path, force=False, *, workspace=None, restart_id=None):
     pid = state.get("pid")
     if pid is None:
         try:
-            metadata = json.loads(((workspace or Path.cwd()) / ".mypr/runtime.json").read_text())
+            metadata = json.loads(
+                await asyncio.to_thread(
+                    read_bytes,
+                    (workspace or Path.cwd()) / ".mypr/runtime.json",
+                    max_bytes=1024 * 1024,
+                )
+            )
             if metadata["generation"] != state["generation"] or metadata["socket"] != str(path):
                 raise ValueError("Runtime metadata does not match the connected manager")
             pid = metadata["pid"]
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             raise RuntimeError("Cannot identify the workspace manager for shutdown") from exc
     if type(pid) is not int or pid <= 1:
         raise RuntimeError("Invalid workspace manager PID")

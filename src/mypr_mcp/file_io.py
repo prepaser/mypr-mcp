@@ -56,7 +56,7 @@ def open_regular(path: Path, mode: str = "rb"):
         "r+b": os.O_RDWR,
         "wb": os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
     }[mode] | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, flags, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise PersistedFileError(f"persisted path is not a regular file: {path}")

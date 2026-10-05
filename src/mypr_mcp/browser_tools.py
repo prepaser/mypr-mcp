@@ -24,8 +24,17 @@ from typing import Any
 from .async_utils import finish_owned
 from .browser_observation import BrowserObservation, BrowserObservations
 from .browser_snapshots import BrowserSnapshots
+from .file_io import PersistedFileError, read_bytes
 
 _SHARED = object()
+_TEMP_PREFIX = ".mypr-browser-"
+
+
+def _read_regular_text(path: Path) -> str:
+    try:
+        return read_bytes(path).decode("utf-8")
+    except PersistedFileError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 class BrowserError(RuntimeError):
@@ -509,7 +518,7 @@ class BrowserTools:
     @staticmethod
     def _atomic_write(path: Path, content: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        output = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+        output = path.with_name(f"{_TEMP_PREFIX}{secrets.token_hex(6)}.tmp")
         fd = None
         try:
             fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -841,21 +850,9 @@ class BrowserTools:
         options.setdefault("indexed_db", True)
         state = await context.storage_state(**options)
         target = self._state_path(name, path, shared=shared)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.{secrets.token_hex(6)}.tmp")
-        fd = None
-        try:
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                fd = None
-                file.write(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-            os.replace(temporary, target)
-        finally:
-            if fd is not None:
-                with suppress(OSError):
-                    os.close(fd)
-            with suppress(FileNotFoundError):
-                temporary.unlink()
+        BrowserTools._atomic_write(
+            target, (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode()
+        )
         return {"name": name, "path": self._display_path(target), "state": state}
 
     async def load_state(
@@ -867,7 +864,7 @@ class BrowserTools:
     ) -> dict[str, Any]:
         target = self._state_path(name, path, shared=shared)
         try:
-            state = json.loads(await asyncio.to_thread(target.read_text, encoding="utf-8"))
+            state = json.loads(await asyncio.to_thread(_read_regular_text, target))
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"browser state does not exist: {target}") from exc
         except json.JSONDecodeError as exc:

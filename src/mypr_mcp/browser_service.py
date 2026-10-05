@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .async_utils import finish_owned, wait_owned
+from .file_io import open_regular
 
 _ENGINES = {"chromium", "firefox", "webkit"}
 _MAX_SERVER_OUTPUT = 64 * 1024
@@ -607,7 +608,7 @@ class _InstallLock:
 
     async def __aenter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("a+")
+        self.file = open_regular(self.path, "ab")
         deadline = time.monotonic() + self.timeout
         try:
             while True:

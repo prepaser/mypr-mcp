@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.ast_rewrite import _apply_matches, _NewlineTracker, _OutputLimit, _PlanStore
+from mypr_mcp.ast_rewrite import (
+    _apply_matches,
+    _NewlineTracker,
+    _OutputLimit,
+    _PlanStore,
+    _write_once,
+)
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.patching import _sha256
 
@@ -154,6 +160,12 @@ def test_overlapping_ast_replacements_are_rejected():
 
     with pytest.raises(ValueError, match="overlapping"):
         _apply_matches(b"abcdef", records, "sample.py")
+
+
+def test_ast_config_write_handles_max_length_target_name(tmp_path: Path):
+    target = tmp_path / ("x" * 255)
+    _write_once(target, "ruleDirs: []\n")
+    assert target.read_text() == "ruleDirs: []\n"
 
 
 def test_ast_rewrite_offsets_must_use_utf8_boundaries():

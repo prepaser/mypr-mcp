@@ -5,6 +5,7 @@ import pytest
 
 from mypr_mcp.package_worker import _validate_specs
 from mypr_mcp.runtime import Runtime
+from mypr_mcp.transport import workspace_id
 
 
 @pytest.mark.parametrize("specs", [[" --help"], ["\t--target=/tmp/install"], [" \n"], [None]])
@@ -31,6 +32,7 @@ async def test_package_option_is_rejected_before_starting_a_worker(tmp_path):
     runtime.restarting = None
     runtime.resetting = False
     runtime.workspace = tmp_path
+    runtime.workspace_id = workspace_id(tmp_path)
     runtime.root = tmp_path / ".mypr"
     runtime.py = tmp_path / "python"
     runtime.generation = "g"

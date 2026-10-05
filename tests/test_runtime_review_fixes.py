@@ -11,9 +11,15 @@ import pytest
 from mypr_mcp.dependency_service import DependencyService
 from mypr_mcp.diagnostics import RPCError
 from mypr_mcp.http_tools import HTTPTools
-from mypr_mcp.runtime import Runtime, _recover_runs
+from mypr_mcp.runtime import (
+    Runtime,
+    _persist_execution,
+    _persist_task_update,
+    _recover_runs,
+)
 from mypr_mcp.runtime_registry import list_managers
 from mypr_mcp.services import MCPBridge
+from mypr_mcp.transport import workspace_id
 
 
 @pytest.mark.parametrize(
@@ -297,6 +303,38 @@ async def test_workspace_config_rejects_replaced_workspace(tmp_path):
             }
         )
     assert not (workspace / ".mypr" / "config.toml").exists()
+
+
+def test_persisted_task_and_execution_writes_reject_replaced_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = workspace / ".mypr"
+    (root / "runs").mkdir(parents=True)
+    expected = workspace_id(workspace)
+    moved = tmp_path / "moved"
+    workspace.rename(moved)
+    workspace.mkdir()
+    (workspace / ".mypr" / "runs").mkdir(parents=True)
+    history = SimpleNamespace(record=lambda *args, **kwargs: None, append=lambda *args: None)
+
+    with pytest.raises(RuntimeError, match="workspace moved"):
+        _persist_execution(
+            root,
+            history,
+            {"id": "a" * 32, "state": "running"},
+            workspace=workspace,
+            workspace_identity=expected,
+        )
+    with pytest.raises(RuntimeError, match="workspace moved"):
+        _persist_task_update(
+            history,
+            workspace / ".mypr" / "runs" / "task.jsonl",
+            "python",
+            {"id": "task", "state": "running"},
+            output={"journal": {"text": "x"}, "history": {}},
+            workspace=workspace,
+            workspace_identity=expected,
+        )
 
 
 async def test_search_does_not_launch_after_reset_generation(monkeypatch, tmp_path):

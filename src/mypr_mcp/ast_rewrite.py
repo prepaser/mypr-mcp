@@ -32,6 +32,11 @@ _MAX_DIFF = 32_768
 _STORE_BYTES = 64 * 1024 * 1024
 _STORE_PLANS = 16
 _PLAN_TTL = 60 * 60
+_TEMP_PREFIX_NAME_LIMIT = 32
+
+
+def _temporary_prefix(name: str) -> str:
+    return f".{name[:_TEMP_PREFIX_NAME_LIMIT]}."
 
 
 async def rewrite_ast(
@@ -703,7 +708,9 @@ def _write_once(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(
+        prefix=_temporary_prefix(path.name), dir=path.parent
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(content)

@@ -85,6 +85,56 @@ def test_automatic_install_pins_existing_distributions(tmp_path, monkeypatch):
     assert "--constraint" in seen.read_text()
 
 
+def test_automatic_repairs_unusable_core_without_upgrading_others(tmp_path, monkeypatch):
+    root = tmp_path / ".mypr"
+    root.mkdir()
+    uv = tmp_path / "uv"
+    uv.write_text("")
+    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
+    calls = []
+    states = iter(
+        [
+            {
+                "distributions": {
+                    "ipykernel": {"name": "ipykernel", "version": "7.2.0"},
+                    "requests": {"name": "requests", "version": "2"},
+                },
+                "imports": {
+                    "ipykernel": {"ok": False, "error": "broken import"},
+                },
+            },
+            {
+                "distributions": {
+                    "ipykernel": {"name": "ipykernel", "version": "7.3.0"},
+                    "requests": {"name": "requests", "version": "2"},
+                },
+                "imports": {"ipykernel": {"ok": True}},
+            },
+        ]
+    )
+
+    def probe(*_args):
+        return next(states)
+
+    def run(command, phase, **_kwargs):
+        calls.append((command, phase))
+        if phase == "install":
+            constraint = Path(command[command.index("--constraint") + 1])
+            assert "ipykernel==7.2.0" not in constraint.read_text()
+            assert "requests==2" in constraint.read_text()
+        return b""
+
+    monkeypatch.setattr(package_worker, "_probe_environment", probe)
+    monkeypatch.setattr(package_worker, "_run", run)
+    result = package_worker.install_packages(
+        sys.executable, root, ["ipykernel"], uv=str(uv), automatic=True
+    )
+
+    assert result["specs"] == ["ipykernel"]
+    assert calls[0][1] == "install"
+    assert calls[0][0][-3:] == ["--reinstall-package", "ipykernel", "ipykernel>=7.3,<8"]
+
+
 def test_automatic_rechecks_under_workspace_lock(tmp_path, monkeypatch):
     root = tmp_path / ".mypr"
     root.mkdir()

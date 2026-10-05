@@ -10,6 +10,7 @@ from mypr_mcp.code_tools import (
     CodeError,
     CodeTools,
     _DiagnosticOutputLimitError,
+    _json_size,
     _LanguageServer,
 )
 
@@ -194,6 +195,46 @@ async def test_workspace_diagnostics_advances_unchanged_cache_metadata(tmp_path:
         await code.aclose()
 
 
+@pytest.mark.asyncio
+async def test_workspace_diagnostic_cache_is_bounded_by_count_and_bytes(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr("mypr_mcp.code_tools.MAX_WORKSPACE_DIAGNOSTIC_REPORTS", 2)
+    monkeypatch.setattr("mypr_mcp.code_tools.MAX_WORKSPACE_DIAGNOSTIC_BYTES", 1_200)
+    path = tmp_path / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    server = _server(tmp_path)
+    server.capabilities = {"diagnosticProvider": {"workspaceDiagnostics": True}}
+    calls = 0
+
+    async def workspace_diagnostics(_previous):
+        nonlocal calls
+        calls += 1
+        current = tmp_path / f"sample-{calls}.py"
+        return {
+            "items": [{
+                "uri": current.as_uri(),
+                "kind": "full",
+                "resultId": str(calls),
+                "items": [],
+            }]
+        }
+
+    server.workspace_diagnostics = workspace_diagnostics
+    server._text_for_uri = _text_for_uri
+    server.aclose = _async_noop
+    code = CodeTools(tmp_path)
+    code._servers["demo"] = server
+    try:
+        for _ in range(5):
+            await code.workspace_diagnostics("demo")
+        cache = code._workspace_diag_results["demo"]
+        assert len(cache) <= 2
+        assert sum(_json_size(item) for item in cache.values()) <= 1_200
+    finally:
+        await code.aclose()
+
+
 async def _async_noop():
     return None
 
@@ -325,6 +366,37 @@ async def test_workspace_diagnostics_rejects_non_progressing_oversized_item(tmp_
             "demo", cursor=failure.value.next_cursor, max_bytes=32768
         )
         assert page["reports"][0]["path"] == str(path)
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_code_actions_rejects_oversized_empty_result_metadata(tmp_path: Path):
+    workspace = tmp_path
+    for _index in range(18):
+        workspace = workspace / ("x" * 90)
+        workspace.mkdir()
+    path = workspace / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    server = _server(workspace)
+    document = SimpleNamespace(
+        path=path,
+        uri=path.as_uri(),
+        version=1,
+        text="value = 1\n",
+    )
+    server.documents = {document.uri: document}
+
+    async def code_actions(*_args, **_kwargs):
+        return document, []
+
+    server.code_actions = code_actions
+    server.aclose = _async_noop
+    code = CodeTools(workspace)
+    code._servers["demo"] = server
+    try:
+        with pytest.raises(ValueError, match="code action metadata"):
+            await code.actions("demo", path, 1, 1, max_bytes=512)
     finally:
         await code.aclose()
 

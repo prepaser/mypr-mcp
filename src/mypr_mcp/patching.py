@@ -35,6 +35,11 @@ from .revisions import RevisionIndexOutcomeUnknown
 _FILE_HEADER = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$")
 _MOVE_HEADER = re.compile(r"^\*\*\* Move to: (.+)$")
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
+_TEMP_PREFIX_NAME_LIMIT = 32
+
+
+def _temporary_prefix(name: str, suffix: str = "") -> str:
+    return f".{name[:_TEMP_PREFIX_NAME_LIMIT]}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -680,7 +685,9 @@ def _commit(
                 for directory in reversed(missing):
                     directory.mkdir()
                     created_dirs.append(directory)
-            fd, name = tempfile.mkstemp(prefix=f".{plan['path'].name}.", dir=parent)
+            fd, name = tempfile.mkstemp(
+                prefix=_temporary_prefix(plan["path"].name, "."), dir=parent
+            )
             temp = Path(name)
             temporaries[plan["path"]] = temp
             with os.fdopen(fd, "wb") as stream:
@@ -695,7 +702,8 @@ def _commit(
             if not state.exists or backup_path in backups:
                 continue
             fd, name = tempfile.mkstemp(
-                prefix=f".{backup_path.name}.mypr-backup.", dir=backup_path.parent
+                prefix=_temporary_prefix(backup_path.name, ".mypr-backup."),
+                dir=backup_path.parent,
             )
             backup = Path(name)
             backups[backup_path] = backup
@@ -863,7 +871,9 @@ def _is_noop_update(plan: dict[str, Any]) -> bool:
 def _restore(path: Path, data: bytes, info: os.stat_result | None) -> None:
     mode = stat.S_IMODE(info.st_mode) if info is not None else 0o600
     parent = path.parent
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.rollback.", dir=parent)
+    fd, name = tempfile.mkstemp(
+        prefix=_temporary_prefix(path.name, ".rollback."), dir=parent
+    )
     temporary = Path(name)
     try:
         with os.fdopen(fd, "wb") as stream:

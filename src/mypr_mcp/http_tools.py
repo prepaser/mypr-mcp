@@ -37,6 +37,11 @@ DEFAULT_TIMEOUT = 30.0
 _MAX_WARNINGS = 4
 _MAX_WARNING_TEXT = 256
 _MAX_WARNING_CLIENTS = 32
+_TEMP_PREFIX_NAME_LIMIT = 32
+
+
+def _temporary_prefix(name: str) -> str:
+    return f".{name[:_TEMP_PREFIX_NAME_LIMIT]}."
 
 
 class BodyTooLarge(RuntimeError):
@@ -540,7 +545,10 @@ class HTTPTools:
             async with client.stream("GET", url, **kwargs) as response:
                 response.raise_for_status()
                 with tempfile.NamedTemporaryFile(
-                    mode="wb", dir=target.parent, prefix=f".{target.name}.", delete=False
+                    mode="wb",
+                    dir=target.parent,
+                    prefix=_temporary_prefix(target.name),
+                    delete=False,
                 ) as handle:
                     temporary = Path(handle.name)
                     received = 0

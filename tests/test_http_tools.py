@@ -341,6 +341,15 @@ async def test_download_is_atomic_on_cancellation(
     await tools.aclose()
 
 
+async def test_download_handles_max_length_target_name(
+    tools: HTTPTools, http_server: str, tmp_path: Path
+):
+    target = tmp_path / ("x" * 255)
+    await tools.download(f"{http_server}/large", target)
+    assert target.read_bytes() == b"x" * 64
+    await tools.aclose()
+
+
 async def test_download_refuses_existing_target(tools: HTTPTools, http_server: str, tmp_path: Path):
     target = tmp_path / "result.bin"
     target.write_bytes(b"old")

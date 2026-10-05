@@ -247,7 +247,7 @@ class DependencyService:
         pending = []
         missing = []
         for name, item in inventory.items():
-            if item["status"] == "unusable":
+            if item["status"] == "unusable" and name not in CORE_PACKAGES:
                 raise RPCError(
                     f"{name} is installed but unusable: {item.get('reason')}",
                     code="dependency_unusable",

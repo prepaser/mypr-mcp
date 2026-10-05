@@ -28,7 +28,7 @@ from .config import MAX_WAIT_MS, ConfigStore
 from .config_runtime import RuntimeConfig
 from .dependency_service import DependencyService
 from .diagnostics import RPCError, error_info, error_response, safe_error
-from .file_io import open_regular
+from .file_io import open_regular, read_bytes
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
@@ -46,7 +46,7 @@ from .storage import Storage
 from .task_results import load_result, store_result
 from .timers import TimerStore
 from .timings import Timings
-from .transport import MAX_MESSAGE, socket_path, workspace_id
+from .transport import MAX_MESSAGE, ensure_workspace_identity, socket_path, workspace_id
 from .web_service import WebService
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
@@ -109,7 +109,18 @@ def _write_json(path, data):
     temp.replace(path)
 
 
-def _persist_execution(root, history, record, event=None, journal_events=None, history_events=None):
+def _persist_execution(
+    root,
+    history,
+    record,
+    event=None,
+    journal_events=None,
+    history_events=None,
+    *,
+    workspace=None,
+    workspace_identity=None,
+):
+    ensure_workspace_identity(workspace or Path(root).parent, workspace_identity)
     if journal_events:
         append_events(root / "runs" / f"{record['id']}.jsonl", journal_events)
     if history_events:
@@ -129,7 +140,21 @@ def _load_execution(path):
     return record
 
 
-def _persist_task_update(history, journal, kind, record, event=None, output=None, entity_id=None):
+def _persist_task_update(
+    history,
+    journal,
+    kind,
+    record,
+    event=None,
+    output=None,
+    entity_id=None,
+    *,
+    workspace=None,
+    workspace_identity=None,
+):
+    if workspace is None and journal is not None:
+        workspace = Path(journal).parents[2]
+    ensure_workspace_identity(workspace, workspace_identity)
     if output is not None and journal is not None:
         append_events(journal, [output["journal"]])
     if output is not None:
@@ -159,14 +184,18 @@ def _close_stores(history, messages, timers=None):
             history.close()
 
 
-def _store_task_result(workspace, history, record, encoded):
+def _store_task_result(workspace, history, record, encoded, *, workspace_identity=None):
+    ensure_workspace_identity(workspace, workspace_identity)
+
     def commit(reference):
+        ensure_workspace_identity(workspace, workspace_identity)
         history.record(
             "python", dict(record, result_ref=reference, result_persisted=True),
             entity_id=f"python:{record['generation']}:{record['id']}",
         )
     return store_result(
-        workspace, record["id"], record["generation"], encoded, commit=commit
+        workspace, record["id"], record["generation"], encoded,
+        commit=commit, workspace_identity=workspace_identity,
     )
 
 
@@ -544,7 +573,10 @@ class Runtime:
             (self.root / name).mkdir(parents=True, exist_ok=True)
         (self.root / "lib/ws_lib/__init__.py").touch(exist_ok=True)
         ignore = self.root / ".gitignore"
-        entries = ignore.read_text().splitlines() if ignore.exists() else []
+        try:
+            entries = read_bytes(ignore, max_bytes=16 * 1024 * 1024).decode().splitlines()
+        except FileNotFoundError:
+            entries = []
         required = [
             "venv/",
             "runs/",
@@ -569,10 +601,8 @@ class Runtime:
         ]
         missing = [entry for entry in required if entry not in entries]
         if missing:
-            with ignore.open("a") as file:
-                if entries:
-                    file.write("\n")
-                file.write("\n".join(missing) + "\n")
+            with open_regular(ignore, "ab") as file:
+                file.write((("\n" if entries else "") + "\n".join(missing) + "\n").encode())
         self.mcp = MCPBridge(
             self.workspace, global_path=self.config_store.global_path,
             snapshot=self._kernel_snapshot,
@@ -652,6 +682,8 @@ class Runtime:
             event,
             journal_events,
             history_events,
+            workspace=self.workspace,
+            workspace_identity=self.workspace_id,
             critical=True,
         )
 
@@ -1238,6 +1270,7 @@ class Runtime:
         inbox_client=None,
         wake_on_output=True,
     ):
+        self._ensure_workspace_identity()
         wait_ms = self.wait_budget(wait_ms, self.poll_wait_ms)
         explicit_budget = max_bytes is not None
         response_budget = self.response_budget(max_bytes)
@@ -2297,6 +2330,7 @@ class Runtime:
                     raise ValueError("Task belongs to another client")
                 reference = await self.io(
                     _store_task_result, self.workspace, self.history, record, req["encoded"],
+                    workspace_identity=self.workspace_id,
                     critical=True,
                 )
                 record.update(result_ref=reference, result_persisted=True)
@@ -2311,7 +2345,13 @@ class Runtime:
                 )
             if not record or not record.get("result_ref") or record.get("result_evicted"):
                 raise RuntimeError("Persisted task result is unavailable or expired")
-            return await self.io(load_result, self.workspace, record["result_ref"])
+            self._ensure_workspace_identity()
+            return await self.io(
+                load_result,
+                self.workspace,
+                record["result_ref"],
+                workspace_identity=self.workspace_id,
+            )
         if op in {"task_event", "task_terminal"}:
             event = dict(req["event"])
             if op == "task_terminal" and event.get("state") not in TERMINAL:
@@ -2458,6 +2498,7 @@ class Runtime:
         requested_client, generation,
     ):
         if op == "shell_start":
+            self._ensure_workspace_identity()
             job = await self.shells.start(
                 req["command"],
                 req.get("cwd", str(self.workspace)),
@@ -2484,11 +2525,13 @@ class Runtime:
             )
             return job
         if op == "shell_poll":
+            self._ensure_workspace_identity()
             history_record = await self.io(self.history.get, req["id"])
             if history_record and history_record.get("output_evicted"):
                 return self.expired_output(history_record, cursor=req.get("cursor", 0))
             return await self.shells.poll(req["id"], req.get("cursor", 0))
         if op == "shell_read":
+            self._ensure_workspace_identity()
             history_record = await self.io(self.history.get, req["id"])
             if history_record and history_record.get("output_evicted"):
                 return self.expired_output(history_record, cursor=req.get("cursor", 0))
@@ -2500,16 +2543,21 @@ class Runtime:
                 wait_ms=req.get("wait_ms", 0),
             )
         if op == "shell_wait":
+            self._ensure_workspace_identity()
             return await self.shells.wait(req["id"])
         if op == "shell_write":
+            self._ensure_workspace_identity()
             return await self.shells.write(
                 req["id"], req.get("text", ""), eof=req.get("eof", False)
             )
         if op == "shell_resize":
+            self._ensure_workspace_identity()
             return await self.shells.resize(req["id"], req["rows"], req["cols"])
         if op == "shell_cancel":
+            self._ensure_workspace_identity()
             return await self.shells.cancel(req["id"])
         if op == "packages_add":
+            self._ensure_workspace_identity()
             return await self._start_package_job(req["specs"], {
                 "client_id": client, "connection_id": connection_id,
                 "exec_id": req.get("exec_id"),
@@ -2564,6 +2612,7 @@ class Runtime:
         if op == "restart":
             from .restart import request_restart
 
+            self._ensure_workspace_identity()
             current = self.execs.get(req.get("exec_id"))
             if (
                 current is None
@@ -2599,6 +2648,7 @@ class Runtime:
         if op == "restart_prepare":
             from .restart import read_ticket
 
+            self._ensure_workspace_identity()
             ident = req.get("restart_id")
             ticket = read_ticket(self.workspace, ident)
             if (
@@ -2616,6 +2666,7 @@ class Runtime:
         if op == "reset":
             from_kernel = req.get("from_kernel", False)
             async with self._admission_lock:
+                self._ensure_workspace_identity()
                 self._check_dispatch_admission(op)
                 current = self.execs.get(req.get("exec_id")) if from_kernel else None
                 if from_kernel and (
@@ -2737,6 +2788,8 @@ class Runtime:
                 event["state"] if old.get("state") != event["state"] else None,
                 output,
                 self.task_history_id(record),
+                workspace=self.workspace,
+                workspace_identity=self.workspace_id,
                 critical=True,
             )
             self.task_records[event["id"]] = record
@@ -2801,6 +2854,7 @@ class Runtime:
 
     async def _reserve_restart_locked(self, ident, current, force):
         async with self._admission_lock:
+            self._ensure_workspace_identity()
             if self.settings.applying:
                 raise RuntimeError("Configuration reload is in progress; retry after it completes")
             if self.resetting or self.stopping.is_set():
@@ -2893,6 +2947,7 @@ class Runtime:
     async def reset(self, current):
         async with self._lifecycle_lock:
             try:
+                self._ensure_workspace_identity()
                 if self.stopping.is_set():
                     if current is None:
                         raise RuntimeError("Workspace manager is stopping")
@@ -3389,7 +3444,7 @@ class Runtime:
                 await writer.wait_closed()
 
     async def run(self):
-        lock = (self.root / "manager.lock").open("a")
+        lock = open_regular(self.root / "manager.lock", "ab")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.umask(0o077)
         try:

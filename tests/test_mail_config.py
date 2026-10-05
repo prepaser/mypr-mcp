@@ -60,6 +60,22 @@ def test_mail_accounts_are_complete_replacements_and_tombstones(tmp_path):
     assert store.load().values["mail"]["accounts"] == {}
 
 
+def test_mail_default_is_cleared_when_inherited_account_is_tombstoned(tmp_path):
+    workspace = tmp_path / "workspace"
+    global_path = tmp_path / "global.toml"
+    _write(
+        global_path,
+        "[mail]\ndefault_account = 'work'\n"
+        "[mail.accounts.work]\nfrom = 'me@example.test'\n"
+        "[mail.accounts.work.imap]\nhost = 'imap.example.test'\n"
+        "username = 'me'\npassword_from = 'I'\n"
+        "[mail.accounts.work.smtp]\nhost = 'smtp.example.test'\n",
+    )
+    _write(workspace / ".mypr/config.toml", "[mail.accounts.work]\nenabled = false\n")
+    snapshot = ConfigStore(workspace, global_path).load()
+    assert snapshot.values["mail"] == {"default_account": "", "accounts": {}}
+
+
 def test_mail_validation_rejects_partial_or_inline_passwords():
     with pytest.raises(ConfigError, match="mail.accounts.work.imap"):
         validate_config({"mail": {"accounts": {"work": {"from": "me@example.test"}}}})

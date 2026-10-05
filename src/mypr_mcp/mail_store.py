@@ -1123,10 +1123,14 @@ class MailStore:
                 "error": "mail snapshot was truncated",
             }
         by_draft: dict[str, list[tuple[str, float]]] = {}
+        referenced_paths: set[str] = set()
         for row in sends:
             by_draft.setdefault(str(row["draft_id"]), []).append(
                 (str(row["state"]), float(row["updated"] or 0))
             )
+        for row in rows:
+            if path := self._mail_relative_path(row["mime_path"]):
+                referenced_paths.add(path)
         cutoff = time.time() - retention_days * _DAY
         for row in rows:
             path = self._mail_relative_path(row["mime_path"])
@@ -1147,6 +1151,23 @@ class MailStore:
                     "reason": "terminal_send",
                     "group": f"draft:{row['id']}",
                     "requires_tombstone": True,
+                }
+            )
+        for path in sorted(protected):
+            if path in referenced_paths or not self._is_orphan_draft_path(path):
+                continue
+            try:
+                if (self.root / path).stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            protected.remove(path)
+            candidates.append(
+                {
+                    "path": path,
+                    "reason": "orphan_draft",
+                    "group": f"orphan:{path}",
+                    "requires_tombstone": False,
                 }
             )
         return {"protected_paths": sorted(protected), "candidates": candidates}
@@ -1237,6 +1258,19 @@ class MailStore:
             return None
         return relative if relative.startswith(".mypr/mail/") else None
 
+    @staticmethod
+    def _is_orphan_draft_path(path: str) -> bool:
+        prefix = ".mypr/mail/drafts/"
+        if not path.startswith(prefix):
+            return False
+        name = path.removeprefix(prefix)
+        if not name.startswith("draft-") or not name.endswith(".eml"):
+            return False
+        token = name[len("draft-") : -len(".eml")]
+        return len(token) == 22 and token.isascii() and all(
+            char.isalnum() or char in "-_" for char in token
+        )
+
     def _draft_mime_exists(self, value: Any) -> bool:
         if self._mail_relative_path(value) is None:
             return False
@@ -1250,25 +1284,46 @@ class MailStore:
         return path.is_file() and not path.is_symlink() and info.st_size <= 25 * 1024 * 1024
 
     def recover_inflight(self) -> int:
-        with self._tx():
-            cursor = self._db.execute(
-                (
-                    "UPDATE mail_sends SET state='unknown',error='mail service "
-                    "restarted during send',updated=? WHERE "
-                    "state='sending'"
-                ),
-                (time.time(),),
-            )
-            unknown = cursor.rowcount
-            cursor = self._db.execute(
-                (
-                    "UPDATE mail_sends SET state='failed',error='mail service "
-                    "restarted before send began',updated=? WHERE "
-                    "state='queued'"
-                ),
-                (time.time(),),
-            )
-            return unknown + cursor.rowcount
+        with StorageLock(self.root / ".mypr" / "storage.lock"):
+            with self._tx():
+                cursor = self._db.execute(
+                    (
+                        "UPDATE mail_sends SET state='unknown',error='mail service "
+                        "restarted during send',updated=? WHERE "
+                        "state='sending'"
+                    ),
+                    (time.time(),),
+                )
+                unknown = cursor.rowcount
+                cursor = self._db.execute(
+                    (
+                        "UPDATE mail_sends SET state='failed',error='mail service "
+                        "restarted before send began',updated=? WHERE "
+                        "state='queued'"
+                    ),
+                    (time.time(),),
+                )
+                recovered = unknown + cursor.rowcount
+            return recovered + self._remove_orphan_drafts()
+
+    def _remove_orphan_drafts(self) -> int:
+        rows = self._db.execute("SELECT mime_path FROM mail_drafts").fetchall()
+        referenced = {
+            path
+            for row in rows
+            if (path := self._mail_relative_path(row["mime_path"])) is not None
+        }
+        removed = 0
+        for relative in self._mail_file_paths():
+            if relative in referenced or not self._is_orphan_draft_path(relative):
+                continue
+            path = self.root / relative
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+        return removed
 
     def snapshot(self, client_id: str, *, offline: bool = False) -> dict[str, Any] | None:
         if self._closed:

@@ -57,6 +57,51 @@ async def test_output_write_failure_does_not_block_pipe_and_survives_eviction(
 
 
 @pytest.mark.asyncio
+async def test_missing_persisted_journal_is_reported_as_truncated_output(tmp_path: Path):
+    shells = Shells(tmp_path)
+    job_id = "b" * 32
+    shells.jobs_root.mkdir(parents=True, exist_ok=True)
+    (shells.jobs_root / f"{job_id}.json").write_text(
+        json.dumps({
+            "id": job_id,
+            "state": "succeeded",
+            "output_count": 1,
+            "warnings": [{"code": "old", "text": str(index)} for index in range(4)],
+        }),
+        encoding="utf-8",
+    )
+    try:
+        polled = await shells.poll(job_id)
+        read = await shells.read(job_id)
+    finally:
+        await shells.close()
+
+    for result in (polled, read):
+        assert result["output"] == []
+        assert result["truncated"] is True
+        assert result["warnings"][0]["code"] == "journal_unavailable"
+        assert result["warnings_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_shell_persistence_rejects_replaced_workspace(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    shells = Shells(workspace)
+    try:
+        started = await shells.start([sys.executable, "-c", "import time; time.sleep(.2)"])
+        moved = tmp_path / "moved"
+        workspace.rename(moved)
+        workspace.mkdir()
+        (workspace / ".mypr" / "jobs").mkdir(parents=True)
+        result = await shells.wait(started["id"])
+        assert any(warning["code"] == "metadata_persist_failed" for warning in result["warnings"])
+        assert not list((workspace / ".mypr" / "jobs").iterdir())
+    finally:
+        await shells.close()
+
+
+@pytest.mark.asyncio
 async def test_metadata_write_failure_keeps_completed_job_bounded_in_memory(monkeypatch, tmp_path):
     shells = Shells(tmp_path, completed_records=0)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import socketserver
 import threading
+import time
 
 import pytest
 
@@ -320,3 +321,34 @@ def test_reconfiguring_other_account_does_not_abort_connecting_smtp(monkeypatch)
     finally:
         release.set()
         transport.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_watch_does_not_wait_for_worker_slot():
+    import asyncio
+
+    transport = MailTransport(max_workers=4)
+    loop = asyncio.get_running_loop()
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = threading.Event()
+
+    def blocker(number):
+        if number <= 2:
+            loop.call_soon_threadsafe(entered[number - 1].set)
+        release.wait(5)
+        return number
+
+    first = asyncio.create_task(transport.run_watch(blocker, 1))
+    second = asyncio.create_task(transport.run_watch(blocker, 2))
+    await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 2)
+    queued = asyncio.create_task(transport.run_watch(blocker, 3))
+    await asyncio.sleep(0.05)
+    started = time.monotonic()
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    assert time.monotonic() - started < 1
+    release.set()
+    assert await first == 1
+    assert await second == 2
+    transport.close()

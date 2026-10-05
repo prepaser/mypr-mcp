@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 
 from mypr_mcp.mail_store import MailStore
@@ -284,3 +285,47 @@ def test_draft_mime_remains_usable_after_workspace_move(tmp_path):
         assert fresh.create_send("client", value["id"], None)["state"] == "queued"
     finally:
         fresh.close()
+
+
+def test_recover_inflight_removes_unindexed_draft_mime(tmp_path):
+    store = MailStore(tmp_path)
+    orphan = store.mail_root / "drafts" / ("draft-" + "a" * 21 + "A.eml")
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"From: sender@example.test\r\n\r\nbody\r\n")
+    manual = orphan.with_name("draft-important.eml")
+    manual.write_bytes(b"manual file")
+    unknown = orphan.with_name("draft-" + "é" * 22 + ".eml")
+    unknown.write_bytes(b"unknown file")
+    try:
+        assert store.recover_inflight() == 1
+        assert not orphan.exists()
+        assert manual.read_bytes() == b"manual file"
+        assert unknown.read_bytes() == b"unknown file"
+    finally:
+        store.close()
+
+
+def test_storage_gc_exposes_only_old_unindexed_draft_mime(tmp_path):
+    store = MailStore(tmp_path)
+    orphan = store.mail_root / "drafts" / ("draft-" + "a" * 21 + "A.eml")
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"orphan")
+    old = time.time() - 31 * 24 * 60 * 60
+    os.utime(orphan, (old, old))
+    relative = orphan.relative_to(tmp_path).as_posix()
+    try:
+        snapshot = store.storage_gc_snapshot()
+        assert snapshot["candidates"] == [
+            {
+                "path": relative,
+                "reason": "orphan_draft",
+                "group": f"orphan:{relative}",
+                "requires_tombstone": False,
+            }
+        ]
+        assert snapshot["protected_paths"] == []
+        assert store.storage_gc_before_delete(snapshot["candidates"]) == [
+            relative
+        ]
+    finally:
+        store.close()

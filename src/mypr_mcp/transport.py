@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from .diagnostics import RPCError
+from .file_io import PersistedFileError, open_regular, read_bytes
 
 MAX_MESSAGE = 32 * 1024 * 1024
 HANDSHAKE_TIMEOUT = 30
@@ -18,6 +19,17 @@ def workspace_id(workspace: Path) -> str:
     if not stat.S_ISDIR(info.st_mode):
         raise NotADirectoryError(workspace)
     return f"{info.st_dev:x}:{info.st_ino:x}"
+
+
+def ensure_workspace_identity(workspace: Path, expected: str | None) -> None:
+    if expected is None:
+        return
+    try:
+        current = workspace_id(Path(workspace))
+    except OSError as exc:
+        raise RuntimeError("The workspace moved; stop its manager and reconnect") from exc
+    if current != expected:
+        raise RuntimeError("The workspace moved; stop its manager and reconnect")
 
 
 def socket_path(workspace: Path) -> Path:
@@ -68,8 +80,8 @@ async def rpc(_socket_path: Path | str | None = None, **request):
 
 def manager_running(workspace: Path) -> bool:
     try:
-        lock = (workspace / ".mypr" / "manager.lock").open("r+")
-    except FileNotFoundError:
+        lock = open_regular(workspace / ".mypr" / "manager.lock", "r+b")
+    except (FileNotFoundError, PersistedFileError):
         return False
     with lock:
         try:
@@ -85,7 +97,9 @@ async def find_runtime(workspace: Path):
     primary = socket_path(workspace)
     candidates = [(primary, None)]
     try:
-        metadata = json.loads((workspace / ".mypr" / "runtime.json").read_text())
+        metadata = json.loads(
+            read_bytes(workspace / ".mypr" / "runtime.json", max_bytes=1024 * 1024)
+        )
         saved_path = Path(metadata["socket"])
         saved_identity = metadata.get("workspace_id")
         matches = saved_identity == identity

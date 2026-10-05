@@ -216,6 +216,52 @@ async def test_ocr_resume_rechecks_source_before_unprocessed_page(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_ocr_resume_rejects_revision_returned_by_worker_after_dependency_wait(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "scan.png"
+    path.write_bytes(b"source")
+    original_revision = hashlib.sha256(path.read_bytes()).hexdigest()
+    changed_revision = hashlib.sha256(b"changed").hexdigest()
+    docs = Documents(Filesystem(tmp_path))
+
+    async def dependencies(*_args):
+        path.write_bytes(b"changed")
+        return {}
+
+    async def worker(*_args, **_kwargs):
+        return {
+            "source": {
+                "path": "scan.png",
+                "revision": changed_revision,
+                "size_bytes": 7,
+                "format": "png",
+            },
+            "coordinate_space": "image_pixels",
+            "pages": [{"page": 2}],
+            "items": [{"type": "word", "page": 2, "text": "changed"}],
+            "complete": True,
+            "truncated": False,
+            "next_page": None,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(docs._extractor, "_ocr_dependencies", dependencies)
+    monkeypatch.setattr(document_tools, "_run_worker", worker)
+    snapshot = {
+        "id": "old-result",
+        "kind": "ocr",
+        "source": {"path": "scan.png", "revision": original_revision},
+        "options": {"max_pages": 1, "max_input_bytes": 64 * 1024 * 1024},
+        "resume": {"page": 1, "next_page": 2, "remaining_pages": 1},
+    }
+    with pytest.raises(ValueError, match="source changed"):
+        await docs._extractor._resume_ocr(
+            snapshot, 0, 0, _tsv([]), path, path.name, 32_768
+        )
+
+
+@pytest.mark.asyncio
 async def test_ocr_resume_returns_cached_words_before_continuing_page(tmp_path, monkeypatch):
     path = tmp_path / "scan.png"
     path.write_bytes(b"source")

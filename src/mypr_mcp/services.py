@@ -36,7 +36,7 @@ from .lsp_config import validate_servers as validate_lsp_servers
 from .terminal import close as close_terminal
 from .terminal import eof_byte
 from .terminal import resize as resize_terminal
-from .transport import workspace_id
+from .transport import ensure_workspace_identity, workspace_id
 
 _MAX_SHELL_WARNINGS = 4
 _MAX_SHELL_WARNING_TEXT = 256
@@ -151,6 +151,7 @@ class Shells:
         self.cache_bytes = cache_bytes
         self.jobs_root = self.workspace / ".mypr" / "jobs"
         self.jobs_root.mkdir(parents=True, exist_ok=True)
+        self.workspace_identity = workspace_id(self.workspace)
         self._jobs: dict[str, _Job] = {}
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -158,6 +159,9 @@ class Shells:
         self._starting = 0
         self._start_changed = asyncio.Event()
         self._start_changed.set()
+
+    def _ensure_workspace_identity(self) -> None:
+        ensure_workspace_identity(self.workspace, self.workspace_identity)
 
     @property
     def active(self) -> list[str]:
@@ -214,6 +218,7 @@ class Shells:
     ) -> dict[str, str]:
         if self._closed:
             raise RuntimeError("shell service is closed")
+        self._ensure_workspace_identity()
         if input is not None and not isinstance(input, str):
             raise TypeError("input must be a string or None")
         if type(stdin) is not bool:
@@ -440,13 +445,30 @@ class Shells:
                 metadata, metadata_warning
             )
             persisted_warnings = state_warnings + self._metadata_warnings(metadata)
-            page, next_index, next_offset, has_more = await asyncio.to_thread(
-                self._read_journal_page,
-                self.jobs_root / f"{job_id}.jsonl",
+            journal_path = self.jobs_root / f"{job_id}.jsonl"
+            page, next_index, next_offset, has_more, missing = await asyncio.to_thread(
+                self._read_journal_page_checked,
+                journal_path,
                 *cursor_value,
                 stream=stream,
                 max_bytes=max_bytes,
             )
+            expected_count = metadata.get("output_count")
+            missing = missing or (
+                type(expected_count) is int
+                and expected_count > next_index
+                and not has_more
+            )
+            if missing and self._journal_expected(metadata) and not self._has_warning(
+                persisted_warnings, "output_persist_failed"
+            ):
+                persisted_warnings = self._with_warning(
+                    persisted_warnings,
+                    {
+                        "code": "journal_unavailable",
+                        "text": "Saved shell output journal is missing.",
+                    },
+                )
             return {
                 "id": job_id,
                 "state": state,
@@ -455,7 +477,8 @@ class Shells:
                 "has_more": has_more,
                 "result": metadata.get("result"),
                 "error": metadata.get("error"),
-                "truncated": bool(metadata.get("truncated", False)),
+                "truncated": bool(metadata.get("truncated", False))
+                or (missing and self._journal_expected(metadata)),
                 "warnings": persisted_warnings[:_MAX_SHELL_WARNINGS],
                 "outcome_unknown": outcome_unknown,
                 "warnings_truncated": bool(metadata.get("warnings_truncated", False))
@@ -543,8 +566,29 @@ class Shells:
         stream: str | None,
         max_bytes: int,
     ) -> tuple[list[dict[str, str]], int, int, bool]:
+        page, index, offset, has_more, _ = cls._read_journal_page_checked(
+            path,
+            event_index,
+            event_offset,
+            stream=stream,
+            max_bytes=max_bytes,
+        )
+        return page, index, offset, has_more
+
+    @classmethod
+    def _read_journal_page_checked(
+        cls,
+        path: Path,
+        event_index: int,
+        event_offset: int,
+        *,
+        stream: str | None,
+        max_bytes: int,
+    ) -> tuple[list[dict[str, str]], int, int, bool, bool]:
         if event_index < 0 or event_offset < 0:
             raise ValueError("invalid shell output cursor")
+        if not path.is_file():
+            return [], event_index, event_offset, False, True
         events, total = read_page(path, event_index, max_bytes + event_offset)
         page, consumed, offset = cls._page_events(
             events,
@@ -554,7 +598,7 @@ class Shells:
             max_bytes=max_bytes,
         )
         next_index = event_index + consumed
-        return page, next_index, offset, next_index < total
+        return page, next_index, offset, next_index < total, False
 
     @staticmethod
     def _encode_read_cursor(job_id: str, event: int, offset: int) -> str:
@@ -625,15 +669,23 @@ class Shells:
                 "error": "unknown job",
                 "warnings": [],
             }
-        output = self._read_journal(journal_path)
+        output, missing = self._read_journal(journal_path, report_missing=True)
         output_count = metadata.get("output_count", len(output))
         if type(output_count) is not int or output_count < len(output):
             output_count = len(output)
+        missing = missing or output_count > len(output)
         self._validate_cursor(cursor, output_count)
         state, state_warnings, outcome_unknown = self._persisted_state(
             metadata, metadata_warning
         )
         warnings = state_warnings + self._metadata_warnings(metadata)
+        if missing and self._journal_expected(metadata) and not self._has_warning(
+            warnings, "output_persist_failed"
+        ):
+            warnings = self._with_warning(
+                warnings,
+                {"code": "journal_unavailable", "text": "Saved shell output journal is missing."},
+            )
         warnings_truncated = bool(metadata.get("warnings_truncated", False))
         for event in output:
             if event.get("type") == "warning":
@@ -655,7 +707,8 @@ class Shells:
             "result": metadata.get("result"),
             "error": metadata.get("error"),
             "finished_at": metadata.get("finished_at"),
-            "truncated": bool(metadata.get("truncated", False)),
+            "truncated": bool(metadata.get("truncated", False))
+            or (missing and self._journal_expected(metadata)),
             "warnings": warnings[:_MAX_SHELL_WARNINGS],
             "warnings_truncated": warnings_truncated,
             "pty": bool(metadata.get("pty", False)),
@@ -874,18 +927,36 @@ class Shells:
         return cursor
 
     @staticmethod
-    def _read_journal(path: Path) -> list[dict[str, str]]:
+    def _read_journal(path: Path, *, report_missing=False):
         try:
             file = open_regular(path)
         except FileNotFoundError:
-            return []
+            return ([], True) if report_missing else []
         output = []
         with file:
             line_number = 0
             while line := file.readline():
                 line_number += 1
                 output.append(decode_event(line, line_number))
-        return output
+        return (output, False) if report_missing else output
+
+    @staticmethod
+    def _journal_expected(metadata: dict[str, Any]) -> bool:
+        count = metadata.get("output_count")
+        return type(count) is not int or count > 0
+
+    @staticmethod
+    def _with_warning(warnings, warning):
+        if warning not in warnings:
+            warnings.insert(0, warning)
+        return warnings
+
+    @staticmethod
+    def _has_warning(warnings, code):
+        return any(
+            isinstance(warning, dict) and warning.get("code") == code
+            for warning in warnings
+        )
 
     @staticmethod
     def _write_output(job: _Job, event: dict[str, str]) -> None:
@@ -958,18 +1029,19 @@ class Shells:
         text = error if isinstance(error, str) else Shells._warning_text(error)
         job.warnings.append({"code": code, "text": text[:_MAX_SHELL_WARNING_TEXT]})
 
-    @classmethod
-    def _persist_output(cls, job: _Job, event: dict[str, str]) -> None:
+    def _persist_output(self, job: _Job, event: dict[str, str]) -> None:
         if job.journal is None or job.journal_failed:
             return
         try:
-            cls._write_output(job, event)
+            self._ensure_workspace_identity()
+            self._write_output(job, event)
         except Exception as exc:
             job.journal_failed = True
-            cls._add_warning(job, "output_persist_failed", exc)
+            self._add_warning(job, "output_persist_failed", exc)
 
     def _persist_metadata(self, job: _Job) -> None:
         try:
+            self._ensure_workspace_identity()
             self._write_metadata(job)
         except Exception as exc:
             job.metadata_failed = True

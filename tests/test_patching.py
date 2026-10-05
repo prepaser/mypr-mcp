@@ -98,6 +98,16 @@ async def test_multi_file_add_update_delete_and_move(tmp_path: Path):
     assert (tmp_path / "moved.txt").read_text() == "one\nfinal\n"
 
 
+async def test_patch_handles_max_length_target_name(tmp_path: Path):
+    name = "x" * 255
+    target = tmp_path / name
+    fs = Filesystem(tmp_path)
+    await fs.write(name, "before\n")
+    result = await fs.patch(name, [{"old": "before", "new": "after"}])
+    assert result["changed"]
+    assert target.read_text() == "after\n"
+
+
 async def test_failed_hunk_and_stale_hash_are_preflight_atomic(tmp_path: Path):
     (tmp_path / "one.txt").write_text("one\n")
     (tmp_path / "two.txt").write_text("two\n")

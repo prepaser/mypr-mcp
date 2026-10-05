@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .file_io import open_regular
 from .protocol import CAPABILITIES
 from .transport import workspace_id
 
@@ -95,7 +96,7 @@ def _read_record(path: Path) -> dict[str, Any] | None:
 def _lock(directory: Path, *, exclusive: bool):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.chmod(0o700)
-    stream = (directory / ".lock").open("a")
+    stream = open_regular(directory / ".lock", "ab")
     fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
     return stream
 

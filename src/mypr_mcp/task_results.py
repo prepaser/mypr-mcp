@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .storage_lock import StorageLock
+from .transport import ensure_workspace_identity
 
 MAX_RESULT_BYTES = 256 * 1024
 
@@ -53,9 +54,17 @@ def encode_result(value: Any) -> str:
 
 
 def store_result(
-    workspace: Path, task_id: str, generation: str, encoded: str, *, commit=None
+    workspace: Path,
+    task_id: str,
+    generation: str,
+    encoded: str,
+    *,
+    commit=None,
+    workspace_identity: str | None = None,
 ) -> dict[str, Any]:
+    ensure_workspace_identity(workspace, workspace_identity)
     with StorageLock(Path(workspace) / ".mypr" / "storage.lock"):
+        ensure_workspace_identity(workspace, workspace_identity)
         reference = _store_result(workspace, task_id, generation, encoded)
         if commit is not None:
             commit(reference)
@@ -96,8 +105,12 @@ def _store_result(workspace: Path, task_id: str, generation: str, encoded: str) 
     }
 
 
-def load_result(workspace: Path, reference: dict[str, Any]) -> Any:
+def load_result(
+    workspace: Path, reference: dict[str, Any], *, workspace_identity: str | None = None
+) -> Any:
+    ensure_workspace_identity(workspace, workspace_identity)
     with StorageLock(Path(workspace) / ".mypr" / "storage.lock"):
+        ensure_workspace_identity(workspace, workspace_identity)
         return _load_result(workspace, reference)
 
 

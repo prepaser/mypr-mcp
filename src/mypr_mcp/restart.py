@@ -22,6 +22,7 @@ from typing import Any
 from packaging.version import InvalidVersion, Version
 
 from .async_utils import wait_owned
+from .file_io import open_regular, read_bytes
 from .protocol import PROTOCOL_VERSION
 from .transport import find_runtime, rpc, workspace_id
 
@@ -30,6 +31,7 @@ TERMINAL_STATES = {"succeeded", "failed"}
 TICKET_STALE_SECONDS = 300.0
 COORDINATOR_START_GRACE = 10.0
 DESCRIPTOR_TIMEOUT = 20.0
+_MAX_TICKET_BYTES = 64 * 1024
 
 
 class RestartInProgress(RuntimeError):
@@ -126,8 +128,8 @@ def read_ticket(workspace: Path, ident: str | None = None) -> dict[str, Any] | N
         return None
     path = _ticket_path(workspace, ident)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except OSError, ValueError:
+        raw = json.loads(read_bytes(path, max_bytes=_MAX_TICKET_BYTES))
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
         return None
     try:
         return _valid_ticket(workspace, raw, ident)
@@ -357,7 +359,7 @@ async def request_restart(
     observed_path, observed_state = observed
     root = _root(workspace)
     lock_path = root / "startup.lock"
-    lock = await asyncio.to_thread(lock_path.open, "a+")
+    lock = await asyncio.to_thread(open_regular, lock_path, "ab")
     try:
         await _acquire_lock(lock)
         existing = active_ticket(workspace)
@@ -396,7 +398,7 @@ async def request_restart(
             "new_version": None,
         }
         _write_ticket(workspace, ticket)
-        log = (root / f"restart-{ticket['id']}.log").open("ab")
+        log = open_regular(root / f"restart-{ticket['id']}.log", "ab")
         launch = asyncio.create_task(
             asyncio.to_thread(
                 subprocess.Popen,
@@ -459,7 +461,7 @@ async def _finalize_origin(workspace: Path, ticket: dict[str, Any]) -> None:
 async def _coordinate(workspace: Path, ident: str) -> None:
     workspace = Path(workspace).resolve()  # noqa: ASYNC240
     root = _root(workspace)
-    lock = await asyncio.to_thread((root / "startup.lock").open, "a+")
+    lock = await asyncio.to_thread(open_regular, root / "startup.lock", "ab")
     try:
         await _acquire_lock(lock)
         ticket = read_ticket(workspace, ident)

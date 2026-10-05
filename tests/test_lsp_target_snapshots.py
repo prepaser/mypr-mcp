@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from mypr_mcp.code_tools import MAX_DOCUMENT_BYTES, CodeTools
+from mypr_mcp.code_tools import MAX_DOCUMENT_BYTES, CodeTools, _LanguageServer
 from mypr_mcp.lsp_edits import EditError
 
 
@@ -276,6 +277,14 @@ async def test_lsp_edit_read_is_bounded(tmp_path: Path):
             await code._read_edit_bytes(path)
     finally:
         await code.aclose()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is not available")
+def test_lsp_source_read_rejects_nonregular_file(tmp_path: Path):
+    path = tmp_path / "source.py"
+    os.mkfifo(path)
+    with pytest.raises(ValueError, match="regular source file"):
+        _LanguageServer._read_file(path)
 
 
 @pytest.mark.asyncio

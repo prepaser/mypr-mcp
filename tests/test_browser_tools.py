@@ -311,6 +311,21 @@ async def test_state_namespace_hashes_client_ids_and_supports_external_path(
     await tools.aclose()
 
 
+def test_atomic_write_handles_max_length_target_name(tmp_path):
+    target = tmp_path / ("x" * 255)
+    BrowserTools._atomic_write(target, b"{}")
+    assert target.read_bytes() == b"{}"
+
+
+@pytest.mark.asyncio
+async def test_load_state_rejects_nonregular_file(tmp_path):
+    target = tmp_path / "state.json"
+    os.mkfifo(target)
+    tools = BrowserTools(tmp_path, lambda: "client", lambda **_: None)
+    with pytest.raises(ValueError, match="regular file"):
+        await tools.load_state(path="state.json")
+
+
 @pytest.mark.asyncio
 async def test_launch_options_header_uses_node_names(tmp_path, fake_playwright):
     async def rpc(op, **fields):

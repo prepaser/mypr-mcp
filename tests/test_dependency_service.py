@@ -147,6 +147,72 @@ async def test_core_preparation_keeps_optional_install_policy(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_core_preparation_repairs_only_incompatible_core_packages(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path, FakeStore(tmp_path))
+    service.apply_config({"auto_install": False})
+    states = {"ipykernel": "unusable", "tomlkit": "installed"}
+    calls = []
+
+    async def packages(names):
+        return {
+            name: {
+                "name": name,
+                "kind": "python",
+                "scope": "workspace",
+                "source": "workspace",
+                "status": states[name],
+                "version": "7.2.0" if name == "ipykernel" else "0.15.0",
+                "path": str(service.python),
+            }
+            for name in names
+        }
+
+    async def install(names, _context):
+        calls.append(tuple(names))
+        for name in names:
+            states[name] = "installed"
+
+    monkeypatch.setattr(service, "_packages", packages)
+    service._install_packages = install
+    try:
+        result = await prepare_core(service)
+        assert [item["status"] for item in result["items"]] == ["installed", "installed"]
+        assert calls == [("ipykernel",)]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_optional_incompatible_package_is_not_repaired_automatically(tmp_path, monkeypatch):
+    service = _service(tmp_path, FakeStore(tmp_path))
+
+    async def packages(names):
+        return {
+            name: {
+                "name": name,
+                "kind": "python",
+                "scope": "workspace",
+                "source": "workspace",
+                "status": "unusable",
+                "version": "0.1.0",
+                "path": str(service.python),
+            }
+            for name in names
+        }
+
+    monkeypatch.setattr(service, "_packages", packages)
+    try:
+        with pytest.raises(RPCError) as failure:
+            await service.ensure(["pillow"], automatic=True)
+        assert failure.value.code == "dependency_unusable"
+        assert failure.value.details["name"] == "pillow"
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_overlapping_python_batches_share_each_pending_package(tmp_path, monkeypatch):
     store = FakeStore(tmp_path)
     service = _service(tmp_path, store)

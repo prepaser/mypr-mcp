@@ -192,6 +192,145 @@ async def test_history_write_cancellation_finishes_revision_record(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_filesystem_write_cancellation_finishes_history_record(
+    tmp_path: Path, monkeypatch
+):
+    import mypr_mcp.filesystem as filesystem_module
+
+    path = tmp_path / "data.txt"
+    path.write_bytes(b"before")
+    fs = Filesystem(tmp_path)
+    original = filesystem_module._write_file
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+
+    def cancel_after_commit(*args, **kwargs):
+        result = original(*args, **kwargs)
+        loop.call_soon_threadsafe(task.cancel)
+        return result
+
+    monkeypatch.setattr(filesystem_module, "_write_file", cancel_after_commit)
+    with pytest.raises(asyncio.CancelledError):
+        await fs.write("data.txt", "after", overwrite=True)
+
+    history = await fs.history("data.txt")
+    assert path.read_bytes() == b"after"
+    assert {item["revision"] for item in history["items"]} >= {
+        sha256("before"),
+        sha256("after"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_filesystem_move_cancellation_restores_both_paths(tmp_path: Path, monkeypatch):
+    import mypr_mcp.filesystem as filesystem_module
+
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"before")
+    fs = Filesystem(tmp_path)
+    original = filesystem_module._copy_bytes
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+
+    def cancel_after_commit(*args, **kwargs):
+        result = original(*args, **kwargs)
+        loop.call_soon_threadsafe(task.cancel)
+        return result
+
+    monkeypatch.setattr(filesystem_module, "_copy_bytes", cancel_after_commit)
+    with pytest.raises(asyncio.CancelledError):
+        await fs.move(
+            "source.txt",
+            "destination.txt",
+            expected_hash=sha256("before"),
+        )
+
+    assert source.read_bytes() == b"before"
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["move", "delete"])
+async def test_history_failure_restores_original_file_mode(
+    tmp_path: Path, monkeypatch, operation: str
+):
+    from mypr_mcp.revisions import RevisionStore
+
+    path = tmp_path / "script.sh"
+    path.write_bytes(b"#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    fs = Filesystem(tmp_path)
+
+    def fail_index(*args, **kwargs):
+        raise OSError("injected index failure")
+
+    if operation == "delete":
+        async def fail_record(*args, **kwargs):
+            raise OSError("injected index failure")
+
+        monkeypatch.setattr(RevisionStore, "record_bytes", fail_record)
+    else:
+        monkeypatch.setattr(RevisionStore, "_write_index_sync", fail_index)
+    with pytest.raises(RuntimeError, match="history write failed"):
+        if operation == "move":
+            await fs.move("script.sh", "moved.sh", expected_hash=sha256(path.read_text()))
+        else:
+            await fs.delete("script.sh", expected_hash=sha256(path.read_text()))
+
+    assert path.exists()
+    assert path.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.asyncio
+async def test_history_failure_does_not_overwrite_external_mode_change(
+    tmp_path: Path, monkeypatch
+):
+    from mypr_mcp.revisions import RevisionStore
+
+    path = tmp_path / "script.sh"
+    path.write_bytes(b"#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    fs = Filesystem(tmp_path)
+    async def change_mode_then_fail(store, resource, contents):
+        path.chmod(0o600)
+        raise OSError("injected index failure")
+
+    monkeypatch.setattr(RevisionStore, "record_bytes", change_mode_then_fail)
+    with pytest.raises(RuntimeError, match="rollback was incomplete"):
+        await fs.write("script.sh", "#!/bin/sh\nexit 1\n", overwrite=True)
+
+    assert path.read_text() == "#!/bin/sh\nexit 1\n"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_inside", [False, True])
+async def test_history_failure_restores_move_across_workspace_boundary(
+    tmp_path: Path, monkeypatch, source_inside: bool
+):
+    from mypr_mcp.revisions import RevisionStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    inside = workspace / "inside.txt"
+    source, destination = (inside, outside) if source_inside else (outside, inside)
+    source.write_bytes(b"before")
+    fs = Filesystem(workspace)
+
+    def fail_index(*args, **kwargs):
+        raise OSError("injected index failure")
+
+    monkeypatch.setattr(RevisionStore, "_write_index_sync", fail_index)
+    with pytest.raises(RuntimeError, match="history write failed"):
+        await fs.move(source, destination, expected_hash=sha256("before"))
+
+    assert source.read_bytes() == b"before"
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
 async def test_revision_index_limit_fails_before_file_write(tmp_path: Path, monkeypatch):
     import mypr_mcp.revisions as revisions_module
 

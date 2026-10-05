@@ -545,6 +545,7 @@ class DocumentExtractor:
                 **({"tessdata_dir": prepared["model_dir"]} if prepared.get("model_dir") else {}),
             },
         )
+        _check_ocr_revision(result, snapshot.get("source", {}).get("revision"))
         next_snapshot = {"kind": "ocr", "options": options, **result}
         try:
             ident = await _thread_settle(self._store.create, next_snapshot)
@@ -679,6 +680,13 @@ def _file_revision(path: Path, limit: int) -> str:
                 raise ValueError("File exceeds max_input_bytes")
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _check_ocr_revision(result: dict[str, Any], expected: Any) -> None:
+    source = result.get("source")
+    actual = source.get("revision") if isinstance(source, dict) else None
+    if not isinstance(expected, str) or actual != expected:
+        raise ValueError("source changed before the next OCR page was processed")
 
 
 def _preflight_file(path: Path, display: str, limit: int) -> None:

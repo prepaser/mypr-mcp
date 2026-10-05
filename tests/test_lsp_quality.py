@@ -190,6 +190,33 @@ async def test_action_cache_is_bounded_and_generation_aware(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_action_cache_is_bounded_by_retained_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(code_tools_module, "MAX_ACTION_CACHE_BYTES", 4096)
+    code = CodeTools(tmp_path)
+    server = _running_server(("fake-lsp",))
+    path = tmp_path / "sample.py"
+    path.write_text("foo\n", encoding="utf-8")
+    document = SimpleNamespace(path=path, uri=path.as_uri(), version=1, text="foo\n")
+    server.documents = {document.uri: document}
+    server.name = "fake"
+    server.generation = "generation"
+
+    async def code_actions(*_args, **_kwargs):
+        return document, [{"title": "Replace", "data": "x" * 1500}]
+
+    server.code_actions = code_actions
+    code._servers["fake"] = server
+    try:
+        for _ in range(5):
+            result = await code.actions("fake", path, 1, 1)
+            assert result["actions"]
+            assert result["actions"][0]["action_id"] in code._actions
+        assert sum(item.size_bytes for item in code._actions.values()) <= 4096
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reused_lsp_cancel_while_operation_is_locked_does_not_persist(tmp_path):
     command = ("fake-lsp",)
     entered = asyncio.Event()

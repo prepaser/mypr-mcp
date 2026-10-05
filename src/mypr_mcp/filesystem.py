@@ -20,7 +20,7 @@ from threading import Lock
 from typing import Any
 from weakref import WeakValueDictionary
 
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES
 from .revisions import RevisionIndexOutcomeUnknown
 
@@ -279,20 +279,33 @@ class Filesystem:
             lock = self._lock(resolved)
             await lock.acquire()
             stack.callback(lock.release)
-            result = await _to_thread_uncancelled(
-                _write_file,
-                resolved,
-                display,
-                encoded,
-                expected_hash,
-                overwrite,
-                create_parents,
-                history_enabled,
+            result, operation_cancelled = await finish_owned(
+                asyncio.to_thread(
+                    _write_file,
+                    resolved,
+                    display,
+                    encoded,
+                    expected_hash,
+                    overwrite,
+                    create_parents,
+                    history_enabled,
+                )
             )
             old = result.pop("_old", None)
+            old_stat = result.pop("_old_stat", None)
+            new_stat = result.pop("_new_stat", None)
             if history_enabled:
-                await self._record_history(resolved, display, old, encoded)
+                await self._record_history(
+                    resolved,
+                    display,
+                    old,
+                    encoded,
+                    old_stat=old_stat,
+                    new_stat=new_stat,
+                )
                 result["history_recorded"] = self._history_resource(resolved) is not None
+            if operation_cancelled:
+                raise asyncio.CancelledError
             return result
 
     async def read_bytes(
@@ -340,20 +353,33 @@ class Filesystem:
             lock = self._lock(resolved)
             await lock.acquire()
             stack.callback(lock.release)
-            result = await _to_thread_uncancelled(
-                _write_file,
-                resolved,
-                display,
-                data,
-                expected_hash,
-                overwrite,
-                create_parents,
-                history_enabled,
+            result, operation_cancelled = await finish_owned(
+                asyncio.to_thread(
+                    _write_file,
+                    resolved,
+                    display,
+                    data,
+                    expected_hash,
+                    overwrite,
+                    create_parents,
+                    history_enabled,
+                )
             )
             old = result.pop("_old", None)
+            old_stat = result.pop("_old_stat", None)
+            new_stat = result.pop("_new_stat", None)
             if history_enabled:
-                await self._record_history(resolved, display, old, data)
+                await self._record_history(
+                    resolved,
+                    display,
+                    old,
+                    data,
+                    old_stat=old_stat,
+                    new_stat=new_stat,
+                )
                 result["history_recorded"] = self._history_resource(resolved) is not None
+            if operation_cancelled:
+                raise asyncio.CancelledError
             return result
 
     async def apply_patch(
@@ -822,15 +848,24 @@ class Filesystem:
             history_enabled = resource is not None
             if history_enabled:
                 _validate_history_size(old, None, display)
-            await _to_thread_uncancelled(
-                _unlink_expected,
-                resolved,
-                display,
-                old,
-                _history_blob_limit() if history_enabled else None,
+            old_stat = (
+                await _to_thread_uncancelled(_stat_regular, resolved, display)
+                if history_enabled
+                else None
+            )
+            _, operation_cancelled = await finish_owned(
+                asyncio.to_thread(
+                    _unlink_expected,
+                    resolved,
+                    display,
+                    old,
+                    _history_blob_limit() if history_enabled else None,
+                )
             )
             if history_enabled:
-                await self._record_history(resolved, display, old, None)
+                await self._record_history(resolved, display, old, None, old_stat=old_stat)
+            if operation_cancelled:
+                raise asyncio.CancelledError
             return {
                 "path": display,
                 "deleted": True,
@@ -934,6 +969,7 @@ class Filesystem:
                 raise RuntimeError(f"File changed while reading: {source_display}")
             if destination_resource is not None:
                 _validate_history_path_size(destination_path, destination_display)
+            destination_info = destination_path.stat() if destination_path.exists() else None
             destination_old = await _to_thread_uncancelled(
                 _read_history_optional_bytes
                 if destination_resource is not None
@@ -947,10 +983,16 @@ class Filesystem:
                 _validate_history_size(old, old, source_display)
             if destination_path.parent != self.workspace and not destination_path.parent.exists():
                 destination_path.parent.mkdir(parents=True, exist_ok=True)
-            transitions = []
+            physical_transitions = []
             plans = []
+            if move:
+                physical_transitions.append(
+                    (source_path, source_display, old, None, source_info)
+                )
+            physical_transitions.append(
+                (destination_path, destination_display, destination_old, old, destination_info)
+            )
             if source_resource is not None and move:
-                transitions.append((source_path, source_display, old, None))
                 plans.append(
                     {
                         "operation": "move",
@@ -961,7 +1003,6 @@ class Filesystem:
                     }
                 )
             if destination_resource is not None:
-                transitions.append((destination_path, destination_display, destination_old, old))
                 if not move or source_resource is None:
                     plans.append(
                         {
@@ -973,65 +1014,95 @@ class Filesystem:
                     )
             if history_enabled:
                 await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
+
+            copy_state = {
+                "destination_committed": False,
+                "source_unlinked": False,
+                "destination_stat": None,
+            }
+
+            async def rollback_physical() -> None:
+                recovery = []
+                for target, _, before, after, before_stat in reversed(physical_transitions):
+                    if target == source_path and move and not copy_state["source_unlinked"]:
+                        continue
+                    after_stat = (
+                        copy_state["destination_stat"]
+                        if target == destination_path
+                        else None
+                    )
+                    try:
+                        await _to_thread_uncancelled(
+                            _restore_transition,
+                            target,
+                            before,
+                            after,
+                            read_limit,
+                            before_stat,
+                            after_stat,
+                        )
+                    except BaseException as rollback_error:
+                        recovery.append(f"{target}: {rollback_error}")
+                if recovery:
+                    raise RuntimeError("; ".join(recovery))
+
             try:
-                copy_state = {"destination_committed": False}
-                await _to_thread_uncancelled(
-                    _copy_bytes,
-                    source_path,
-                    destination_path,
-                    old,
-                    destination_old,
-                    _signature(source_info),
-                    move,
-                    copy_state,
-                    read_limit,
+                _, copy_cancelled = await finish_owned(
+                    asyncio.to_thread(
+                        _copy_bytes,
+                        source_path,
+                        destination_path,
+                        old,
+                        destination_old,
+                        _signature(source_info),
+                        move,
+                        copy_state,
+                        read_limit,
+                    )
                 )
             except BaseException as exc:
                 if not copy_state["destination_committed"]:
                     raise
                 try:
-                    await _to_thread_uncancelled(
-                        _restore_transition,
-                        destination_path,
-                        destination_old,
-                        old,
-                        read_limit,
-                    )
+                    await rollback_physical()
                 except BaseException as rollback_error:
                     raise RuntimeError(
-                        f"lifecycle operation failed and destination rollback was incomplete: "
+                        f"lifecycle operation failed and rollback was incomplete: "
                         f"{rollback_error}"
                     ) from exc
                 raise
+            if copy_cancelled:
+                try:
+                    await rollback_physical()
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        f"lifecycle operation was cancelled and rollback was incomplete: "
+                        f"{rollback_error}"
+                    ) from rollback_error
+                raise asyncio.CancelledError
             if history_enabled:
                 try:
-                    await _to_thread_uncancelled(history_store.record_changes_sync, plans)
+                    _, history_cancelled = await finish_owned(
+                        asyncio.to_thread(history_store.record_changes_sync, plans)
+                    )
                 except RevisionIndexOutcomeUnknown as exc:
                     raise RuntimeError(
                         "history index outcome is unknown; the lifecycle change remains in "
                         "place. Inspect history before retrying."
                     ) from exc
                 except BaseException as exc:
-                    recovery = []
-                    for target, _, before, after in reversed(transitions):
-                        try:
-                            await _to_thread_uncancelled(
-                                _restore_transition,
-                                target,
-                                before,
-                                after,
-                                read_limit,
-                            )
-                        except BaseException as rollback_error:
-                            recovery.append(f"{target}: {rollback_error}")
-                    if recovery:
+                    try:
+                        await rollback_physical()
+                    except BaseException as rollback_error:
                         raise RuntimeError(
                             "history write failed and lifecycle rollback was incomplete: "
-                            + "; ".join(recovery)
+                            f"{rollback_error}"
                         ) from exc
                     raise RuntimeError(
                         "history write failed; lifecycle change was rolled back"
                     ) from exc
+                if history_cancelled:
+                    raise asyncio.CancelledError
             return {
                 "source": source_display,
                 "path": destination_display,
@@ -1072,7 +1143,14 @@ class Filesystem:
         return relative.as_posix()
 
     async def _record_history(
-        self, path: Path, display: str, old: bytes | None, new: bytes | None
+        self,
+        path: Path,
+        display: str,
+        old: bytes | None,
+        new: bytes | None,
+        *,
+        old_stat: os.stat_result | None = None,
+        new_stat: os.stat_result | None = None,
     ) -> None:
         resource = self._history_resource(path)
         if resource is None or old == new:
@@ -1080,7 +1158,7 @@ class Filesystem:
         _validate_history_size(old, new, display)
         store = self._history_store()
         try:
-            await store.record_bytes(resource, (old, new))
+            _, cancelled = await finish_owned(store.record_bytes(resource, (old, new)))
         except BaseException as exc:
             try:
                 await _to_thread_uncancelled(
@@ -1089,6 +1167,8 @@ class Filesystem:
                     old,
                     new,
                     _history_blob_limit(),
+                    old_stat,
+                    new_stat,
                 )
             except BaseException as rollback_error:
                 raise RuntimeError(
@@ -1098,6 +1178,8 @@ class Filesystem:
             raise RuntimeError(
                 f"history write failed for {display}; file change was rolled back"
             ) from exc
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def image(
         self,
@@ -1211,22 +1293,35 @@ class Filesystem:
             lock = self._lock(resolved)
             await lock.acquire()
             stack.callback(lock.release)
-            result = await _to_thread_uncancelled(
-                _patch_file,
-                resolved,
-                display,
-                edits,
-                expected_hash,
-                dry_run,
-                encoding,
-                max_diff_bytes,
-                history_enabled,
+            result, operation_cancelled = await finish_owned(
+                asyncio.to_thread(
+                    _patch_file,
+                    resolved,
+                    display,
+                    edits,
+                    expected_hash,
+                    dry_run,
+                    encoding,
+                    max_diff_bytes,
+                    history_enabled,
+                )
             )
             old = result.pop("_old", None)
             new = result.pop("_new", None)
+            old_stat = result.pop("_old_stat", None)
+            new_stat = result.pop("_new_stat", None)
             if history_enabled and not dry_run:
-                await self._record_history(resolved, display, old, new)
+                await self._record_history(
+                    resolved,
+                    display,
+                    old,
+                    new,
+                    old_stat=old_stat,
+                    new_stat=new_stat,
+                )
                 result["history_recorded"] = self._history_resource(resolved) is not None
+            if operation_cancelled:
+                raise asyncio.CancelledError
             return result
 
     async def search(
@@ -1956,6 +2051,8 @@ def _write_file(
     )
     result = _write_result(display, data, info, old is not None)
     result["_old"] = old
+    result["_old_stat"] = old_stat
+    result["_new_stat"] = info
     return result
 
 
@@ -1990,8 +2087,9 @@ def _patch_file(
         _validate_history_size(old, new_bytes, display)
     new_hash = _sha256(new_bytes)
     diff, diff_truncated = _bounded_diff(display, original, updated, max_diff_bytes)
+    new_stat = old_stat
     if not dry_run and new_bytes != old:
-        _atomic_write(
+        new_stat = _atomic_write(
             path,
             new_bytes,
             old,
@@ -2010,6 +2108,8 @@ def _patch_file(
         "diff_truncated": diff_truncated,
         "_old": old,
         "_new": new_bytes,
+        "_old_stat": old_stat,
+        "_new_stat": new_stat,
     }
 
 
@@ -2084,13 +2184,16 @@ def _atomic_write(
     *,
     on_commit: Callable[[], None] | None = None,
     max_bytes: int | None = None,
+    mode: int | None = None,
 ) -> os.stat_result:
-    mode = stat.S_IMODE(old_stat.st_mode) if old_stat is not None else 0o600
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    file_mode = mode if mode is not None else (
+        stat.S_IMODE(old_stat.st_mode) if old_stat is not None else 0o600
+    )
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name[:32]}.", dir=path.parent)
     temporary_path = Path(temporary)
     try:
         with os.fdopen(fd, "wb") as stream:
-            os.fchmod(stream.fileno(), mode)
+            os.fchmod(stream.fileno(), file_mode)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
@@ -2191,6 +2294,12 @@ def _validate_history_path_size(path: Path, display: str) -> os.stat_result | No
     return info
 
 
+def _stat_regular(path: Path, display: str) -> os.stat_result:
+    info = path.stat()
+    _require_regular(info, display)
+    return info
+
+
 def _unlink_expected(
     path: Path, display: str, expected: bytes, max_bytes: int | None = None
 ) -> None:
@@ -2212,7 +2321,7 @@ def _copy_bytes(
     destination_old: bytes | None,
     source_signature: tuple[int, int, int, int, int],
     move: bool,
-    state: dict[str, bool] | None = None,
+    state: dict[str, Any] | None = None,
     max_bytes: int | None = None,
 ) -> None:
     source_mode = stat.S_IMODE(source.stat().st_mode)
@@ -2232,6 +2341,8 @@ def _copy_bytes(
     )
     if destination_info is None:
         destination.chmod(source_mode)
+    if state is not None:
+        state["destination_stat"] = destination.stat()
     if move:
         try:
             current = _read_optional_bytes(destination, str(destination), max_bytes=max_bytes)
@@ -2254,6 +2365,8 @@ def _copy_bytes(
         if current != data or _signature(source_info) != source_signature:
             raise RuntimeError(f"Source changed while moving: {source}")
         source.unlink()
+        if state is not None:
+            state["source_unlinked"] = True
 
 
 def _restore_transition(
@@ -2261,6 +2374,8 @@ def _restore_transition(
     old: bytes | None,
     new: bytes | None,
     max_bytes: int | None = None,
+    old_stat: os.stat_result | None = None,
+    new_stat: os.stat_result | None = None,
 ) -> None:
     try:
         current = _read_optional_bytes(path, str(path), max_bytes=max_bytes)
@@ -2273,14 +2388,34 @@ def _restore_transition(
             raise RuntimeError(f"File changed while rolling back: {path}")
         if old is None:
             return
-        _atomic_write(path, old, None, None, max_bytes=max_bytes)
+        _atomic_write(
+            path,
+            old,
+            None,
+            None,
+            max_bytes=max_bytes,
+            mode=None if old_stat is None else stat.S_IMODE(old_stat.st_mode),
+        )
         return
     if current != new:
         raise RuntimeError(f"File changed while rolling back: {path}")
+    current_stat = None
+    if new_stat is not None:
+        current_stat = path.stat()
+        if _signature(current_stat) != _signature(new_stat):
+            raise RuntimeError(f"File metadata changed while rolling back: {path}")
     if old is None:
         path.unlink(missing_ok=True)
     else:
-        _atomic_write(path, old, new, path.stat(), max_bytes=max_bytes)
+        current_stat = current_stat or path.stat()
+        _atomic_write(
+            path,
+            old,
+            new,
+            current_stat,
+            max_bytes=max_bytes,
+            mode=None if old_stat is None else stat.S_IMODE(old_stat.st_mode),
+        )
 
 
 async def _to_thread_uncancelled(function, *args, **kwargs):

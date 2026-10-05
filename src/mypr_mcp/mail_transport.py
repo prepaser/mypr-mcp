@@ -100,9 +100,15 @@ class MailTransport:
         if self._closed:
             raise MailTransportError("mail transport is closed", code="service_closed")
         loop = asyncio.get_running_loop()
-        return await wait_owned(
-            loop.run_in_executor(self._watch_executor, lambda: function(*args, **kwargs))
-        )
+        future = self._watch_executor.submit(function, *args, **kwargs)
+        awaitable = asyncio.wrap_future(future, loop=loop)
+        try:
+            return await asyncio.shield(awaitable)
+        except asyncio.CancelledError:
+            if future.cancel():
+                raise
+            await wait_owned(awaitable, propagate=False)
+            raise
 
     def account_names(self) -> list[str]:
         accounts = self.config.get("accounts", self.config)

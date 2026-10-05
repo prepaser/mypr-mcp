@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import tomlkit
 
+from .file_io import open_regular
 from .lsp_config import validate_servers as _validate_lsp_servers
 
 CONFIG_VERSION = 1
@@ -472,6 +473,12 @@ def validate_mail_config(value: Any) -> dict[str, Any]:
         result["accounts"] = _validate_mail_accounts(
             layer["accounts"], "mail.accounts", normalize=True
         )
+    default = result["default_account"]
+    if default and (
+        default not in result["accounts"]
+        or result["accounts"][default].get("enabled", True) is False
+    ):
+        result["default_account"] = ""
     return result
 
 
@@ -829,10 +836,7 @@ def parse_config(raw: bytes | str | None) -> dict:
 
 def load_workspace_config(workspace: str | os.PathLike[str]) -> ConfigSnapshot:
     path = Path(workspace).resolve() / ".mypr" / "config.toml"
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        raw = None
+    raw = ConfigStore._read(path)
     try:
         values = parse_config(raw)
     except ConfigError as exc:
@@ -1445,10 +1449,10 @@ class ConfigStore:
         path = self._profile_lock_path()
         if create:
             path.parent.mkdir(parents=True, exist_ok=True)
-            stream = path.open("a")
+            stream = open_regular(path, "ab")
         else:
             try:
-                stream = path.open("r")
+                stream = open_regular(path)
             except FileNotFoundError:
                 yield False
                 return
@@ -1474,11 +1478,11 @@ class ConfigStore:
                 lock_path = path.with_suffix(".lock")
                 if target_lock:
                     lock_path.parent.mkdir(parents=True, exist_ok=True)
-                    stream = lock_path.open("a")
+                    stream = open_regular(lock_path, "ab")
                     mode = fcntl.LOCK_EX
                 else:
                     try:
-                        stream = lock_path.open("r")
+                        stream = open_regular(lock_path)
                     except FileNotFoundError:
                         continue
                     mode = fcntl.LOCK_SH
@@ -1526,7 +1530,7 @@ class ConfigStore:
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                dir=path.parent, prefix=f".{path.name}.", delete=False
+                dir=path.parent, prefix=".mypr-config-", delete=False
             ) as stream:
                 temporary = Path(stream.name)
                 stream.write(data)

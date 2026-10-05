@@ -23,6 +23,8 @@ from urllib.parse import unquote, urlparse
 
 from .async_utils import finish_owned, wait_owned
 from .config import ConfigSnapshot, ConfigStore
+from .file_io import PersistedFileError
+from .file_io import read_bytes as read_persisted_bytes
 from .lsp_config import validate_configuration, validate_servers
 from .lsp_edits import (
     EditError,
@@ -44,6 +46,9 @@ MAX_DIAGNOSTICS = 256
 MAX_HOVER_CHARS = 64 * 1024
 MAX_STDERR_BYTES = 16 * 1024
 MAX_ACTIONS = 1024
+MAX_ACTION_CACHE_BYTES = 8 * 1024 * 1024
+MAX_WORKSPACE_DIAGNOSTIC_REPORTS = 1024
+MAX_WORKSPACE_DIAGNOSTIC_BYTES = 8 * 1024 * 1024
 ACTION_TTL = 3600.0
 MAX_EDIT_TARGETS = 100
 MAX_SYMBOL_DEPTH = 32
@@ -111,6 +116,7 @@ class _StoredAction:
     created: float
     target_snapshots: dict[Path, str | None]
     target_documents: dict[Path, tuple[int, str]]
+    size_bytes: int
 
 
 def _position(text: str, line: Any, character: Any, encoding: str) -> dict[str, int]:
@@ -208,6 +214,19 @@ def _source_lines(text: str) -> list[str]:
 
 def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _stored_action_size(
+    action: dict[str, Any],
+    document_text: str,
+    target_snapshots: dict[Path, str | None],
+    target_documents: dict[Path, tuple[int, str]],
+) -> int:
+    snapshots = [[str(path), value] for path, value in target_snapshots.items()]
+    documents = [[str(path), list(value)] for path, value in target_documents.items()]
+    return 256 + len(document_text.encode("utf-8")) + _json_size(
+        {"action": action, "snapshots": snapshots, "documents": documents}
+    )
 
 
 def _file_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -686,10 +705,12 @@ class _LanguageServer:
 
     @staticmethod
     def _read_file(path: Path) -> str:
-        with path.open("rb") as stream:
-            raw = stream.read(MAX_DOCUMENT_BYTES + 1)
-        if len(raw) > MAX_DOCUMENT_BYTES:
-            raise ValueError(f"document exceeds {MAX_DOCUMENT_BYTES} bytes")
+        try:
+            raw = read_persisted_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
+        except PersistedFileError as exc:
+            if "not a regular file" not in str(exc):
+                raise
+            raise ValueError(f"code navigation requires a regular source file: {path}") from exc
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -2393,8 +2414,23 @@ class CodeTools:
                 or server.generation != stored.generation
             ):
                 self._actions.pop(action_id, None)
-        while len(self._actions) > MAX_ACTIONS:
-            self._actions.popitem(last=False)
+        retained_bytes = sum(stored.size_bytes for stored in self._actions.values())
+        while self._actions and (
+            len(self._actions) > MAX_ACTIONS or retained_bytes > MAX_ACTION_CACHE_BYTES
+        ):
+            _, stored = self._actions.popitem(last=False)
+            retained_bytes -= stored.size_bytes
+
+    def _prune_workspace_diagnostics(
+        self, cache: dict[str, dict[str, Any]]
+    ) -> None:
+        retained_bytes = sum(_json_size(report) for report in cache.values())
+        while cache and (
+            len(cache) > MAX_WORKSPACE_DIAGNOSTIC_REPORTS
+            or retained_bytes > MAX_WORKSPACE_DIAGNOSTIC_BYTES
+        ):
+            uri = next(iter(cache))
+            retained_bytes -= _json_size(cache.pop(uri))
 
     async def rename(
         self,
@@ -2477,6 +2513,10 @@ class CodeTools:
             "actions": [],
             "truncated": len(raw_actions) > MAX_RESULTS,
         }
+        if _json_size(result) > max_bytes:
+            raise ValueError(
+                "max_bytes is too small for code action metadata; increase the budget"
+            )
         created_ids: list[str] = []
         try:
             async with server._operation_lock:
@@ -2512,6 +2552,13 @@ class CodeTools:
                         )
                     target_snapshots[document.path] = origin_revision
                     target_documents[document.path] = (document_version, origin_revision)
+                    size_bytes = _stored_action_size(
+                        raw, document_text, target_snapshots, target_documents
+                    )
+                    if size_bytes > MAX_ACTION_CACHE_BYTES:
+                        raise CodeError(
+                            "language server code action exceeds the retained action cache limit"
+                        )
                     self._actions[action_id] = _StoredAction(
                         server.name,
                         copy.deepcopy(raw),
@@ -2522,8 +2569,13 @@ class CodeTools:
                         time.monotonic(),
                         target_snapshots,
                         target_documents,
+                        size_bytes,
                     )
                     created_ids.append(action_id)
+                    self._prune_actions()
+                    if action_id not in self._actions:
+                        result["truncated"] = True
+                        continue
                     command = raw.get("command")
                     if isinstance(command, dict):
                         has_command = isinstance(command.get("command"), str)
@@ -2554,6 +2606,18 @@ class CodeTools:
             raise
         finally:
             self._prune_actions()
+        retained_actions = [
+            item for item in result["actions"] if item["action_id"] in self._actions
+        ]
+        if len(retained_actions) != len(result["actions"]):
+            result["truncated"] = True
+            result["actions"] = retained_actions
+        if _json_size(result) > max_bytes:
+            for action_id in created_ids:
+                self._actions.pop(action_id, None)
+            raise ValueError(
+                "max_bytes is too small for code action metadata; increase the budget"
+            )
         return result
 
     async def prepare_action(self, action_id: str) -> dict[str, Any]:
@@ -2774,7 +2838,11 @@ class CodeTools:
                 or self._server_generation(server) != server_generation
             ):
                 raise CodeError("language server changed during workspace diagnostics")
-            previous_reports.update(cache_updates)
+            for uri, report in cache_updates.items():
+                previous_reports.pop(uri, None)
+                if _json_size(report) <= MAX_WORKSPACE_DIAGNOSTIC_BYTES:
+                    previous_reports[uri] = report
+            self._prune_workspace_diagnostics(previous_reports)
             ident = self._diagnostic_snapshots.create(
                 {"server": server.name, "generation": server_generation},
                 items,
