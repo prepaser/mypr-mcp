@@ -503,6 +503,26 @@ async def test_new_file_rollback_preserves_concurrent_edit(tmp_path: Path):
     assert path.read_text(encoding="utf-8") == concurrent
 
 
+@pytest.mark.asyncio
+async def test_long_module_name_rolls_back_after_index_failure(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    name = "a" * 240
+    path = tmp_path / ".mypr" / "lib" / "ws_lib" / f"{name}.py"
+    original_write = fs.write
+
+    async def fail_index(path, text, **kwargs):
+        if ".mypr/revisions/index/" in str(path):
+            raise OSError("injected index failure")
+        return await original_write(path, text, **kwargs)
+
+    fs.write = fail_index
+    with pytest.raises(RuntimeError, match="file change was rolled back"):
+        await modules.write(name, "VALUE = 1\n")
+
+    assert not path.exists()
+
+
 def test_create_rollback_restores_concurrent_broken_symlink(tmp_path: Path, monkeypatch):
     import mypr_mcp.revisions as revisions
 

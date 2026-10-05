@@ -85,6 +85,24 @@ async def test_run_timeout_cancels_process_and_keeps_output(shell):
     assert not service.active
 
 
+async def test_run_timeout_includes_pending_start_and_cleans_up(shell, monkeypatch):
+    commands, service = shell
+    original = commands.start
+
+    async def delayed_start(*args, **kwargs):
+        handle = await original(*args, **kwargs)
+        await asyncio.sleep(0.03)
+        return handle
+
+    monkeypatch.setattr(commands, "start", delayed_start)
+    result = await commands.run(
+        [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.001
+    )
+    assert result["timed_out"] is True
+    assert result["state"] == "cancelled"
+    assert not service.active
+
+
 async def test_run_check_error_keeps_result(shell):
     commands, _ = shell
     with pytest.raises(api.ShellError) as caught:

@@ -57,6 +57,20 @@ def manager(tmp_path: Path) -> ModuleManager:
 
 
 @pytest.mark.asyncio
+async def test_module_list_page_bounds_items_and_returns_cursor(tmp_path: Path):
+    modules = manager(tmp_path)
+    await modules.write("a", "VALUE = 'a'\n")
+    await modules.write("nested.b", "VALUE = 'b'\n")
+
+    first = await modules.list_page(limit=1)
+    assert [item["name"] for item in first["items"]] == ["a"]
+    assert first["has_more"] is True
+    second = await modules.list_page(limit=1, cursor=first["next_cursor"])
+    assert [item["name"] for item in second["items"]] == ["nested.b"]
+    assert second["has_more"] is False
+
+
+@pytest.mark.asyncio
 async def test_module_write_read_and_stale_revision(tmp_path: Path):
     modules = manager(tmp_path)
     created = await modules.write("demo", "VALUE = 1\n")

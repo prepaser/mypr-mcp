@@ -56,7 +56,7 @@ async def ensure(workspace, *, locked=False):
         # Recover abandoned restart state before reusing or starting a manager.
         from .restart import recover_ticket
 
-        await recover_ticket(workspace)
+        await recover_ticket(workspace, locked=True)
         found = await find_runtime(workspace)
         if found is not None:
             path, state = found

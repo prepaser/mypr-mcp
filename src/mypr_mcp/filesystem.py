@@ -981,8 +981,11 @@ class Filesystem:
                 raise FileExistsError(destination_display)
             if history_enabled:
                 _validate_history_size(old, old, source_display)
-            if destination_path.parent != self.workspace and not destination_path.parent.exists():
-                destination_path.parent.mkdir(parents=True, exist_ok=True)
+            created_dirs: list[tuple[Path, tuple[int, int]]] = []
+            if destination_path.parent != self.workspace:
+                created_dirs = await _to_thread_uncancelled(
+                    _create_parent_dirs, destination_path.parent
+                )
             physical_transitions = []
             plans = []
             if move:
@@ -1013,7 +1016,11 @@ class Filesystem:
                         }
                     )
             if history_enabled:
-                await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
+                try:
+                    await _to_thread_uncancelled(history_store.prepare_changes_sync, plans)
+                except BaseException:
+                    await _to_thread_uncancelled(_remove_empty_dirs, created_dirs)
+                    raise
 
             copy_state = {
                 "destination_committed": False,
@@ -1046,6 +1053,9 @@ class Filesystem:
                 if recovery:
                     raise RuntimeError("; ".join(recovery))
 
+            async def cleanup_created_dirs() -> None:
+                await _to_thread_uncancelled(_remove_empty_dirs, created_dirs)
+
             try:
                 _, copy_cancelled = await finish_owned(
                     asyncio.to_thread(
@@ -1062,23 +1072,28 @@ class Filesystem:
                 )
             except BaseException as exc:
                 if not copy_state["destination_committed"]:
+                    await cleanup_created_dirs()
                     raise
                 try:
                     await rollback_physical()
                 except BaseException as rollback_error:
+                    await cleanup_created_dirs()
                     raise RuntimeError(
                         f"lifecycle operation failed and rollback was incomplete: "
                         f"{rollback_error}"
                     ) from exc
+                await cleanup_created_dirs()
                 raise
             if copy_cancelled:
                 try:
                     await rollback_physical()
                 except BaseException as rollback_error:
+                    await cleanup_created_dirs()
                     raise RuntimeError(
                         f"lifecycle operation was cancelled and rollback was incomplete: "
                         f"{rollback_error}"
                     ) from rollback_error
+                await cleanup_created_dirs()
                 raise asyncio.CancelledError
             if history_enabled:
                 try:
@@ -1094,10 +1109,12 @@ class Filesystem:
                     try:
                         await rollback_physical()
                     except BaseException as rollback_error:
+                        await cleanup_created_dirs()
                         raise RuntimeError(
                             "history write failed and lifecycle rollback was incomplete: "
                             f"{rollback_error}"
                         ) from exc
+                    await cleanup_created_dirs()
                     raise RuntimeError(
                         "history write failed; lifecycle change was rolled back"
                     ) from exc
@@ -2367,6 +2384,48 @@ def _copy_bytes(
         source.unlink()
         if state is not None:
             state["source_unlinked"] = True
+
+
+def _create_parent_dirs(path: Path) -> list[tuple[Path, tuple[int, int]]]:
+    if path.exists():
+        return []
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    created: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for directory in reversed(missing):
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+                break
+            info = directory.stat()
+            created.append((directory, (info.st_dev, info.st_ino)))
+    except BaseException:
+        _remove_empty_dirs(created)
+        raise
+    return created
+
+
+def _remove_empty_dirs(created: list[tuple[Path, tuple[int, int]]]) -> None:
+    for directory, identity in reversed(created):
+        try:
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or (info.st_dev, info.st_ino) != identity
+            ):
+                continue
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _restore_transition(

@@ -480,7 +480,7 @@ class EditPlanStore:
         preconditions: dict[Path, str | None] | None = None,
         documents: dict[Path, tuple[int, str]] | None = None,
     ) -> EditPlan:
-        return await wait_owned(
+        operation = asyncio.ensure_future(
             asyncio.to_thread(
                 self.create,
                 root,
@@ -493,6 +493,19 @@ class EditPlanStore:
                 documents=documents,
             )
         )
+        cancelled = False
+        while True:
+            try:
+                plan = await asyncio.shield(operation)
+                break
+            except asyncio.CancelledError:
+                if operation.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            await wait_owned(asyncio.to_thread(self.remove, plan.ident), propagate=False)
+            raise asyncio.CancelledError
+        return plan
 
     def get(self, ident: str) -> EditPlan:
         with self._cache_lock:

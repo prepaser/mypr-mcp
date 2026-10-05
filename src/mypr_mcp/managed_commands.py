@@ -34,6 +34,7 @@ class ManagedCommands:
         timeout=None,  # noqa: ASYNC109
         check=False,
         max_bytes=32768,
+        errors="replace",
     ) -> dict[str, Any]:
         if type(max_bytes) is not int or max_bytes < 0:
             raise ValueError("max_bytes must be a non-negative integer")
@@ -44,24 +45,22 @@ class ManagedCommands:
             or timeout < 0
         ):
             raise ValueError("timeout must be a finite non-negative number or None")
+        if type(errors) is not str or errors not in {"replace", "surrogateescape"}:
+            raise ValueError("errors must be 'replace' or 'surrogateescape'")
+        # Shells handles invalid input; the byte limit can leave an incomplete character.
+        decode_errors = "ignore" if errors == "replace" else errors
         shells = self.shells
         launch = asyncio.create_task(
             self._start(
-                shells, command, cwd or str(self.runtime.workspace), env, input=input
+                shells,
+                command,
+                cwd or str(self.runtime.workspace),
+                env,
+                input=input,
+                errors=errors,
             )
         )
-        try:
-            job = await asyncio.shield(launch)
-        except asyncio.CancelledError:
-            # A cancellation can arrive after create_subprocess_exec but before
-            # start() returns its ID. Finish start, register the job, then kill it.
-            job = await _uncancelled(launch, propagate=False)
-            ident = await self._track_or_cancel(shells, job, command)
-            with suppress(Exception):
-                await self._cancel(shells, ident)
-            raise
-
-        ident = await self._track_or_cancel(shells, job, command)
+        ident: str | None = None
         streams = {"stdout": bytearray(), "stderr": bytearray()}
         remaining = max_bytes
         cursor = None
@@ -85,7 +84,7 @@ class ManagedCommands:
             for event in events:
                 if not isinstance(event, dict):
                     continue
-                raw = str(event.get("text", "")).encode("utf-8", "replace")
+                raw = str(event.get("text", "")).encode("utf-8", errors)
                 if remaining == 0:
                     truncated |= bool(raw)
                     break
@@ -134,6 +133,8 @@ class ManagedCommands:
 
         try:
             async with asyncio.timeout(timeout):
+                job = await asyncio.shield(launch)
+                ident = await self._track_or_cancel(shells, job, command)
                 while True:
                     page = await shells.read(
                         ident, cursor=cursor, max_bytes=_PAGE_BYTES, wait_ms=1000
@@ -143,19 +144,38 @@ class ManagedCommands:
                         break
         except TimeoutError:
             timed_out = True
-            await self._cancel(shells, ident)
+            if ident is None:
+                # Shielded startup may still be creating a process. Finish it
+                # so the manager can associate and cancel the launched job.
+                with suppress(Exception):
+                    job = await _uncancelled(launch, propagate=False)
+                    ident = await self._track_or_cancel(shells, job, command)
+            if ident is not None:
+                with suppress(Exception):
+                    await self._cancel(shells, ident)
+            if ident is not None:
+                with suppress(Exception):
+                    await drain()
+        except asyncio.CancelledError:
+            # A cancellation can arrive after create_subprocess_exec but before
+            # start() returns its ID. Finish start, register the job, then kill it.
             with suppress(Exception):
-                await drain()
+                job = await _uncancelled(launch, propagate=False)
+                if ident is None:
+                    ident = await self._track_or_cancel(shells, job, command)
+                await self._cancel(shells, ident)
+            raise
         except BaseException:
             with suppress(Exception):
-                await self._cancel(shells, ident)
+                if ident is not None:
+                    await self._cancel(shells, ident)
             raise
         result = {
             "id": ident,
             "state": page.get("state", "unknown"),
             "returncode": (page.get("result") or {}).get("returncode"),
-            "stdout": bytes(streams["stdout"]).decode("utf-8", "ignore"),
-            "stderr": bytes(streams["stderr"]).decode("utf-8", "ignore"),
+            "stdout": bytes(streams["stdout"]).decode("utf-8", decode_errors),
+            "stderr": bytes(streams["stderr"]).decode("utf-8", decode_errors),
             "error": page.get("error"),
             "truncated": truncated,
             "warnings": warnings,
@@ -176,6 +196,7 @@ class ManagedCommands:
         input=None,
         timeout=30,  # noqa: ASYNC109
         max_bytes=16 * 1024 * 1024,
+        errors="replace",
         on_stdout,
     ) -> dict[str, Any]:
         """Run a command while forwarding bounded stdout chunks to a callback.
@@ -194,12 +215,20 @@ class ManagedCommands:
             raise ValueError("timeout must be a finite non-negative number or None")
         if not callable(on_stdout):
             raise TypeError("on_stdout must be callable")
+        if type(errors) is not str or errors not in {"replace", "surrogateescape"}:
+            raise ValueError("errors must be 'replace' or 'surrogateescape'")
+        decode_errors = "ignore" if errors == "replace" else errors
 
         shells = self.shells
         deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
         launch = asyncio.create_task(
             self._start(
-                shells, command, cwd or str(self.runtime.workspace), env, input=input
+                shells,
+                command,
+                cwd or str(self.runtime.workspace),
+                env,
+                input=input,
+                errors=errors,
             )
         )
         ident: str | None = None
@@ -237,7 +266,7 @@ class ManagedCommands:
             for event in events:
                 if not isinstance(event, dict):
                     continue
-                raw = str(event.get("text", "")).encode("utf-8", "replace")
+                raw = str(event.get("text", "")).encode("utf-8", errors)
                 if not raw:
                     continue
                 stream = "stderr" if event.get("stream") == "stderr" else "stdout"
@@ -253,7 +282,7 @@ class ManagedCommands:
                     if len(diagnostic) < len(kept):
                         truncated = True
                 elif forward and kept:
-                    text = kept.decode("utf-8", "ignore")
+                    text = kept.decode("utf-8", decode_errors)
                     if text:
                         reason = await on_stdout(text)
                         if reason is not None and not preserve_reason:
@@ -338,7 +367,7 @@ class ManagedCommands:
             "state": page.get("state", "unknown"),
             "returncode": (page.get("result") or {}).get("returncode"),
             "stdout": "",
-            "stderr": bytes(stderr).decode("utf-8", "ignore"),
+            "stderr": bytes(stderr).decode("utf-8", decode_errors),
             "error": page.get("error"),
             "truncated": truncated,
             "warnings": warnings,
@@ -355,6 +384,8 @@ class ManagedCommands:
             raise RuntimeError("shell start returned no job ID")
         ident = str(job["id"])
         try:
+            if self._pinned:
+                self.runtime._check_managed_command_admission(self.generation, shells)
             self.runtime.track_shell(
                 ident,
                 self.client_id,
@@ -368,13 +399,16 @@ class ManagedCommands:
             raise
         return ident
 
-    async def _start(self, shells, command, cwd, env, *, input=None):
+    async def _start(self, shells, command, cwd, env, *, input=None, errors="replace"):
+        kwargs = {} if errors == "replace" else {"output_errors": errors}
         if self._pinned:
             starter = getattr(self.runtime, "start_managed_command", None)
             if not callable(starter):
                 raise RuntimeError("Managed command runtime cannot validate its generation")
-            return await starter(self.generation, shells, command, cwd, env, input=input)
-        return await shells.start(command, cwd, env, input=input)
+            return await starter(
+                self.generation, shells, command, cwd, env, input=input, **kwargs
+            )
+        return await shells.start(command, cwd, env, input=input, **kwargs)
 
     @staticmethod
     async def _cancel(shells, ident):

@@ -303,14 +303,19 @@ class ScanService:
         if type(max_bytes) is not int or not 1 <= max_bytes <= _RESULT_LIMIT:
             raise ValueError(f"max_bytes must be between 1 and {_RESULT_LIMIT}")
         offset = self._decode_cursor(cursor, scan_id) if cursor is not None else 0
-        rows, next_offset, more = await asyncio.to_thread(
-            self._read_results_page,
-            Path(record["result_path"]),
-            offset,
-            max_entries,
-            max_bytes,
-            record.get("state") not in _TERMINAL,
-        )
+        output_missing = False
+        try:
+            rows, next_offset, more = await asyncio.to_thread(
+                self._read_results_page,
+                Path(record["result_path"]),
+                offset,
+                max_entries,
+                max_bytes,
+                record.get("state") not in _TERMINAL,
+            )
+        except FileNotFoundError:
+            rows, next_offset, more = [], offset, False
+            output_missing = True
         next_cursor = self._encode_cursor(scan_id, next_offset) if more else None
         result = {
             "id": scan_id,
@@ -325,6 +330,12 @@ class ScanService:
         }
         if record.get("mode") in {"tcp", "udp"}:
             result["complete"] = bool(record.get("complete", False))
+        if output_missing:
+            result.update(output_unavailable=True, truncated=True, complete=False)
+            result["warnings"].append({
+                "code": "scan_output_unavailable",
+                "text": "Saved scan output is missing; an empty page is not a complete result.",
+            })
         return result
 
     @staticmethod
@@ -337,9 +348,13 @@ class ScanService:
         budget_more = False
         eof = False
         more_data = False
-        if not path.is_file():
-            return rows, offset, running
-        with open_regular(path) as stream:
+        try:
+            source = open_regular(path)
+        except FileNotFoundError:
+            if running:
+                return rows, offset, True
+            raise
+        with source as stream:
             if offset > os.fstat(stream.fileno()).st_size:
                 raise ValueError("scan cursor is beyond the retained results")
             stream.seek(offset)

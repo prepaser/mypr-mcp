@@ -99,6 +99,22 @@ def test_install_lock_timeout(tmp_path):
     asyncio.run(run())
 
 
+def test_cache_path_matches_playwright_registry_resolution(tmp_path, monkeypatch):
+    service = BrowserService(tmp_path / "workspace", Path("/usr/bin/python"))
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "browser-cache")
+    monkeypatch.setenv("INIT_CWD", str(tmp_path / "initial-cwd"))
+    assert service._cache_path() == (tmp_path / "initial-cwd/browser-cache").resolve()
+
+    monkeypatch.delenv("INIT_CWD")
+    assert service._cache_path() == (tmp_path / "workspace/browser-cache").resolve()
+
+    package_root = tmp_path / "playwright/driver/package"
+    package_root.mkdir(parents=True)
+    service._driver_package_root = package_root
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
+    assert service._cache_path() == package_root / ".local-browsers"
+
+
 @pytest.mark.parametrize("browser", ["", "chrome", "Chromium", None])
 def test_invalid_browser(tmp_path, browser):
     service = BrowserService(tmp_path, Path("/usr/bin/python"))

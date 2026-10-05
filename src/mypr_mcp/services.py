@@ -32,6 +32,7 @@ from .async_utils import finish_owned, wait_owned
 from .config import ConfigSnapshot, ConfigStore, MCPConfig, validate_name, validate_servers
 from .file_io import open_regular, read_bytes
 from .journal import decode_event, read_page
+from .json_utils import json_bytes, json_text
 from .lsp_config import validate_servers as validate_lsp_servers
 from .terminal import close as close_terminal
 from .terminal import eof_byte
@@ -56,6 +57,7 @@ class _Job:
     group_id: int
     output_limit: int
     kind: str = "shell"
+    output_errors: str = "replace"
     state: str = "running"
     output: list[dict[str, str]] = field(default_factory=list)
     output_bytes: int = 0
@@ -184,6 +186,7 @@ class Shells:
         *,
         inherit_env: bool = True,
         kind: str = "shell",
+        output_errors: str = "replace",
     ) -> dict[str, str]:
         await self._begin_start()
         try:
@@ -198,6 +201,7 @@ class Shells:
                 cols,
                 inherit_env=inherit_env,
                 kind=kind,
+                output_errors=output_errors,
             )
         finally:
             await wait_owned(self._end_start(), propagate=False)
@@ -215,9 +219,12 @@ class Shells:
         *,
         inherit_env: bool = True,
         kind: str = "shell",
+        output_errors: str = "replace",
     ) -> dict[str, str]:
         if self._closed:
             raise RuntimeError("shell service is closed")
+        if output_errors not in {"replace", "surrogateescape"}:
+            raise ValueError("output_errors must be replace or surrogateescape")
         self._ensure_workspace_identity()
         if input is not None and not isinstance(input, str):
             raise TypeError("input must be a string or None")
@@ -297,6 +304,7 @@ class Shells:
         job_id = uuid.uuid4().hex
         job = self._new_job(job_id, process, process.pid, kind=kind)
         self._jobs[job_id] = job
+        job.output_errors = output_errors
         if pty:
             assert master_fd is not None
             job.pty = True
@@ -534,19 +542,24 @@ class Shells:
                 continue
             if not page and max_bytes == 0:
                 break
-            raw = str(event.get("text", "")).encode("utf-8")
+            text = str(event.get("text", ""))
+            raw = text.encode("utf-8", "surrogateescape")
             start = event_offset if position == event_index else 0
-            if start > len(raw) or (start < len(raw) and raw[start] & 0xC0 == 0x80):
+            prefix = raw[:start].decode("utf-8", "surrogateescape")
+            if start > len(raw) or not text.startswith(prefix):
                 raise ValueError("invalid shell output cursor")
             remaining = max_bytes - size
             if remaining <= 0:
                 break
-            kept = raw[start : start + remaining].decode("utf-8", "ignore")
+            kept = raw[start : start + remaining].decode("utf-8", "surrogateescape")
+            suffix = text[len(prefix):]
+            while kept and not suffix.startswith(kept):
+                kept = kept[:-1]
             if not kept and raw[start:]:
                 if page:
                     break
                 raise ValueError("max_bytes is too small for the next UTF-8 character")
-            consumed = len(kept.encode("utf-8"))
+            consumed = len(kept.encode("utf-8", "surrogateescape"))
             if consumed:
                 page.append({**event, "text": kept})
                 size += consumed
@@ -963,7 +976,7 @@ class Shells:
         if job.journal is None:
             return
         with job.journal.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            file.write(json_text(event, separators=(",", ":")) + "\n")
 
     @staticmethod
     def _write_metadata(job: _Job) -> None:
@@ -984,7 +997,7 @@ class Shells:
             "cols": job.cols,
         }
         temporary = job.metadata.with_suffix(".tmp")
-        temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        temporary.write_text(json_text(data), encoding="utf-8")
         os.replace(temporary, job.metadata)
 
     def _prune_completed(self) -> None:
@@ -1048,7 +1061,7 @@ class Shells:
             self._add_warning(job, "metadata_persist_failed", exc)
 
     async def _drain(self, job: _Job, stream: Any, name: str) -> None:
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        decoder = codecs.getincrementaldecoder("utf-8")(job.output_errors)
         package_decoder = (
             codecs.getincrementaldecoder("utf-8")("replace")
             if job.kind == "package" and name == "stdout"
@@ -1081,7 +1094,7 @@ class Shells:
                 if text:
                     event = {"stream": name, "text": text}
                     job.output.append(event)
-                    job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
+                    job.memory_bytes += len(json_bytes(event))
                     self._persist_output(job, event)
                     job.changed.set()
             if len(keep) < len(chunk):
@@ -1097,7 +1110,7 @@ class Shells:
         if text and job.output_bytes < job.output_limit:
             event = {"stream": name, "text": text}
             job.output.append(event)
-            job.memory_bytes += len(json.dumps(event, ensure_ascii=False).encode())
+            job.memory_bytes += len(json_bytes(event))
             self._persist_output(job, event)
             job.changed.set()
 

@@ -38,4 +38,6 @@ Response budgets include metadata. `document_symbols()`, `workspace_symbols()`, 
 
 The in-memory code action cache is limited to 8 MiB of retained action data in addition to the 1,024-action count limit. An individual action that exceeds the byte limit is rejected instead of returning an action ID that cannot later be prepared. Each server's in-memory workspace diagnostic cache retains at most 1,024 reports and 8 MiB of report data; the oldest entries are evicted first, and an oversized report is returned in the current snapshot without being retained for an unchanged follow-up.
 
+Disabled code actions are returned with `supported=False` and `prepare_action()` rejects them, including when `codeAction/resolve` marks an action disabled. Plans created by a canceled preview are removed before cancellation is returned. Malformed pull diagnostic reports, including reports without their required `items` member, are rejected instead of being reported as a clean empty result.
+
 Protocol details follow [LSP 3.17](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/).

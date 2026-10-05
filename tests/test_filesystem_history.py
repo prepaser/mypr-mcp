@@ -121,6 +121,44 @@ async def test_history_failure_rolls_back_single_file(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["copy", "move"])
+@pytest.mark.parametrize("external_change", [False, True])
+async def test_lifecycle_failure_cleans_only_created_destination_dirs(
+    tmp_path: Path, monkeypatch, operation: str, external_change: bool
+):
+
+    fs = Filesystem(tmp_path)
+    source = await fs.write("source.txt", "source")
+    store = fs._history_store()
+    created = tmp_path / "nested" / "deep"
+
+    def fail_record(_plans):
+        if external_change:
+            created.mkdir(parents=True, exist_ok=True)
+            (created / "external.txt").write_text("keep")
+        raise OSError("injected index failure")
+
+    store.record_changes_sync = fail_record
+    monkeypatch.setattr(fs, "_history_store", lambda: store)
+    with pytest.raises(RuntimeError, match="history write failed"):
+        if operation == "copy":
+            await fs.copy("source.txt", "nested/deep/destination.txt")
+        else:
+            await fs.move(
+                "source.txt",
+                "nested/deep/destination.txt",
+                expected_hash=source["revision"],
+            )
+
+    assert (tmp_path / "source.txt").read_text() == "source"
+    assert not (created / "destination.txt").exists()
+    if external_change:
+        assert (created / "external.txt").read_text() == "keep"
+    else:
+        assert not (tmp_path / "nested").exists()
+
+
+@pytest.mark.asyncio
 async def test_history_can_be_explicitly_disabled_for_large_files(tmp_path: Path, monkeypatch):
     import mypr_mcp.revisions as revisions
 

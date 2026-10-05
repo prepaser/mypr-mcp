@@ -38,14 +38,19 @@ def _python_path(root: Path) -> Path:
     return root / "venv" / "bin" / "python"
 
 
-def _browser_cache_path() -> Path | None:
+def _browser_cache_path(workspace: Path | None = None) -> Path | None:
     value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
     if value == "0":
         return None
-    if value:
-        return Path(value).expanduser().resolve()
     cache_root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return (Path(cache_root) / "ms-playwright").expanduser().resolve()
+    path = Path(value) if value else Path(cache_root) / "ms-playwright"
+    if path.is_absolute():
+        return path.resolve()
+    workspace = workspace or Path.cwd()
+    base = Path(os.environ.get("INIT_CWD") or workspace)
+    if not base.is_absolute():
+        base = workspace / base
+    return (base / path).resolve()
 
 
 async def _probe_python(python: Path) -> dict[str, Any]:
@@ -253,6 +258,79 @@ async def _service_status(ws: Any, attr: str, method: str) -> dict[str, Any]:
         }
 
 
+async def _runtime_readiness(ws: Any) -> dict[str, Any]:
+    """Inspect the live manager when this doctor runs inside a kernel."""
+
+    if ws is None:
+        return {
+            "configured": False,
+            "available": False,
+            "status": "unknown",
+            "reason": "runtime health requires a kernel connection",
+        }
+    callback = getattr(ws, "status", None)
+    if callback is None:
+        return {
+            "configured": True,
+            "available": False,
+            "status": "unknown",
+            "reason": "runtime status is unavailable",
+        }
+    try:
+        value = callback(detail=False)
+        if hasattr(value, "__await__"):
+            value = await asyncio.wait_for(value, 5)
+        healthy = value.get("healthy") if isinstance(value, dict) else None
+        status = "healthy" if healthy is True else "unhealthy" if healthy is False else "unknown"
+        return {
+            "configured": True,
+            "available": healthy is True,
+            "status": status,
+            "healthy": healthy,
+            "generation": value.get("generation") if isinstance(value, dict) else None,
+            "connection_count": value.get("connection_count") if isinstance(value, dict) else None,
+            "active_count": value.get("active_count") if isinstance(value, dict) else None,
+            "queued_count": value.get("queued_count") if isinstance(value, dict) else None,
+            "error": value.get("health_error") if isinstance(value, dict) else None,
+        }
+    except Exception as exc:
+        return {
+            "configured": True,
+            "available": False,
+            "status": "unhealthy",
+            "error": f"{type(exc).__name__}: {exc}"[:512],
+        }
+
+
+async def _storage_readiness(workspace: Path, ws: Any = None) -> dict[str, Any]:
+    """Inspect free space locally and managed usage when a manager is live."""
+
+    path = workspace
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    try:
+        usage = await asyncio.to_thread(shutil.disk_usage, path)
+    except OSError as exc:
+        result: dict[str, Any] = {
+            "available": False,
+            "ready": False,
+            "path": str(path),
+            "error": f"{type(exc).__name__}: {exc}"[:512],
+        }
+    else:
+        result = {
+            "available": True,
+            "ready": usage.free > 0,
+            "path": str(path),
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+        }
+    if ws is not None:
+        result["managed"] = await _service_status(ws, "storage", "usage")
+    return result
+
+
 def _mail_readiness(config: dict[str, Any]) -> dict[str, Any]:
     accounts = {}
     for name, account in config.get("accounts", {}).items():
@@ -331,6 +409,8 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         "mail": {},
         "web": {},
         "dependencies": {},
+        "runtime": {},
+        "storage": {},
         "warnings": [],
     }
     startup_failure = await asyncio.to_thread(read_startup_failure, root)
@@ -361,6 +441,8 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
         result["config"].update(valid=False, error=f"{type(exc).__name__}: {exc}"[:512])
         result["warnings"].append("configuration is unavailable")
     python = _python_path(root)
+    result["runtime"] = await _runtime_readiness(ws)
+    result["storage"] = await _storage_readiness(path, ws)
     result["python"] = await _probe_python(python)
     for name in _BINARIES:
         found = shutil.which(name)
@@ -390,7 +472,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result["search"] = {
         name: result["binaries"][name] for name in _SEARCH_BINARIES
     }
-    browser_cache = _browser_cache_path()
+    browser_cache = _browser_cache_path(path)
     result["ocr"] = {
         "tesseract": await _tesseract(),
         "python": {

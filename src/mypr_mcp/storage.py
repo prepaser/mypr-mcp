@@ -81,6 +81,8 @@ class _Entry:
     category: str
     size: int
     mtime_ns: int
+    ctime_ns: int
+    device: int
     inode: int
     digest: str | None
 
@@ -906,8 +908,10 @@ class Storage:
                 return None
             if (
                 current.st_ino != info.st_ino
+                or current.st_dev != info.st_dev
                 or current.st_size != info.st_size
                 or current.st_mtime_ns != info.st_mtime_ns
+                or current.st_ctime_ns != info.st_ctime_ns
             ):
                 return None
         return _Entry(
@@ -916,6 +920,8 @@ class Storage:
             category or self._category(relative) or "other",
             info.st_size,
             info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_dev,
             info.st_ino,
             digest,
         )
@@ -1069,8 +1075,6 @@ class Storage:
             group = entry.relative
             if entry.relative in protected_paths or entry.path.name.endswith(".lock"):
                 continue
-            if entry.size > _MAX_HASH_BYTES:
-                continue
             expired = entry.mtime_ns / 1_000_000_000 <= cutoff
             if entry.category == "revisions" and entry.path.parent.name == "objects":
                 if revision_protect_all or entry.path.name in revision_refs:
@@ -1078,8 +1082,19 @@ class Storage:
                 reason = "unreferenced_revision_object"
                 requires_tombstone = False
             elif entry.category in {"runs", "jobs"} and entry.relative.endswith(".jsonl"):
-                reason = "completed_output"
-                requires_tombstone = True
+                owners = references.get(entry.relative, ())
+                orphan = (
+                    not owners
+                    and expired
+                    and not history_state.get("references_truncated")
+                    and callable(getattr(self.history, "storage_gc_snapshot", None))
+                    and (
+                        (record := record_by_id.get(entry.path.stem)) is not None
+                        and not record.active
+                    )
+                )
+                reason = "orphan_output" if orphan else "completed_output"
+                requires_tombstone = not orphan
             elif entry.category == "scans" and entry.relative.endswith((".jsonl", ".xml")):
                 reason = "completed_scan_output"
                 requires_tombstone = True
@@ -1141,6 +1156,8 @@ class Storage:
                     "category": entry.category,
                     "size": entry.size,
                     "mtime_ns": entry.mtime_ns,
+                    "ctime_ns": entry.ctime_ns,
+                    "device": entry.device,
                     "inode": entry.inode,
                     "digest": None,
                     "reason": reason,
@@ -1180,7 +1197,7 @@ class Storage:
             if entry is None or not self._same_entry(entry, item):
                 invalid_groups.add(item["group"])
                 continue
-            if entry.digest is None:
+            if entry.digest is None and entry.size <= _MAX_HASH_BYTES:
                 invalid_groups.add(item["group"])
                 continue
             hydrated.append({**item, "digest": entry.digest})
@@ -1632,7 +1649,12 @@ class Storage:
             current.relative == planned["path"]
             and current.size == planned["size"]
             and current.mtime_ns == planned["mtime_ns"]
+            and (
+                planned.get("ctime_ns") is None
+                or current.ctime_ns == planned["ctime_ns"]
+            )
             and current.inode == planned["inode"]
+            and (planned.get("device") is None or current.device == planned["device"])
             and (planned.get("digest") is None or current.digest == planned["digest"])
         )
 

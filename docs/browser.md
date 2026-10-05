@@ -2,9 +2,13 @@
 
 `ws.browser` exposes native async Playwright objects. Observation and accessibility snapshots add bounded inspection without replacing Playwright's page, locator, or event APIs.
 
+Managed browser installation uses Playwright's registry rules. An absolute `PLAYWRIGHT_BROWSERS_PATH` selects that directory; a relative value is resolved from `INIT_CWD` when set, or from the workspace directory used to start the browser service. `PLAYWRIGHT_BROWSERS_PATH=0` uses the installed Playwright driver's `.local-browsers` directory. When the variable is unset on Linux, the registry is below `$XDG_CACHE_HOME/ms-playwright`, defaulting to `~/.cache/ms-playwright`. These paths are also used for installation locks and cache fingerprints.
+
 HAR recordings use a separate temporary path for each context and are published to `record_har_path` when the context closes. This applies to plain HAR files, ZIP archives, and attached resources. Contexts can use the same final path without consuming each other's temporary recording; the last successfully closed context replaces the final file.
 
 While a context is closing, `context()` rejects reuse of its name. If HAR publication fails, the capture remains associated with the context; resolve the filesystem error and retry `await ws.browser.close(name)`. Close contexts explicitly to flush their recordings, as described in [Playwright's context lifecycle](https://playwright.dev/python/docs/api/class-browsercontext#browser-context-close).
+
+`await ws.browser.aclose()` closes all managed browser resources during workspace shutdown. If a resource cleanup fails, the next call retries only the resources that remain; a successful call is idempotent.
 
 ## Page events
 

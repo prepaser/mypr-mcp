@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,41 @@ def _plan(store: EditPlanStore, root: Path, marker: str):
         marker,
         server="fake",
     )
+
+
+@pytest.mark.asyncio
+async def test_acreate_cancellation_discards_unreturned_plan(tmp_path, monkeypatch):
+    store = EditPlanStore(tmp_path)
+    path = tmp_path / "sample.py"
+    created = threading.Event()
+    release = threading.Event()
+    original = EditPlanStore.create
+
+    def delayed_create(self, *args, **kwargs):
+        plan = original(self, *args, **kwargs)
+        created.set()
+        release.wait(5)
+        return plan
+
+    monkeypatch.setattr(EditPlanStore, "create", delayed_create)
+    task = asyncio.create_task(
+        store.acreate(
+            tmp_path,
+            [PlannedOperation("update", path, b"old", b"new", sha256(b"old"))],
+            "generation",
+            "title",
+        )
+    )
+    for _ in range(100):
+        if created.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert created.is_set()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not list((tmp_path / ".mypr" / "change-plans" / "lsp").glob("*.json"))
 
 
 @pytest.mark.asyncio

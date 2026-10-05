@@ -380,6 +380,8 @@ class Search:
                     "max_bytes": scan_bytes,
                     "on_stdout": lambda chunk: self._consume(collector, chunk),
                 }
+                if "errors" in inspect.signature(self.shell.stream).parameters:
+                    kwargs["errors"] = "surrogateescape"
                 if env is not None and "env" in inspect.signature(self.shell.stream).parameters:
                     kwargs["env"] = env
                 run = await self.shell.stream(command, **kwargs)
@@ -390,6 +392,8 @@ class Search:
                     "timeout": remaining,
                     "max_bytes": scan_bytes,
                 }
+                if "errors" in inspect.signature(self.shell.run).parameters:
+                    kwargs["errors"] = "surrogateescape"
                 if env is not None and "env" in inspect.signature(self.shell.run).parameters:
                     kwargs["env"] = env
                 run = await self.shell.run(command, **kwargs)

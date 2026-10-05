@@ -22,7 +22,7 @@ from jupyter_client.kernelspec import KernelSpec
 
 from . import __version__
 from .async_utils import wait_owned
-from .bootstrap import install_core, prepare_core, run_command
+from .bootstrap import ensure_workspace_python, install_core, prepare_core, run_command
 from .browser_service import BrowserService, validate_launch_options
 from .config import MAX_WAIT_MS, ConfigStore
 from .config_runtime import RuntimeConfig
@@ -32,6 +32,7 @@ from .file_io import open_regular, read_bytes
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
+from .json_utils import json_bytes
 from .mail_service import MailService
 from .managed_commands import ManagedCommands
 from .messages import MessageStore
@@ -493,8 +494,8 @@ class Runtime:
 
     def retain_completed(self, kind, rec):
         key = (kind, rec.get("generation"), rec["id"])
-        size = len(json.dumps(self.public_record(rec), ensure_ascii=False).encode())
-        size += len(json.dumps(rec.get("events", []), ensure_ascii=False).encode())
+        size = len(json_bytes(self.public_record(rec)))
+        size += len(json_bytes(rec.get("events", [])))
         self.completed_bytes -= self.completed.pop(key, 0)
         self.completed[key] = size
         self.completed_bytes += size
@@ -579,6 +580,7 @@ class Runtime:
             entries = []
         required = [
             "venv/",
+            ".venv-invalid-*/",
             "runs/",
             "artifacts/",
             "jobs/",
@@ -607,9 +609,7 @@ class Runtime:
             self.workspace, global_path=self.config_store.global_path,
             snapshot=self._kernel_snapshot,
         )
-        py = self.root / "venv/bin/python"
-        if not py.exists():
-            await self.command("uv", "venv", str(self.root / "venv"), "--python", sys.executable)
+        py = await ensure_workspace_python(self.root, command=self.command)
         self.py = py
         self.dependencies = self.new_dependencies()
         bin_root = str(self.dependencies.store.bin_root)
@@ -1335,12 +1335,12 @@ class Runtime:
                             :error_limit
                         ].decode(errors="ignore")
                     error_size = len(
-                        json.dumps(restart_error, ensure_ascii=False).encode()
+                        json_bytes(restart_error)
                     )
                     bounded = []
                     size = error_size
                     for event in restarted.get("output", []):
-                        event_size = len(json.dumps(event, ensure_ascii=False).encode())
+                        event_size = len(json_bytes(event))
                         if not bounded and size + event_size > response_budget:
                             raise ValueError(
                                 f"Output event at cursor {cursor} requires "
@@ -1366,7 +1366,7 @@ class Runtime:
             error_limit = min(1024, response_budget // 4)
             if error is not None:
                 error = error.encode(errors="replace")[:error_limit].decode(errors="ignore")
-            size = len(json.dumps(error, ensure_ascii=False).encode())
+            size = len(json_bytes(error))
             output_evicted = bool(
                 rec.get("output_evicted") or rec.get("scan_output_evicted")
             )
@@ -1381,7 +1381,7 @@ class Runtime:
                     size,
                 )
                 if explicit_budget and output:
-                    first_size = len(json.dumps(output[0], ensure_ascii=False).encode())
+                    first_size = len(json_bytes(output[0]))
                     if size + first_size > response_budget:
                         raise ValueError(
                             f"Output event at cursor {cursor} requires {size + first_size} "
@@ -1393,7 +1393,7 @@ class Runtime:
                     raise ValueError("Invalid output cursor")
                 output = []
                 for event in rec["events"][cursor:]:
-                    n = len(json.dumps(event, ensure_ascii=False).encode())
+                    n = len(json_bytes(event))
                     if not output and explicit_budget and size + n > response_budget:
                         raise ValueError(
                             f"Output event at cursor {cursor} requires {size + n} bytes; "
@@ -2487,11 +2487,13 @@ class Runtime:
             raise RuntimeError("The workspace moved; stop its manager and reconnect")
 
     async def start_managed_command(
-        self, generation, shells, command, cwd, env, *, input=None
+        self, generation, shells, command, cwd, env, *, input=None, output_errors="replace"
     ):
         async with self._admission_lock:
             self._check_managed_command_admission(generation, shells)
-            return await shells.start(command, cwd, env, input=input)
+            return await shells.start(
+                command, cwd, env, input=input, output_errors=output_errors
+            )
 
     async def _dispatch_shell(
         self, op, req, *, client, connection_id, connection,
@@ -3320,13 +3322,14 @@ class Runtime:
             return record
         previous = record["state"]
         text = "".join(item["text"] for item in full["output"])
+        raw = text.encode("utf-8", "surrogateescape")
         fields = dict(
             state=full["state"],
             finished=record.get("finished", time.time()),
             error=full.get("error"),
             result=full.get("result"),
-            output=text.encode()[:65536].decode(errors="ignore"),
-            output_truncated=full.get("truncated") or len(text.encode()) > 65536,
+            output=raw[:65536].decode("utf-8", "surrogateescape"),
+            output_truncated=full.get("truncated") or len(raw) > 65536,
             **({key: full[key] for key in ("pty", "rows", "cols") if key in full}),
             **({"warnings": full["warnings"]} if full.get("warnings") else {}),
             **({"warnings_truncated": True} if full.get("warnings_truncated") else {}),
@@ -3434,7 +3437,7 @@ class Runtime:
         except Exception as exc:
             response = error_response(exc, operation_name)
         try:
-            writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
+            writer.write(json_bytes(response) + b"\n")
             await writer.drain()
         except ConnectionError, BrokenPipeError:
             pass

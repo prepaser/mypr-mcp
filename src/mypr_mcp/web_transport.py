@@ -17,6 +17,8 @@ from .config import validate_web_config
 from .diagnostics import RPCError, safe_text
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_RESULT_URL_BYTES = 8 * 1024
+MAX_RESULT_TITLE_BYTES = 8 * 1024
 _PROVIDERS = frozenset({"kagi", "brave", "tavily"})
 _URL_SCHEMES = frozenset({"http", "https"})
 
@@ -205,7 +207,10 @@ class WebTransport:
         }
         if operation == "search":
             result["query"] = params["query"]
-            result["results"] = _normalize_search(provider, response)
+            results, failures = _normalize_search(provider, response)
+            result["results"] = results
+            if failures:
+                result["failed_results"] = failures
             if provider == "tavily" and params["options"].get("include_raw_content") == "text":
                 for item in result["results"]:
                     if "content" in item:
@@ -705,7 +710,9 @@ def _date_range(value: str) -> bool:
     return match[1] <= match[2]
 
 
-def _normalize_search(provider: str, response: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _normalize_search(
+    provider: str, response: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if provider == "kagi":
         data = response.get("data")
         if not isinstance(data, Mapping):
@@ -728,6 +735,7 @@ def _normalize_search(provider: str, response: Mapping[str, Any]) -> list[dict[s
             "web provider returned invalid search results", "invalid_response", provider=provider
         )
     normalized = []
+    failures = []
     for item in values:
         if not isinstance(item, Mapping) or not _string(item.get("url")):
             raise _web_error(
@@ -735,13 +743,25 @@ def _normalize_search(provider: str, response: Mapping[str, Any]) -> list[dict[s
                 "invalid_response",
                 provider=provider,
             )
+        url = _string(item["url"])
+        if len(url.encode("utf-8")) > MAX_RESULT_URL_BYTES:
+            prefix, _ = _bounded_text(url, 256)
+            failures.append(
+                {
+                    "url": prefix,
+                    "url_truncated": True,
+                    "error": f"search result URL exceeds {MAX_RESULT_URL_BYTES} bytes",
+                }
+            )
+            continue
         normalized.append(_search_item(item))
-    return normalized
+    return normalized, failures
 
 
 def _search_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    title, title_truncated = _bounded_text(_string(item.get("title")), MAX_RESULT_TITLE_BYTES)
     result: dict[str, Any] = {
-        "title": _string(item.get("title")),
+        "title": title,
         "url": _string(item.get("url")),
         "snippet": _string(item.get("snippet") or item.get("description") or item.get("content")),
     }
@@ -766,7 +786,16 @@ def _search_item(item: Mapping[str, Any]) -> dict[str, Any]:
             result["snippet"] = "\n".join(filter(None, [result["snippet"], *extra]))
     if metadata:
         result["metadata"] = metadata
+    if title_truncated:
+        result.setdefault("metadata", {})["title_truncated"] = True
     return result
+
+
+def _bounded_text(value: str, limit: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", "ignore"), True
 
 
 def _normalize_context(response: Mapping[str, Any]) -> list[dict[str, Any]]:

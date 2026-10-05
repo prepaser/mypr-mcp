@@ -21,6 +21,7 @@ from weakref import WeakValueDictionary
 
 from .async_utils import wait_owned
 from .file_io import open_regular, read_bytes
+from .json_utils import json_bytes, json_text
 from .storage_lock import StorageLock
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -30,10 +31,15 @@ _MAX_INDEX_BYTES = 16 * 1024 * 1024
 _MAX_BLOB_BYTES = 64 * 1024 * 1024
 _MAX_HISTORY_RECORDS = 10_000
 _V2_KINDS = {"modules", "skills", "files"}
+_TEMP_PREFIX_NAME_LIMIT = 32
 _ABSENT_REVISION = "absent"
 _ACTIVE_STORAGE_LOCKS: contextvars.ContextVar[frozenset[tuple[str, int]]] = contextvars.ContextVar(
     "mypr_revision_storage_locks", default=frozenset()
 )
+
+
+def _temporary_prefix(name: str, suffix: str = ".") -> str:
+    return f".{name[:_TEMP_PREFIX_NAME_LIMIT]}{suffix}"
 
 
 class RevisionIndexOutcomeUnknown(RuntimeError):
@@ -173,7 +179,7 @@ class RevisionStore:
         if index["count"] == previous_count and index.get("next_sequence") == previous_next:
             return
         _check_index_size(index)
-        encoded = json.dumps(index, ensure_ascii=False, separators=(",", ":"))
+        encoded = json_text(index, separators=(",", ":"))
         planned_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         try:
             await self.fs.write(
@@ -687,7 +693,7 @@ class RevisionStore:
         return _validate_index(index, self.kind, resource, encoded_size), page["revision"]
 
     def _index_path(self, resource: str) -> str:
-        key = hashlib.sha256(f"{self.kind}\0{resource}".encode()).hexdigest()
+        key = hashlib.sha256(os.fsencode(f"{self.kind}\0{resource}")).hexdigest()
         return f".mypr/revisions/index/{self.kind}/{key}.json"
 
     def _blob_path(self, revision: str) -> Path:
@@ -787,7 +793,9 @@ def _unlink_if_revision(path: Path, expected_revision: str) -> tuple[str, str]:
         current_revision = hashlib.sha256(stream.read(_MAX_BLOB_BYTES + 1)).hexdigest()
     if current_revision != expected_revision:
         return "changed", f"target changed concurrently to revision {current_revision}"
-    fd, backup_name = tempfile.mkstemp(prefix=f".{path.name}.rollback-", dir=path.parent)
+    fd, backup_name = tempfile.mkstemp(
+        prefix=_temporary_prefix(path.name, ".rollback-"), dir=path.parent
+    )
     os.close(fd)
     backup = Path(backup_name)
     preserve_backup = False
@@ -879,7 +887,7 @@ def _prune_index(index: dict[str, Any]) -> None:
         removed.extend(records[:count])
         del records[:count]
     while len(records) > 1 and len(
-        json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        json_bytes(index, separators=(",", ":"))
     ) > _MAX_INDEX_BYTES:
         removed.append(records.pop(0))
     if removed:
@@ -888,18 +896,20 @@ def _prune_index(index: dict[str, Any]) -> None:
 
 
 def _check_index_size(index: dict[str, Any]) -> None:
-    encoded = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = json_bytes(index, separators=(",", ":"))
     if len(encoded) > _MAX_INDEX_BYTES:
         raise ValueError("revision history has reached its metadata size limit")
 
 
 def _encode_index(index: dict[str, Any]) -> bytes:
-    return json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return json_bytes(index, separators=(",", ":"))
 
 
 def _write_index_bytes_sync(path: Path, encoded: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(
+        prefix=_temporary_prefix(path.name), dir=path.parent
+    )
     temporary_path = Path(temporary)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -924,7 +934,9 @@ def _write_blob(path: Path, data: bytes) -> None:
         if existing != data:
             raise RuntimeError(f"Revision object {revision} does not match its hash")
         return
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(
+        prefix=_temporary_prefix(path.name), dir=path.parent
+    )
     temporary_path = Path(temporary)
     try:
         with os.fdopen(fd, "wb") as stream:

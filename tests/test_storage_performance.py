@@ -62,7 +62,7 @@ async def test_gc_hashes_selected_files_without_hashing_protected_files(
 
 
 @pytest.mark.asyncio
-async def test_gc_skips_files_above_digest_limit_but_usage_counts_them(
+async def test_gc_revalidates_files_above_digest_limit_without_reading_them(
     tmp_path: Path, monkeypatch
 ):
     candidate = tmp_path / ".mypr" / "searches" / "large.json"
@@ -72,7 +72,10 @@ async def test_gc_skips_files_above_digest_limit_but_usage_counts_them(
     plan = await Storage(tmp_path).gc(max_bytes=0)
     usage = await Storage(tmp_path).usage()
 
-    assert plan["candidates"] == []
+    assert [item["path"] for item in plan["candidates"]] == [
+        ".mypr/searches/large.json"
+    ]
+    assert plan["candidates"][0]["digest"] is None
     assert usage["total_bytes"] == 2
 
 

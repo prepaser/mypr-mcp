@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import inspect
 import os
 import threading
 from pathlib import Path
 from typing import Any
 
+from .json_utils import json_bytes
 from .snapshots import SnapshotStore
 
 _MAX_COMMAND_BYTES = 16 * 1024 * 1024
@@ -681,7 +682,7 @@ class Git:
             "scan_truncated": bool(snapshot.get("truncated")),
             "warnings": list(snapshot.get("warnings", [])),
         }
-        if len(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
+        if len(json_bytes(base, separators=(",", ":"))) > max_bytes:
             raise ValueError("max_bytes is too small for commit metadata; increase the budget")
         selected: list[dict[str, Any]] = []
         cursor_reserve = "x" * 128
@@ -705,7 +706,7 @@ class Git:
                 "has_more": provisional_cursor is not None,
             }
             if (
-                len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode())
+                len(json_bytes(candidate, separators=(",", ":")))
                 > max_bytes
             ):
                 if not selected:
@@ -728,7 +729,7 @@ class Git:
         base["has_more"] = more
         base["truncated"] = bool(snapshot.get("truncated")) or more
         base["scan_truncated"] = bool(snapshot.get("truncated"))
-        if len(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
+        if len(json_bytes(base, separators=(",", ":"))) > max_bytes:
             raise ValueError("max_bytes is too small for commit metadata; increase the budget")
         return base
 
@@ -1019,6 +1020,9 @@ class Git:
         return page
 
     async def _run(self, args: list[str], *, max_bytes: int = _MAX_COMMAND_BYTES) -> dict[str, Any]:
+        options = {}
+        if "errors" in inspect.signature(self.shell.run).parameters:
+            options["errors"] = "surrogateescape"
         result = await self.shell.run(
             [
                 "git",
@@ -1038,6 +1042,7 @@ class Git:
             check=False,
             max_bytes=max_bytes,
             env={**os.environ, "GIT_PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0"},
+            **options,
         )
         if result.get("error"):
             raise RuntimeError(f"git failed: {result['error']}")
@@ -1096,9 +1101,9 @@ class Git:
         while index < len(items):
             item = items[index]
             if isinstance(item, str):
-                cost = len(item.encode("utf-8"))
+                cost = len(json_bytes(item))
             else:
-                cost = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode())
+                cost = len(json_bytes(item, separators=(",", ":")))
             if not page and cost > max_bytes:
                 raise ValueError("max_bytes is too small for a Git record; increase the budget")
             if page and used + cost > max_bytes:
@@ -1112,7 +1117,7 @@ class Git:
 
     @staticmethod
     def _chunk_text(text: str, chunk_bytes: int = 128) -> list[str]:
-        raw = text.encode("utf-8")
+        raw = text.encode("utf-8", "surrogateescape")
         chunks: list[str] = []
         start = 0
         while start < len(raw):
@@ -1121,7 +1126,7 @@ class Git:
                 end -= 1
             if end == start:
                 end = min(start + chunk_bytes, len(raw))
-            chunks.append(raw[start:end].decode("utf-8"))
+            chunks.append(raw[start:end].decode("utf-8", "surrogateescape"))
             start = end
         return chunks
 

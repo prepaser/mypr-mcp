@@ -269,6 +269,21 @@ def _clean_diagnostic(value: Any) -> dict[str, Any] | None:
     return result
 
 
+def _code_action_disabled_reason(action: Any) -> str | None:
+    if not isinstance(action, dict):
+        return None
+    disabled = action.get("disabled")
+    if disabled is None:
+        return None
+    if isinstance(disabled, dict):
+        reason = disabled.get("reason", "")
+    elif isinstance(disabled, str):
+        reason = disabled
+    else:
+        reason = "the language server marked this action as disabled"
+    return str(reason)[:1024]
+
+
 def _supports(value: Any) -> bool:
     return value is True or isinstance(value, dict)
 
@@ -1402,6 +1417,8 @@ class _LanguageServer:
                 if self._closed or self._closing or self.generation != server_generation:
                     raise CodeError("language server changed during diagnostics")
                 if isinstance(result, dict) and result.get("kind") == "unchanged":
+                    if not isinstance(result.get("resultId"), str):
+                        raise CodeError("language server returned malformed diagnostic resultId")
                     cached = self.diagnostics_cache.get(doc.uri)
                     if cached is None or previous is None:
                         result = await self._request(
@@ -1416,9 +1433,11 @@ class _LanguageServer:
                         }
                 if not isinstance(result, dict) or result.get("kind") != "full":
                     raise CodeError("language server returned no full diagnostics snapshot")
-                values = result.get("items", [])
+                values = result.get("items")
                 if not isinstance(values, list):
                     raise CodeError("language server returned malformed diagnostic items")
+                if "resultId" in result and not isinstance(result["resultId"], str):
+                    raise CodeError("language server returned malformed diagnostic resultId")
                 diagnostics = []
                 dropped = False
                 for item in values[:MAX_DIAGNOSTICS] if isinstance(values, list) else []:
@@ -2582,18 +2601,21 @@ class CodeTools:
                     else:
                         has_command = isinstance(command, str)
                     edit_value = raw.get("edit")
+                    disabled_reason = _code_action_disabled_reason(raw)
                     item = {
                         "action_id": action_id,
                         "title": title[:1024],
                         "kind": raw.get("kind") if isinstance(raw.get("kind"), str) else None,
                         "has_edit": isinstance(edit_value, dict),
                         "has_command": has_command,
-                        "supported": isinstance(edit_value, dict) and not has_command,
+                        "supported": (
+                            isinstance(edit_value, dict)
+                            and not has_command
+                            and disabled_reason is None
+                        ),
                     }
-                    if isinstance(raw.get("disabled"), dict):
-                        item["disabled"] = str(raw["disabled"].get("reason", ""))[:1024]
-                    elif isinstance(raw.get("disabled"), str):
-                        item["disabled"] = raw["disabled"][:1024]
+                    if disabled_reason is not None:
+                        item["disabled"] = disabled_reason
                     result["actions"].append(item)
                     if _json_size(result) > max_bytes:
                         result["actions"].pop()
@@ -2630,6 +2652,10 @@ class CodeTools:
             raise EditError("unknown or expired code action") from exc
         server_name = stored.server_name
         action = stored.action
+        disabled_reason = _code_action_disabled_reason(action)
+        if disabled_reason is not None:
+            detail = f": {disabled_reason}" if disabled_reason else ""
+            raise EditError(f"code action is disabled{detail}")
         generation = stored.generation
         version = stored.document_version
         server = await self._get_server(server_name)
@@ -2654,6 +2680,12 @@ class CodeTools:
                 if not isinstance(provider, dict) or provider.get("resolveProvider") is not True:
                     raise EditError("code action requires unsupported codeAction/resolve")
                 action = await server.resolve_code_action(action)
+                if not isinstance(action, dict):
+                    raise EditError("language server returned malformed resolved code action")
+                disabled_reason = _code_action_disabled_reason(action)
+                if disabled_reason is not None:
+                    detail = f": {disabled_reason}" if disabled_reason else ""
+                    raise EditError(f"code action is disabled{detail}")
                 resolved = True
                 command = action.get("command")
                 has_command = isinstance(command, str) or (
@@ -2779,24 +2811,35 @@ class CodeTools:
                 raise CodeError("language server changed during workspace diagnostics")
             if not isinstance(raw, dict):
                 raise CodeError("language server returned malformed workspace diagnostics")
-            reports = raw.get("items", [])
+            reports = raw.get("items")
             if not isinstance(reports, list):
                 raise CodeError("language server returned malformed workspace diagnostic items")
             items: list[dict[str, Any]] = []
             cache_updates: dict[str, dict[str, Any]] = {}
             for report in reports:
                 if not isinstance(report, dict) or not isinstance(report.get("uri"), str):
-                    continue
+                    raise CodeError(
+                        "language server returned malformed workspace diagnostic report"
+                    )
                 uri = report["uri"]
                 path = server._workspace_uri_path(uri)
                 if path is None:
                     continue
-                kind = report.get("kind", "full")
+                kind = report.get("kind")
+                if "version" in report and (
+                    report["version"] is not None and type(report["version"]) is not int
+                ):
+                    raise CodeError(
+                        "language server returned malformed workspace diagnostic version"
+                    )
                 if kind == "unchanged":
                     result_id = report.get("resultId")
                     cached = previous_reports.get(uri)
                     if cached is None or not isinstance(result_id, str):
-                        continue
+                        raise CodeError(
+                            "language server returned an invalid unchanged "
+                            "workspace diagnostic report"
+                        )
                     cleaned = copy.deepcopy(cached)
                     cleaned["kind"] = "unchanged"
                     cleaned["result_id"] = result_id
@@ -2809,8 +2852,14 @@ class CodeTools:
                     cache_updates[uri] = cached
                     items.append(cleaned)
                     continue
-                if kind != "full" or not isinstance(report.get("items", []), list):
-                    continue
+                if kind != "full" or not isinstance(report.get("items"), list):
+                    raise CodeError(
+                        "language server returned malformed workspace diagnostic report"
+                    )
+                if "resultId" in report and not isinstance(report["resultId"], str):
+                    raise CodeError(
+                        "language server returned malformed workspace diagnostic resultId"
+                    )
                 text = await server._text_for_uri(uri, {})
                 diagnostics = []
                 dropped = False

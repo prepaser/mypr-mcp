@@ -95,6 +95,7 @@ class BrowserService:
         self._close_task: asyncio.Task[None] | None = None
         self._verified: set[str] = set()
         self._install_root = self.workspace / ".mypr" / "browser"
+        self._driver_package_root: Path | None = None
         self._install_root.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -546,14 +547,53 @@ class BrowserService:
         payload = f"{sdk_version}:{browser}:{self._cache_path()}"
         return hashlib.sha256(payload.encode()).hexdigest()
 
+    def _find_driver_package_root(self) -> Path | None:
+        if self._driver_package_root is not None:
+            return self._driver_package_root
+        roots = [self.py.parent.parent]
+        with contextlib.suppress(OSError):
+            resolved = self.py.resolve()
+            if resolved.parent.parent not in roots:
+                roots.append(resolved.parent.parent)
+        candidates: list[Path] = []
+        for root in roots:
+            candidates.extend(
+                [
+                    root / "Lib" / "site-packages" / "playwright" / "driver" / "package",
+                    root / "lib" / "site-packages" / "playwright" / "driver" / "package",
+                ]
+            )
+            for lib_root in (root / "Lib", root / "lib"):
+                with contextlib.suppress(OSError):
+                    candidates.extend(
+                        lib_root.glob("python*/site-packages/playwright/driver/package")
+                    )
+        for candidate in candidates:
+            if candidate.is_dir():
+                self._driver_package_root = candidate.resolve()
+                return self._driver_package_root
+        return None
+
+    def _resolve_playwright_path(self, value: str | os.PathLike[str]) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path.resolve()
+        base = Path(os.environ.get("INIT_CWD") or self.workspace)
+        if not base.is_absolute():
+            base = self.workspace / base
+        return (base / path).resolve()
+
     def _cache_path(self) -> Path:
         value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-        if value and value != "0":
-            return Path(value).expanduser().resolve()
-        return (
-            Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser().resolve()
-            / "ms-playwright"
-        )
+        if value == "0":
+            package_root = self._find_driver_package_root()
+            if package_root is None:
+                raise RuntimeError("unable to locate the Playwright driver package")
+            return package_root / ".local-browsers"
+        if value:
+            return self._resolve_playwright_path(value)
+        cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        return self._resolve_playwright_path(Path(cache) / "ms-playwright")
 
     def _cache_lock_path(self, browser: str) -> Path:
         cache = self._cache_path()

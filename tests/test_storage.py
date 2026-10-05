@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import mypr_mcp.storage as storage_module
+from mypr_mcp.history import History
 from mypr_mcp.storage import Storage
 
 
@@ -198,6 +199,66 @@ async def test_gc_requires_tombstone_before_deleting_output(tmp_path: Path):
     )
     assert not output.exists()
     assert result["deleted_bytes"] > 0
+
+
+@pytest.mark.asyncio
+async def test_gc_collects_expired_orphan_shell_output(tmp_path: Path):
+    metadata = tmp_path / ".mypr" / "jobs" / "orphan.json"
+    output = metadata.with_suffix(".jsonl")
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps({"id": "orphan", "kind": "shell", "state": "succeeded"}),
+        encoding="utf-8",
+    )
+    old(output, "orphan output")
+    history = History(tmp_path)
+    try:
+        storage = Storage(tmp_path, history=history)
+        plan = await storage.gc(max_bytes=0)
+        candidate = next(
+            item for item in plan["candidates"] if item["path"] == ".mypr/jobs/orphan.jsonl"
+        )
+        assert candidate["reason"] == "orphan_output"
+        assert ".mypr/jobs/orphan.jsonl" not in {item["path"] for item in plan["tombstones"]}
+
+        result = await storage.gc_apply(plan["plan_id"])
+
+        assert not output.exists()
+        assert metadata.exists()
+        assert result["deleted"]
+    finally:
+        history.close()
+
+
+@pytest.mark.asyncio
+async def test_gc_collects_large_owned_output_with_metadata_revalidation(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(storage_module, "_MAX_HASH_BYTES", 1)
+    metadata = tmp_path / ".mypr" / "jobs" / "owned.json"
+    output = metadata.with_suffix(".jsonl")
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps({"id": "owned", "kind": "shell", "state": "succeeded"}),
+        encoding="utf-8",
+    )
+    old(output, "owned output")
+    history = History(tmp_path)
+    try:
+        history.record("shell", {"id": "owned", "kind": "shell", "state": "succeeded"})
+        storage = Storage(tmp_path, history=history)
+        plan = await storage.gc(max_bytes=0)
+        candidate = next(
+            item for item in plan["candidates"] if item["path"] == ".mypr/jobs/owned.jsonl"
+        )
+        assert candidate["digest"] is None
+
+        result = await storage.gc_apply(plan["plan_id"])
+
+        assert not output.exists()
+        assert result["deleted"]
+    finally:
+        history.close()
 
 
 @pytest.mark.asyncio

@@ -189,6 +189,56 @@ async def test_actions_error_discards_only_new_ids(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_disabled_actions_cannot_be_prepared_before_or_after_resolve(tmp_path: Path):
+    origin = tmp_path / "origin.py"
+    origin.write_text("foo\n", encoding="utf-8")
+    edit = {
+        "changes": {
+            origin.as_uri(): [
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3},
+                    },
+                    "newText": "bar",
+                }
+            ]
+        }
+    }
+    code = CodeTools(tmp_path)
+    server = _server(origin, edit)
+    server.capabilities = {"codeActionProvider": {"resolveProvider": True}}
+    document = next(iter(server.documents.values()))
+    direct = {
+        "title": "Disabled direct",
+        "disabled": {"reason": "directly disabled"},
+        "edit": edit,
+    }
+    resolved = {
+        "title": "Disabled on resolve",
+        "data": {"resolve": True},
+    }
+
+    async def code_actions(*_args, **_kwargs):
+        return document, [direct, resolved]
+
+    async def resolve_code_action(action):
+        return {**action, "disabled": {"reason": "disabled after resolve"}, "edit": edit}
+
+    server.code_actions = code_actions
+    server.resolve_code_action = resolve_code_action
+    code._servers["fake"] = server
+    try:
+        listed = await code.actions("fake", origin, 1, 1)
+        assert [item["supported"] for item in listed["actions"]] == [False, False]
+        for item in listed["actions"]:
+            with pytest.raises(EditError, match="code action is disabled"):
+                await code.prepare_action(item["action_id"])
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
 async def test_prepared_plan_rejects_stale_nonedited_origin(tmp_path: Path):
     origin = tmp_path / "origin.py"
     other = tmp_path / "other.py"

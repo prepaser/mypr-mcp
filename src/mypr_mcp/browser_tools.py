@@ -867,7 +867,7 @@ class BrowserTools:
             state = json.loads(await asyncio.to_thread(_read_regular_text, target))
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"browser state does not exist: {target}") from exc
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"invalid browser state: {target}") from exc
         if not isinstance(state, dict):
             raise ValueError("browser state must be a JSON object")
@@ -938,10 +938,17 @@ class BrowserTools:
         return await fs.image(self._display_path(target))
 
     async def aclose(self) -> None:
-        if self._cleanup_task is None:
-            self._closed = True
-            self._cleanup_task = asyncio.create_task(self._cleanup())
-        _, cancelled = await _shielded(self._cleanup_task)
+        self._closed = True
+        cleanup = self._cleanup_task
+        if cleanup is not None and cleanup.done():
+            if cleanup.cancelled() or cleanup.exception() is not None:
+                cleanup = None
+            else:
+                return
+        if cleanup is None:
+            cleanup = asyncio.create_task(self._cleanup())
+            self._cleanup_task = cleanup
+        _, cancelled = await _shielded(cleanup)
         if cancelled:
             raise asyncio.CancelledError
 
@@ -961,14 +968,19 @@ class BrowserTools:
             async with self._connection_lock:
                 contexts = list(self._contexts.values())
                 for item in contexts:
-                    try:
-                        _, operation_cancelled = await _shielded(item.context.close())
-                    except asyncio.CancelledError:
-                        cancelled = True
-                    except BaseException as exc:
-                        errors.append(RuntimeError(f"context {item.name!r} close failed: {exc}"))
-                    else:
-                        cancelled |= operation_cancelled
+                    if not item.closed:
+                        try:
+                            _, operation_cancelled = await _shielded(item.context.close())
+                        except asyncio.CancelledError:
+                            cancelled = True
+                        except BaseException as exc:
+                            errors.append(
+                                RuntimeError(f"context {item.name!r} close failed: {exc}")
+                            )
+                        else:
+                            cancelled |= operation_cancelled
+                            item.closed = True
+                    if item.closed:
                         try:
                             self._finalize_context_artifacts(item)
                         except BaseException as exc:

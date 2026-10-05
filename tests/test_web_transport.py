@@ -171,6 +171,49 @@ async def test_kagi_search_builds_json_request_and_normalizes_results(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_search_bounds_title_and_reports_oversized_url(monkeypatch):
+    oversized_url = "https://example.test/" + ("x" * 9000)
+
+    async def handler(request):
+        return httpx2.Response(
+            200,
+            json={
+                "data": {
+                    "search": [
+                        {
+                            "title": "t" * 9000,
+                            "url": "https://example.test/title",
+                            "snippet": "bounded",
+                        },
+                        {"title": "t" * 9000, "url": oversized_url, "snippet": "skipped"},
+                        {"title": "kept", "url": "https://example.test/kept", "snippet": "ok"},
+                    ]
+                }
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("WEB_KEY", "secret-token")
+    transport = WebTransport(_config("kagi"), transport=httpx2.MockTransport(handler))
+    try:
+        result = await transport.run("search", "kagi", {"query": "hello"})
+    finally:
+        await transport.close()
+
+    assert len(result["results"]) == 2
+    assert result["results"][0]["url"] == "https://example.test/title"
+    assert len(result["results"][0]["title"].encode()) == 8 * 1024
+    assert result["results"][0]["metadata"]["title_truncated"] is True
+    assert result["results"][1] == {
+        "title": "kept",
+        "url": "https://example.test/kept",
+        "snippet": "ok",
+    }
+    assert result["failed_results"][0]["url_truncated"] is True
+    assert "exceeds" in result["failed_results"][0]["error"]
+
+
+@pytest.mark.asyncio
 async def test_brave_context_maps_grounding_and_does_not_leak_key(monkeypatch):
     seen = []
 

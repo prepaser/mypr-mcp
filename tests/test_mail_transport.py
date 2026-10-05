@@ -323,6 +323,70 @@ def test_reconfiguring_other_account_does_not_abort_connecting_smtp(monkeypatch)
         transport.close()
 
 
+def test_reconfigure_reclaims_retired_connection_slots(monkeypatch):
+    import mypr_mcp.mail_transport as module
+
+    class IMAP:
+        def shutdown(self):
+            pass
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(module, "_connect_imap", lambda *_: IMAP())
+    transport = MailTransport({"accounts": {"old": {}}})
+    try:
+        for index in range(20):
+            name = f"account-{index}"
+            transport._get_imap(name, {})
+            transport.reconfigure({"accounts": {}}, accounts={name})
+        assert len(transport._connect_locks) == 0
+        assert len(transport._epochs) == 0
+        assert len(transport._connect_refs) == 0
+    finally:
+        transport.close()
+
+
+def test_reconfigure_keeps_generation_guard_until_connect_finishes(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import mypr_mcp.mail_transport as module
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class IMAP:
+        def shutdown(self):
+            pass
+
+        def logout(self):
+            pass
+
+    def connect(*_args):
+        started.set()
+        assert release.wait(5)
+        return IMAP()
+
+    monkeypatch.setattr(module, "_connect_imap", connect)
+    transport = MailTransport({"accounts": {"old": {}}})
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(transport._get_imap, "old", {})
+            assert started.wait(2)
+            transport.reconfigure({"accounts": {}}, accounts={"old"})
+            assert len(transport._connect_locks) == 1
+            assert len(transport._epochs) == 1
+            release.set()
+            with pytest.raises(MailTransportError, match="reconfigured"):
+                pending.result(timeout=2)
+        assert not transport._connect_locks
+        assert not transport._epochs
+        assert not transport._connect_refs
+    finally:
+        release.set()
+        transport.close()
+
+
 @pytest.mark.asyncio
 async def test_cancelled_queued_watch_does_not_wait_for_worker_slot():
     import asyncio

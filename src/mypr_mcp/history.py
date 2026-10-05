@@ -23,6 +23,7 @@ from typing import Any
 from .client_ids import ADJECTIVES, ANIMALS
 from .file_io import read_bytes
 from .history_maintenance import vacuum_if_worthwhile
+from .json_utils import json_text
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
@@ -1593,11 +1594,11 @@ def _decode_entity(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, str] | N
 
 
 def _dump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    return json_text(value, separators=(",", ":"), default=str)
 
 
 def _sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(value.encode("utf-8", "backslashreplace")).hexdigest()
 
 
 def _sha256_optional_text(value: Any) -> str | None:
@@ -1648,7 +1649,7 @@ def _bounded(value: Any) -> Any:
                 continue
             without_value = {k: v for k, v in result.items() if k != key}
             room = max(0, _MAX_PAYLOAD_BYTES - len(_dump(without_value).encode()) - 64)
-            encoded = value.encode("utf-8")[:room]
+            encoded = value.encode("utf-8", "backslashreplace")[:room]
             result[key] = encoded.decode("utf-8", "ignore")
             if len(_dump(result).encode()) <= _MAX_PAYLOAD_BYTES:
                 return result

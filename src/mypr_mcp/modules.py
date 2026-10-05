@@ -39,37 +39,98 @@ class ModuleManager:
         self.shell = shell
         self.revisions = RevisionStore(self.workspace, fs, "modules")
 
-    def list(self) -> list[dict[str, Any]]:
-        if not self.root.is_dir():
-            return []
+    def list(self, *, limit: int | None = None, cursor: int = 0) -> list[dict[str, Any]]:
+        """List modules synchronously, optionally selecting a bounded page.
+
+        The no-argument form remains compatible with the original API. New
+        callers that run inside an event loop should use :meth:`list_page` so
+        directory traversal and hashing run in the worker thread.
+        """
+
+        return self._list_sync(limit=limit, cursor=cursor)
+
+    async def list_page(self, *, limit: int = 100, cursor: int = 0) -> dict[str, Any]:
+        """Return a bounded module page without blocking the kernel loop."""
+
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if type(cursor) is not int or cursor < 0:
+            raise ValueError("cursor must be a non-negative integer")
+        return await asyncio.to_thread(self._list_page_sync, limit, cursor)
+
+    def _list_sync(self, *, limit: int | None, cursor: int) -> list[dict[str, Any]]:
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("limit must be a positive integer or None")
+        if type(cursor) is not int or cursor < 0:
+            raise ValueError("cursor must be a non-negative integer")
         found: list[dict[str, Any]] = []
-        for path in sorted(self.root.rglob("*.py")):
-            if path.name == "__init__.py" or not path.is_file():
+        paths = self._iter_module_paths()
+        if limit is None:
+            paths = iter(sorted(paths))
+        for index, path in enumerate(paths):
+            if index < cursor:
                 continue
-            try:
-                relative = path.resolve().relative_to(self.root.resolve())
-            except ValueError:
-                continue
-            name = ".".join(relative.with_suffix("").parts)
-            try:
-                digest, size = hashlib.sha256(), 0
-                with open_regular(path) as source:
-                    while chunk := source.read(1024 * 1024):
-                        digest.update(chunk)
-                        size += len(chunk)
-            except (OSError, UnicodeError) as exc:
-                found.append({"name": name, "path": self._display(path), "error": str(exc)})
-                continue
-            revision = digest.hexdigest()
-            found.append(
-                {
-                    "name": name,
-                    "path": self._display(path),
-                    "revision": revision,
-                    "size": size,
-                }
-            )
+            if limit is not None and len(found) >= limit:
+                break
+            found.append(self._module_info(path))
         return found
+
+    def _list_page_sync(self, limit: int, cursor: int) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        seen = 0
+        has_more = False
+        for path in self._iter_module_paths():
+            if seen < cursor:
+                seen += 1
+                continue
+            if len(items) >= limit:
+                has_more = True
+                break
+            items.append(self._module_info(path))
+            seen += 1
+        return {
+            "items": items,
+            "next_cursor": cursor + len(items) if has_more else None,
+            "has_more": has_more,
+        }
+
+    def _iter_module_paths(self):
+        if not self.root.is_dir():
+            return
+        root = self.root.resolve()
+        for directory, dirnames, filenames in os.walk(self.root, followlinks=False):
+            dirnames.sort()
+            for filename in sorted(filenames):
+                if not filename.endswith(".py") or filename == "__init__.py":
+                    continue
+                path = Path(directory) / filename
+                try:
+                    path.resolve().relative_to(root)
+                except ValueError:
+                    continue
+                if path.is_file():
+                    yield path
+
+    def _module_info(self, path: Path) -> dict[str, Any]:
+        try:
+            relative = path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return {"path": self._display(path), "error": "module path escapes workspace"}
+        name = ".".join(relative.with_suffix("").parts)
+        try:
+            digest, size = hashlib.sha256(), 0
+            with open_regular(path) as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+        except (OSError, UnicodeError) as exc:
+            return {"name": name, "path": self._display(path), "error": str(exc)}
+        return {
+            "name": name,
+            "path": self._display(path),
+            "revision": digest.hexdigest(),
+            "size": size,
+        }
 
     async def read(self, name: str, *, max_bytes: int = 4 * 1024 * 1024) -> dict[str, Any]:
         path = self._module_path(name)

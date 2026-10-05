@@ -196,6 +196,138 @@ async def test_workspace_diagnostics_advances_unchanged_cache_metadata(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_workspace_diagnostics_rejects_missing_items(tmp_path: Path):
+    path = tmp_path / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    server = _server(tmp_path)
+    server.capabilities = {"diagnosticProvider": {"workspaceDiagnostics": True}}
+
+    async def workspace_diagnostics(_previous):
+        return {
+            "items": [{"uri": path.as_uri(), "kind": "full", "resultId": "one"}]
+        }
+
+    server.workspace_diagnostics = workspace_diagnostics
+    server.aclose = _async_noop
+    code = CodeTools(tmp_path)
+    code._servers["demo"] = server
+    try:
+        with pytest.raises(CodeError, match="malformed workspace diagnostic report"):
+            await code.workspace_diagnostics("demo")
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_document_diagnostics_rejects_missing_items(tmp_path: Path):
+    path = tmp_path / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    server = _server(tmp_path)
+    server.capabilities = {"diagnosticProvider": {}}
+    document = SimpleNamespace(path=path, uri=path.as_uri(), version=1, text="value = 1\n")
+
+    async def document_for(_path, _language=None):
+        return document, 0
+
+    async def request(*_args, **_kwargs):
+        return {"kind": "full"}
+
+    server._document = document_for
+    server._request = request
+    server.position_encoding = "utf-16"
+    server.diagnostics_cache = {}
+    server.aclose = _async_noop
+    try:
+        with pytest.raises(CodeError, match="malformed diagnostic items"):
+            await server.diagnostics(path)
+    finally:
+        await server.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_id", [None, 123])
+async def test_document_diagnostics_rejects_invalid_result_id(tmp_path: Path, result_id):
+    path = tmp_path / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    server = _server(tmp_path)
+    server.capabilities = {"diagnosticProvider": {}}
+    document = SimpleNamespace(path=path, uri=path.as_uri(), version=1, text="value = 1\n")
+    calls = []
+
+    async def document_for(_path, _language=None):
+        return document, 0
+
+    async def request(_method, params):
+        calls.append(params)
+        if len(calls) == 1:
+            return {"kind": "full", "items": [], "resultId": result_id}
+        return {"kind": "full", "items": [], "resultId": "valid"}
+
+    server._document = document_for
+    server._request = request
+    server.position_encoding = "utf-16"
+    server.diagnostics_cache = {}
+    server.aclose = _async_noop
+    try:
+        with pytest.raises(CodeError, match="diagnostic resultId"):
+            await server.diagnostics(path)
+        result = await server.diagnostics(path)
+        assert result["ready"] is True
+        assert "previousResultId" not in calls[1]
+    finally:
+        await server.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [("version", True), ("resultId", 123)])
+async def test_workspace_diagnostics_rejects_invalid_metadata_before_cache_update(
+    tmp_path: Path, field, value
+):
+    path = tmp_path / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    server = _server(tmp_path)
+    server.capabilities = {"diagnosticProvider": {"workspaceDiagnostics": True}}
+    calls = []
+
+    async def workspace_diagnostics(previous):
+        calls.append(previous)
+        if len(calls) == 1:
+            report = {
+                "uri": path.as_uri(),
+                "kind": "full",
+                "version": None,
+                "resultId": "invalid-candidate",
+                "items": [],
+            }
+            report[field] = value
+            return {"items": [report]}
+        return {
+            "items": [{
+                "uri": path.as_uri(),
+                "kind": "full",
+                "version": None,
+                "resultId": "valid",
+                "items": [],
+            }]
+        }
+
+    server.workspace_diagnostics = workspace_diagnostics
+    server._text_for_uri = _text_for_uri
+    server.aclose = _async_noop
+    code = CodeTools(tmp_path)
+    code._servers["demo"] = server
+    try:
+        with pytest.raises(CodeError, match="workspace diagnostic"):
+            await code.workspace_diagnostics("demo")
+        result = await code.workspace_diagnostics("demo")
+        assert result["reports"][0]["version"] is None
+        assert result["reports"][0]["result_id"] == "valid"
+        assert calls == [None, None]
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
 async def test_workspace_diagnostic_cache_is_bounded_by_count_and_bytes(
     tmp_path: Path, monkeypatch
 ):

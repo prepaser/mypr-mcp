@@ -46,6 +46,7 @@ from .skill_tools import (
     _MetadataLimitError,
     _read_metadata_prefix,
     _read_prefix,
+    skill_paths_page,
 )
 from .system_tools import SystemTools
 from .terminal import validate_size as _terminal_size
@@ -1556,27 +1557,25 @@ class Shell:
                 cols=cols,
             )
         )
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        timed_out = False
         try:
-            handle = await asyncio.shield(launch)
-        except asyncio.CancelledError:
+            async with asyncio.timeout_at(deadline):
+                handle = await asyncio.shield(launch)
+                await handle._monitor
+        except (TimeoutError, asyncio.CancelledError) as exc:
 
             async def stop_launch():
                 handle = await launch
                 await handle.cancel()
+                return handle
 
-            with suppress(Exception):
-                await _complete_cleanup(stop_launch())
-            raise
-        timed_out = False
-        try:
-            async with asyncio.timeout(timeout):
-                await handle._monitor
-        except TimeoutError:
+            if isinstance(exc, asyncio.CancelledError):
+                with suppress(Exception):
+                    await _complete_cleanup(stop_launch())
+                raise
             timed_out = True
-            await _complete_cleanup(handle.cancel())
-        except asyncio.CancelledError:
-            await _complete_cleanup(handle.cancel())
-            raise
+            handle = await _complete_cleanup(stop_launch())
         result = handle.status()
         result["state"] = result.pop("status")
         result["returncode"] = (handle._result or {}).get("returncode")
@@ -1831,6 +1830,8 @@ class Skills(SkillsWriting):
         limit: int = DEFAULT_LIST_LIMIT,
         max_metadata_bytes: int = DEFAULT_METADATA_BYTES,
         max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+        offset: int = 0,
+        scan_limit: int = 10_000,
     ) -> list[dict[str, Any]]:
         if type(limit) is not int or not 1 <= limit <= self.MAX_LIST_LIMIT:
             raise ValueError(f"limit must be between 1 and {self.MAX_LIST_LIMIT}")
@@ -1848,8 +1849,10 @@ class Skills(SkillsWriting):
             raise ValueError(
                 f"max_response_bytes must be between 16384 and {self.MAX_RESPONSE_BYTES}"
             )
-        if not self.root.is_dir():
-            return []
+        if type(scan_limit) is not int or not 1 <= scan_limit <= 1_000_000:
+            raise ValueError("scan_limit must be between 1 and 1000000")
+        if type(offset) is not int or not 0 <= offset <= scan_limit:
+            raise ValueError("offset must be between 0 and scan_limit")
         found = []
         yaml_ready = False
 
@@ -1861,8 +1864,13 @@ class Skills(SkillsWriting):
             await self._ensure_yaml(text)
             yaml_ready = True
 
-        paths = sorted(self.root.rglob("*/SKILL.md"))
-        for index, path in enumerate(paths[:limit]):
+        discovery = await asyncio.to_thread(
+            skill_paths_page, self.root, offset=offset, limit=limit, scan_limit=scan_limit
+        )
+        paths = discovery["paths"]
+        if not paths and discovery["scan_truncated"]:
+            raise ValueError("skill discovery reached scan_limit; increase scan_limit")
+        for index, path in enumerate(paths):
             name = path.parent.relative_to(self.root).as_posix()
             try:
                 resolved = self._path(name)
@@ -1881,23 +1889,36 @@ class Skills(SkillsWriting):
             candidate = [*found, item]
             if len(_json_bytes(candidate)) > max_response_bytes:
                 if found:
+                    found[-1].update(
+                        next_offset=offset + index,
+                        scan_truncated=discovery["scan_truncated"],
+                        omitted_at_least=discovery["has_more"],
+                    )
                     _mark_skill_list_truncated(
-                        found,
-                        len(paths) - index,
+                        found, len(paths) - index + int(discovery["has_more"]),
                         max_response_bytes,
                     )
                 else:
                     found.append(_fit_skill_item(item, max_response_bytes))
-                    _mark_skill_list_truncated(found, len(paths) - index - 1, max_response_bytes)
+                    found[-1].update(
+                        next_offset=offset + index + 1,
+                        scan_truncated=discovery["scan_truncated"],
+                        omitted_at_least=discovery["has_more"],
+                    )
+                    _mark_skill_list_truncated(
+                        found, len(paths) - index - 1 + int(discovery["has_more"]),
+                        max_response_bytes,
+                    )
                 break
             found.append(item)
         else:
-            if len(paths) > limit:
-                _mark_skill_list_truncated(
-                    found,
-                    len(paths) - limit,
-                    max_response_bytes,
+            if discovery["has_more"] and found:
+                found[-1].update(
+                    next_offset=discovery["next_offset"],
+                    scan_truncated=discovery["scan_truncated"],
+                    omitted_at_least=True,
                 )
+                _mark_skill_list_truncated(found, 1, max_response_bytes)
         return found
 
     def read(self, name: str, *, max_bytes: int | None = DEFAULT_READ_BYTES) -> str:
@@ -2008,8 +2029,13 @@ class Workspace:
     async def _close_resources(self):
         origin = asyncio.current_task()
         cleanup = self._cleanup_task
+        retry = cleanup is not None and cleanup.done() and (
+            cleanup.cancelled() or cleanup.exception() is not None
+        )
+        if retry:
+            cleanup = None
         if cleanup is None:
-            if self._closing:
+            if self._closing and not retry:
                 return
             self._closing = True
             self.tasks._closing = True

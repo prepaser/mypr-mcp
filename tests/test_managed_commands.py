@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from mypr_mcp.managed_commands import ManagedCommands
+from mypr_mcp.runtime import Runtime
 
 
 class FakeRuntime:
@@ -13,6 +14,27 @@ class FakeRuntime:
 
     def track_shell(self, *args, **kwargs):
         self.tracked.append((args, kwargs))
+
+
+async def test_generation_change_after_start_cancels_old_job_without_tracking():
+    shells = FakeShell()
+    runtime = FakeRuntime(shells)
+    runtime.generation = "old"
+
+    async def start(*args, **kwargs):
+        runtime.generation = "new"
+        runtime.shells = object()
+        return {"id": "old-job"}
+
+    runtime.start_managed_command = start
+    runtime._check_managed_command_admission = lambda generation, service: (
+        Runtime._check_managed_command_admission(runtime, generation, service)
+    )
+    command = ManagedCommands(runtime, "c", "conn", "exec", shells=shells, generation="old")
+    with pytest.raises(RuntimeError, match="Expired kernel generation"):
+        await command.run(["unused"])
+    assert shells.cancelled == ["old-job"]
+    assert runtime.tracked == []
 
 
 class FakeShell:
@@ -102,6 +124,32 @@ class TimeoutShell:
         return {"id": ident, "state": "cancelled"}
 
 
+class SlowStartShell:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = []
+
+    async def start(self, command, cwd, env, *, input=None):
+        self.started.set()
+        await self.release.wait()
+        return {"id": "slow-start"}
+
+    async def read(self, ident, *, cursor, max_bytes, wait_ms):
+        return {
+            "id": ident,
+            "state": "cancelled",
+            "output": [],
+            "cursor": "done",
+            "has_more": False,
+            "result": {"returncode": -15},
+        }
+
+    async def cancel(self, ident):
+        self.cancelled.append(ident)
+        return {"id": ident, "state": "cancelled"}
+
+
 @pytest.mark.asyncio
 async def test_run_timeout_cancels_and_returns_bounded_terminal_result():
     result = await ManagedCommands(FakeRuntime(TimeoutShell()), "c", "conn", "exec").run(
@@ -110,6 +158,23 @@ async def test_run_timeout_cancels_and_returns_bounded_terminal_result():
     assert result["timed_out"] is True
     assert result["state"] == "cancelled"
     assert result["stdout"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_includes_startup_and_cancels_late_job():
+    shells = SlowStartShell()
+    task = asyncio.create_task(
+        ManagedCommands(FakeRuntime(shells), "c", "conn", "exec").run(
+            ["slow-start"], timeout=0.01
+        )
+    )
+    await shells.started.wait()
+    await asyncio.sleep(0.02)
+    shells.release.set()
+    result = await task
+    assert result["timed_out"] is True
+    assert result["id"] == "slow-start"
+    assert shells.cancelled == ["slow-start"]
 
 
 async def test_quiet_running_pages_do_not_finish_command():

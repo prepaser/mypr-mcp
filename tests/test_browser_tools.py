@@ -327,6 +327,15 @@ async def test_load_state_rejects_nonregular_file(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_load_state_rejects_non_utf8_file(tmp_path):
+    target = tmp_path / "state.json"
+    target.write_bytes(b"\xff")
+    tools = BrowserTools(tmp_path, lambda: "client", lambda **_: None)
+    with pytest.raises(ValueError, match="invalid browser state"):
+        await tools.load_state(path="state.json")
+
+
+@pytest.mark.asyncio
 async def test_launch_options_header_uses_node_names(tmp_path, fake_playwright):
     async def rpc(op, **fields):
         return "ws://127.0.0.1:1234/pw"
@@ -678,6 +687,35 @@ async def test_close_failure_is_reported_and_registry_is_retained(tmp_path, fake
     assert any(item["name"] == "default" for item in tools.list())
     context.close = original_close
     await tools.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_retries_failed_cleanup(tmp_path, fake_playwright):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context()
+    original_close = context.close
+    attempts = 0
+
+    async def close_once_then_succeed():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary close failure")
+        await original_close()
+
+    context.close = close_once_then_succeed
+    with pytest.raises(BrowserError, match="temporary close failure"):
+        await tools.aclose()
+    assert tools.list()
+
+    await tools.aclose()
+    assert attempts == 2
+    assert not tools.list()
+    await tools.aclose()
+    assert attempts == 2
 
 
 def test_playwright_options_header_is_json(tmp_path):

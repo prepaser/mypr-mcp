@@ -6,7 +6,6 @@ import asyncio
 import datetime as _datetime
 import difflib
 import hashlib
-import json
 import os
 import re
 import stat
@@ -14,8 +13,87 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .json_utils import json_bytes
 from .persistence import await_completion
 from .revisions import RevisionStore
+
+
+def _iter_skill_paths(root: Path, state: dict[str, Any]):
+    root = root.resolve()
+    pending = [(root, frozenset({root}))]
+    while pending and not state["scan_truncated"]:
+        directory, ancestors = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = []
+                for entry in iterator:
+                    state["scanned"] += 1
+                    if state["scanned"] > state["scan_limit"]:
+                        state["scan_truncated"] = True
+                        break
+                    entries.append(entry)
+            entries.sort(key=lambda entry: entry.name)
+        except OSError:
+            continue
+        directories = []
+        for entry in entries:
+            candidate = Path(entry.path)
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+                if directory != root and entry.name == "SKILL.md" and entry.is_file():
+                    yield candidate
+                elif entry.is_dir() and resolved not in ancestors:
+                    if entry.is_symlink():
+                        skill = candidate / "SKILL.md"
+                        skill.resolve().relative_to(root)
+                        if skill.is_file():
+                            yield skill
+                    else:
+                        directories.append((candidate, ancestors | {resolved}))
+            except OSError, ValueError:
+                continue
+        pending.extend(reversed(directories))
+
+
+def skill_paths_page(
+    root: str | os.PathLike[str],
+    *,
+    offset: int = 0,
+    limit: int = 100,
+    scan_limit: int = 10_000,
+) -> dict[str, Any]:
+    """Return a bounded skill path page without collecting the whole tree."""
+
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if type(scan_limit) is not int or scan_limit < 1:
+        raise ValueError("scan_limit must be a positive integer")
+    if offset > scan_limit:
+        raise ValueError("offset must not exceed scan_limit")
+    paths: list[Path] = []
+    seen = 0
+    has_more = False
+    state = {"scanned": 0, "scan_limit": scan_limit, "scan_truncated": False}
+    for path in _iter_skill_paths(Path(root), state):
+        if seen < offset:
+            seen += 1
+            continue
+        if len(paths) >= limit:
+            has_more = True
+            break
+        paths.append(path)
+        seen += 1
+    has_more |= bool(state["scan_truncated"])
+    return {
+        "paths": paths,
+        "next_offset": offset + len(paths) if has_more else None,
+        "has_more": has_more,
+        "scanned": state["scanned"],
+        "scan_truncated": state["scan_truncated"],
+    }
 
 
 class SkillsWriting:
@@ -348,7 +426,7 @@ def _bounded_metadata_value(
 
 
 def _json_bytes(value: Any) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return json_bytes(value, separators=(",", ":"))
 
 
 def _fit_skill_item(item: dict[str, Any], max_bytes: int) -> dict[str, Any]:
@@ -394,6 +472,9 @@ def _mark_skill_list_truncated(
         "metadata_truncated",
         "list_truncated",
         "omitted",
+        "omitted_at_least",
+        "next_offset",
+        "scan_truncated",
     }
     while len(_json_bytes(items)) > max_bytes:
         candidates = [key for key in item if key not in reserved]

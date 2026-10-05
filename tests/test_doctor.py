@@ -38,3 +38,13 @@ async def test_doctor_reports_invalid_global_config(tmp_path, monkeypatch):
     assert str(global_path) in result["config"]["error"]
     assert "configuration is unavailable" in result["warnings"]
     assert not result["ready"]
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_runtime_unknown_and_available_storage(tmp_path):
+    result = await doctor_workspace(tmp_path)
+
+    assert result["runtime"]["status"] == "unknown"
+    assert result["runtime"]["available"] is False
+    assert result["storage"]["available"] is True
+    assert result["storage"]["free_bytes"] > 0

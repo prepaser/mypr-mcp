@@ -12,6 +12,7 @@ import asyncio
 import fcntl
 import inspect
 import json
+import math
 import os
 import secrets
 import subprocess
@@ -21,7 +22,7 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 from .file_io import open_regular, read_bytes
 from .protocol import PROTOCOL_VERSION
 from .transport import find_runtime, rpc, workspace_id
@@ -75,6 +76,27 @@ def _write_ticket(workspace: Path, ticket: dict[str, Any]) -> None:
     ticket["updated_at"] = time.time()
     _atomic_write(_ticket_path(workspace), ticket)
     _atomic_write(_ticket_path(workspace, ticket["id"]), ticket)
+
+
+def _ticket_time(ticket: dict[str, Any]) -> float:
+    value = ticket.get("updated_at")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return float("-inf")
+    try:
+        value = float(value)
+    except (OverflowError, ValueError):
+        return float("-inf")
+    return value if math.isfinite(value) else float("-inf")
+
+
+def _newer_ticket(current: dict[str, Any], archived: dict[str, Any]) -> dict[str, Any]:
+    """Choose one copy without allowing an older abandoned copy to win."""
+
+    current_terminal = current["state"] in TERMINAL_STATES
+    archived_terminal = archived["state"] in TERMINAL_STATES
+    if current_terminal != archived_terminal:
+        return current if current_terminal else archived
+    return current if _ticket_time(current) >= _ticket_time(archived) else archived
 
 
 async def _acquire_lock(lock) -> None:
@@ -192,26 +214,65 @@ def active_ticket(workspace: Path) -> dict[str, Any] | None:
     return ticket if ticket is not None and _ticket_active(workspace, ticket) else None
 
 
-async def recover_ticket(workspace: Path, ident: str | None = None) -> dict[str, Any] | None:
+async def recover_ticket(
+    workspace: Path, ident: str | None = None, *, locked: bool = False
+) -> dict[str, Any] | None:
     """Finalize an abandoned coordinator ticket so callers can recover safely."""
 
     workspace = Path(workspace)
-    ticket = read_ticket(workspace, ident)
-    if ticket is None or ticket["state"] in TERMINAL_STATES or _ticket_active(workspace, ticket):
-        return ticket
-    ticket["state"] = "failed"
-    ticket["error"] = "Restart coordinator is no longer running"
+    lock = None
     try:
-        await _finalize_origin(workspace, ticket)
-    except Exception as exc:
-        ticket["error"] += f"; origin finalization failed: {exc}"
-    finally:
+        if not locked:
+            lock, cancelled = await finish_owned(
+                asyncio.to_thread(open_regular, _root(workspace) / "startup.lock", "ab")
+            )
+            if cancelled:
+                raise asyncio.CancelledError
+            await _acquire_lock(lock)
+
         current = read_ticket(workspace)
+        if ident is None and current is not None:
+            ident = current["id"]
+        ticket = read_ticket(workspace, ident) if ident is not None else None
+        if ticket is None:
+            if current is None or ident != current["id"]:
+                return None
+            ticket = current
+            if ticket["state"] in TERMINAL_STATES:
+                _write_ticket(workspace, ticket)
+                return ticket
         if current is not None and current["id"] == ticket["id"]:
+            selected = _newer_ticket(current, ticket)
+            if selected["state"] in TERMINAL_STATES:
+                if selected is not current or selected != ticket:
+                    _write_ticket(workspace, selected)
+                return selected
+            ticket = selected
+        if ticket["state"] in TERMINAL_STATES or _ticket_active(workspace, ticket):
+            return ticket
+        original_time = _ticket_time(ticket)
+        ticket = dict(ticket)
+        ticket["state"] = "failed"
+        ticket["error"] = "Restart coordinator is no longer running"
+        try:
+            await _finalize_origin(workspace, ticket)
+        except Exception as exc:
+            ticket["error"] += f"; origin finalization failed: {exc}"
+        latest = read_ticket(workspace)
+        if latest is not None and latest["id"] == ticket["id"]:
+            if latest["state"] in TERMINAL_STATES:
+                return latest
+            if _ticket_time(latest) > original_time and _ticket_active(workspace, latest):
+                return latest
+        if latest is not None and latest["id"] == ticket["id"]:
             _write_ticket(workspace, ticket)
         else:
             _atomic_write(_ticket_path(workspace, ticket["id"]), ticket)
-    return ticket
+        return ticket
+    finally:
+        if lock is not None:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
 
 
 async def wait_ticket(workspace: Path, ident: str, timeout: float = 240.0) -> dict[str, Any]:  # noqa: ASYNC109
@@ -367,7 +428,7 @@ async def request_restart(
             raise RestartInProgress(existing)
         abandoned = read_ticket(workspace)
         if abandoned is not None and abandoned["state"] not in TERMINAL_STATES:
-            await recover_ticket(workspace)
+            await recover_ticket(workspace, locked=True)
         found = await find_runtime(workspace)
         if found is None:
             raise RuntimeError("No reachable workspace manager to restart")

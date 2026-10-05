@@ -7,13 +7,121 @@ import contextlib
 import fcntl
 import json
 import os
+import secrets
+import shutil
 import signal
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
 from .async_utils import wait_owned
 from .diagnostics import RPCError
+from .file_io import open_regular, read_bytes
 from .python_dependencies import CORE_PACKAGES, package_environment
+
+_INVALID_VENV_IGNORE = b".venv-invalid-*/"
+
+
+def _workspace_python_paths(root: Path) -> tuple[Path, Path, Path]:
+    venv = root / "venv"
+    return venv, venv / "bin", venv / "bin" / "python"
+
+
+def _workspace_python_structure(root: Path) -> bool:
+    """Check the files that make a workspace virtual environment usable."""
+
+    venv, bin_dir, python = _workspace_python_paths(root)
+    try:
+        if not venv.is_dir():
+            return False
+        if not bin_dir.is_dir():
+            return False
+        config_candidates = [venv / "pyvenv.cfg"]
+        if bin_dir.is_symlink():
+            config_candidates.append(bin_dir.resolve().parent / "pyvenv.cfg")
+        config_info = next(
+            (
+                candidate.stat()
+                for candidate in config_candidates
+                if candidate.is_file()
+            ),
+            None,
+        )
+        if (
+            config_info is None
+            or not stat.S_ISREG(config_info.st_mode)
+            or config_info.st_size > 64 * 1024
+        ):
+            return False
+        python_info = python.stat()
+        if not stat.S_ISREG(python_info.st_mode) or not os.access(python, os.X_OK):
+            return False
+        result = subprocess.run(
+            [
+                str(python), "-I", "-c",
+                "import sys; raise SystemExit(sys.prefix == sys.base_prefix)",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _remove_workspace_venv(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _ensure_recovery_ignore(root: Path) -> None:
+    path = root / ".gitignore"
+    try:
+        data = read_bytes(path, max_bytes=16 * 1024 * 1024)
+    except FileNotFoundError:
+        data = b""
+    if _INVALID_VENV_IGNORE in data.splitlines():
+        return
+    prefix = b"" if not data or data.endswith(b"\n") else b"\n"
+    with open_regular(path, "ab") as stream:
+        stream.write(prefix + _INVALID_VENV_IGNORE + b"\n")
+
+
+async def _repair_workspace_python(root: Path, command) -> Path:
+    venv, _bin_dir, python = _workspace_python_paths(root)
+    backup: Path | None = None
+    if venv.exists() or venv.is_symlink():
+        backup = root / f".venv-invalid-{secrets.token_hex(8)}"
+        os.replace(venv, backup)
+    try:
+        await command("uv", "venv", str(venv), "--python", sys.executable)
+        if not await wait_owned(asyncio.to_thread(_workspace_python_structure, root)):
+            raise RuntimeError("uv created an unusable workspace Python environment")
+        await wait_owned(asyncio.to_thread(_ensure_recovery_ignore, root))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            _remove_workspace_venv(venv)
+        if backup is not None and not venv.exists() and not venv.is_symlink():
+            os.replace(backup, venv)
+        raise
+    return python
+
+
+async def ensure_workspace_python(root: Path, *, command=None) -> Path:
+    """Return a usable workspace interpreter, repairing a broken environment."""
+
+    root = Path(root)
+    if command is None:
+        command = run_command
+    if await wait_owned(asyncio.to_thread(_workspace_python_structure, root)):
+        return _workspace_python_paths(root)[2]
+    return await wait_owned(_repair_workspace_python(root, command))
 
 
 async def run_command(*args: str, env=None, timeout_seconds: float = 180) -> None:
@@ -123,9 +231,7 @@ async def prepare_workspace(workspace: Path, *, command=run_command):
                 "Stop the workspace manager before preparing kernel dependencies.",
                 code="manager_running", operation="kernel_prepare",
             )
-        python = root / "venv/bin/python"
-        if not python.exists():
-            await command("uv", "venv", str(root / "venv"), "--python", sys.executable)
+        python = await ensure_workspace_python(root, command=command)
 
         async def install(names, _context):
             await install_core(python, root, names, config, command)
