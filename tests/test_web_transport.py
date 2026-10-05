@@ -6,6 +6,7 @@ import httpx2
 import pytest
 
 from mypr_mcp.diagnostics import RPCError
+from mypr_mcp.web_snapshots import WebSnapshots
 from mypr_mcp.web_transport import MAX_RESPONSE_BYTES, WebTransport
 
 
@@ -211,6 +212,92 @@ async def test_search_bounds_title_and_reports_oversized_url(monkeypatch):
     }
     assert result["failed_results"][0]["url_truncated"] is True
     assert "exceeds" in result["failed_results"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_context_and_extract_bound_provider_metadata(monkeypatch):
+    oversized_url = "https://example.test/" + ("x" * 9000)
+
+    async def context_handler(_request):
+        return httpx2.Response(
+            200,
+            json={
+                "grounding": {
+                    "generic": [
+                        {
+                            "title": "t" * 9000,
+                            "url": "https://example.test/context",
+                            "snippets": ["context"],
+                        },
+                        {"title": "skip", "url": oversized_url, "snippets": ["skip"]},
+                    ]
+                },
+                "sources": {"https://example.test/context": {}},
+            },
+        )
+
+    async def extract_handler(_request):
+        return httpx2.Response(
+            200,
+            json={
+                "results": [{"url": oversized_url, "raw_content": "content"}],
+                "failed_results": [{"url": "https://failed.test", "error": "오" * 9000}],
+            },
+        )
+
+    monkeypatch.setenv("WEB_KEY", "secret-token")
+    context_transport = WebTransport(
+        _config("brave"), transport=httpx2.MockTransport(context_handler)
+    )
+    extract_transport = WebTransport(
+        _config("tavily"), transport=httpx2.MockTransport(extract_handler)
+    )
+    try:
+        context = await context_transport.run("context", "brave", {"query": "q"})
+        extract = await extract_transport.run(
+            "extract", "tavily", {"urls": ["https://request.test"]}
+        )
+    finally:
+        await context_transport.close()
+        await extract_transport.close()
+
+    assert len(context["results"][0]["title"].encode()) == 8 * 1024
+    assert context["results"][0]["metadata"]["title_truncated"] is True
+    assert context["failed_results"][0]["url_truncated"] is True
+    assert not extract["results"]
+    assert extract["failed_results"][0]["url_truncated"] is True
+    assert len(extract["failed_results"][1]["error"].encode()) <= 8 * 1024
+    assert extract["failed_results"][1]["error_truncated"] is True
+
+
+@pytest.mark.parametrize("provider,operation", [("brave", "context"), ("tavily", "search")])
+async def test_nested_provider_metadata_fits_default_page(monkeypatch, provider, operation):
+    url = "https://example.test"
+    metadata = {f"field{i}": "x" * 4096 for i in range(32)}
+    payload = (
+        {
+            "grounding": {"generic": [{"url": url, "snippets": ["content"]}]},
+            "sources": {url: metadata},
+        }
+        if operation == "context"
+        else {"results": [{"url": url, "content": "content", "source": metadata, "score": 0.5}]}
+    )
+
+    async def handler(_request):
+        return httpx2.Response(200, json=payload)
+
+    monkeypatch.setenv("WEB_KEY", "secret-token")
+    transport = WebTransport(_config(provider), transport=httpx2.MockTransport(handler))
+    try:
+        result = await transport.run(operation, provider, {"query": "q"})
+    finally:
+        await transport.close()
+    page = WebSnapshots().create("owner", result, 32768)
+    assert page["results"][0]["url"] == url
+    assert page["results"][0]["metadata"]["metadata_truncated"] is True
+    assert "source" not in page["results"][0]["metadata"]
+    if operation == "search":
+        assert page["results"][0]["metadata"]["score"] == 0.5
 
 
 @pytest.mark.asyncio

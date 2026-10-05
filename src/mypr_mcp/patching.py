@@ -42,6 +42,93 @@ def _temporary_prefix(name: str, suffix: str = "") -> str:
     return f".{name[:_TEMP_PREFIX_NAME_LIMIT]}{suffix}"
 
 
+def _open_artifact_parent(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    proc_fd = Path("/proc/self/fd")
+    try:
+        relative = path.relative_to(proc_fd)
+    except ValueError:
+        relative = None
+    if relative and relative.parts and relative.parts[0].isdigit():
+        descriptor = os.dup(int(relative.parts[0]))
+        try:
+            for part in relative.parts[1:]:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                raise NotADirectoryError(str(path))
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    return os.open(path, flags)
+
+
+def _artifact_identity(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def _bind_artifact_parent(fd: int, fallback: int) -> int:
+    try:
+        target = Path(os.readlink(f"/proc/self/fd/{fd}")).parent
+        bound = _open_artifact_parent(target)
+    except (OSError, ValueError):
+        return fallback
+    os.close(fallback)
+    return bound
+
+
+def _remove_artifact(
+    path: Path,
+    parent_fd: int,
+    identity: tuple[int, int],
+) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and (info.st_dev, info.st_ino) == identity:
+        parent_info = path.parent.lstat()
+        owner_info = os.fstat(parent_fd)
+        if (parent_info.st_dev, parent_info.st_ino) == (
+            owner_info.st_dev,
+            owner_info.st_ino,
+        ):
+            path.unlink(missing_ok=True)
+            return
+    try:
+        info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (info.st_dev, info.st_ino) != identity:
+        return
+    os.unlink(path.name, dir_fd=parent_fd)
+
+
+def _remove_created_dirs(
+    created: list[tuple[Path, tuple[int, int]]],
+) -> list[tuple[Path, OSError]]:
+    errors: list[tuple[Path, OSError]] = []
+    for directory, identity in reversed(created):
+        try:
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or (info.st_dev, info.st_ino) != identity
+            ):
+                continue
+            directory.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append((directory, exc))
+    return errors
+
+
 @dataclass(frozen=True)
 class _Hunk:
     old_start: int | None
@@ -662,7 +749,8 @@ def _commit(
 ) -> dict[str, Any]:
     temporaries: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
-    created_dirs: list[Path] = []
+    created_dirs: list[tuple[Path, tuple[int, int]]] = []
+    artifact_parents: dict[Path, tuple[int, tuple[int, int]]] = {}
     committed: list[
         tuple[Path, bytes | None, os.stat_result | None, bytes | None, os.stat_result | None]
     ] = []
@@ -684,10 +772,21 @@ def _commit(
                     current = current.parent
                 for directory in reversed(missing):
                     directory.mkdir()
-                    created_dirs.append(directory)
-            fd, name = tempfile.mkstemp(
-                prefix=_temporary_prefix(plan["path"].name, "."), dir=parent
-            )
+                    info = directory.lstat()
+                    created_dirs.append((directory, (info.st_dev, info.st_ino)))
+            parent_fd = _open_artifact_parent(parent)
+            fd: int | None = None
+            try:
+                fd, name = tempfile.mkstemp(
+                    prefix=_temporary_prefix(plan["path"].name, "."), dir=parent
+                )
+                parent_fd = _bind_artifact_parent(fd, parent_fd)
+                artifact_parents[Path(name)] = (parent_fd, _artifact_identity(fd))
+            except BaseException:
+                if fd is not None:
+                    os.close(fd)
+                os.close(parent_fd)
+                raise
             temp = Path(name)
             temporaries[plan["path"]] = temp
             with os.fdopen(fd, "wb") as stream:
@@ -701,10 +800,20 @@ def _commit(
             state = states[backup_path]
             if not state.exists or backup_path in backups:
                 continue
-            fd, name = tempfile.mkstemp(
-                prefix=_temporary_prefix(backup_path.name, ".mypr-backup."),
-                dir=backup_path.parent,
-            )
+            parent_fd = _open_artifact_parent(backup_path.parent)
+            fd = None
+            try:
+                fd, name = tempfile.mkstemp(
+                    prefix=_temporary_prefix(backup_path.name, ".mypr-backup."),
+                    dir=backup_path.parent,
+                )
+                parent_fd = _bind_artifact_parent(fd, parent_fd)
+                artifact_parents[Path(name)] = (parent_fd, _artifact_identity(fd))
+            except BaseException:
+                if fd is not None:
+                    os.close(fd)
+                os.close(parent_fd)
+                raise
             backup = Path(name)
             backups[backup_path] = backup
             with os.fdopen(fd, "wb") as stream:
@@ -767,7 +876,13 @@ def _commit(
         if history_store is not None:
             try:
                 history_store.record_changes_sync(plans)
-            except RevisionIndexOutcomeUnknown:
+            except RevisionIndexOutcomeUnknown as exc:
+                preserve_backups = True
+                if backups:
+                    exc.add_note(
+                        "patch changes remain in place; recovery backups preserved at "
+                        + ", ".join(str(path) for path in backups.values())
+                    )
                 raise
             except BaseException as exc:
                 raise RuntimeError("history record failed; patch will be rolled back") from exc
@@ -776,6 +891,9 @@ def _commit(
         return result
     except BaseException as exc:
         primary = exc
+        if isinstance(exc, RevisionIndexOutcomeUnknown):
+            preserve_backups = True
+            raise
         recovery: list[str] = []
         for path, old, old_info, expected_new, expected_info in reversed(committed):
             try:
@@ -815,21 +933,31 @@ def _commit(
         cleanup_errors: list[str] = []
         for temporary in temporaries.values():
             try:
-                temporary.unlink(missing_ok=True)
+                parent = artifact_parents.get(temporary)
+                if parent is None:
+                    temporary.unlink(missing_ok=True)
+                else:
+                    _remove_artifact(temporary, parent[0], parent[1])
             except BaseException as cleanup_exc:
                 cleanup_errors.append(f"{temporary}: {cleanup_exc}")
         if not preserve_backups:
             for backup in backups.values():
                 try:
-                    backup.unlink(missing_ok=True)
+                    parent = artifact_parents.get(backup)
+                    if parent is None:
+                        backup.unlink(missing_ok=True)
+                    else:
+                        _remove_artifact(backup, parent[0], parent[1])
                 except BaseException as cleanup_exc:
                     cleanup_errors.append(f"{backup}: {cleanup_exc}")
-        if not completed:
-            for directory in reversed(created_dirs):
-                try:
-                    directory.rmdir()
-                except BaseException as cleanup_exc:
-                    cleanup_errors.append(f"{directory}: {cleanup_exc}")
+        if not completed and not isinstance(primary, RevisionIndexOutcomeUnknown):
+            for directory, cleanup_error in _remove_created_dirs(created_dirs):
+                cleanup_errors.append(f"{directory}: {cleanup_error}")
+        for parent_fd, _ in artifact_parents.values():
+            try:
+                os.close(parent_fd)
+            except OSError as cleanup_exc:
+                cleanup_errors.append(f"artifact parent fd: {cleanup_exc}")
         if cleanup_errors:
             preserve_backups = True
             note = "patch cleanup failed; artifacts may remain at: " + "; ".join(cleanup_errors)

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .diagnostic_snapshots import DiagnosticSnapshots
+from .json_utils import json_bytes
 
 _MAX_OUTPUT = 32768
 _PROBE_OUTPUT = 1024 * 1024
@@ -29,7 +30,7 @@ def _number(value, name, *, minimum=0, maximum=None):
 
 
 def _size(value):
-    return len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode())
+    return len(json_bytes(value, allow_nan=False))
 
 
 def _bounded(result, limit=_MAX_OUTPUT):
@@ -385,7 +386,7 @@ class SystemTools:
                 asyncio.create_task(self._read(proc.stdout, _PROBE_OUTPUT)),
                 asyncio.create_task(self._read(proc.stderr, 65536)),
             ]
-            payload = json.dumps({"section": section, **request}).encode()
+            payload = json_bytes({"section": section, **request})
             proc.stdin.write(payload)
             await proc.stdin.drain()
             proc.stdin.close()

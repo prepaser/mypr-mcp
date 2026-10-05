@@ -17,9 +17,50 @@ from .json_utils import json_bytes
 from .persistence import await_completion
 from .revisions import RevisionStore
 
+_MAX_DISCOVERY_ERRORS = 16
+
+
+def _bounded_text(value: Any, limit: int = 512) -> str:
+    try:
+        text = str(value)
+        try:
+            raw = text.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:
+            raw = text.encode("utf-8", "backslashreplace")
+        return raw[:limit].decode("utf-8", "surrogateescape")
+    except Exception:
+        return type(value).__name__
+
+
+def _discovery_error(state: dict[str, Any], path: Path, error: OSError) -> None:
+    state["error_count"] += 1
+    errors = state.setdefault("errors", [])
+    if len(errors) >= _MAX_DISCOVERY_ERRORS:
+        return
+    errors.append(
+        {
+            "code": "discovery_error",
+            "message": _bounded_text(f"Unable to inspect {path}: {error}"),
+        }
+    )
+
 
 def _iter_skill_paths(root: Path, state: dict[str, Any]):
-    root = root.resolve()
+    root = Path(root)
+    try:
+        root_stat = root.stat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _discovery_error(state, root, exc)
+        return
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return
+    try:
+        root = root.resolve()
+    except OSError as exc:
+        _discovery_error(state, root, exc)
+        return
     pending = [(root, frozenset({root}))]
     while pending and not state["scan_truncated"]:
         directory, ancestors = pending.pop()
@@ -33,7 +74,8 @@ def _iter_skill_paths(root: Path, state: dict[str, Any]):
                         break
                     entries.append(entry)
             entries.sort(key=lambda entry: entry.name)
-        except OSError:
+        except OSError as exc:
+            _discovery_error(state, directory, exc)
             continue
         directories = []
         for entry in entries:
@@ -41,17 +83,23 @@ def _iter_skill_paths(root: Path, state: dict[str, Any]):
             try:
                 resolved = candidate.resolve()
                 resolved.relative_to(root)
-                if directory != root and entry.name == "SKILL.md" and entry.is_file():
+                entry_stat = entry.stat(follow_symlinks=True)
+                entry_is_file = stat.S_ISREG(entry_stat.st_mode)
+                entry_is_dir = stat.S_ISDIR(entry_stat.st_mode)
+                if directory != root and entry.name == "SKILL.md" and entry_is_file:
                     yield candidate
-                elif entry.is_dir() and resolved not in ancestors:
+                elif entry_is_dir and resolved not in ancestors:
                     if entry.is_symlink():
                         skill = candidate / "SKILL.md"
                         skill.resolve().relative_to(root)
-                        if skill.is_file():
+                        if stat.S_ISREG(skill.stat().st_mode):
                             yield skill
                     else:
                         directories.append((candidate, ancestors | {resolved}))
-            except OSError, ValueError:
+            except ValueError:
+                continue
+            except OSError as exc:
+                _discovery_error(state, candidate, exc)
                 continue
         pending.extend(reversed(directories))
 
@@ -76,7 +124,13 @@ def skill_paths_page(
     paths: list[Path] = []
     seen = 0
     has_more = False
-    state = {"scanned": 0, "scan_limit": scan_limit, "scan_truncated": False}
+    state = {
+        "scanned": 0,
+        "scan_limit": scan_limit,
+        "scan_truncated": False,
+        "errors": [],
+        "error_count": 0,
+    }
     for path in _iter_skill_paths(Path(root), state):
         if seen < offset:
             seen += 1
@@ -93,6 +147,10 @@ def skill_paths_page(
         "has_more": has_more,
         "scanned": state["scanned"],
         "scan_truncated": state["scan_truncated"],
+        "errors": list(state["errors"]),
+        "complete": not state["scan_truncated"] and not state["errors"],
+        "warnings_truncated": state["error_count"] > len(state["errors"]),
+        "error_count": state["error_count"],
     }
 
 

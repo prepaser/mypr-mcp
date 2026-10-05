@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import secrets
 import time
 from collections import OrderedDict
 from copy import deepcopy
 from typing import Any
+
+from .json_utils import json_bytes
 
 _MAX_PAGE_BYTES = 32768
 
@@ -80,7 +81,7 @@ class DiagnosticSnapshots:
             "omitted_by_source": max(0, snapshot["total"] - len(rows)),
         }
         self._set_cursor(result, snapshot_id, end, len(rows))
-        while len(json.dumps(result, ensure_ascii=False).encode()) > _MAX_PAGE_BYTES:
+        while len(json_bytes(result)) > _MAX_PAGE_BYTES:
             if len(page_rows) > 1:
                 page_rows.pop()
                 end -= 1
@@ -103,7 +104,7 @@ class DiagnosticSnapshots:
             self._set_cursor(result, snapshot_id, end, len(rows))
             if not page_rows:
                 break
-        if len(json.dumps(result, ensure_ascii=False).encode()) > _MAX_PAGE_BYTES:
+        if len(json_bytes(result)) > _MAX_PAGE_BYTES:
             raise RuntimeError("diagnostic page metadata exceeds the 32 KiB output limit")
         return result
 

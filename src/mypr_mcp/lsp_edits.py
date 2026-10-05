@@ -100,8 +100,8 @@ def position_offset(text: str, position: Any, encoding: str) -> int:
 def apply_text_edits(text: str, edits: Any, encoding: str) -> str:
     if not isinstance(edits, list):
         raise EditError("LSP text edits must be a list")
-    converted: list[tuple[int, int, str]] = []
-    for item in edits:
+    converted: list[tuple[int, int, str, int]] = []
+    for index, item in enumerate(edits):
         if not isinstance(item, dict) or not isinstance(item.get("range"), dict):
             raise EditError("LSP text edit is malformed")
         raw_range = item["range"]
@@ -112,14 +112,19 @@ def apply_text_edits(text: str, edits: Any, encoding: str) -> str:
         replacement = item.get("newText")
         if not isinstance(replacement, str) or "\x00" in replacement:
             raise EditError("LSP text edit replacement is invalid")
-        converted.append((start, end, replacement))
-    converted.sort(key=lambda value: (value[0], value[1]), reverse=True)
+        converted.append((start, end, replacement, index))
+
+    def sort_key(value: tuple[int, int, str, int]) -> tuple[int, int, int]:
+        start, end, _, index = value
+        return (-start, 0 if end > start else 1, -index)
+
+    converted.sort(key=sort_key)
     previous_start = len(text) + 1
-    for start, end, _ in converted:
+    for start, end, _, _ in converted:
         if end > previous_start:
             raise EditError("overlapping LSP text edits are unsupported")
         previous_start = start
-    for start, end, replacement in converted:
+    for start, end, replacement, _ in converted:
         text = text[:start] + replacement + text[end:]
     return text
 

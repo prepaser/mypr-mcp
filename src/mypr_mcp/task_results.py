@@ -29,6 +29,10 @@ def encode_result(value: Any) -> str:
         if kind is str:
             if len(item) > MAX_RESULT_BYTES:
                 raise ValueError("task result exceeds the 256 KiB limit")
+            try:
+                item.encode("utf-8", "surrogateescape")
+            except UnicodeEncodeError:
+                raise ValueError("task result contains invalid Unicode") from None
         elif kind in (list, tuple):
             if len(item) > 100_000:
                 raise ValueError("task result exceeds the JSON structure limit")
@@ -46,6 +50,7 @@ def encode_result(value: Any) -> str:
     size = 0
     encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     for chunk in encoder.iterencode(value):
+        chunk = chunk.encode("utf-8", "backslashreplace").decode("utf-8")
         size += len(chunk.encode("utf-8"))
         if size > MAX_RESULT_BYTES:
             raise ValueError("task result exceeds the 256 KiB limit")
@@ -72,7 +77,10 @@ def store_result(
 
 
 def _store_result(workspace: Path, task_id: str, generation: str, encoded: str) -> dict[str, Any]:
-    if not isinstance(encoded, str) or len(encoded.encode("utf-8")) > MAX_RESULT_BYTES:
+    if (
+        not isinstance(encoded, str)
+        or len(encoded.encode("utf-8", "backslashreplace")) > MAX_RESULT_BYTES
+    ):
         raise ValueError("task result exceeds the 256 KiB limit")
     value = json.loads(encoded, parse_constant=lambda _: _invalid_number())
     encoded = encode_result(value)

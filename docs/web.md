@@ -64,7 +64,7 @@ Results use a common envelope:
 
 Publication dates use `published_at` when available; source scores and rankings remain in each result's `metadata`. Request IDs and usage are included only when provided. mypr requests Tavily usage by default; use `options={"include_usage": False}` to omit it. Scores from different providers are not comparable. A normal empty `results` list means no result was returned; it does not represent authentication, quota, rate-limit, timeout, or malformed-response failures. Page envelopes also include `result_count` and `failed_count`; these describe the complete saved snapshot rather than only the current page.
 
-Search titles are bounded before they enter a snapshot, and a provider result whose URL exceeds the field limit is retained in `failed_results` with a truncated URL prefix instead of making the complete page unreadable. Inspect `failed_results` when comparing the saved response with the provider count.
+Search and context titles are bounded before they enter a snapshot. Search, context, and extraction results whose URL exceeds the field limit are retained in `failed_results` with a truncated URL prefix and `url_truncated` instead of making the complete page unreadable. Context titles shortened to the limit report `metadata.title_truncated`; shortened extraction errors report `error_truncated`. Oversized metadata fields are omitted and `metadata.metadata_truncated` is set. Inspect `failed_results` when comparing the saved response with the provider count.
 
 ## Context and extraction
 

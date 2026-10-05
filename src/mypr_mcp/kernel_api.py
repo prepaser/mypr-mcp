@@ -1868,6 +1868,14 @@ class Skills(SkillsWriting):
             skill_paths_page, self.root, offset=offset, limit=limit, scan_limit=scan_limit
         )
         paths = discovery["paths"]
+        if discovery["errors"]:
+            detail = "; ".join(item["message"] for item in discovery["errors"][:3])
+            if discovery["error_count"] > 3:
+                detail += (
+                    f"; {discovery['error_count'] - 3}"
+                    " more discovery errors"
+                )
+            raise RuntimeError(f"Skill discovery incomplete: {detail}")
         if not paths and discovery["scan_truncated"]:
             raise ValueError("skill discovery reached scan_limit; increase scan_limit")
         for index, path in enumerate(paths):

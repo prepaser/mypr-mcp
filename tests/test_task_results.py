@@ -41,6 +41,18 @@ def test_json_result_limits_and_integrity(tmp_path):
         load_result(tmp_path, reference)
 
 
+def test_saved_result_preserves_filesystem_surrogates(tmp_path):
+    value = {"path": os.fsdecode(b"name-\xff"), "literal": r"\udcff"}
+    encoded = encode_result(value)
+    assert json.loads(encoded) == value
+    reference = store_result(tmp_path, "task", "generation", encoded)
+    assert load_result(tmp_path, reference) == value
+    with pytest.raises(ValueError, match="256 KiB"):
+        encode_result("\udcff" * 50_000)
+    with pytest.raises(ValueError, match="invalid Unicode"):
+        encode_result("\ud83d\ude00")
+
+
 def test_fifo_result_is_rejected_without_waiting_for_a_writer(tmp_path):
     reference = store_result(tmp_path, "task", "generation", encode_result({"ok": True}))
     path = tmp_path / reference["path"]

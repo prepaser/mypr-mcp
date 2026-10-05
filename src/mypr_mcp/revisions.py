@@ -45,6 +45,13 @@ def _temporary_prefix(name: str, suffix: str = ".") -> str:
 class RevisionIndexOutcomeUnknown(RuntimeError):
     """Raised when an index write cannot be distinguished from an external update."""
 
+    def __init__(self, message: str, *, resource: str | None = None) -> None:
+        self.code = "outcome_unknown"
+        self.details = {"outcome_unknown": True}
+        if resource is not None:
+            self.details["resource"] = resource
+        super().__init__(message)
+
 
 def _empty_index(kind: str, resource: str, version: int) -> dict[str, Any]:
     index: dict[str, Any] = {
@@ -269,11 +276,12 @@ class RevisionStore:
         try:
             await self.record(resource, (old, new))
         except RevisionIndexOutcomeUnknown as exc:
-            raise RuntimeError(
+            raise RevisionIndexOutcomeUnknown(
                 f"Revision index outcome is unknown for {resource}; the target remains at "
                 f"revision {new_revision}. Prior content is recoverable with revision "
                 f"{old_revision or 'absent'}; inspect read_revision() and history() before "
-                "retrying."
+                "retrying.",
+                resource=resource,
             ) from exc
         except BaseException as exc:
             try:

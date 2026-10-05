@@ -60,6 +60,7 @@ class MailStore:
 
     def _create_schema(self) -> None:
         with self._lock:
+            self._recover_interrupted_rebuilds()
             self._db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS mail_watches (
@@ -218,36 +219,7 @@ class MailStore:
                     notification_unique = True
                     break
             if not notification_unique:
-                self._db.executescript(
-                    """
-                    CREATE TABLE mail_notifications_new (
-                        notification_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                        id TEXT NOT NULL UNIQUE,
-                        client_id TEXT NOT NULL,
-                        watch_id TEXT NOT NULL,
-                        account TEXT NOT NULL,
-                        mailbox TEXT NOT NULL,
-                        endpoint_identity TEXT NOT NULL DEFAULT '',
-                        uidvalidity INTEGER,
-                        uid INTEGER,
-                        kind TEXT NOT NULL,
-                        payload TEXT NOT NULL,
-                        created REAL NOT NULL,
-                        acknowledged REAL,
-                        UNIQUE(client_id, watch_id, endpoint_identity, uidvalidity, uid, kind)
-                    );
-                    INSERT INTO mail_notifications_new
-                        (notification_seq,id,client_id,watch_id,account,mailbox,endpoint_identity,uidvalidity,uid,kind,payload,created,acknowledged)
-                    SELECT notification_seq,id,client_id,watch_id,account,mailbox,
-                        COALESCE(endpoint_identity,''),uidvalidity,uid,kind,payload,
-                        created,acknowledged
-                    FROM mail_notifications;
-                    DROP TABLE mail_notifications;
-                    ALTER TABLE mail_notifications_new RENAME TO mail_notifications;
-                    CREATE INDEX IF NOT EXISTS mail_notifications_client_idx
-                        ON mail_notifications(client_id, acknowledged, notification_seq);
-                    """
-                )
+                self._rebuild_notifications()
             indexes = self._db.execute("PRAGMA index_list(mail_refs)").fetchall()
             legacy_unique = False
             for index in indexes:
@@ -261,27 +233,260 @@ class MailStore:
                     legacy_unique = True
                     break
             if legacy_unique:
-                self._db.executescript(
-                    """
-                    CREATE TABLE mail_refs_new (
-                        id TEXT PRIMARY KEY NOT NULL,
-                        account TEXT NOT NULL,
-                        mailbox TEXT NOT NULL,
-                        uidvalidity INTEGER NOT NULL,
-                        uid INTEGER NOT NULL,
-                        endpoint_identity TEXT NOT NULL DEFAULT '',
-                        created REAL NOT NULL,
-                        UNIQUE(account, mailbox, uidvalidity, uid, endpoint_identity)
-                    );
-                    INSERT INTO mail_refs_new
-                        SELECT id,account,mailbox,uidvalidity,uid,endpoint_identity,created
-                        FROM mail_refs;
-                    DROP TABLE mail_refs;
-                    ALTER TABLE mail_refs_new RENAME TO mail_refs;
-                    CREATE INDEX IF NOT EXISTS mail_refs_namespace_idx
-                        ON mail_refs(account, mailbox, uidvalidity, uid);
-                    """
+                self._rebuild_refs()
+
+    def _recover_interrupted_rebuilds(self) -> None:
+        for table, key, columns in (
+            (
+                "mail_notifications",
+                "id",
+                (
+                    "notification_seq",
+                    "id",
+                    "client_id",
+                    "watch_id",
+                    "account",
+                    "mailbox",
+                    "endpoint_identity",
+                    "uidvalidity",
+                    "uid",
+                    "kind",
+                    "payload",
+                    "created",
+                    "acknowledged",
+                ),
+            ),
+            (
+                "mail_refs",
+                "id",
+                ("id", "account", "mailbox", "uidvalidity", "uid", "endpoint_identity", "created"),
+            ),
+        ):
+            replacement = f"{table}_new"
+            if not self._table_exists(replacement):
+                continue
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                highwater = max(
+                    filter(
+                        lambda value: value is not None,
+                        (
+                            self._sequence_highwater(table),
+                            self._sequence_highwater(replacement),
+                        ),
+                    ),
+                    default=None,
                 )
+                if self._table_exists(table):
+                    relation = self._rebuild_rows_relation(table, replacement, key, columns)
+                    if relation == "different":
+                        raise sqlite3.DatabaseError(
+                            f"ambiguous interrupted {table} migration; "
+                            "both tables contain different data"
+                        )
+                    if relation == "original_empty":
+                        self._db.execute(f"DROP TABLE {table}")
+                        self._db.execute(f"ALTER TABLE {replacement} RENAME TO {table}")
+                    else:
+                        self._db.execute(f"DROP TABLE {replacement}")
+                else:
+                    replacement_columns = {
+                        row[1] for row in self._db.execute(f"PRAGMA table_info({replacement})")
+                    }
+                    if set(columns) - replacement_columns:
+                        raise sqlite3.DatabaseError(
+                            f"ambiguous interrupted {table} migration; "
+                            "replacement schema is incomplete"
+                        )
+                    self._db.execute(f"ALTER TABLE {replacement} RENAME TO {table}")
+                if highwater is not None and table == "mail_notifications":
+                    self._restore_sequence(table, highwater)
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def _table_exists(self, name: str) -> bool:
+        return (
+            self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()
+            is not None
+        )
+
+    def _sequence_highwater(self, table: str) -> int | None:
+        if not self._table_exists("sqlite_sequence"):
+            return None
+        row = self._db.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return max(0, int(row[0]))
+
+    def _restore_sequence(self, table: str, highwater: int) -> None:
+        current = self._sequence_highwater(table)
+        if current is None or highwater > current:
+            updated = self._db.execute(
+                "UPDATE sqlite_sequence SET seq=? WHERE name=?", (highwater, table)
+            )
+            if not updated.rowcount:
+                self._db.execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)", (table, highwater)
+                )
+
+    def _rebuild_rows_relation(
+        self, original: str, replacement: str, key: str, columns: tuple[str, ...]
+    ) -> str:
+        original_columns = {row[1] for row in self._db.execute(f"PRAGMA table_info({original})")}
+        replacement_columns = {
+            row[1] for row in self._db.execute(f"PRAGMA table_info({replacement})")
+        }
+        if (
+            set(columns) - {"endpoint_identity"} - original_columns
+            or set(columns) - replacement_columns
+        ):
+            raise sqlite3.DatabaseError(
+                f"ambiguous interrupted {original} migration; replacement schema is incomplete"
+            )
+        original_count = self._db.execute(f"SELECT COUNT(*) FROM {original}").fetchone()[0]
+        replacement_count = self._db.execute(f"SELECT COUNT(*) FROM {replacement}").fetchone()[0]
+        if self._has_duplicate_keys(original, key) or self._has_duplicate_keys(replacement, key):
+            raise sqlite3.DatabaseError(
+                f"ambiguous interrupted {original} migration; duplicate keys"
+            )
+        if original_count == 0 and replacement_count > 0:
+            return "original_empty"
+        if replacement_count == 0:
+            return "same" if original_count == 0 else "replacement_empty"
+        if self._projection_differs(
+            original, replacement, original_columns, replacement_columns, columns
+        ):
+            return "different"
+        return "same"
+
+    def _has_duplicate_keys(self, table: str, key: str) -> bool:
+        return (
+            self._db.execute(
+                f"SELECT 1 FROM {table} GROUP BY {key} HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
+    def _projection_differs(
+        self,
+        original: str,
+        replacement: str,
+        original_columns: set[str],
+        replacement_columns: set[str],
+        columns: tuple[str, ...],
+    ) -> bool:
+        def projection(available: set[str]) -> str:
+            values = []
+            for column in columns:
+                if column == "endpoint_identity" and column not in available:
+                    values.append("''")
+                elif column == "endpoint_identity":
+                    values.append("COALESCE(endpoint_identity,'')")
+                else:
+                    values.append(column)
+            return ",".join(values)
+
+        for first, second in ((original, replacement), (replacement, original)):
+            first_columns = original_columns if first == original else replacement_columns
+            second_columns = replacement_columns if second == replacement else original_columns
+            first_projection = projection(first_columns)
+            second_projection = projection(second_columns)
+            if self._db.execute(
+                f"SELECT 1 FROM (SELECT {first_projection} FROM {first} "
+                f"EXCEPT SELECT {second_projection} FROM {second}) LIMIT 1"
+            ).fetchone():
+                return True
+        return False
+
+    def _rebuild_notifications(self) -> None:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            highwater = self._sequence_highwater("mail_notifications")
+            self._db.execute(
+                """
+                CREATE TABLE mail_notifications_new (
+                    notification_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    client_id TEXT NOT NULL,
+                    watch_id TEXT NOT NULL,
+                    account TEXT NOT NULL,
+                    mailbox TEXT NOT NULL,
+                    endpoint_identity TEXT NOT NULL DEFAULT '',
+                    uidvalidity INTEGER,
+                    uid INTEGER,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created REAL NOT NULL,
+                    acknowledged REAL,
+                    UNIQUE(client_id, watch_id, endpoint_identity, uidvalidity, uid, kind)
+                )
+                """
+            )
+            self._db.execute(
+                """
+                INSERT INTO mail_notifications_new
+                    (notification_seq,id,client_id,watch_id,account,mailbox,endpoint_identity,uidvalidity,uid,kind,payload,created,acknowledged)
+                SELECT notification_seq,id,client_id,watch_id,account,mailbox,
+                    COALESCE(endpoint_identity,''),uidvalidity,uid,kind,payload,
+                    created,acknowledged
+                FROM mail_notifications
+                """
+            )
+            self._db.execute("DROP TABLE mail_notifications")
+            self._db.execute("ALTER TABLE mail_notifications_new RENAME TO mail_notifications")
+            self._db.execute(
+                "CREATE INDEX mail_notifications_client_idx "
+                "ON mail_notifications(client_id, acknowledged, notification_seq)"
+            )
+            if highwater is not None:
+                self._restore_sequence("mail_notifications", highwater)
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def _rebuild_refs(self) -> None:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute(
+                """
+                CREATE TABLE mail_refs_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    account TEXT NOT NULL,
+                    mailbox TEXT NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    endpoint_identity TEXT NOT NULL DEFAULT '',
+                    created REAL NOT NULL,
+                    UNIQUE(account, mailbox, uidvalidity, uid, endpoint_identity)
+                )
+                """
+            )
+            self._db.execute(
+                """
+                INSERT INTO mail_refs_new
+                    (id,account,mailbox,uidvalidity,uid,endpoint_identity,created)
+                SELECT id,account,mailbox,uidvalidity,uid,
+                    COALESCE(endpoint_identity,''),created
+                FROM mail_refs
+                """
+            )
+            self._db.execute("DROP TABLE mail_refs")
+            self._db.execute("ALTER TABLE mail_refs_new RENAME TO mail_refs")
+            self._db.execute(
+                "CREATE INDEX mail_refs_namespace_idx ON mail_refs("
+                "account, mailbox, uidvalidity, uid)"
+            )
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
 
     def _migrate_send_seq(self) -> None:
         self._db.execute("BEGIN IMMEDIATE")
@@ -749,9 +954,16 @@ class MailStore:
         if not include_acknowledged:
             clauses.append("acknowledged IS NULL")
         if cursor is not None:
+            cursor = int(cursor)
             clauses.append("notification_seq > ?")
-            values.append(int(cursor))
+            values.append(cursor)
         with self._lock:
+            if cursor is not None and cursor > (
+                self._sequence_highwater("mail_notifications") or 0
+            ):
+                raise ValueError(
+                    "mail notification cursor exceeds the stored sequence; retry without cursor"
+                )
             rows = self._db.execute(
                 "SELECT * FROM mail_notifications WHERE "
                 + " AND ".join(clauses)

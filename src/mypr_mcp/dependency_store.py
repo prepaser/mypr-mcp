@@ -42,6 +42,7 @@ _MAX_ARCHIVE_MEMBERS = 10_000
 _MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024
 _VERSION_RE = re.compile(r"(?<!\d)(\d+)(?:\.(\d+))(?:\.(\d+))?(?!\d)")
+_MODEL_MARKER_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.:-]+$")
 _SYSTEM_MINIMUMS = {
     "rg": "14.0.0",
@@ -810,6 +811,7 @@ class DependencyStore:
                     not isinstance(metadata, dict)
                     or metadata.get("name") != artifact.name
                     or not isinstance(metadata.get("version"), str)
+                    or _MODEL_MARKER_VERSION_RE.fullmatch(metadata.get("version", "")) is None
                     or _sha256(path) != metadata.get("sha256")
                 ):
                     raise ValueError

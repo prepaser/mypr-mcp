@@ -2562,7 +2562,8 @@ class CodeTools:
                     action_id = secrets.token_urlsafe(18)
                     target_snapshots: dict[Path, str | None] = {}
                     target_documents: dict[Path, tuple[int, str]] = {}
-                    if isinstance(raw.get("edit"), dict):
+                    disabled_reason = _code_action_disabled_reason(raw)
+                    if disabled_reason is None and isinstance(raw.get("edit"), dict):
                         target_snapshots, target_documents = await self._capture_edit_targets(
                             server,
                             raw["edit"],
@@ -2601,7 +2602,6 @@ class CodeTools:
                     else:
                         has_command = isinstance(command, str)
                     edit_value = raw.get("edit")
-                    disabled_reason = _code_action_disabled_reason(raw)
                     item = {
                         "action_id": action_id,
                         "title": title[:1024],

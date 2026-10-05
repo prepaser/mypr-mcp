@@ -25,6 +25,7 @@ from typing import Any
 
 from .file_io import open_regular, read_bytes
 from .history import _TERMINAL_STATES
+from .json_utils import json_bytes
 from .storage_lock import StorageLock
 
 DEFAULT_AGE_DAYS = 30
@@ -230,7 +231,7 @@ class Storage:
             raise NotADirectoryError(self.workspace)
         return f"{info.st_dev:x}:{info.st_ino:x}"
 
-    def _history_snapshot(self) -> dict[str, Any]:
+    def _history_snapshot(self, paths: Iterable[str] | None = None) -> dict[str, Any]:
         result: dict[str, Any] = {
             "active_ids": set(),
             "protected_paths": set(),
@@ -243,7 +244,21 @@ class Storage:
         if not callable(method):
             return result
         try:
-            raw = method()
+            if paths is None:
+                raw = method()
+            else:
+                raw = method(paths=tuple(paths))
+        except TypeError as exc:
+            if paths is None or "unexpected keyword argument" not in str(exc):
+                result["error"] = f"history snapshot failed: {type(exc).__name__}"
+                return result
+            try:
+                raw = method()
+            except Exception as fallback_exc:
+                result["error"] = (
+                    f"history snapshot failed: {type(fallback_exc).__name__}"
+                )
+                return result
         except Exception as exc:
             result["error"] = f"history snapshot failed: {type(exc).__name__}"
             return result
@@ -252,29 +267,35 @@ class Storage:
             return result
         if raw.get("uncertain") is True:
             result["error"] = "history snapshot is uncertain"
+        scoped_limit = _MAX_FILES if raw.get("paths_scoped") is True else _MAX_PLAN_CANDIDATES
         active_source = raw.get("active_ids", ())
         if not isinstance(active_source, Iterable):
             active_source = ()
-        active_values = list(islice(active_source, _MAX_PLAN_CANDIDATES + 1))
-        if len(active_values) > _MAX_PLAN_CANDIDATES:
+        active_values = list(islice(active_source, scoped_limit + 1))
+        if len(active_values) > scoped_limit:
             result["references_truncated"] = True
         result["active_ids"] = {
             value
-            for value in active_values[:_MAX_PLAN_CANDIDATES]
+            for value in active_values[:scoped_limit]
             if isinstance(value, str) and value
         }
         protected_source = raw.get("protected_paths", ())
         if not isinstance(protected_source, Iterable):
             protected_source = ()
-        protected_values = list(islice(protected_source, _MAX_PLAN_CANDIDATES + 1))
-        if len(protected_values) > _MAX_PLAN_CANDIDATES:
+        protected_values = list(islice(protected_source, scoped_limit + 1))
+        if len(protected_values) > scoped_limit:
             result["references_truncated"] = True
-        result["protected_paths"] = self._safe_relative_set(protected_values[:_MAX_PLAN_CANDIDATES])
+        result["protected_paths"] = self._safe_relative_set(protected_values[:scoped_limit])
         references = raw.get("references", {})
         if isinstance(references, Mapping):
-            if len(references) > _MAX_PLAN_CANDIDATES:
+            reference_limit = (
+                _MAX_FILES
+                if raw.get("paths_scoped") is True
+                else _MAX_PLAN_CANDIDATES
+            )
+            if len(references) > reference_limit:
                 result["references_truncated"] = True
-            items = list(islice(references.items(), _MAX_PLAN_CANDIDATES))
+            items = list(islice(references.items(), reference_limit))
             for path, owners in items:
                 if not isinstance(path, str) or not isinstance(owners, Iterable):
                     continue
@@ -586,7 +607,7 @@ class Storage:
     def _plan_sync(self, options: dict[str, Any], active_ids: set[str]) -> dict[str, Any]:
         with StorageLock(self.lock_path):
             entries, truncated = self._entries()
-            history_state = self._history_snapshot()
+            history_state = self._history_snapshot(entry.relative for entry in entries)
             history_state["mail"] = self._mail_snapshot()
             database_state = self._database_snapshot(options)
             active = active_ids | set(history_state["active_ids"])
@@ -662,7 +683,7 @@ class Storage:
                     "database": database_result,
                 }
             entries, scan_truncated = self._entries()
-            history_state = self._history_snapshot()
+            history_state = self._history_snapshot(entry.relative for entry in entries)
             history_state["mail"] = self._mail_snapshot()
             if history_state.get("error"):
                 return {
@@ -782,7 +803,36 @@ class Storage:
                         )
                 except Exception:
                     marker_failed = True
-            for item, _, current_plan in prevalidated.values():
+            acknowledged.update(
+                item["path"]
+                for item in marker_candidates
+                if item["path"].endswith(".idx")
+                and item["path"].removesuffix(".idx") + ".jsonl" in acknowledged
+            )
+            blocked_groups = {
+                item["group"]
+                for item in marker_candidates
+                if item["requires_tombstone"] and item["path"] not in acknowledged
+            }
+            blocked_reason = "history_marker_failed" if marker_failed else "tombstone_required"
+            pair_failures: set[str] = set()
+            ordered_items = sorted(
+                prevalidated.values(),
+                key=lambda value: (
+                    value[0]["group"],
+                    value[0]["path"].endswith(".idx"),
+                    value[0]["path"],
+                ),
+            )
+            for item, _, current_plan in ordered_items:
+                if item["group"] in blocked_groups:
+                    skipped.append({**item, "reason": blocked_reason})
+                    continue
+                if item["path"].endswith(".idx"):
+                    journal = item["path"].removesuffix(".idx") + ".jsonl"
+                    if journal in apply_items and item["group"] in pair_failures:
+                        skipped.append({**item, "reason": "paired_file_invalid"})
+                        continue
                 if (
                     current_plan["requires_tombstone"]
                     and item["path"] not in acknowledged
@@ -811,20 +861,30 @@ class Storage:
                     )
                 except OSError as exc:
                     skipped.append({**item, "reason": f"stat_failed: {type(exc).__name__}"})
+                    if item["path"].endswith(".jsonl"):
+                        pair_failures.add(item["group"])
                     continue
                 if current is None:
                     skipped.append({**item, "reason": "already_absent"})
+                    if item["path"].endswith(".jsonl"):
+                        pair_failures.add(item["group"])
                     continue
                 if not self._inside_workspace(path):
                     skipped.append({**item, "reason": "workspace_identity_changed"})
+                    if item["path"].endswith(".jsonl"):
+                        pair_failures.add(item["group"])
                     continue
                 if not self._same_entry(current, item):
                     skipped.append({**item, "reason": "changed_since_plan"})
+                    if item["path"].endswith(".jsonl"):
+                        pair_failures.add(item["group"])
                     continue
                 try:
                     path.unlink()
                 except OSError as exc:
                     skipped.append({**item, "reason": f"delete_failed: {type(exc).__name__}"})
+                    if item["path"].endswith(".jsonl"):
+                        pair_failures.add(item["group"])
                 else:
                     deleted.append(item)
             database_result = self._database_apply(
@@ -1095,6 +1155,34 @@ class Storage:
                 )
                 reason = "orphan_output" if orphan else "completed_output"
                 requires_tombstone = not orphan
+            elif entry.category == "scans" and entry.relative.endswith(".idx"):
+                journal = entry.relative.removesuffix(".idx") + ".jsonl"
+                owners = references.get(entry.relative, ())
+                owner = record_by_id.get(entry.path.stem)
+                if journal in entries_by_path or not expired:
+                    continue
+                if owners:
+                    if any(owner_id in protected["active_ids"] for owner_id in owners):
+                        continue
+                elif owner is None or owner.active:
+                    continue
+                reason = "orphan_index"
+                requires_tombstone = False
+                group = journal
+            elif entry.category in {"runs", "jobs"} and entry.relative.endswith(".idx"):
+                journal = entry.relative.removesuffix(".idx") + ".jsonl"
+                owners = references.get(entry.relative, ())
+                owner = record_by_id.get(entry.path.stem)
+                if journal in entries_by_path or not expired:
+                    continue
+                if owners:
+                    if any(owner_id in protected["active_ids"] for owner_id in owners):
+                        continue
+                elif owner is None or owner.active:
+                    continue
+                reason = "orphan_index"
+                requires_tombstone = False
+                group = journal
             elif entry.category == "scans" and entry.relative.endswith((".jsonl", ".xml")):
                 reason = "completed_scan_output"
                 requires_tombstone = True
@@ -1150,23 +1238,40 @@ class Storage:
                 requires_tombstone = details.get("requires_tombstone", False)
             else:
                 continue
-            candidates.append(
-                {
-                    "path": entry.relative,
-                    "category": entry.category,
-                    "size": entry.size,
-                    "mtime_ns": entry.mtime_ns,
-                    "ctime_ns": entry.ctime_ns,
-                    "device": entry.device,
-                    "inode": entry.inode,
-                    "digest": None,
-                    "reason": reason,
-                    "requires_tombstone": requires_tombstone
-                    and entry.relative not in history_state.get("tombstones", {}),
-                    "expired": expired,
-                    "group": group,
-                }
-            )
+            candidate = {
+                "path": entry.relative,
+                "category": entry.category,
+                "size": entry.size,
+                "mtime_ns": entry.mtime_ns,
+                "ctime_ns": entry.ctime_ns,
+                "device": entry.device,
+                "inode": entry.inode,
+                "digest": None,
+                "reason": reason,
+                "requires_tombstone": requires_tombstone
+                and entry.relative not in history_state.get("tombstones", {}),
+                "expired": expired,
+                "group": group,
+            }
+            candidates.append(candidate)
+            if entry.category in {"runs", "jobs", "scans"} and entry.relative.endswith(".jsonl"):
+                sidecar_path = entry.relative.removesuffix(".jsonl") + ".idx"
+                sidecar = entries_by_path.get(sidecar_path)
+                if sidecar is not None and sidecar_path not in protected_paths:
+                    candidates.append(
+                        {
+                            **candidate,
+                            "path": sidecar_path,
+                            "category": sidecar.category,
+                            "size": sidecar.size,
+                            "mtime_ns": sidecar.mtime_ns,
+                            "ctime_ns": sidecar.ctime_ns,
+                            "device": sidecar.device,
+                            "inode": sidecar.inode,
+                            "reason": "journal_index",
+                            "expired": expired,
+                        }
+                    )
         return sorted(
             candidates,
             key=lambda item: (not item["expired"], item["mtime_ns"], item["path"]),
@@ -1176,13 +1281,11 @@ class Storage:
     def _limit_candidates(
         candidates: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], bool]:
-        grouped: list[list[dict[str, Any]]] = []
+        groups: dict[str, list[dict[str, Any]]] = {}
         for item in candidates:
-            if not grouped or grouped[-1][0]["group"] != item["group"]:
-                grouped.append([])
-            grouped[-1].append(item)
+            groups.setdefault(item["group"], []).append(item)
         limited: list[dict[str, Any]] = []
-        for group in grouped:
+        for group in groups.values():
             if len(limited) + len(group) > _MAX_PLAN_CANDIDATES:
                 continue
             limited.extend(group)
@@ -1367,7 +1470,7 @@ class Storage:
 
     @staticmethod
     def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        encoded = json_bytes(value, separators=(",", ":"))
         if len(encoded) > 16 * 1024 * 1024:
             raise ValueError("revision index exceeds its size limit")
         path.parent.mkdir(parents=True, exist_ok=True)

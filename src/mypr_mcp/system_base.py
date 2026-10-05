@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .json_utils import json_bytes
 from .system_limits import collect_limits
 
 _SYSFS = Path("/sys")
@@ -46,10 +47,14 @@ def _text(value: Any, limit: int = _MAX_TEXT) -> str | None:
     if value is None:
         return None
     try:
-        raw = str(value).encode("utf-8", "replace")
+        text = str(value)
+        try:
+            raw = text.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:
+            raw = text.encode("utf-8", "backslashreplace")
     except Exception:
         return None
-    return raw[:limit].decode("utf-8", "ignore")
+    return raw[:limit].decode("utf-8", "surrogateescape")
 
 
 def _base() -> dict[str, Any]:
@@ -778,4 +783,4 @@ def collect(section: str, request: dict[str, Any] | None = None) -> dict[str, An
         if len(warnings) > 8:
             bounded[-1] = f"{len(warnings) - 7} additional warnings omitted"
         result["warnings"] = bounded
-    return json.loads(json.dumps(result, default=str))
+    return json.loads(json_bytes(result, default=str))

@@ -1101,9 +1101,10 @@ class Filesystem:
                         asyncio.to_thread(history_store.record_changes_sync, plans)
                     )
                 except RevisionIndexOutcomeUnknown as exc:
-                    raise RuntimeError(
+                    raise RevisionIndexOutcomeUnknown(
                         "history index outcome is unknown; the lifecycle change remains in "
-                        "place. Inspect history before retrying."
+                        "place. Inspect history before retrying.",
+                        resource=destination_display,
                     ) from exc
                 except BaseException as exc:
                     try:
@@ -1176,6 +1177,12 @@ class Filesystem:
         store = self._history_store()
         try:
             _, cancelled = await finish_owned(store.record_bytes(resource, (old, new)))
+        except RevisionIndexOutcomeUnknown as exc:
+            raise RevisionIndexOutcomeUnknown(
+                f"history index outcome is unknown for {display}; the file change "
+                "remains in place. Inspect history before retrying.",
+                resource=display,
+            ) from exc
         except BaseException as exc:
             try:
                 await _to_thread_uncancelled(

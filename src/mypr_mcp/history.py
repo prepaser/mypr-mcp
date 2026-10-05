@@ -16,7 +16,8 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -343,7 +344,7 @@ class History:
             "next_cursor": items[-1]["id"] if more and items else None,
         }
 
-    def storage_records(self) -> list[dict[str, Any]]:
+    def _storage_record_rows(self) -> Iterator[dict[str, Any]]:
         self._ensure_open()
         fields = (
             "id", "kind", "state", "generation", "history_id", "exec_id",
@@ -370,41 +371,41 @@ class History:
             if field not in {"id", "kind"}
         )
         with self._lock:
-            rows = self._db.execute(f"SELECT {', '.join(projected)} FROM entities").fetchall()
-        records = []
-        for row in rows:
-            if not row["data_valid"]:
-                records.append(
-                    _corrupt_entity(
-                        row["row_id"], row["row_kind"], "invalid_json",
+            rows = self._db.execute(f"SELECT {', '.join(projected)} FROM entities")
+            for row in rows:
+                yield self._storage_record_from_row(row, fields)
+
+    @staticmethod
+    def _storage_record_from_row(
+        row: sqlite3.Row, fields: tuple[str, ...]
+    ) -> dict[str, Any]:
+        if not row["data_valid"]:
+            return _corrupt_entity(
+                row["row_id"], row["row_kind"], "invalid_json",
+                created=row["row_created"], updated=row["row_updated"],
+            )
+        if row["data_type"] != "object":
+            return _corrupt_entity(
+                row["row_id"], row["row_kind"], "invalid_object",
+                created=row["row_created"], updated=row["row_updated"],
+            )
+        record = {
+            field: row[f"data_{field}"] if field in {"id", "kind"} else row[field]
+            for field in fields
+        }
+        for field in ("result_ref", "artifacts"):
+            if isinstance(record[field], str):
+                try:
+                    record[field] = json.loads(record[field])
+                except (TypeError, ValueError, UnicodeError):
+                    return _corrupt_entity(
+                        row["row_id"], row["row_kind"], "invalid_nested_json",
                         created=row["row_created"], updated=row["row_updated"],
                     )
-                )
-                continue
-            if row["data_type"] != "object":
-                records.append(
-                    _corrupt_entity(
-                        row["row_id"], row["row_kind"], "invalid_object",
-                        created=row["row_created"], updated=row["row_updated"],
-                    )
-                )
-                continue
-            record = {
-                field: row[f"data_{field}"] if field in {"id", "kind"} else row[field]
-                for field in fields
-            }
-            for field in ("result_ref", "artifacts"):
-                if isinstance(record[field], str):
-                    try:
-                        record[field] = json.loads(record[field])
-                    except (TypeError, ValueError, UnicodeError):
-                        record = _corrupt_entity(
-                            row["row_id"], row["row_kind"], "invalid_nested_json",
-                            created=row["row_created"], updated=row["row_updated"],
-                        )
-                        break
-            records.append(record)
-        return records
+        return record
+
+    def storage_records(self) -> list[dict[str, Any]]:
+        return list(self._storage_record_rows())
 
     def _relative_storage_path(self, value: Any) -> str | None:
         if not isinstance(value, str) or not value:
@@ -431,14 +432,14 @@ class History:
             return paths
         directory = self.root / ".mypr" / "artifacts" / owner
         try:
-            children = list(directory.iterdir()) if directory.is_dir() else []
+            children = islice(directory.iterdir(), 4096) if directory.is_dir() else ()
+            for child in children:
+                if child.is_file() and not child.is_symlink():
+                    path = self._relative_storage_path(str(child))
+                    if path is not None:
+                        paths.add(path)
         except OSError:
-            children = []
-        for child in children[:4096]:
-            if child.is_file() and not child.is_symlink():
-                path = self._relative_storage_path(str(child))
-                if path is not None:
-                    paths.add(path)
+            pass
         return paths
 
     def _scan_paths_with_status(
@@ -511,14 +512,26 @@ class History:
     def _scan_paths(self, ident: str) -> set[str]:
         return self._scan_paths_with_status(ident)[0]
 
-    def storage_gc_snapshot(self, *, retention_days: int = 30) -> dict[str, Any]:
+    def storage_gc_snapshot(
+        self,
+        *,
+        retention_days: int = 30,
+        paths: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         if type(retention_days) is not int or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
+        retained_paths = None
+        if paths is not None:
+            retained_paths = {
+                path
+                for value in paths
+                if (path := self._relative_storage_path(value)) is not None
+            }
         active, protected, references, tombstones = set(), set(), {}, {}
         warnings: list[dict[str, str]] = []
         uncertain = False
         warnings_truncated = False
-        for record in self.storage_records():
+        for record in self._storage_record_rows():
             if record.get("corrupt"):
                 uncertain = True
                 warnings_truncated |= _append_warning(warnings, record.get("warning"))
@@ -552,6 +565,16 @@ class History:
                 if path is not None:
                     paths.append(path)
             paths.extend(self._artifact_paths(record))
+            if retained_paths is not None:
+                scoped = []
+                for path in paths:
+                    if path in retained_paths:
+                        scoped.append(path)
+                    elif path.endswith(".jsonl"):
+                        sidecar = path.removesuffix(".jsonl") + ".idx"
+                        if sidecar in retained_paths:
+                            scoped.append(sidecar)
+                paths = scoped
             live = record.get("state") in _ACTIVE_STATES
             if live:
                 active.add(ident)
@@ -571,6 +594,7 @@ class History:
         return {
             "active_ids": active, "protected_paths": protected,
             "references": references, "tombstones": tombstones,
+            "paths_scoped": retained_paths is not None,
             "uncertain": uncertain, "warnings": warnings,
             "warnings_truncated": warnings_truncated,
             "history": self.storage_history_snapshot(retention_days=retention_days),
@@ -1007,7 +1031,8 @@ class History:
                 raise
 
     def storage_gc_before_delete(self, candidates) -> list[str]:
-        snapshot = self.storage_gc_snapshot()
+        paths = [item["path"] for item in candidates]
+        snapshot = self.storage_gc_snapshot(paths=paths)
         if snapshot.get("uncertain"):
             return []
         protected = set(snapshot["protected_paths"])
@@ -1017,17 +1042,25 @@ class History:
     def mark_storage_evicted(self, paths: list[str]) -> list[str]:
         """Preserve entity identity and deduplication while expiring owned data."""
         self._ensure_open()
-        if any(record.get("corrupt") for record in self.storage_records()):
-            return []
         selected = set(paths)
         marked: set[str] = set()
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                for row in self._db.execute("SELECT id, data FROM entities").fetchall():
+                for row in self._db.execute(
+                    "SELECT id, data FROM entities ORDER BY entity_seq"
+                ):
                     record, warning = _decode_entity(row)
                     if warning is not None:
-                        continue
+                        self._db.execute("ROLLBACK")
+                        return []
+                    for field in ("result_ref", "artifacts"):
+                        if isinstance(record.get(field), str):
+                            try:
+                                record[field] = json.loads(record[field])
+                            except (TypeError, ValueError, UnicodeError):
+                                self._db.execute("ROLLBACK")
+                                return []
                     if record.get("state") not in _TERMINAL_STATES:
                         continue
                     kind = record.get("kind")
@@ -1091,6 +1124,12 @@ class History:
                             path
                             for path in selected
                             if path in output_paths or path == result_path or path in artifact_paths
+                        )
+                        marked.update(
+                            path
+                            for path in selected
+                            if path.endswith(".idx")
+                            and path.removesuffix(".idx") + ".jsonl" in output_paths
                         )
                 self._db.execute("COMMIT")
             except BaseException:

@@ -19,6 +19,7 @@ from .diagnostics import RPCError, safe_text
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_RESULT_URL_BYTES = 8 * 1024
 MAX_RESULT_TITLE_BYTES = 8 * 1024
+MAX_RESULT_METADATA_BYTES = 8 * 1024
 _PROVIDERS = frozenset({"kagi", "brave", "tavily"})
 _URL_SCHEMES = frozenset({"http", "https"})
 
@@ -217,7 +218,10 @@ class WebTransport:
                         item["format"] = "text"
         elif operation == "context":
             result["query"] = params["query"]
-            result["results"] = _normalize_context(response)
+            results, failures = _normalize_context(response)
+            result["results"] = results
+            if failures:
+                result["failed_results"] = failures
         else:
             successes, failures = _normalize_extract(provider, response, params)
             result["results"] = successes
@@ -784,10 +788,10 @@ def _search_item(item: Mapping[str, Any]) -> dict[str, Any]:
         extra = [value for value in item["extra_snippets"] if isinstance(value, str)]
         if extra:
             result["snippet"] = "\n".join(filter(None, [result["snippet"], *extra]))
-    if metadata:
-        result["metadata"] = metadata
     if title_truncated:
-        result.setdefault("metadata", {})["title_truncated"] = True
+        metadata["title_truncated"] = True
+    if metadata:
+        result["metadata"] = _bounded_metadata(metadata)
     return result
 
 
@@ -798,7 +802,28 @@ def _bounded_text(value: str, limit: int) -> tuple[str, bool]:
     return encoded[:limit].decode("utf-8", "ignore"), True
 
 
-def _normalize_context(response: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _url_failure(url: str, error: str) -> dict[str, Any]:
+    prefix, _ = _bounded_text(url, 256)
+    return {"url": prefix, "url_truncated": True, "error": error}
+
+
+def _bounded_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    result = {}
+    truncated = False
+    for key, value in metadata.items():
+        candidate = {**result, key: value, "metadata_truncated": True}
+        if len(json.dumps(candidate, separators=(",", ":")).encode()) <= MAX_RESULT_METADATA_BYTES:
+            result[key] = value
+        else:
+            truncated = True
+    if truncated:
+        result["metadata_truncated"] = True
+    return result
+
+
+def _normalize_context(
+    response: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     grounding = response.get("grounding")
     sources = response.get("sources", {})
     if not isinstance(grounding, Mapping) or not isinstance(sources, Mapping):
@@ -806,6 +831,7 @@ def _normalize_context(response: Mapping[str, Any]) -> list[dict[str, Any]]:
             "web provider returned invalid context", "invalid_response", provider="brave"
         )
     results = []
+    failures = []
     for kind in ("generic", "poi", "map"):
         values = grounding.get(kind, [])
         if kind == "poi" and values is None:
@@ -821,6 +847,12 @@ def _normalize_context(response: Mapping[str, Any]) -> list[dict[str, Any]]:
                 raise _web_error(
                     "web provider returned invalid context", "invalid_response", provider="brave"
                 )
+            url = _string(item["url"])
+            if len(url.encode("utf-8")) > MAX_RESULT_URL_BYTES:
+                failures.append(
+                    _url_failure(url, f"context result URL exceeds {MAX_RESULT_URL_BYTES} bytes")
+                )
+                continue
             snippets = item.get("snippets", [])
             if not isinstance(snippets, list) or any(
                 not isinstance(value, str) for value in snippets
@@ -836,16 +868,21 @@ def _normalize_context(response: Mapping[str, Any]) -> list[dict[str, Any]]:
             metadata = {"kind": kind}
             if source:
                 metadata["source"] = _safe_value(source)
+            title, title_truncated = _bounded_text(
+                _string(item.get("title") or source.get("title")), MAX_RESULT_TITLE_BYTES
+            )
+            if title_truncated:
+                metadata["title_truncated"] = True
             results.append(
                 {
-                    "title": _string(item.get("title") or source.get("title")),
-                    "url": item["url"],
+                    "title": title,
+                    "url": url,
                     "content": "\n".join(snippets),
                     "format": "text",
-                    "metadata": metadata,
+                    "metadata": _bounded_metadata(metadata),
                 }
             )
-    return results
+    return results, failures
 
 
 def _normalize_extract(
@@ -876,6 +913,11 @@ def _normalize_extract(
             raise _web_error(
                 "web provider returned invalid page content", "invalid_response", provider=provider
             )
+        if len(url.encode("utf-8")) > MAX_RESULT_URL_BYTES:
+            failures.append(
+                _url_failure(url, f"extraction result URL exceeds {MAX_RESULT_URL_BYTES} bytes")
+            )
+            continue
         if error or content is None:
             failures.append({"url": url, "error": error or "content unavailable"})
             continue
@@ -898,7 +940,13 @@ def _normalize_extract(
                     "invalid_response",
                     provider=provider,
                 )
-            failures.append({"url": _string(item.get("url")), "error": _string(item.get("error"))})
+            url = _string(item.get("url"))
+            error = _string(item.get("error"))
+            failures.append(
+                _url_failure(url, error)
+                if len(url.encode("utf-8")) > MAX_RESULT_URL_BYTES
+                else {"url": url, "error": error}
+            )
     errors = response.get("errors")
     if isinstance(errors, Mapping):
         errors = [errors]
@@ -917,7 +965,13 @@ def _normalize_extract(
                     provider=provider,
                 )
             failures.append({"error": _string(error.get("message") or error.get("error"))})
-    return successes, [item for item in failures if any(item.values())]
+    failures = [item for item in failures if any(item.values())]
+    for item in failures:
+        error, shortened = _bounded_text(_string(item.get("error")), MAX_RESULT_TITLE_BYTES)
+        item["error"] = error
+        if shortened:
+            item["error_truncated"] = True
+    return successes, failures
 
 
 def _string(value: Any) -> str:

@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import sys
 import tokenize
 from importlib.abc import Loader, MetaPathFinder
@@ -22,6 +23,35 @@ from typing import Any
 from .file_io import open_regular, read_bytes
 from .persistence import await_completion
 from .revisions import RevisionStore
+
+_MAX_DISCOVERY_WARNINGS = 16
+
+
+def _bounded_text(value: Any, limit: int = 512) -> str:
+    try:
+        text = str(value)
+        try:
+            raw = text.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:
+            raw = text.encode("utf-8", "backslashreplace")
+        return raw[:limit].decode("utf-8", "surrogateescape")
+    except Exception:
+        return type(value).__name__
+
+
+def _discovery_warning(
+    errors: list[dict[str, str]], path: Path, error: OSError, error_count: list[int] | None = None
+) -> None:
+    if error_count is not None:
+        error_count[0] += 1
+    if len(errors) >= _MAX_DISCOVERY_WARNINGS:
+        return
+    errors.append(
+        {
+            "code": "discovery_error",
+            "message": _bounded_text(f"Unable to inspect {path}: {error}"),
+        }
+    )
 
 
 class ModuleManager:
@@ -64,7 +94,9 @@ class ModuleManager:
         if type(cursor) is not int or cursor < 0:
             raise ValueError("cursor must be a non-negative integer")
         found: list[dict[str, Any]] = []
-        paths = self._iter_module_paths()
+        errors: list[dict[str, str]] = []
+        error_count = [0]
+        paths = self._iter_module_paths(errors, error_count)
         if limit is None:
             paths = iter(sorted(paths))
         for index, path in enumerate(paths):
@@ -73,13 +105,20 @@ class ModuleManager:
             if limit is not None and len(found) >= limit:
                 break
             found.append(self._module_info(path))
+        if error_count[0]:
+            detail = "; ".join(item["message"] for item in errors[:3])
+            if error_count[0] > 3:
+                detail += f"; {error_count[0] - 3} more discovery errors"
+            raise RuntimeError(f"Module discovery incomplete: {detail}")
         return found
 
     def _list_page_sync(self, limit: int, cursor: int) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         seen = 0
         has_more = False
-        for path in self._iter_module_paths():
+        errors: list[dict[str, str]] = []
+        error_count = [0]
+        for path in self._iter_module_paths(errors, error_count):
             if seen < cursor:
                 seen += 1
                 continue
@@ -92,13 +131,40 @@ class ModuleManager:
             "items": items,
             "next_cursor": cursor + len(items) if has_more else None,
             "has_more": has_more,
+            "complete": not error_count[0],
+            "warnings": errors,
+            "warnings_truncated": error_count[0] > len(errors),
+            "error_count": error_count[0],
         }
 
-    def _iter_module_paths(self):
-        if not self.root.is_dir():
+    def _iter_module_paths(
+        self,
+        errors: list[dict[str, str]] | None = None,
+        error_count: list[int] | None = None,
+    ):
+        errors = errors if errors is not None else []
+        try:
+            if not stat.S_ISDIR(self.root.stat().st_mode):
+                return
+        except FileNotFoundError:
             return
-        root = self.root.resolve()
-        for directory, dirnames, filenames in os.walk(self.root, followlinks=False):
+        except OSError as exc:
+            _discovery_warning(errors, self.root, exc, error_count)
+            return
+        try:
+            root = self.root.resolve()
+        except OSError as exc:
+            _discovery_warning(errors, self.root, exc, error_count)
+            return
+
+        def onerror(error: OSError) -> None:
+            _discovery_warning(
+                errors, Path(getattr(error, "filename", self.root)), error, error_count
+            )
+
+        for directory, dirnames, filenames in os.walk(
+            self.root, followlinks=False, onerror=onerror
+        ):
             dirnames.sort()
             for filename in sorted(filenames):
                 if not filename.endswith(".py") or filename == "__init__.py":
@@ -106,10 +172,12 @@ class ModuleManager:
                 path = Path(directory) / filename
                 try:
                     path.resolve().relative_to(root)
+                    if stat.S_ISREG(path.stat().st_mode):
+                        yield path
                 except ValueError:
                     continue
-                if path.is_file():
-                    yield path
+                except OSError as exc:
+                    _discovery_warning(errors, path, exc, error_count)
 
     def _module_info(self, path: Path) -> dict[str, Any]:
         try:
