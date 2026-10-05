@@ -30,6 +30,39 @@ def _server(root: Path, generation: str = "generation") -> _LanguageServer:
     return server
 
 
+def _navigation_server(
+    root: Path, capabilities: dict[str, object], request
+) -> _LanguageServer:
+    server = _LanguageServer(root, "demo", ("demo",), frozenset({"python"}), 1)
+    server.capabilities = capabilities
+    server.initialized = True
+
+    async def notify(*_args, **_kwargs):
+        return False
+
+    server._notify_committed = notify
+    server._request = request
+    return server
+
+
+def _long_document(root: Path) -> Path:
+    directory = root / ("a" * 200) / ("b" * 200)
+    directory.mkdir(parents=True)
+    path = directory / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    return path
+
+
+def _wrapper(server: _LanguageServer) -> CodeTools:
+    code = object.__new__(CodeTools)
+
+    async def get_server(_name):
+        return server
+
+    code._get_server = get_server
+    return code
+
+
 @pytest.mark.asyncio
 async def test_workspace_symbols_rejects_metadata_larger_than_budget(tmp_path: Path):
     server = _server(tmp_path)
@@ -46,6 +79,64 @@ async def test_workspace_symbols_rejects_metadata_larger_than_budget(tmp_path: P
     code._get_server = get_server
     with pytest.raises(ValueError, match="workspace symbol metadata"):
         await code.workspace_symbols("demo", "x" * 4096, max_bytes=512)
+
+
+@pytest.mark.asyncio
+async def test_document_symbols_rejects_metadata_larger_than_budget(tmp_path: Path):
+    path = _long_document(tmp_path)
+
+    async def request(*_args, **_kwargs):
+        return []
+
+    server = _navigation_server(
+        tmp_path, {"documentSymbolProvider": True}, request
+    )
+    code = _wrapper(server)
+    try:
+        with pytest.raises(ValueError, match="document symbol metadata"):
+            await code.document_symbols("demo", path, max_bytes=512)
+    finally:
+        await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_calls_rejects_metadata_larger_than_budget(tmp_path: Path):
+    path = _long_document(tmp_path)
+
+    async def request(*_args, **_kwargs):
+        return []
+
+    server = _navigation_server(
+        tmp_path, {"callHierarchyProvider": True}, request
+    )
+    code = _wrapper(server)
+    try:
+        with pytest.raises(ValueError, match="call hierarchy metadata"):
+            await code.calls("demo", path, 1, 1, direction="outgoing", max_bytes=512)
+    finally:
+        await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_calls_reject_metadata_larger_than_budget(tmp_path: Path):
+    path = _long_document(tmp_path)
+
+    async def request(method, *_args, **_kwargs):
+        if method == "textDocument/prepareCallHierarchy":
+            await asyncio.sleep(0.01)
+            raise CodeError("LSP request textDocument/prepareCallHierarchy timed out")
+        return []
+
+    server = _navigation_server(
+        tmp_path, {"callHierarchyProvider": True}, request
+    )
+    server.timeout = 0.001
+    code = _wrapper(server)
+    try:
+        with pytest.raises(ValueError, match="call hierarchy metadata"):
+            await code.calls("demo", path, 1, 1, direction="outgoing", max_bytes=512)
+    finally:
+        await server.aclose()
 
 
 @pytest.mark.asyncio

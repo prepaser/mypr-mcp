@@ -979,6 +979,10 @@ class _LanguageServer:
                 "symbols": [],
                 "truncated": False,
             }
+            if _json_size(result) > max_bytes:
+                raise ValueError(
+                    "max_bytes is too small for document symbol metadata; increase the budget"
+                )
             truncated = len(raw) > MAX_RESULTS
             for item in raw[:MAX_RESULTS]:
                 clean = await self._clean_symbol(
@@ -995,6 +999,10 @@ class _LanguageServer:
             if omitted[0]:
                 truncated = True
             result["truncated"] = truncated
+            if _json_size(result) > max_bytes:
+                raise ValueError(
+                    "max_bytes is too small for document symbol metadata; increase the budget"
+                )
             return result
 
     async def workspace_symbols(
@@ -1113,7 +1121,7 @@ class _LanguageServer:
                     str(exc) == "LSP request textDocument/prepareCallHierarchy timed out"
                     and asyncio.get_running_loop().time() >= deadline
                 ):
-                    return {
+                    result = {
                         "direction": direction,
                         "path": str(doc.path),
                         "document_version": doc.version,
@@ -1122,6 +1130,12 @@ class _LanguageServer:
                         "ambiguous": False,
                         "truncated": True,
                     }
+                    if _json_size(result) > max_bytes:
+                        raise ValueError(
+                            "max_bytes is too small for call hierarchy metadata; "
+                            "increase the budget"
+                        ) from exc
+                    return result
                 raise
             if prepared is None:
                 prepared = []
@@ -1154,6 +1168,10 @@ class _LanguageServer:
                 "ambiguous": len(candidates) > 1,
                 "truncated": truncated,
             }
+            if _json_size(result) > max_bytes:
+                raise ValueError(
+                    "max_bytes is too small for call hierarchy metadata; increase the budget"
+                )
             method = (
                 "callHierarchy/incomingCalls"
                 if direction == "incoming"

@@ -261,7 +261,7 @@ class NetworkTools:
         except TimeoutError as exc:
             raise TimeoutError(f"DNS resolution exceeded its {timeout:g}-second limit") from exc
         addresses: list[dict[str, Any]] = []
-        seen: set[tuple[int, str, int]] = set()
+        seen: set[tuple[int, str, int, int]] = set()
         for item in result:
             if not isinstance(item, dict):
                 raise RuntimeError("DNS worker returned an invalid address")
@@ -272,7 +272,8 @@ class NetworkTools:
                 raise RuntimeError("DNS worker returned an invalid socket address")
             address = sockaddr[0]
             item_port = sockaddr[1] if len(sockaddr) > 1 else None
-            key = (item_family, address, item_port or 0)
+            scope_id = sockaddr[3] if item_family == socket.AF_INET6 and len(sockaddr) > 3 else 0
+            key = (item_family, address, item_port or 0, scope_id)
             if key in seen:
                 continue
             seen.add(key)
@@ -282,6 +283,9 @@ class NetworkTools:
             }
             if item_port is not None:
                 value["port"] = item_port
+            if item_family == socket.AF_INET6:
+                value["flowinfo"] = sockaddr[2] if len(sockaddr) > 2 else 0
+                value["scope_id"] = scope_id
             if canonname:
                 value["canonical_name"] = canonname
             addresses.append(value)

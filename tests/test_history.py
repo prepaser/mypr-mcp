@@ -1,4 +1,6 @@
 import json
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -253,6 +255,7 @@ def test_storage_gc_normalizes_artifacts_and_scan_metadata(tmp_path):
             },
         )
         snapshot = history.storage_gc_snapshot()
+        assert snapshot["uncertain"] is False
         assert ".mypr/scans/request.jsonl" in snapshot["references"]
         assert ".mypr/scans/request.xml" in snapshot["references"]
         assert ".mypr/artifacts/exec/image.png" in snapshot["references"]
@@ -271,5 +274,82 @@ def test_storage_gc_normalizes_artifacts_and_scan_metadata(tmp_path):
         assert updated["code"] == "display('x')"
         assert updated["messages"] == ["keep"]
         assert updated["client_id"] == "client"
+    finally:
+        history.close()
+
+
+@pytest.mark.parametrize("metadata_kind", ["fifo", "oversized", "invalid"])
+def test_scan_metadata_failure_makes_storage_gc_uncertain(tmp_path: Path, metadata_kind: str):
+    scan_dir = tmp_path / ".mypr" / "scans"
+    scan_dir.mkdir(parents=True)
+    metadata = scan_dir / "job.json"
+    if metadata_kind == "fifo":
+        os.mkfifo(metadata)
+    elif metadata_kind == "invalid":
+        metadata.write_text("null", encoding="utf-8")
+    else:
+        metadata.write_bytes(b"{" + b"x" * (1024 * 1024))
+
+    history = History(tmp_path)
+    try:
+        history.record("scan", {"id": "job", "state": "succeeded"})
+        result: list[dict] = []
+
+        def read_snapshot() -> None:
+            result.append(history.storage_gc_snapshot())
+
+        worker = threading.Thread(target=read_snapshot, daemon=True)
+        worker.start()
+        worker.join(1)
+        assert not worker.is_alive()
+        snapshot = result[0]
+        assert snapshot["uncertain"] is True
+        expected_code = (
+            "scan_metadata_invalid_object"
+            if metadata_kind == "invalid"
+            else "scan_metadata_unreadable"
+        )
+        assert snapshot["warnings"][0]["code"] == expected_code
+        assert ".mypr/scans/job.jsonl" in snapshot["references"]
+        assert history.storage_gc_before_delete(
+            [{"path": ".mypr/scans/job.jsonl"}]
+        ) == []
+    finally:
+        history.close()
+        metadata.unlink(missing_ok=True)
+
+
+def test_evicted_scan_metadata_can_be_removed_before_the_next_gc(tmp_path: Path):
+    scan_dir = tmp_path / ".mypr" / "scans"
+    scan_dir.mkdir(parents=True)
+    result = scan_dir / "job.jsonl"
+    summary = scan_dir / "job.summary.json"
+    artifact = scan_dir / "job.xml"
+    for path in (result, summary, artifact):
+        path.write_text("x", encoding="utf-8")
+    (scan_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "id": "job",
+                "result_path": str(result),
+                "summary_path": str(summary),
+                "artifact_path": str(artifact),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    history = History(tmp_path)
+    try:
+        history.record("scan", {"id": "job", "state": "succeeded"})
+        assert history.storage_gc_snapshot()["uncertain"] is False
+        marked = history.storage_gc_before_delete(
+            [{"path": ".mypr/scans/job.xml"}]
+        )
+        assert marked == [".mypr/scans/job.xml"]
+        (scan_dir / "job.json").unlink()
+        snapshot = history.storage_gc_snapshot()
+        assert snapshot["uncertain"] is False
+        assert snapshot["tombstones"][".mypr/scans/job.jsonl"] == {"id": "job"}
     finally:
         history.close()

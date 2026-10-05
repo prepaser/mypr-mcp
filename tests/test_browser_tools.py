@@ -340,7 +340,10 @@ async def test_recording_and_storage_paths_are_workspace_relative(tmp_path, fake
         storage_state="state.json",
     )
     options = context.options
-    assert options["record_har_path"] == str(tmp_path / "artifacts/recording.har")
+    recording = Path(options["record_har_path"])
+    assert recording.parent == tmp_path / "artifacts"
+    assert recording.suffix == ".har"
+    assert recording != tmp_path / "artifacts/recording.har"
     assert options["record_video_dir"] == str(tmp_path / "artifacts/video")
     assert options["storage_state"] == str(tmp_path / "state.json")
     assert (tmp_path / "artifacts/video").is_dir()
@@ -353,14 +356,18 @@ async def test_remote_har_archive_is_exported_over_existing_file(tmp_path, fake_
         return "ws://127.0.0.1:1234/pw"
 
     tools = BrowserTools(tmp_path, lambda: "client", rpc)
-    await tools.context("har", record_har_path="recording.har")
+    context = await tools.context("har", record_har_path="recording.har")
     target = tmp_path / "recording.har"
+    recording = Path(context.options["record_har_path"])
+    temporary = Path(f"{recording}.tmp")
+    await asyncio.to_thread(recording.write_text, '{"native": true}', encoding="utf-8")
     target.write_text('{"old": true}', encoding="utf-8")
-    with zipfile.ZipFile(f"{target}.tmp", "w") as archive:
+    with zipfile.ZipFile(temporary, "w") as archive:
         archive.writestr("har.har", '{"new": true}')
     await tools.close("har")
     assert target.read_text(encoding="utf-8") == '{"new": true}'
-    assert not await asyncio.to_thread(Path(f"{target}.tmp").exists)
+    assert not await asyncio.to_thread(temporary.exists)
+    assert not await asyncio.to_thread(recording.exists)
     await tools.aclose()
 
 
@@ -370,14 +377,203 @@ async def test_attached_har_exports_json_and_resources(tmp_path, fake_playwright
         return "ws://127.0.0.1:1234/pw"
 
     tools = BrowserTools(tmp_path, lambda: "client", rpc)
-    await tools.context("har", record_har_path="recording.har", record_har_content="attach")
+    context = await tools.context(
+        "har", record_har_path="recording.har", record_har_content="attach"
+    )
     target = tmp_path / "recording.har"
-    with zipfile.ZipFile(f"{target}.tmp", "w") as archive:
+    with zipfile.ZipFile(f"{context.options['record_har_path']}.tmp", "w") as archive:
         archive.writestr("har.har", '{"log": {"entries": []}}')
         archive.writestr("resource.dat", b"attached")
     await tools.close("har")
     assert json.loads(target.read_text(encoding="utf-8"))["log"]
     assert (tmp_path / "resource.dat").read_bytes() == b"attached"
+    await tools.aclose()
+
+
+@pytest.mark.parametrize("suffix", [".har", ".zip"])
+async def test_clients_recording_to_same_har_path_publish_their_own_capture(
+    tmp_path, fake_playwright, suffix
+):
+    identity = {"value": "one"}
+
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: identity["value"], rpc)
+    target = tmp_path / f"recording{suffix}"
+    first = await tools.context("har", record_har_path=target)
+    assert await tools.context("har", record_har_path=target) is first
+    identity["value"] = "two"
+    second = await tools.context("har", record_har_path=target)
+    sources = []
+    for client, context in (("one", first), ("two", second)):
+        path = Path(context.options["record_har_path"])
+        source = path if suffix == ".zip" else Path(f"{path}.tmp")
+        sources.append(source)
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("har.har", json.dumps({"client": client}))
+    assert sources[0] != sources[1]
+
+    def capture():
+        if suffix == ".zip":
+            with zipfile.ZipFile(target) as archive:
+                return json.loads(archive.read("har.har"))
+        return json.loads(target.read_text())
+
+    try:
+        await first.close()
+        assert capture() == {"client": "one"}
+        assert sources[1].exists()
+        await tools.close("har")
+        assert capture() == {"client": "two"}
+        assert not list(tmp_path.glob(".mypr-har-*"))
+    finally:
+        await tools.aclose()
+
+
+async def test_plain_har_capture_is_published_after_context_close(tmp_path, fake_playwright):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context("har", record_har_path="recording.har")
+    recording = Path(context.options["record_har_path"])
+    await asyncio.to_thread(recording.write_text, '{"local": true}')
+    await tools.close("har")
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"local": True}
+    assert not await asyncio.to_thread(recording.exists)
+    await tools.aclose()
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_failed_har_publication_keeps_capture_before_context_replacement(
+    tmp_path, fake_playwright, monkeypatch, disconnect
+):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context("har", record_har_path="recording.har")
+    temporary = Path(f"{context.options['record_har_path']}.tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        archive.writestr("har.har", '{"captured": true}')
+    original = BrowserTools._atomic_write
+
+    def fail(*args):
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(BrowserTools, "_atomic_write", staticmethod(fail))
+    monkeypatch.delattr(FakeContext, "is_closed")
+    if disconnect:
+        record = next(iter(tools._connections.values()))
+        record.browser.closed = True
+        tools._connection_disconnected(record)
+    else:
+        with pytest.raises(BrowserError, match="publication failed"):
+            await tools.close("har")
+    with pytest.raises(RuntimeError, match="publication failed"):
+        await tools.context("har", record_har_path="recording.har")
+    assert tools._contexts[("client", "har")].context is context
+    assert await asyncio.to_thread(temporary.exists)
+    monkeypatch.setattr(BrowserTools, "_atomic_write", staticmethod(original))
+    await tools.close("har")
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    assert not await asyncio.to_thread(temporary.exists)
+    await tools.aclose()
+
+
+async def test_context_closing_keeps_its_har_until_native_export_finishes(
+    tmp_path, fake_playwright, monkeypatch
+):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context("har", record_har_path="recording.har")
+    original_close = context.close
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        context.closed = True
+        started.set()
+        await release.wait()
+        with zipfile.ZipFile(f"{context.options['record_har_path']}.tmp", "w") as archive:
+            archive.writestr("har.har", '{"captured": true}')
+        await original_close()
+
+    monkeypatch.setattr(context, "close", close)
+    task = asyncio.create_task(context.close())
+    await started.wait()
+    try:
+        with pytest.raises(BrowserError, match="closing"):
+            await tools.context("har", record_har_path="recording.har")
+        assert tools._contexts[("client", "har")].context is context
+    finally:
+        release.set()
+        await task
+        await tools.aclose()
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    assert not list(tmp_path.glob(".mypr-har-*"))
+
+
+async def test_browser_disconnect_publishes_retained_har(tmp_path, fake_playwright):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context("har", record_har_path="recording.har")
+    temporary = Path(f"{context.options['record_har_path']}.tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        archive.writestr("har.har", '{"captured": true}')
+    record = next(iter(tools._connections.values()))
+    record.browser.closed = True
+    tools._connection_disconnected(record)
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    assert not await asyncio.to_thread(temporary.exists)
+    assert not tools.list()
+    await tools.aclose()
+
+
+async def test_cancelled_context_creation_retains_har_when_publication_fails(
+    tmp_path, fake_playwright, monkeypatch
+):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    await tools.context()
+    browser = fake_playwright.chromium.browsers[0]
+    original_create = browser.new_context
+    started, release = asyncio.Event(), asyncio.Event()
+    captures = []
+
+    async def create(**options):
+        context = await original_create(**options)
+        captures.append(context)
+        with zipfile.ZipFile(f"{options['record_har_path']}.tmp", "w") as archive:
+            archive.writestr("har.har", '{"captured": true}')
+        started.set()
+        await release.wait()
+        return context
+
+    original_write = BrowserTools._atomic_write
+
+    def fail(*args):
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(browser, "new_context", create)
+    monkeypatch.setattr(BrowserTools, "_atomic_write", staticmethod(fail))
+    task = asyncio.create_task(tools.context("har", record_har_path="recording.har"))
+    await started.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert tools._contexts[("client", "har")].context is captures[0]
+    monkeypatch.setattr(BrowserTools, "_atomic_write", staticmethod(original_write))
+    await tools.close("har")
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    assert not list(tmp_path.glob(".mypr-har-*"))
     await tools.aclose()
 
 

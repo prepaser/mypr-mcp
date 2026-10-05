@@ -56,7 +56,9 @@ class _Context:
     connection_key: tuple[object, str]
     signature: str
     har_path: Path | None
+    har_recording_path: Path | None
     har_content: str | None
+    closed: bool = False
 
 
 async def _shielded(awaitable: Awaitable[Any]) -> tuple[Any, bool]:
@@ -363,6 +365,7 @@ class BrowserTools:
             if existing is not None:
                 record = self._connections.get(existing.connection_key)
                 if record is None or not self._browser_alive(record):
+                    self._finalize_context_artifacts(existing)
                     self._contexts.pop(key, None)
                     if record is not None:
                         self._forget_connection(record)
@@ -371,8 +374,11 @@ class BrowserTools:
                             f"browser connection {record.name!r} is no longer available; "
                             "reconnect it before creating a context"
                         )
-                elif getattr(existing.context, "is_closed", lambda: False)():
+                elif existing.closed:
+                    self._finalize_context_artifacts(existing)
                     self._contexts.pop(key, None)
+                elif getattr(existing.context, "is_closed", lambda: False)():
+                    raise BrowserError(f"browser context {name!r} is closing; wait for it to close")
                 elif existing.signature != signature:
                     raise RuntimeError(f"browser context {name!r} settings changed; close it first")
                 else:
@@ -392,21 +398,27 @@ class BrowserTools:
                     raise ValueError("launch_options cannot be used with an external connection")
                 if browser != record.browser_name:
                     raise ValueError(f"connection {connection!r} uses {record.browser_name}")
+            native_options = dict(context_options)
+            har_path = (
+                Path(context_options["record_har_path"])
+                if context_options.get("record_har_path") is not None
+                else None
+            )
+            har_recording_path = None
+            if har_path is not None:
+                har_recording_path = har_path.with_name(
+                    f".mypr-har-{secrets.token_hex(12)}{har_path.suffix}"
+                )
+                native_options["record_har_path"] = str(har_recording_path)
             try:
                 native_context, cancelled = await _shielded(
-                    record.browser.new_context(**context_options)
+                    record.browser.new_context(**native_options)
                 )
             except Exception as exc:
                 if not record.external and not self._browser_alive(record):
                     self._forget_connection(record)
                 raise BrowserError(f"unable to create browser context: {exc}") from exc
-            if self._closed or cancelled:
-                with suppress(Exception):
-                    await _shielded(native_context.close())
-                if cancelled:
-                    raise asyncio.CancelledError
-                raise BrowserError("browser manager is closed")
-            self._contexts[key] = _Context(
+            item = _Context(
                 key=key,
                 name=name,
                 owner=owner,
@@ -415,25 +427,32 @@ class BrowserTools:
                 browser_name=browser,
                 connection_key=record.key,
                 signature=signature,
-                har_path=(
-                    Path(context_options["record_har_path"])
-                    if context_options.get("record_har_path") is not None
-                    else None
-                ),
+                har_path=har_path,
+                har_recording_path=har_recording_path,
                 har_content=(
                     str(context_options["record_har_content"])
                     if context_options.get("record_har_content") is not None
                     else None
                 ),
             )
+            self._contexts[key] = item
             on_close = getattr(native_context, "on", None)
             if callable(on_close):
                 on_close("close", lambda *_args: self._context_closed(key, native_context))
+            if self._closed or cancelled:
+                with suppress(Exception):
+                    await _shielded(native_context.close())
+                    self._finalize_context_artifacts(item)
+                    self._forget_context(key, native_context)
+                if cancelled:
+                    raise asyncio.CancelledError
+                raise BrowserError("browser manager is closed")
             return native_context
 
     def _context_closed(self, key: tuple[object, str], context: Any) -> None:
         item = self._contexts.get(key)
         if item is not None and item.context is context:
+            item.closed = True
             self._observations.close_context(context)
             try:
                 self._finalize_context_artifacts(item)
@@ -448,10 +467,12 @@ class BrowserTools:
 
     @staticmethod
     def _finalize_context_artifacts(item: _Context) -> None:
-        if item.har_path is None:
+        if item.har_path is None or item.har_recording_path is None:
             return
-        temporary = Path(f"{item.har_path}.tmp")
+        temporary = Path(f"{item.har_recording_path}.tmp")
         if not temporary.exists():
+            if item.har_recording_path.exists():
+                os.replace(item.har_recording_path, item.har_path)
             return
         try:
             with zipfile.ZipFile(temporary) as archive:
@@ -483,6 +504,7 @@ class BrowserTools:
             raise RuntimeError(f"unable to finalize HAR {item.har_path}: {exc}") from exc
 
         temporary.unlink()
+        item.har_recording_path.unlink(missing_ok=True)
 
     @staticmethod
     def _atomic_write(path: Path, content: bytes) -> None:
@@ -511,8 +533,7 @@ class BrowserTools:
         self._connections.pop(record.key, None)
         for key, item in list(self._contexts.items()):
             if item.connection_key == record.key:
-                self._observations.close_context(item.context)
-                self._contexts.pop(key, None)
+                self._context_closed(key, item.context)
 
     def _track_connection(self, record: _Connection) -> None:
         self._connections[record.key] = record

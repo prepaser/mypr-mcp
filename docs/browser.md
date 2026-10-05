@@ -2,6 +2,10 @@
 
 `ws.browser` exposes native async Playwright objects. Observation and accessibility snapshots add bounded inspection without replacing Playwright's page, locator, or event APIs.
 
+HAR recordings use a separate temporary path for each context and are published to `record_har_path` when the context closes. This applies to plain HAR files, ZIP archives, and attached resources. Contexts can use the same final path without consuming each other's temporary recording; the last successfully closed context replaces the final file.
+
+While a context is closing, `context()` rejects reuse of its name. If HAR publication fails, the capture remains associated with the context; resolve the filesystem error and retry `await ws.browser.close(name)`. Close contexts explicitly to flush their recordings, as described in [Playwright's context lifecycle](https://playwright.dev/python/docs/api/class-browsercontext#browser-context-close).
+
 ## Page events
 
 ```python

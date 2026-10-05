@@ -211,6 +211,28 @@ async def test_model_git_digest_and_local_marker_detect_corruption(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_model_fifo_marker_is_rejected_without_blocking(tmp_path, monkeypatch):
+    data = b"model fixture"
+    artifact = _fixture_artifact(
+        "tessdata:eng",
+        version="4.2.0",
+        url="fixture://eng",
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    _patch_resolver(monkeypatch, artifact)
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    model_dir = store.model_root / "tessdata_fast-4.2.0-fixture"
+    model_dir.mkdir(parents=True)
+    (model_dir / "eng.traineddata").write_bytes(data)
+    os.mkfifo(model_dir / ".eng.mypr-complete.json")
+    try:
+        state = await asyncio.wait_for(store.inspect("tessdata:eng"), 1)
+        assert state["status"] == "unusable"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_corrupt_managed_binary_is_repaired_without_running_it(tmp_path, monkeypatch):
     archive = tmp_path / "rg.tar.gz"
     _archive(archive, "tar.gz", {"rg-15.2.0/rg": b"#!/bin/sh\necho rg 15.2.0\n"})

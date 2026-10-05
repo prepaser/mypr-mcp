@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -397,6 +399,85 @@ async def test_probe_output_limit_reaps_noisy_process(tmp_path, monkeypatch):
     assert service.active_count == 0
     assert not service._probe_processes
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_reaps_descendant_after_parent_exits(tmp_path):
+    service = _service(tmp_path, FakeStore(tmp_path))
+    service.python = Path(sys.executable)
+    pid_file = tmp_path / "descendant.pid"
+    script = (
+        "import json, os, subprocess, sys\n"
+        "pid_file = json.loads(sys.argv[1])['pid_file']\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "with open(pid_file, 'w') as stream: stream.write(str(child.pid))\n"
+        "print('{}')\n"
+    )
+    try:
+        assert await service._probe(script, {"pid_file": str(pid_file)}) == {}
+        pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown", ["cancel", "close"])
+async def test_probe_shutdown_reaps_detached_descendant(tmp_path, shutdown):
+    service = _service(tmp_path, FakeStore(tmp_path))
+    service.python = Path(sys.executable)
+    pid_file = tmp_path / "detached.pid"
+    child_script = (
+        "import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "os.setsid(); "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+    )
+    script = (
+        "import json, subprocess, sys, time\n"
+        "payload = json.loads(sys.argv[1])\n"
+        "subprocess.Popen([sys.executable, '-c', payload['child_script'], payload['pid_file']], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "time.sleep(30)\n"
+    )
+    pid = None
+    probe = asyncio.create_task(
+        service._probe(
+            script,
+            {"pid_file": str(pid_file), "child_script": child_script},
+        )
+    )
+    try:
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert pid_file.exists()
+        pid = int(pid_file.read_text())
+        if shutdown == "cancel":
+            probe.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await probe
+        else:
+            await service.close()
+            with pytest.raises(asyncio.CancelledError):
+                await probe
+        for _ in range(200):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("detached probe descendant survived shutdown")
+    finally:
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await service.close()
 
 
 @pytest.mark.asyncio

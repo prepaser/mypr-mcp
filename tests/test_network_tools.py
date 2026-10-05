@@ -1,12 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import ssl
 import subprocess
 
 import pytest
 
 from mypr_mcp.network_tools import NetworkTools
+
+
+async def test_resolve_preserves_ipv6_scopes_without_duplicate_endpoints(tmp_path, monkeypatch):
+    import mypr_mcp.network_tools as network
+
+    async def resolve(*args):
+        return [
+            {"family": socket.AF_INET6, "sockaddr": ["fe80::1", 80, 7, 2]},
+            {"family": socket.AF_INET6, "sockaddr": ["fe80::1", 80, 7, 3]},
+            {"family": socket.AF_INET6, "sockaddr": ["fe80::1", 80, 7, 2]},
+            {"family": socket.AF_INET, "sockaddr": ["127.0.0.1", 80]},
+            {"family": socket.AF_INET, "sockaddr": ["127.0.0.1", 80]},
+        ]
+
+    monkeypatch.setattr(network, "_resolve_worker", resolve)
+    result = await NetworkTools(tmp_path).resolve("scoped.test", 80)
+    assert result["addresses"] == [
+        {"family": "AF_INET6", "address": "fe80::1", "port": 80, "flowinfo": 7, "scope_id": 2},
+        {"family": "AF_INET6", "address": "fe80::1", "port": 80, "flowinfo": 7, "scope_id": 3},
+        {"family": "AF_INET", "address": "127.0.0.1", "port": 80},
+    ]
 
 
 @pytest.mark.asyncio

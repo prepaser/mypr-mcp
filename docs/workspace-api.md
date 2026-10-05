@@ -81,7 +81,7 @@ Built-in automatic Python packages include `ipykernel`, `tomlkit`, `httpx2`, `h2
 
 `mypr-mcp prepare` prepares the core workspace packages in advance or for recovery while the workspace manager is stopped. Normal kernel startup also prepares these packages regardless of `auto_install`. It does not accept a workspace selector.
 
-Dependency status counts running and queued package probes as active work. Reset and shutdown cancel these probes and collect their subprocesses before releasing the service.
+Dependency status counts running and queued package probes as active work. Probes run under the process-tree guard, which also collects descendants after the probe exits. Reset and shutdown cancel these probes and collect their subprocesses before releasing the service.
 
 ## Result pages
 
@@ -241,7 +241,7 @@ restored = await ws.browser.context("restored", storage_state=state)
 
 ## Network diagnostics and scans
 
-`ws.net.resolve(host, port=None)` returns deduplicated IPv4/IPv6 addresses. `connect(host, port, timeout=3)` reports `open`, `closed`, `timeout`, or `unreachable` without raising for ordinary connection failures. `tls()` uses certificate and hostname verification by default and reports the negotiated TLS version, cipher, peer certificate, and SHA-256 fingerprint. Set `verify=False` only for diagnostics; `cert_pem` or `fingerprint` can pin the peer certificate.
+`ws.net.resolve(host, port=None)` returns deduplicated IPv4/IPv6 addresses. IPv6 results preserve `scope_id` and `flowinfo`; identical link-local addresses on different interfaces remain separate entries. `connect(host, port, timeout=3)` reports `open`, `closed`, `timeout`, or `unreachable` without raising for ordinary connection failures. `tls()` uses certificate and hostname verification by default and reports the negotiated TLS version, cipher, peer certificate, and SHA-256 fingerprint. Set `verify=False` only for diagnostics; `cert_pem` or `fingerprint` can pin the peer certificate.
 
 TCP scans default to ports 1–1024, 64 concurrent connections, 200 connection attempts per second, and a one-second connection timeout. The native scanner needs no external binary or root privileges. It resolves each hostname once per scan and checks every unique resolved address; each result retains the original `host`, numeric `address`, `family`, port, and connection state. Use `family="ipv4"` or `family="ipv6"` to restrict the default `"any"` selection. Literal IPs bypass DNS, and literal addresses of the other family are excluded.
 

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import signal
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,8 @@ from .python_dependencies import (
 
 _KINDS = {"binary", "python", "model", "browser"}
 _BROWSERS = ("chromium", "firefox", "webkit")
-_PROBE_CLEANUP_TIMEOUT = 2
+# process_guard allows two seconds for TERM and another two for KILL/reaping.
+_PROBE_CLEANUP_TIMEOUT = 5
 _PROBE_DRAIN_LIMIT = 128 * 1024
 _PACKAGE_PROBE = """import contextlib, importlib, importlib.metadata as m, importlib.util
 import json, os, sys
@@ -443,13 +446,28 @@ class DependencyService:
             readers: tuple[asyncio.Task[bytes], ...] = ()
             wait_task: asyncio.Task[int] | None = None
             try:
+                command = [
+                    str(self.python),
+                    "-I",
+                    "-c",
+                    script,
+                    json.dumps(arguments),
+                ]
+                if sys.platform.startswith("linux"):
+                    guard = Path(__file__).with_name("process_guard.py")
+                    command = [
+                        sys.executable,
+                        "-I",
+                        str(guard),
+                        "--parent-pid",
+                        str(os.getpid()),
+                        "--tree",
+                        "--",
+                        *command,
+                    ]
                 launch = asyncio.create_task(
                     asyncio.create_subprocess_exec(
-                        str(self.python),
-                        "-I",
-                        "-c",
-                        script,
-                        json.dumps(arguments),
+                        *command,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         start_new_session=True,
@@ -494,14 +512,14 @@ class DependencyService:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*readers, return_exceptions=True)
-            kill_error = None
+            signal_error = None
             if process.returncode is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    process.send_signal(signal.SIGTERM)
                 except ProcessLookupError:
                     pass
                 except BaseException as exc:
-                    kill_error = exc
+                    signal_error = exc
             if wait_task is None or wait_task.cancelled():
                 wait_task = asyncio.create_task(process.wait())
             drains = (
@@ -513,6 +531,16 @@ class DependencyService:
                 async with asyncio.timeout(_PROBE_CLEANUP_TIMEOUT):
                     await asyncio.gather(*tasks, return_exceptions=True)
             except TimeoutError:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    except BaseException as exc:
+                        if signal_error is None:
+                            signal_error = exc
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
                 for task in tasks:
                     if not task.done():
                         task.cancel()
@@ -520,8 +548,8 @@ class DependencyService:
             finally:
                 _close_probe_stream(process.stdout)
                 _close_probe_stream(process.stderr)
-            if kill_error is not None:
-                raise kill_error
+            if signal_error is not None:
+                raise signal_error
             await wait_owned(process.wait(), propagate=False)
         finally:
             self._probe_processes.discard(process)

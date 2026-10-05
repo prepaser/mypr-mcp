@@ -32,6 +32,7 @@ _MAX_WARNING_TEXT = 256
 _MAX_HISTORY_GC_ITEMS = 1000
 _MAX_HISTORY_JSON_RETRIES = 64
 _MAX_EXECUTION_RECORD_BYTES = 16 * 1024 * 1024
+_MAX_SCAN_METADATA_BYTES = 1 * 1024 * 1024
 _DAY = 24 * 60 * 60
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
 _BULKY_ENTITY_FIELDS = {"code", "output", "events"}
@@ -439,25 +440,75 @@ class History:
                     paths.add(path)
         return paths
 
-    def _scan_paths(self, ident: str) -> set[str]:
+    def _scan_paths_with_status(
+        self, ident: str, *, metadata_optional: bool = False
+    ) -> tuple[set[str], dict[str, str] | None]:
         metadata = self.root / ".mypr" / "scans" / f"{ident}.json"
         paths: set[str] = set()
+        warning: dict[str, str] | None = None
+        loaded = False
         try:
-            payload = json.loads(metadata.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = json.loads(
+                read_bytes(
+                    metadata,
+                    max_bytes=_MAX_SCAN_METADATA_BYTES,
+                    follow_symlinks=False,
+                ).decode("utf-8")
+            )
+            loaded = True
+        except FileNotFoundError:
             payload = None
+            if not metadata_optional:
+                warning = {
+                    "code": "scan_metadata_missing",
+                    "text": (
+                        f"Scan {ident} metadata is missing while its paths are still referenced."
+                    )[:_MAX_WARNING_TEXT],
+                }
+        except (OSError, UnicodeError, ValueError) as exc:
+            payload = None
+            warning = {
+                "code": "scan_metadata_unreadable",
+                "text": (
+                    f"Scan {ident} metadata could not be read safely: {type(exc).__name__}."
+                )[:_MAX_WARNING_TEXT],
+            }
         if isinstance(payload, Mapping):
+            found_field = False
             for key in ("result_path", "summary_path", "artifact", "artifact_path", "config"):
-                path = self._relative_storage_path(payload.get(key))
-                if path is not None:
+                if key not in payload or payload[key] is None:
+                    continue
+                found_field = True
+                path = self._relative_storage_path(payload[key])
+                if path is None:
+                    warning = {
+                        "code": "scan_metadata_invalid_path",
+                        "text": (
+                            f"Scan {ident} metadata contains an invalid {key} path."
+                        )[:_MAX_WARNING_TEXT],
+                    }
+                else:
                     paths.add(path)
+            if not found_field:
+                warning = {
+                    "code": "scan_metadata_incomplete",
+                    "text": f"Scan {ident} metadata contains no output paths."[:_MAX_WARNING_TEXT],
+                }
+        elif loaded:
+            warning = {
+                "code": "scan_metadata_invalid_object",
+                "text": f"Scan {ident} metadata is not a JSON object."[:_MAX_WARNING_TEXT],
+            }
         if not paths:
             prefix = f".mypr/scans/{ident}"
             paths.update(
                 f"{prefix}{suffix}"
                 for suffix in (".jsonl", ".summary.json", ".xml", ".request.json")
             )
-        return paths
+        return paths, warning
+
+    def _scan_paths(self, ident: str) -> set[str]:
+        return self._scan_paths_with_status(ident)[0]
 
     def storage_gc_snapshot(self, *, retention_days: int = 30) -> dict[str, Any]:
         if type(retention_days) is not int or retention_days < 1:
@@ -481,7 +532,17 @@ class History:
             elif kind == "execution":
                 paths = [f".mypr/runs/{ident}.jsonl"]
             elif kind == "scan":
-                paths = sorted(self._scan_paths(ident))
+                paths, warning = self._scan_paths_with_status(
+                    ident,
+                    metadata_optional=(
+                        bool(record.get("scan_output_evicted"))
+                        or record.get("state") in {"failed", "cancelled", "lost", "reset"}
+                    ),
+                )
+                if warning is not None:
+                    uncertain = True
+                    warnings_truncated |= _append_warning(warnings, warning)
+                paths = sorted(paths)
             else:
                 paths = [f".mypr/jobs/{ident}.jsonl"]
             reference = record.get("result_ref")
@@ -977,7 +1038,16 @@ class History:
                     elif kind == "execution":
                         output_paths = {f".mypr/runs/{ident}.jsonl"}
                     elif kind == "scan":
-                        output_paths = self._scan_paths(ident)
+                        output_paths, warning = self._scan_paths_with_status(
+                            ident,
+                            metadata_optional=(
+                                bool(record.get("scan_output_evicted"))
+                                or record.get("state") in {"failed", "cancelled", "lost", "reset"}
+                            ),
+                        )
+                        if warning is not None:
+                            self._db.execute("ROLLBACK")
+                            return []
                     else:
                         output_paths = {f".mypr/jobs/{ident}.jsonl"}
                     updated = False

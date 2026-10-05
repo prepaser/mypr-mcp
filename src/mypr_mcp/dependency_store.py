@@ -33,12 +33,14 @@ from .dependency_catalog import (
     Artifact,
     resolve_artifact,
 )
+from .file_io import read_bytes
 
 _INSTALL_TIMEOUT = 300.0
 _MAX_NETWORK_TASKS = 2
 _CHUNK_SIZE = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 10_000
 _MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
+_MAX_METADATA_BYTES = 64 * 1024
 _VERSION_RE = re.compile(r"(?<!\d)(\d+)(?:\.(\d+))(?:\.(\d+))?(?!\d)")
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.:-]+$")
 _SYSTEM_MINIMUMS = {
@@ -728,7 +730,9 @@ class DependencyStore:
                 artifact, "unusable", source="shared", reason="managed artifact is unverified"
             )
         try:
-            metadata = json.loads(marker.read_text(encoding="utf-8"))
+            metadata = json.loads(
+                read_bytes(marker, max_bytes=_MAX_METADATA_BYTES, follow_symlinks=False)
+            )
             if (
                 not isinstance(metadata, dict)
                 or metadata.get("name") != artifact.name
@@ -799,7 +803,9 @@ class DependencyStore:
             try:
                 if marker.is_symlink():
                     raise ValueError
-                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                metadata = json.loads(
+                    read_bytes(marker, max_bytes=_MAX_METADATA_BYTES, follow_symlinks=False)
+                )
                 if (
                     not isinstance(metadata, dict)
                     or metadata.get("name") != artifact.name

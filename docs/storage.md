@@ -24,6 +24,8 @@ gc_interval_seconds = 300
 
 `enabled` controls automatic cleanup. `retention_days`, `max_bytes`, and `revision_keep` are the defaults used by `ws.storage.gc()` when its optional arguments are omitted. `gc_interval_seconds` controls the background pass; manual `usage()` and `gc()` remain available when automatic cleanup is off. Protected files are included in usage summaries but are never selected as ordinary file-deletion candidates.
 
+Scan metadata reads are limited to 1 MiB and must be stable regular files. Unreadable or malformed metadata makes GC report uncertain references and defer deletion, preserving artifacts whose ownership cannot be determined. Metadata already removed by normal scan-output retention does not prevent later cleanup.
+
 Build a plan first. A dry run does not delete anything:
 
 ```python
