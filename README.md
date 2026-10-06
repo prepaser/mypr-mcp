@@ -196,7 +196,7 @@ execute_wait_ms = 1000
 poll_wait_ms = 1000
 ```
 
-`response_bytes` controls the default `execute`/`poll` response page and must be between 1 KiB and 1 MiB. A per-call `max_bytes` can lower or raise the page budget within that same range.
+`response_bytes` controls the default `execute`/`poll` response page, including saved restart results, and must be between 1 KiB and 1 MiB. The default budget permits one oversized event so the cursor can advance. A per-call `max_bytes` overrides the budget within that same range and rejects an oversized first event with the cursor unchanged; increase the budget to read it.
 
 `execute_wait_ms` and `poll_wait_ms` control the default notification wait for the corresponding MCP tools. Each accepts an integer from 0 through 30,000 milliseconds. A per-call `wait_ms` overrides the configured value, including with `0` for an immediate response.
 

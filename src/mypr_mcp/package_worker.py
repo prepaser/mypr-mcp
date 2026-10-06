@@ -6,6 +6,7 @@ import argparse
 import errno
 import fcntl
 import json
+import math
 import os
 import shutil
 import stat
@@ -102,9 +103,34 @@ def _probe_environment(python: Path, modules: list[str]) -> dict[str, Any]:
     """Read distribution versions and import status from the workspace Python."""
 
     script = """
+import contextlib
 import importlib.metadata as metadata
+import io
 import json
 import sys
+
+class _Capture(io.StringIO):
+    encoding = "utf-8"
+    errors = "strict"
+
+    def __init__(self, limit=512):
+        super().__init__()
+        self.limit = limit
+        self.parts = []
+        self.size = 0
+
+    def write(self, value):
+        if not isinstance(value, str):
+            raise TypeError("write() argument must be str")
+        length = len(value)
+        if self.size < self.limit:
+            value = value[: self.limit - self.size]
+            self.parts.append(value)
+            self.size += len(value)
+        return length
+
+    def text(self):
+        return ''.join(self.parts)
 
 requested = json.loads(sys.argv[1])
 dist = {}
@@ -119,10 +145,17 @@ for item in metadata.distributions():
     }
 imports = {}
 for name in requested:
+    stdout = _Capture()
+    stderr = _Capture()
     try:
-        __import__(name)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            __import__(name)
     except BaseException as exc:
-        imports[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:512]}
+        detail = f"{type(exc).__name__}: {exc}"
+        diagnostic = (stdout.text() + stderr.text()).strip()
+        if diagnostic:
+            detail += f" [import output: {diagnostic}]"
+        imports[name] = {"ok": False, "error": detail[:512]}
     else:
         imports[name] = {"ok": True}
 print(json.dumps({"distributions": dist, "imports": imports}, separators=(",", ":")))
@@ -425,8 +458,13 @@ def _open_lock(path: Path):
 
 
 def _lock(stream, timeout: float) -> None:
-    if timeout <= 0:
-        raise ValueError("lock_timeout must be positive")
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("lock_timeout must be a finite positive number")
     deadline = time.monotonic() + timeout
     while True:
         try:

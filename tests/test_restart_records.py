@@ -4,6 +4,7 @@ import threading
 
 import pytest
 
+import mypr_mcp.restart as restart
 from mypr_mcp.history import History
 from mypr_mcp.restart_records import _output_evicted, finalize_origin, poll_restart
 
@@ -245,3 +246,88 @@ async def test_offline_restart_poll_uses_configured_default(
     page = await bridge._poll_restart("a" * 32, 0, override)
     assert page["state"] == ("failed" if unstable_config else "running")
     assert calls == [True]
+
+
+async def test_offline_restart_poll_uses_configured_response_budget(tmp_path, monkeypatch):
+    from mypr_mcp.bridge import ConnectionBridge
+    from mypr_mcp.config import ConfigSnapshot, ConfigStore
+    from mypr_mcp.journal import append_events
+    from mypr_mcp.transport import workspace_id
+
+    snapshot = ConfigSnapshot(
+        values={"limits": {"response_bytes": 1024, "poll_wait_ms": 0}},
+        revision=None,
+    )
+    monkeypatch.setattr(ConfigStore, "load", lambda _self: snapshot)
+    ident = "6" * 32
+    ticket_id = "7" * 32
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    (root / f"{ident}.json").write_text(
+        json.dumps(
+            {
+                "id": ident,
+                "generation": "old",
+                "state": "succeeded",
+                "restart_id": ticket_id,
+            }
+        )
+    )
+    append_events(
+        root / f"{ident}.jsonl",
+        [{"type": "stream", "text": "x" * 100} for _ in range(20)],
+    )
+    restart._write_ticket(
+        tmp_path,
+        {
+            "id": ticket_id,
+            "state": "succeeded",
+            "workspace_id": workspace_id(tmp_path),
+            "target": {"python": "/usr/bin/python", "package_root": "/tmp", "version": "1"},
+            "origin": {"exec_id": ident},
+            "new_generation": "new",
+        },
+    )
+    bridge = ConnectionBridge(tmp_path)
+    async def recover(_ident):
+        pass
+
+    monkeypatch.setattr(bridge, "_recover_restart", recover)
+
+    page = await bridge._poll_restart(ident, 0, 0)
+
+    assert len(page["output"]) == 7
+    assert page["cursor"] == 7
+    assert page["has_more"]
+
+
+def test_restart_poll_rejects_cursor_past_logical_end(tmp_path, monkeypatch):
+    from mypr_mcp import restart
+    from mypr_mcp.transport import workspace_id
+
+    ident = "8" * 32
+    ticket_id = "9" * 32
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    (root / f"{ident}.json").write_text(
+        json.dumps(
+            {
+                "id": ident,
+                "generation": "old",
+                "state": "succeeded",
+                "restart_id": ticket_id,
+            }
+        )
+    )
+    ticket = {
+        "id": ticket_id,
+        "state": "succeeded",
+        "workspace_id": workspace_id(tmp_path),
+        "target": {"python": "/usr/bin/python", "package_root": "/tmp", "version": "1"},
+        "origin": {"exec_id": ident},
+        "new_generation": "new",
+    }
+    monkeypatch.setattr(restart, "read_ticket", lambda *_args: ticket)
+
+    with pytest.raises(ValueError, match="Invalid output cursor"):
+        poll_restart(tmp_path, ident, cursor=1)

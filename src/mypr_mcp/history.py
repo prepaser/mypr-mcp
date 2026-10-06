@@ -527,7 +527,7 @@ class History:
                 for value in paths
                 if (path := self._relative_storage_path(value)) is not None
             }
-        active, protected, references, tombstones = set(), set(), {}, {}
+        active, protected, known_owners, references, tombstones = set(), set(), set(), {}, {}
         warnings: list[dict[str, str]] = []
         uncertain = False
         warnings_truncated = False
@@ -575,9 +575,14 @@ class History:
                         if sidecar in retained_paths:
                             scoped.append(sidecar)
                 paths = scoped
-            live = record.get("state") in _ACTIVE_STATES
+            state = record.get("state")
+            if paths and state in _TERMINAL_STATES:
+                known_owners.add(ident)
+            live = state in _ACTIVE_STATES
             if live:
                 active.add(ident)
+                protected.update(paths)
+            elif paths and state not in _TERMINAL_STATES:
                 protected.update(paths)
             for path in paths:
                 references.setdefault(path, []).append(ident)
@@ -593,6 +598,7 @@ class History:
                     tombstones[path] = {"id": ident}
         return {
             "active_ids": active, "protected_paths": protected,
+            "known_owner_ids": known_owners,
             "references": references, "tombstones": tombstones,
             "paths_scoped": retained_paths is not None,
             "uncertain": uncertain, "warnings": warnings,
@@ -1109,12 +1115,9 @@ class History:
                     artifact_paths = self._artifact_paths(record)
                     if artifact_paths & selected:
                         record.update(
-                            output_evicted=True,
                             artifact_evicted=True,
-                            output_evicted_at=time.time(),
+                            artifact_evicted_at=time.time(),
                         )
-                        record.pop("output", None)
-                        record.pop("events", None)
                         updated = True
                     if updated:
                         self._db.execute(

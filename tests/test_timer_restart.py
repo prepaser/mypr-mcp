@@ -12,6 +12,7 @@ import mypr_mcp.bridge as bridge_module
 import mypr_mcp.restart as restart
 import mypr_mcp.timers as timers_module
 from mypr_mcp.bridge import ConnectionBridge
+from mypr_mcp.diagnostics import RPCError
 from mypr_mcp.history import History
 from mypr_mcp.protocol import descriptor, target_installation
 from mypr_mcp.timers import TimerStore
@@ -40,6 +41,7 @@ def _restart_fixture(
     client_id: str = "alice",
     connection_id: str = "connection",
     request_id: str | None = None,
+    code: str | None = None,
     exec_id: str = "a" * 32,
     ticket_id: str = "b" * 32,
 ):
@@ -80,6 +82,7 @@ def _restart_fixture(
         "created": time.time(),
         "truncated": False,
         "restart_result": "Workspace restart completed" if state == "succeeded" else None,
+        **({"code": code} if code is not None else {}),
     }
     (runs / f"{exec_id}.json").write_text(json.dumps(record))
     return exec_id, ticket
@@ -200,6 +203,7 @@ async def test_execute_connection_failure_recovers_matching_origin(
         workspace,
         connection_id=bridge.connection_id,
         request_id=request_id,
+        code="42",
     )
     monkeypatch.setattr(bridge, "wait_ready", _noop)
 
@@ -214,6 +218,64 @@ async def test_execute_connection_failure_recovers_matching_origin(
     assert result["exec_id"] == exec_id
     assert result["state"] == "succeeded"
     assert result["timers"]["items"][0]["id"] == timer["id"]
+
+
+async def test_execute_connection_failure_does_not_recover_conflicting_code(
+    timer_workspace, monkeypatch
+):
+    workspace, store = timer_workspace
+    store.close()
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+    bridge._state = _old_bridge_state()
+    bridge._ready.set()
+    monkeypatch.setattr(bridge, "_recover_restart", _noop)
+    request_id = "execute-request"
+    _restart_fixture(
+        workspace,
+        connection_id=bridge.connection_id,
+        request_id=request_id,
+        code="42",
+    )
+    monkeypatch.setattr(bridge, "wait_ready", _noop)
+
+    async def disconnected(*args, **kwargs):
+        raise ConnectionError("manager disconnected")
+
+    monkeypatch.setattr(bridge_module, "rpc", disconnected)
+    with pytest.raises(ConnectionError, match="manager disconnected"):
+        await bridge.request(
+            "execute", code="different", request_id=request_id, wait_ms=0
+        )
+
+
+async def test_execute_application_error_is_not_treated_as_restart_disconnect(
+    timer_workspace, monkeypatch
+):
+    workspace, store = timer_workspace
+    store.close()
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+    bridge._state = _old_bridge_state()
+    bridge._ready.set()
+    monkeypatch.setattr(bridge, "_recover_restart", _noop)
+    request_id = "execute-request"
+    _restart_fixture(
+        workspace,
+        connection_id=bridge.connection_id,
+        request_id=request_id,
+        code="42",
+    )
+    monkeypatch.setattr(bridge, "wait_ready", _noop)
+
+    async def rejected(*args, **kwargs):
+        raise RPCError("request_id already used for different code")
+
+    monkeypatch.setattr(bridge_module, "rpc", rejected)
+    with pytest.raises(RPCError, match="different code"):
+        await bridge.request(
+            "execute", code="different", request_id=request_id, wait_ms=0
+        )
 
 
 async def test_poll_connection_failure_recovers_matching_ticket(timer_workspace, monkeypatch):

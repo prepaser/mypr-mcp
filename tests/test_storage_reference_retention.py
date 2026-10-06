@@ -128,10 +128,165 @@ async def test_gc_preserves_active_history_owned_files_after_reference_growth(
         plan = await Storage(tmp_path, history=history).gc(max_bytes=0)
 
         paths = {item["path"] for item in plan["candidates"]}
+        assert "active" in plan["protected"]["active_ids"]
         assert ".mypr/task-results/active.json" not in paths
         assert ".mypr/artifacts/active/saved.bin" not in paths
         assert result.exists()
         assert artifact.exists()
+    finally:
+        history.close()
+
+
+@pytest.mark.asyncio
+async def test_gc_artifact_eviction_does_not_expire_retained_journal(tmp_path):
+    metadata = tmp_path / ".mypr" / "jobs" / "artifact-only.json"
+    output = metadata.with_suffix(".jsonl")
+    artifact = tmp_path / ".mypr" / "artifacts" / "artifact-only" / "image.bin"
+    _old(metadata, json.dumps({"id": "artifact-only", "kind": "shell", "state": "succeeded"}))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("retained output", encoding="utf-8")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"old artifact")
+    old = time.time() - 40 * 24 * 60 * 60
+    os.utime(artifact, (old, old))
+
+    history = History(tmp_path)
+    try:
+        history.record(
+            "shell",
+            {"id": "artifact-only", "kind": "shell", "state": "succeeded"},
+            updated_at=old,
+        )
+        max_bytes = metadata.stat().st_size + output.stat().st_size
+        storage = Storage(tmp_path, history=history)
+        plan = await storage.gc(max_bytes=max_bytes)
+        assert {item["path"] for item in plan["candidates"]} == {
+            ".mypr/artifacts/artifact-only/image.bin"
+        }
+
+        await storage.gc_apply(plan["plan_id"])
+
+        record = history.get("artifact-only")
+        assert output.exists()
+        assert not artifact.exists()
+        assert record is not None
+        assert record.get("artifact_evicted") is True
+        assert record.get("output_evicted") is not True
+    finally:
+        history.close()
+
+
+@pytest.mark.asyncio
+async def test_gc_collects_artifact_owned_by_terminal_python_history(tmp_path):
+    artifact = tmp_path / ".mypr" / "artifacts" / "python-owner" / "image.bin"
+    _old(artifact, b"old artifact")
+    history = History(tmp_path)
+    try:
+        old = time.time() - 40 * 24 * 60 * 60
+        history_id = "python:" + "e" * 32 + ":python-owner"
+        history.record(
+            "python",
+            {
+                "id": "python-owner",
+                "kind": "python",
+                "generation": "e" * 32,
+                "history_id": history_id,
+                "state": "succeeded",
+            },
+            entity_id=history_id,
+            updated_at=old,
+        )
+        storage = Storage(tmp_path, history=history)
+        plan = await storage.gc(max_bytes=0)
+
+        assert ".mypr/artifacts/python-owner/image.bin" in {
+            item["path"] for item in plan["candidates"]
+        }
+    finally:
+        history.close()
+
+
+@pytest.mark.asyncio
+async def test_gc_keeps_artifact_for_history_owner_with_unknown_state(tmp_path):
+    artifact = tmp_path / ".mypr" / "artifacts" / "unknown-owner" / "image.bin"
+    _old(artifact, b"unknown state")
+    history = History(tmp_path)
+    try:
+        old = time.time() - 40 * 24 * 60 * 60
+        history_id = "python:" + "f" * 32 + ":unknown-owner"
+        history.record(
+            "python",
+            {
+                "id": "unknown-owner",
+                "kind": "python",
+                "generation": "f" * 32,
+                "history_id": history_id,
+                "state": "unknown",
+            },
+            entity_id=history_id,
+            updated_at=old,
+        )
+        storage = Storage(tmp_path, history=history)
+        plan = await storage.gc(max_bytes=0)
+
+        assert ".mypr/artifacts/unknown-owner/image.bin" not in {
+            item["path"] for item in plan["candidates"]
+        }
+        assert "known_owner_ids" not in plan["protected"]
+    finally:
+        history.close()
+
+
+@pytest.mark.asyncio
+async def test_gc_does_not_cross_generation_for_unknown_python_owner(tmp_path):
+    old_artifact = tmp_path / ".mypr" / "artifacts" / "exec-old" / "image.bin"
+    unknown_artifact = tmp_path / ".mypr" / "artifacts" / "exec-unknown" / "image.bin"
+    _old(old_artifact, b"old artifact")
+    _old(unknown_artifact, b"unknown artifact")
+    history = History(tmp_path)
+    try:
+        old = time.time() - 40 * 24 * 60 * 60
+        history.record(
+            "execution",
+            {"id": "exec-old", "kind": "execution", "state": "succeeded"},
+            updated_at=old,
+        )
+        history.record(
+            "execution",
+            {"id": "exec-unknown", "kind": "execution", "state": "succeeded"},
+            updated_at=old,
+        )
+        history.record(
+            "python",
+            {
+                "id": "job",
+                "kind": "python",
+                "generation": "1" * 32,
+                "history_id": "python:" + "1" * 32 + ":job",
+                "exec_id": "exec-old",
+                "state": "succeeded",
+            },
+            entity_id="python:" + "1" * 32 + ":job",
+            updated_at=old,
+        )
+        history.record(
+            "python",
+            {
+                "id": "job",
+                "kind": "python",
+                "generation": "2" * 32,
+                "history_id": "python:" + "2" * 32 + ":job",
+                "exec_id": "exec-unknown",
+                "state": "unknown",
+            },
+            entity_id="python:" + "2" * 32 + ":job",
+            updated_at=old,
+        )
+        plan = await Storage(tmp_path, history=history).gc(max_bytes=0)
+        paths = {item["path"] for item in plan["candidates"]}
+
+        assert ".mypr/artifacts/exec-old/image.bin" in paths
+        assert ".mypr/artifacts/exec-unknown/image.bin" not in paths
     finally:
         history.close()
 
@@ -294,3 +449,27 @@ def test_atomic_revision_json_preserves_surrogate_paths(tmp_path):
     Storage._atomic_json(path, value)
 
     assert json.loads(path.read_text(encoding="utf-8")) == value
+
+
+def test_public_gc_plan_bounds_active_owner_diagnostics():
+    active_ids = [f"client-{index}" for index in range(storage_module._MAX_PUBLIC_ITEMS + 1)]
+    plan = storage_module.Storage._public_plan(
+        {
+            "protected": {
+                "paths": [],
+                "references": {},
+                "active_ids": active_ids,
+                "known_owner_ids": ["internal-only"],
+            },
+            "candidates": [],
+            "tombstones": [],
+            "database": {},
+        }
+    )
+
+    protected = plan["protected"]
+    assert protected["active_ids"] == active_ids[: storage_module._MAX_PUBLIC_ITEMS]
+    assert protected["active_id_count"] == len(active_ids)
+    assert protected["active_ids_truncated"] is True
+    assert "known_owner_ids" not in protected
+    assert plan["public_truncated"] is True

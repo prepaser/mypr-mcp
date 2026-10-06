@@ -11,7 +11,7 @@ from typing import Any
 
 from .async_utils import wait_owned
 from .config import validate_web_config
-from .diagnostics import RPCError
+from .diagnostics import RPCError, safe_error
 from .web_snapshots import WebSnapshots, page_limit
 from .web_transport import WebTransport, provider_capabilities, validate_request
 
@@ -44,6 +44,7 @@ class WebService:
         self._lock = asyncio.Lock()
         self._close_task = None
         self._last_log_succeeded = None
+        self._retired_transports: list[Any] = []
 
     @property
     def applied_config(self):
@@ -184,9 +185,20 @@ class WebService:
                 "errors": {},
                 "applied_config": self.applied_config,
             }
+            cleanup_errors: list[str] = []
+            try:
+                await self._close_retired_transports()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                cleanup_errors.append(safe_error(exc))
             if desired == self.config:
+                if cleanup_errors:
+                    result["errors"]["cleanup"] = "; ".join(cleanup_errors)
                 return result
             if self.active_count:
+                if cleanup_errors:
+                    result["errors"]["cleanup"] = "; ".join(cleanup_errors)
                 result["deferred"] = ["web"]
                 return result
             self._applying = True
@@ -195,8 +207,17 @@ class WebService:
                 old_transport, self.transport = self.transport, new_transport
                 self.config = desired
                 self._slots = asyncio.Semaphore(desired["max_concurrency"])
-                await old_transport.close()
+                try:
+                    await old_transport.close()
+                except asyncio.CancelledError:
+                    self._retired_transports.append(old_transport)
+                    raise
+                except Exception as exc:
+                    self._retired_transports.append(old_transport)
+                    cleanup_errors.append(safe_error(exc))
                 result.update(applied=["web"], applied_config=self.applied_config)
+                if cleanup_errors:
+                    result["errors"]["cleanup"] = "; ".join(cleanup_errors)
                 return result
             finally:
                 self._applying = False
@@ -218,16 +239,23 @@ class WebService:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await self.transport.close()
+                await self._close_retired_transports()
                 self.transport = self._transport_factory(self.config)
                 self.snapshots.clear()
             finally:
                 self._applying = False
 
     async def close(self):
-        if self._close_task is None:
-            self._closed = True
-            self._close_task = asyncio.create_task(self._close())
-        await wait_owned(self._close_task)
+        close_task = self._close_task
+        if close_task is not None and close_task.done() and (
+            close_task.cancelled() or close_task.exception() is not None
+        ):
+            close_task = None
+        self._closed = True
+        if close_task is None:
+            close_task = asyncio.create_task(self._close())
+            self._close_task = close_task
+        await wait_owned(close_task)
 
     async def _close(self):
         async with self._lock:
@@ -236,4 +264,20 @@ class WebService:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.transport.close()
+            await self._close_retired_transports()
             self.snapshots.clear()
+
+    async def _close_retired_transports(self) -> None:
+        if not self._retired_transports:
+            return
+        remaining: list[Any] = []
+        failures: list[BaseException] = []
+        for transport in self._retired_transports:
+            try:
+                await transport.close()
+            except BaseException as exc:
+                remaining.append(transport)
+                failures.append(exc)
+        self._retired_transports = remaining
+        if failures:
+            raise failures[0]

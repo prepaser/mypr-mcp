@@ -235,6 +235,35 @@ async def test_worker_output_cap_drains_and_kills_process_group(tmp_path, monkey
     await _assert_reaped(int(pid_path.read_text()))
 
 
+async def test_document_worker_round_trips_surrogateescaped_paths_before_dependencies(
+    tmp_path, monkeypatch
+):
+    from mypr_mcp import document_tools
+
+    worker = tmp_path / "echo-worker.py"
+    worker.write_text(
+        "import json, sys\n"
+        "request = json.loads(sys.stdin.buffer.read())\n"
+        "response = {'ok': True, 'result': {"
+        "'path': request['path'], 'display': request['display']}}\n"
+        "encoded = json.dumps(response, ensure_ascii=False, separators=(',', ':'))\n"
+        "sys.stdout.buffer.write(encoded.encode('utf-8', 'backslashreplace'))\n"
+    )
+    monkeypatch.setattr(document_tools, "_WORKER", worker)
+    monkeypatch.setattr(document_tools.sys, "platform", "win32")
+
+    async def settle(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(document_tools, "_thread_settle", settle)
+    path = tmp_path / os.fsdecode(b"input-\xff.docx")
+    display = os.fsdecode(b"display-\xff.docx")
+
+    result = await document_tools._run_worker("test", path, display, {})
+
+    assert result == {"path": str(path), "display": display}
+
+
 async def test_cancelled_worker_removes_temp_tree_and_reaps_child(tmp_path, monkeypatch):
     from mypr_mcp import document_tools
 

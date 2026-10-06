@@ -32,6 +32,12 @@ _MAX_COMPRESSION_RATIO = 200
 _MAX_RESUME_TSV = 8 * 1024 * 1024
 
 
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8", "backslashreplace"
+    )
+
+
 class _Failure(Exception):
     def __init__(self, kind: str, message: str) -> None:
         self.kind = kind
@@ -59,7 +65,7 @@ class _Collector:
             item = {**item, "text": text[:_MAX_TEXT], "text_truncated": True}
             self.truncated = True
             self.reason = "text_item_limit"
-        size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode())
+        size = len(_json_bytes(item))
         if self.bytes + size > _MAX_OUTPUT:
             self.truncated = True
             self.reason = "result_size_limit"
@@ -700,33 +706,29 @@ def main() -> int:
         response = {"ok": False, "kind": exc.kind, "error": str(exc)}
     except BaseException as exc:
         response = {"ok": False, "kind": "DocumentError", "error": f"{type(exc).__name__}: {exc}"}
-    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = _json_bytes(response)
     if len(encoded) > _MAX_OUTPUT and response.get("ok") is True:
         result = response.get("result")
         if isinstance(result, dict) and result.get("resume") is not None:
             result["items"] = []
             result["resume"]["word_offset"] = 0
             result["resume"]["tsv_offset"] = 0
-            encoded = json.dumps(
-                response, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            encoded = _json_bytes(response)
         if (
             len(encoded) > _MAX_OUTPUT
             and isinstance(result, dict)
             and result.pop("resume", None) is not None
         ):
             response["result"] = result
-            encoded = json.dumps(
-                response, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            encoded = _json_bytes(response)
     if len(encoded) > _MAX_OUTPUT:
-        encoded = json.dumps(
+        encoded = _json_bytes(
             {
                 "ok": False,
                 "kind": "ValueError",
                 "error": "Document result exceeds the 7 MiB worker limit",
             }
-        ).encode()
+        )
     sys.stdout.buffer.write(encoded)
     return 0
 

@@ -83,6 +83,40 @@ async def test_native_lens_extraction_and_trace_are_preserved(monkeypatch):
         await transport.close()
 
 
+async def test_close_retries_a_native_transport_after_client_close_failure(monkeypatch):
+    async def handler(request):
+        return httpx2.Response(
+            200,
+            json={"data": {"search": [{"title": "A", "url": "https://example.test"}]}},
+            request=request,
+        )
+
+    class CloseOnce(httpx2.MockTransport):
+        def __init__(self):
+            super().__init__(handler)
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("temporary provider transport failure")
+            await super().aclose()
+
+    monkeypatch.setenv("WEB_KEY", "secret")
+    native = CloseOnce()
+    transport = WebTransport(_config("kagi"), transport=native)
+    await transport.run("search", "kagi", {"query": "test"})
+
+    with pytest.raises(RuntimeError, match="temporary provider transport failure"):
+        await transport.close()
+    assert native.close_calls == 1
+    assert "kagi" in transport._clients
+
+    await transport.close()
+    assert native.close_calls == 2
+    assert not transport._clients
+
+
 async def test_tavily_advanced_extract_and_brave_source_metadata(monkeypatch):
     async def handler(request):
         body = json.loads(request.content)

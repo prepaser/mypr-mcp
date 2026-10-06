@@ -66,7 +66,7 @@ The optional top-level `version` field is the configuration format version. Its 
 | `completed_records` | `128` | Integer ≥ `1` | Completed entries retained by each manager record and shell-output cache | Reload |
 | `cache_bytes` | `33554432` (32 MiB) | Integer ≥ `1024` | Serialized cache budget, shared equally between manager records and shell output | Reload |
 
-`response_bytes` limits one output page, not the complete MCP response. Per-call `max_bytes` can override it within the same range. Reducing cache limits evicts completed cache entries only; active work and saved journals remain available. Arbitrary Python objects held by user code are outside these limits. See [completed-work retention](../README.md#completed-work-retention).
+`response_bytes` limits one output page, including saved restart results, not the complete MCP response. The default permits a single oversized event; an explicit per-call `max_bytes` uses a strict first-event limit and leaves the cursor unchanged if that event cannot fit. Per-call budgets use the same range. Reducing cache limits evicts completed cache entries only; active work and saved journals remain available. Arbitrary Python objects held by user code are outside these limits. See [completed-work retention](../README.md#completed-work-retention).
 
 `execute_wait_ms` and `poll_wait_ms` control how long the corresponding MCP tool waits for completion, output, or notifications when its `wait_ms` argument is omitted. They accept integer values from 0 through 30,000 milliseconds. A per-call `wait_ms`, including `0`, takes precedence over the configured default. These settings apply after `await ws.config.reload()` and do not require a reset.
 

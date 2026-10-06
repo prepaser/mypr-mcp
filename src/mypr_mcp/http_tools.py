@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .async_utils import wait_owned
+from .http_transport import RetryableTransport, close_client, retryable_transports
 
 if TYPE_CHECKING:
     import httpx2
@@ -147,53 +148,6 @@ def _check_url(url: str) -> None:
         raise ValueError("url must be a non-empty string")
 
 
-class _RetryableTransport:
-    def __init__(self, transport: Any):
-        self.transport = transport
-        self.closed = False
-        self._lock = asyncio.Lock()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.transport, name)
-
-    async def handle_async_request(self, request: Any) -> Any:
-        return await self.transport.handle_async_request(request)
-
-    async def __aenter__(self) -> Any:
-        await self.transport.__aenter__()
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        async with self._lock:
-            if not self.closed:
-                await self.transport.__aexit__(*args)
-                self.closed = True
-
-    async def aclose(self) -> None:
-        async with self._lock:
-            if not self.closed:
-                await self.transport.aclose()
-                self.closed = True
-
-
-def _retryable_transports(client: Any) -> tuple[_RetryableTransport, ...]:
-    transports: dict[int, _RetryableTransport] = {}
-
-    def wrap(transport: Any) -> _RetryableTransport:
-        key = id(transport)
-        if key not in transports:
-            transports[key] = _RetryableTransport(transport)
-        return transports[key]
-
-    # HTTPX marks the client closed before closing these transports.
-    client._transport = wrap(client._transport)
-    client._mounts = {
-        key: wrap(transport) if transport is not None else None
-        for key, transport in client._mounts.items()
-    }
-    return tuple(transports.values())
-
-
 class HTTPTools:
     """Manage named native HTTPX2 clients for one workspace kernel."""
 
@@ -208,7 +162,7 @@ class HTTPTools:
         self._ensure_dependencies = ensure_dependencies
         self._clients: dict[tuple[str, str, str], Any] = {}
         self._options: dict[tuple[str, str, str], dict[str, Any]] = {}
-        self._transports: dict[int, tuple[_RetryableTransport, ...]] = {}
+        self._transports: dict[int, tuple[RetryableTransport, ...]] = {}
         self._closed = False
         self._shutdown_task: asyncio.Task[None] | None = None
         self._html = None
@@ -495,7 +449,7 @@ class HTTPTools:
 
         option_snapshot = self._snapshot_options(requested)
         created = httpx2.AsyncClient(**requested)
-        self._transports[id(created)] = _retryable_transports(created)
+        self._transports[id(created)] = retryable_transports(created)
         self._clients[key] = created
         self._options[key] = option_snapshot
         return created
@@ -665,10 +619,7 @@ class HTTPTools:
 
     async def _close_client(self, client: Any) -> None:
         transports = self._transports.get(id(client))
-        if client.is_closed and transports is not None:
-            await _close_all(transports)
-        else:
-            await client.aclose()
+        await close_client(client, transports)
         self._transports.pop(id(client), None)
 
     async def _close_clients(self) -> None:
@@ -696,13 +647,6 @@ async def _run_blocking(function: Callable[..., Any], *args: Any) -> Any:
 
 async def _wait_uncancelled(task: asyncio.Task[Any]) -> Any:
     return await wait_owned(task)
-
-
-async def _close_all(clients: tuple[Any, ...]) -> None:
-    results = await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
 
 
 __all__ = ["BodyTooLarge", "HTTPTools"]

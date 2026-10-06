@@ -1,5 +1,6 @@
 """Durable execution results for cells that replace their own manager."""
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -35,6 +36,33 @@ def restart_id_for_execution(workspace, exec_id):
         return None
     ident = record.get("restart_id")
     return ident if isinstance(ident, str) else None
+
+
+def restart_request_matches(workspace, exec_id, code):
+    """Verify a retry's source against the durable restart origin record."""
+
+    if (
+        not isinstance(exec_id, str)
+        or len(exec_id) != 32
+        or any(character not in "0123456789abcdef" for character in exec_id)
+        or not isinstance(code, str)
+    ):
+        return False
+    path = Path(workspace) / ".mypr" / "runs" / f"{exec_id}.json"
+    try:
+        record = _read_record(path)
+    except (OSError, ValueError, TypeError):
+        return False
+    source = record.get("code")
+    if isinstance(source, str):
+        return source == code
+    digest = record.get("code_sha256")
+    return (
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and hashlib.sha256(code.encode("utf-8", "backslashreplace")).hexdigest() == digest
+    )
 
 
 def finalize_origin(workspace, ticket):
@@ -77,7 +105,7 @@ def finalize_origin(workspace, ticket):
         history.close()
 
 
-def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None):
+def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None, strict_budget=None):
     from .restart import read_ticket
 
     if (
@@ -100,6 +128,10 @@ def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None):
     if not ticket or (ticket.get("origin") or {}).get("exec_id") != exec_id:
         return None
     budget = 32768 if max_bytes is None else max_bytes
+    if strict_budget is None:
+        strict_budget = max_bytes is not None
+    if type(strict_budget) is not bool:
+        raise TypeError("strict_budget must be a boolean")
     if type(budget) is not int or not 1024 <= budget <= 1048576:
         raise RPCError("max_bytes must be between 1024 and 1048576 bytes", code="invalid_request")
     error = ticket.get("error") if ticket["state"] == "failed" else None
@@ -112,11 +144,12 @@ def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None):
     if state in {"succeeded", "failed"}:
         # The coordinator does not write the manager's output journal.
         _, total = read_page(path.with_suffix(".jsonl"), 0, 0) if not evicted else ([], 0)
-        if not evicted and not 0 <= cursor <= total + 1:
+        logical_total = total + bool(record.get("restart_result"))
+        if not evicted and not 0 <= cursor <= logical_total:
             raise ValueError("Invalid output cursor")
         if cursor <= total and not evicted:
             events, count = read_page(path.with_suffix(".jsonl"), cursor, budget, error_size)
-            if events and max_bytes is not None:
+            if events and strict_budget:
                 _check_budget(events[0], error_size, budget, cursor)
             if cursor + len(events) == total and record.get("restart_result"):
                 final = {"type": "result", "text": record["restart_result"]}
@@ -125,10 +158,10 @@ def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None):
                     or len(json.dumps([*events, final], ensure_ascii=False).encode())
                     + error_size <= budget
                 ):
-                    if not events and max_bytes is not None:
+                    if not events and strict_budget:
                         _check_budget(final, error_size, budget, cursor)
                     events.append(final)
-        count = total + bool(record.get("restart_result")) if not evicted else cursor
+        count = logical_total if not evicted else cursor
     return {
         "exec_id": exec_id,
         "client_id": record.get("client_id"),

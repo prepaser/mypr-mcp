@@ -235,6 +235,7 @@ class Storage:
         result: dict[str, Any] = {
             "active_ids": set(),
             "protected_paths": set(),
+            "known_owner_ids": set(),
             "references": {},
             "references_truncated": False,
             "tombstones": {},
@@ -286,6 +287,17 @@ class Storage:
         if len(protected_values) > scoped_limit:
             result["references_truncated"] = True
         result["protected_paths"] = self._safe_relative_set(protected_values[:scoped_limit])
+        known_source = raw.get("known_owner_ids", ())
+        if not isinstance(known_source, Iterable):
+            known_source = ()
+        known_values = list(islice(known_source, scoped_limit + 1))
+        if len(known_values) > scoped_limit:
+            result["references_truncated"] = True
+        result["known_owner_ids"] = {
+            value
+            for value in known_values[:scoped_limit]
+            if isinstance(value, str) and value
+        }
         references = raw.get("references", {})
         if isinstance(references, Mapping):
             reference_limit = (
@@ -611,6 +623,7 @@ class Storage:
             history_state["mail"] = self._mail_snapshot()
             database_state = self._database_snapshot(options)
             active = active_ids | set(history_state["active_ids"])
+            history_state["active_ids"] = active
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
             candidates = self._candidates(entries, records, protected, options, history_state)
@@ -719,6 +732,7 @@ class Storage:
                     "database": database_result,
                 }
             active = self._active_ids() | set(history_state["active_ids"])
+            history_state["active_ids"] = active
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
             current_candidates = {
@@ -1053,7 +1067,14 @@ class Storage:
             entry.relative for entry in entries if entry.relative.endswith(".lock")
         }
         protected_paths.update(history_state.get("protected_paths", set()))
-        active_ids = {record.ident for record in records if record.active}
+        active_ids = {
+            *history_state.get("active_ids", ()),
+            *(record.ident for record in records if record.active),
+        }
+        known_owner_ids = {
+            *history_state.get("known_owner_ids", ()),
+            *(record.ident for record in records),
+        }
         references: dict[str, set[str]] = defaultdict(set)
         active_references: set[str] = set()
         for record in records:
@@ -1106,6 +1127,7 @@ class Storage:
         return {
             "paths": sorted(protected_paths | active_references),
             "active_ids": sorted(active_ids),
+            "known_owner_ids": sorted(known_owner_ids),
             "references": {key: sorted(value) for key, value in references.items()},
             "tombstones": dict(history_state.get("tombstones", {})),
             "mail": self._public_mail_state(mail_state),
@@ -1123,6 +1145,8 @@ class Storage:
             return []
         protected_paths = set(protected["paths"])
         references = protected["references"]
+        known_owner_ids = set(protected.get("known_owner_ids", ()))
+        active_owner_ids = set(protected.get("active_ids", ()))
         record_by_id = {record.ident: record for record in records}
         revision_refs = self._revision_refs(entries, options["revision_keep"])
         revision_protect_all = revision_refs is None
@@ -1188,9 +1212,10 @@ class Storage:
                 requires_tombstone = True
             elif entry.category == "artifacts":
                 owners = references.get(entry.relative, [])
-                if not owners or any(
-                    record_by_id.get(owner, _Record("", None, True, frozenset())).active
-                    for owner in owners
+                if (
+                    not owners
+                    or any(owner not in known_owner_ids for owner in owners)
+                    or any(owner in active_owner_ids for owner in owners)
                 ):
                     continue
                 reason = "generated_artifact"
@@ -1781,12 +1806,17 @@ class Storage:
         candidates = list(result.get("candidates", ()))
         tombstones = list(result.get("tombstones", ()))
         protected = dict(result.get("protected", {}))
+        protected.pop("known_owner_ids", None)
         paths = list(protected.get("paths", ()))
         references = dict(protected.get("references", {}))
+        active_ids = list(protected.get("active_ids", ()))
         result["candidates"] = candidates[:_MAX_PUBLIC_ITEMS]
         result["tombstones"] = tombstones[:_MAX_PUBLIC_ITEMS]
         protected["paths"] = paths[:_MAX_PUBLIC_ITEMS]
         protected["references"] = dict(list(references.items())[:_MAX_PUBLIC_ITEMS])
+        protected["active_ids"] = active_ids[:_MAX_PUBLIC_ITEMS]
+        protected["active_id_count"] = len(active_ids)
+        protected["active_ids_truncated"] = len(active_ids) > _MAX_PUBLIC_ITEMS
         result["protected"] = protected
         database = dict(result.get("database", {}))
         database_ids = list(database.get("selected_ids", ()))
@@ -1817,6 +1847,7 @@ class Storage:
                 len(tombstones) > _MAX_PUBLIC_ITEMS,
                 len(paths) > _MAX_PUBLIC_ITEMS,
                 len(references) > _MAX_PUBLIC_ITEMS,
+                len(active_ids) > _MAX_PUBLIC_ITEMS,
                 database["public_truncated"],
             )
         )

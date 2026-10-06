@@ -270,7 +270,8 @@ def test_storage_gc_normalizes_artifacts_and_scan_metadata(tmp_path):
         assert marked == [".mypr/artifacts/exec/image.png", ".mypr/scans/request.xml"]
         assert history.get("job")["scan_output_evicted"]
         updated = history.get("exec")
-        assert updated["output_evicted"]
+        assert updated["artifact_evicted"]
+        assert "output_evicted" not in updated
         assert updated["code"] == "display('x')"
         assert updated["messages"] == ["keep"]
         assert updated["client_id"] == "client"

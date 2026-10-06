@@ -15,6 +15,7 @@ import httpx2
 
 from .config import validate_web_config
 from .diagnostics import RPCError, safe_text
+from .http_transport import RetryableTransport, close_client, retryable_transports
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_RESULT_URL_BYTES = 8 * 1024
@@ -42,6 +43,7 @@ class WebTransport:
         self._transport = transport
         self._client_factory = client_factory
         self._clients: dict[str, Any] = {}
+        self._transports: dict[int, tuple[RetryableTransport, ...]] = {}
         self._client_lock = asyncio.Lock()
         self._slots = asyncio.Semaphore(self.config["max_concurrency"])
         self._closed = False
@@ -77,10 +79,24 @@ class WebTransport:
 
     async def close(self) -> None:
         self._closed = True
-        clients = tuple(self._clients.values())
-        self._clients.clear()
-        if clients:
-            await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+        clients = tuple(self._clients.items())
+        results = await asyncio.gather(
+            *(self._close_client(client) for _, client in clients), return_exceptions=True
+        )
+        failures: list[BaseException] = []
+        for (provider, client), result in zip(clients, results, strict=True):
+            if isinstance(result, BaseException):
+                failures.append(result)
+            elif self._clients.get(provider) is client:
+                self._clients.pop(provider, None)
+                self._transports.pop(id(client), None)
+        if failures:
+            raise failures[0]
+
+    async def _close_client(self, client: Any) -> None:
+        transports = self._transports.get(id(client))
+        await close_client(client, transports)
+        self._transports.pop(id(client), None)
 
     def _select_provider(self, provider: str | None) -> str:
         if provider is not None and (not isinstance(provider, str) or provider not in _PROVIDERS):
@@ -142,7 +158,9 @@ class WebTransport:
                 client = httpx2.AsyncClient(**kwargs)
             else:
                 client = self._client_factory(provider, **kwargs)
+            transports = retryable_transports(client)
             self._clients[provider] = client
+            self._transports[id(client)] = transports
             return client
 
     async def _request(

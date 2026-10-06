@@ -131,8 +131,13 @@ def _persist_execution(
 
 
 def _load_execution(path):
-    with open_regular(path) as stream:
-        raw = stream.read(MAX_MESSAGE + 1)
+    try:
+        with open_regular(path) as stream:
+            raw = stream.read(MAX_MESSAGE + 1)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"execution record is unreadable: {exc}") from exc
     if len(raw) > MAX_MESSAGE:
         raise ValueError("execution record exceeds its size limit")
     record = json.loads(raw)
@@ -1324,7 +1329,12 @@ class Runtime:
             await recover_ticket(self.workspace, rec["restart_id"])
         if cold or rec.get("restart_id"):
             restarted = await self.io(
-                poll_restart, self.workspace, ident, cursor, max_bytes=max_bytes
+                poll_restart,
+                self.workspace,
+                ident,
+                cursor,
+                max_bytes=response_budget,
+                strict_budget=explicit_budget,
             )
             if restarted is not None:
                 if explicit_budget:

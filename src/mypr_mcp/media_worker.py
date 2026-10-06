@@ -17,6 +17,12 @@ _MAX_RENDER_PIXELS = 4_000_000
 _MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
 
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8", "backslashreplace"
+    )
+
+
 class _Failure(Exception):
     def __init__(self, kind: str, message: str) -> None:
         self.kind = kind
@@ -532,7 +538,7 @@ def main() -> None:
             "kind": type(exc).__name__,
             "error": f"Media operation failed: {str(exc)[:1024]}",
         }
-    sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.buffer.write(_json_bytes(response))
 
 
 if __name__ == "__main__":

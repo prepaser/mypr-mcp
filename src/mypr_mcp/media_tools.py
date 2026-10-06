@@ -15,6 +15,7 @@ from typing import Any
 
 from .async_utils import finish_owned, wait_owned
 from .document_tools import DocumentExtractor, _preflight_file
+from .json_utils import json_bytes
 
 _WORKER = Path(__file__).with_name("media_worker.py")
 _GUARD = Path(__file__).with_name("process_guard.py")
@@ -344,11 +345,10 @@ class Documents:
 async def _call(
     operation: str, path: Path, display: str, options: dict[str, Any]
 ) -> dict[str, Any]:
-    request = json.dumps(
+    request = json_bytes(
         {"operation": operation, "path": str(path), "display": display, **options},
-        ensure_ascii=False,
         separators=(",", ":"),
-    ).encode("utf-8")
+    )
     if len(request) > 64 * 1024:
         raise ValueError("Media request exceeds its size limit")
     env = {

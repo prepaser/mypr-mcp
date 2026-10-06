@@ -352,6 +352,9 @@ class DependencyStore:
             if task is None:
                 task = asyncio.create_task(self._install(name), name=f"mypr-install:{name}")
                 self._inflight[name] = task
+                task.add_done_callback(
+                    lambda task, name=name: self._release_inflight(name, task)
+                )
         try:
             return await asyncio.shield(task)
         finally:
@@ -373,6 +376,9 @@ class DependencyStore:
             if task is None:
                 task = asyncio.create_task(self._install(name), name=f"mypr-install:{name}")
                 self._inflight[name] = task
+                task.add_done_callback(
+                    lambda task, name=name: self._release_inflight(name, task)
+                )
         try:
             result = await asyncio.shield(task)
             if result.get("source") == "system":
@@ -929,6 +935,12 @@ class DependencyStore:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _release_inflight(self, name: str, task: asyncio.Task[Any]) -> None:
+        if self._inflight.get(name) is task:
+            self._inflight.pop(name, None)
+        if not task.cancelled():
+            task.exception()
 
 
 def _lock_name(name: str) -> str:

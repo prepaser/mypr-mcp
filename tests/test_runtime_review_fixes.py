@@ -264,6 +264,26 @@ async def test_corrupt_cold_execution_poll_has_classified_error(tmp_path, value)
     assert failed.value.details["outcome_unknown"] is True
 
 
+async def test_unreadable_cold_execution_poll_does_not_poison_runtime(tmp_path):
+    runtime = Runtime(tmp_path)
+    runtime.healthy = True
+    ident = "b" * 32
+    (runtime.root / "runs").mkdir()
+    (runtime.root / "runs" / f"{ident}.json").mkdir()
+
+    async def direct_io(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    runtime.io = direct_io
+
+    with pytest.raises(RPCError) as failed:
+        await runtime.poll(ident, wait_ms=0)
+
+    assert failed.value.code == "execution_metadata_corrupt"
+    assert runtime.healthy
+    assert runtime.health_error is None
+
+
 async def test_attach_rejects_corrupt_history_before_creating_handle(monkeypatch):
     import mypr_mcp.kernel_api as api
 

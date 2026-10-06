@@ -511,6 +511,37 @@ async def test_cancellation_while_waiting_for_lock_does_not_leak_lock(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_cancellation_of_last_waiter_releases_completed_install(tmp_path, monkeypatch):
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def inspect(_name):
+        return {"status": "missing"}
+
+    async def install(_name):
+        started.set()
+        await release.wait()
+        return {"status": "installed"}
+
+    monkeypatch.setattr(store, "inspect", inspect)
+    monkeypatch.setattr(store, "_install", install)
+    request = asyncio.create_task(store.ensure("rg"))
+    await asyncio.wait_for(started.wait(), 1)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    release.set()
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if not store._inflight:
+            break
+    assert not store._inflight
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_cancellation_after_temp_directory_creation_cleans_directory(tmp_path, monkeypatch):
     from mypr_mcp import dependency_store
 

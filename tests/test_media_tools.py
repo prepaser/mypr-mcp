@@ -204,6 +204,29 @@ async def test_media_worker_output_is_capped_and_process_reaped(tmp_path, monkey
     _assert_process_reaped(int(pid_path.read_text()))
 
 
+async def test_media_worker_round_trips_surrogateescaped_paths_before_dependencies(
+    tmp_path, monkeypatch
+):
+    from mypr_mcp import media_tools
+
+    worker = tmp_path / "echo-worker.py"
+    worker.write_text(
+        "import json, sys\n"
+        "request = json.loads(sys.stdin.buffer.read())\n"
+        "response = {'ok': True, 'result': {"
+        "'path': request['path'], 'display': request['display']}}\n"
+        "encoded = json.dumps(response, ensure_ascii=False, separators=(',', ':'))\n"
+        "sys.stdout.buffer.write(encoded.encode('utf-8', 'backslashreplace'))\n"
+    )
+    monkeypatch.setattr(media_tools, "_WORKER", worker)
+    path = tmp_path / os.fsdecode(b"input-\xff.png")
+    display = os.fsdecode(b"display-\xff.png")
+
+    result = await media_tools._call("test", path, display, {})
+
+    assert result == {"path": str(path), "display": display}
+
+
 async def test_cancelled_media_worker_is_reaped(tmp_path, monkeypatch):
     from mypr_mcp import media_tools
 

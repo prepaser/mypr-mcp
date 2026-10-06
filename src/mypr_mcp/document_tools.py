@@ -23,6 +23,7 @@ from typing import Any
 
 from .async_utils import wait_owned
 from .file_io import open_regular
+from .json_utils import json_bytes
 from .storage_lock import StorageLock
 
 _WORKER = Path(__file__).with_name("document_worker.py")
@@ -95,7 +96,7 @@ class _ResultStore:
                 }
             )
             payload["resume"] = resume
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        encoded = json_bytes(payload, separators=(",", ":"))
         if len(encoded) > _MAX_RESULT_BYTES:
             raise DocumentToolError("Document result exceeds its 7 MiB snapshot limit")
         with self._store_locked():
@@ -903,16 +904,15 @@ async def _run_worker(
     *,
     limit_seconds: int = _TIMEOUT,
 ) -> dict[str, Any]:
-    request = json.dumps(
+    request = json_bytes(
         {
             "operation": operation,
             "path": str(path) if path is not None else None,
             "display": display,
             **options,
         },
-        ensure_ascii=False,
         separators=(",", ":"),
-    ).encode()
+    )
     if len(request) > 64 * 1024:
         raise ValueError("Document request exceeds its size limit")
     env = {

@@ -7,11 +7,28 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.lsp_edits import EditError, EditPlan, EditPlanStore, PlannedOperation, sha256
+from mypr_mcp.code_tools import _uri_path
+from mypr_mcp.lsp_edits import (
+    EditError,
+    EditPlan,
+    EditPlanStore,
+    PlannedOperation,
+    _safe_path,
+    sha256,
+)
 
 
 def _operation(path: Path) -> PlannedOperation:
     return PlannedOperation("update", path, b"old\n", b"new\n", sha256(b"old\n"))
+
+
+def test_file_uri_preserves_surrogateescaped_names(tmp_path: Path):
+    path = tmp_path / os.fsdecode(b"name-\xff.py")
+    path.write_bytes(b"source\n")
+    uri = path.as_uri()
+
+    assert _uri_path(uri) == path
+    assert _safe_path(tmp_path, uri) == path
 
 
 def test_lsp_plan_preconditions_and_documents_roundtrip(tmp_path: Path):

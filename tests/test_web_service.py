@@ -42,6 +42,18 @@ class Transport:
         self.closed = True
 
 
+class CloseOnceTransport(Transport):
+    def __init__(self, config):
+        super().__init__(config)
+        self.close_calls = 0
+
+    async def close(self):
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise RuntimeError("temporary web transport failure")
+        self.closed = True
+
+
 def test_pages_preserve_unicode_and_failures_without_exceeding_budget():
     store = WebSnapshots()
     text = '한글 😀 \\"\n' * 3000
@@ -165,6 +177,46 @@ async def test_config_reload_defers_even_force_and_waiting_requests_are_active()
     finally:
         old.release.set()
         await asyncio.gather(*(task for task in (first, second) if task), return_exceptions=True)
+        await service.close()
+
+
+async def test_config_reload_retains_failed_old_transport_for_retry():
+    created = []
+
+    def factory(config):
+        transport = CloseOnceTransport(config)
+        created.append(transport)
+        return transport
+
+    service = WebService(CONFIG, transport_factory=factory)
+    old = service.transport
+    desired = copy.deepcopy(service.config)
+    desired["max_concurrency"] = 2
+    try:
+        applied = await service.apply_config(desired)
+        assert applied["applied"] == ["web"]
+        assert "temporary web transport failure" in applied["errors"]["cleanup"]
+        assert service.transport is not old
+        assert service._retired_transports == [old]
+        await service.apply_config(service.config)
+        assert old.close_calls == 2
+        assert not service._retired_transports
+    finally:
+        try:
+            await service.close()
+        except RuntimeError:
+            await service.close()
+
+
+async def test_close_retries_failed_web_transport():
+    service = WebService(CONFIG, transport_factory=CloseOnceTransport)
+    try:
+        with pytest.raises(RuntimeError, match="temporary web transport failure"):
+            await service.close()
+        assert service.transport.close_calls == 1
+        await service.close()
+        assert service.transport.close_calls == 2
+    finally:
         await service.close()
 
 

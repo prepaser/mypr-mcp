@@ -15,7 +15,11 @@ from .diagnostics import RPCError
 from .mail_store import MailStore
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, recover_ticket, wait_ticket
-from .restart_records import poll_restart, restart_id_for_execution
+from .restart_records import (
+    poll_restart,
+    restart_id_for_execution,
+    restart_request_matches,
+)
 from .timers import TimerStore
 from .transport import HANDSHAKE_TIMEOUT, attachment, find_runtime, rpc
 
@@ -78,13 +82,21 @@ class ConnectionBridge:
     def _decorate(self, result, *, init=False):
         if self._state is None:
             return result
+        if result.get("generation") is not None and result["generation"] != self.generation:
+            return result
         full = init or self._reported_generation != self.generation
         info = runtime_info(self._state, include_instructions=full)
         self._reported_generation = self.generation
         return {**result, "runtime": info}
 
-    def _restart_result(self, exec_id, cursor, max_bytes):
-        result = poll_restart(self.workspace, exec_id, cursor, max_bytes=max_bytes)
+    def _restart_result(self, exec_id, cursor, max_bytes, strict_budget):
+        result = poll_restart(
+            self.workspace,
+            exec_id,
+            cursor,
+            max_bytes=max_bytes,
+            strict_budget=strict_budget,
+        )
         if result is None or self.client_id is None:
             return result, None
         preview, due_at = TimerStore.snapshot_existing(
@@ -99,16 +111,29 @@ class ConnectionBridge:
 
     async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
         await self._recover_restart(exec_id)
-        if wait_ms is None:
+        strict_budget = max_bytes is not None
+        snapshot = None
+        if max_bytes is None or wait_ms is None:
             try:
                 snapshot = await asyncio.to_thread(ConfigStore(self.workspace).load)
-                wait_ms = snapshot.values["limits"]["poll_wait_ms"]
             except (ConfigError, OSError, RuntimeError):
-                wait_ms = DEFAULT_LIMITS["poll_wait_ms"]
+                snapshot = None
+        if max_bytes is None:
+            max_bytes = (
+                snapshot.values["limits"]["response_bytes"]
+                if snapshot is not None
+                else DEFAULT_LIMITS["response_bytes"]
+            )
+        if wait_ms is None:
+            wait_ms = (
+                snapshot.values["limits"]["poll_wait_ms"]
+                if snapshot is not None
+                else DEFAULT_LIMITS["poll_wait_ms"]
+            )
         deadline = time.monotonic() + min(30000, max(0, wait_ms)) / 1000
         while True:
             result, due_at = await asyncio.to_thread(
-                self._restart_result, exec_id, cursor, max_bytes
+                self._restart_result, exec_id, cursor, max_bytes, strict_budget
             )
             if (
                 result is None
@@ -178,13 +203,21 @@ class ConnectionBridge:
         connection_id = self.connection_id
         try:
             result = await call_manager(connection_id)
-        except ConnectionError, OSError, RuntimeError:
+        except (ConnectionError, OSError):
             ticket = self._ticket()
             origin = (ticket or {}).get("origin") or {}
+            request_id = fields.get("request_id")
             if (
                 op == "execute"
                 and origin.get("connection_id") == connection_id
-                and origin.get("request_id") == fields.get("request_id")
+                and request_id is not None
+                and origin.get("request_id") == request_id
+                and await asyncio.to_thread(
+                    restart_request_matches,
+                    self.workspace,
+                    origin.get("exec_id"),
+                    fields.get("code"),
+                )
             ):
                 result = await self._poll_restart(
                     origin["exec_id"],

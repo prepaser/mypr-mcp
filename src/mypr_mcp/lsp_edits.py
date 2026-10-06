@@ -6,6 +6,7 @@ import asyncio
 import difflib
 import hashlib
 import math
+import os
 import re
 import stat
 import threading
@@ -135,12 +136,12 @@ def _safe_path(root: Path, value: Any) -> Path:
     parsed = value
     if not parsed.startswith("file://"):
         raise EditError("LSP workspace edits must use file URIs")
-    from urllib.parse import unquote, urlparse
+    from urllib.parse import unquote_to_bytes, urlparse
 
     uri = urlparse(parsed)
     if uri.netloc not in ("", "localhost"):
         raise EditError("LSP workspace edit URI is outside the workspace")
-    path = Path(unquote(uri.path))
+    path = Path(os.fsdecode(unquote_to_bytes(uri.path)))
     resolved = path.resolve(strict=False)
     try:
         resolved.relative_to(root)

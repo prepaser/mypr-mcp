@@ -4,6 +4,7 @@ import fcntl
 import os
 import stat
 import sys
+import venv
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,25 @@ def test_automatic_noop_does_not_invoke_uv_or_touch_manifest(tmp_path, monkeypat
     assert result["already_satisfied"] == ["pillow"]
     assert result["durability"] == "unchanged"
     assert manifest.read_text() == "existing==1\n"
+
+
+def test_probe_suppresses_registered_module_import_output(tmp_path):
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    sites = list((environment / "lib").glob("python*/site-packages"))
+    assert len(sites) == 1
+    (sites[0] / "tomlkit.py").write_text("print('package import banner')\n")
+    metadata = sites[0] / "tomlkit-0.15.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: tomlkit\nVersion: 0.15.0\n"
+    )
+
+    result = package_worker._probe_environment(
+        environment / "bin" / "python", ["tomlkit"]
+    )
+
+    assert result["imports"]["tomlkit"] == {"ok": True}
 
 
 def test_automatic_install_pins_existing_distributions(tmp_path, monkeypatch):
@@ -200,6 +220,12 @@ def test_automatic_install_rejects_existing_version_changes(tmp_path, monkeypatc
             sys.executable, root, ["pillow"], uv=str(uv), automatic=True
         )
     assert manifest.read_text() == "old==1\n"
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_package_lock_rejects_nonfinite_timeout(timeout):
+    with pytest.raises(ValueError, match="finite positive"):
+        package_worker._lock(None, timeout)
 
 
 @pytest.mark.parametrize("spec", ["pillow>=1", "requests", "https://example.invalid/pkg"])

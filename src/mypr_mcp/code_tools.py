@@ -19,12 +19,13 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 from .async_utils import finish_owned, wait_owned
 from .config import ConfigSnapshot, ConfigStore
 from .file_io import PersistedFileError
 from .file_io import read_bytes as read_persisted_bytes
+from .json_utils import json_bytes
 from .lsp_config import validate_configuration, validate_servers
 from .lsp_edits import (
     EditError,
@@ -205,7 +206,7 @@ def _uri_path(uri: Any) -> Path | None:
     parsed = urlparse(uri)
     if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
         return None
-    return Path(unquote(parsed.path))
+    return Path(os.fsdecode(unquote_to_bytes(parsed.path)))
 
 
 def _source_lines(text: str) -> list[str]:
@@ -213,7 +214,7 @@ def _source_lines(text: str) -> list[str]:
 
 
 def _json_size(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return len(json_bytes(value, separators=(",", ":")))
 
 
 def _stored_action_size(
@@ -617,7 +618,7 @@ class _LanguageServer:
         if self._failure:
             raise CodeError(self._failure)
         try:
-            body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            body = json_bytes(message, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             raise CodeError(f"LSP message is not JSON serializable: {exc}") from exc
         if len(body) > MAX_MESSAGE_BYTES:
