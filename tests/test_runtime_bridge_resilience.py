@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,56 @@ import pytest
 import mypr_mcp.bridge as bridge_module
 import mypr_mcp.runtime as runtime_module
 from mypr_mcp.bridge import ConnectionBridge
+from mypr_mcp.diagnostics import RPCError
 from mypr_mcp.runtime import Runtime
+
+
+@pytest.mark.parametrize("matching", [True, False])
+async def test_bridge_recovers_admitted_restart_after_stopping_rpc_error(
+    tmp_path, monkeypatch, matching
+):
+    bridge = ConnectionBridge(tmp_path)
+    bridge._state = {"generation": "old"}
+    bridge.path = tmp_path / "old.sock"
+    code = "await ws.restart()"
+    exec_id = "a" * 32
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    (runs / f"{exec_id}.json").write_text(json.dumps({"code": code}))
+    ticket = {"old_generation": "old", "origin": {
+        "connection_id": bridge.connection_id, "exec_id": exec_id, "request_id": "request",
+    }}
+    requests = []
+    polls = []
+
+    async def rpc(path, **fields):
+        assert path == tmp_path / "old.sock"
+        requests.append(fields)
+        bridge._state = {"generation": "new"}
+        bridge.path = tmp_path / "new.sock"
+        bridge.connection_id = "new-connection"
+        raise RPCError("RuntimeError: Workspace manager is stopping", error_type="RuntimeError")
+
+    async def poll(exec_id, *args):
+        polls.append(exec_id)
+        return {"exec_id": exec_id, "state": "succeeded"}
+
+    monkeypatch.setattr(bridge, "wait_ready", _noop)
+    monkeypatch.setattr(bridge, "_decorate", lambda result: result)
+    monkeypatch.setattr(bridge, "_poll_restart", poll)
+    monkeypatch.setattr(bridge_module, "active_ticket", lambda _: None)
+    monkeypatch.setattr(bridge_module, "read_ticket", lambda _: ticket)
+    monkeypatch.setattr(bridge_module, "rpc", rpc)
+    submitted = code if matching else "print('different')"
+    if matching:
+        result = await bridge.request("execute", code=submitted, request_id="request")
+        assert result["state"] == "succeeded"
+        assert polls == [exec_id]
+    else:
+        with pytest.raises(RPCError, match="stopping"):
+            await bridge.request("execute", code=submitted, request_id="request")
+        assert not polls
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio

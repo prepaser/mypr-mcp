@@ -58,6 +58,22 @@ def _kernel_class():
     class WorkspaceKernel(IPythonKernel):
         async def execute_request(self, stream, ident, parent):
             metadata = (parent or {}).get("metadata", {})
+            if isinstance(metadata, dict) and metadata.get("mypr_control") == "lifecycle_abort":
+                result = {
+                    "status": "ok", "execution_count": 0,
+                    "user_expressions": {}, "payload": [],
+                }
+                try:
+                    if metadata.get("generation") != os.environ.get("MYPR_GENERATION"):
+                        raise RuntimeError("Expired lifecycle generation")
+                    exec_id = metadata.get("exec_id")
+                    if not isinstance(exec_id, str) or not exec_id:
+                        raise ValueError("Lifecycle recovery requires an execution ID")
+                    self._mypr_workspace.tasks._abort_lifecycle(exec_id)
+                except Exception as exc:
+                    result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
+                self.session.send(stream, "execute_reply", result, parent, ident=ident)
+                return
             if isinstance(metadata, dict) and metadata.get("mypr_control") == "cleanup":
                 result = {
                     "status": "ok",

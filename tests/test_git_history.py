@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import threading
@@ -304,9 +305,62 @@ async def test_commit_info_includes_root_metadata_unicode_files_and_exact_pages(
     assert page["files"] == [
         {"status": "A", "path": "한글.txt", "additions": 1, "deletions": 0}
     ]
-    import json
-
     assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()) <= 1024
+
+
+@pytest.mark.asyncio
+async def test_commit_info_patch_pages_are_bounded_and_reassemble(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "large.txt").write_text("한글 line\n" * 3000, encoding="utf-8")
+    commit = _commit(tmp_path, "large patch", "Ada", "2020-06-01T12:00:00+0000")
+    api = Git(tmp_path, ShellRunner())
+
+    page = await api.commit_info(
+        commit, include_files=False, include_patch=True, max_bytes=4096
+    )
+    parts = [page["patch"]]
+    while page["next_cursor"]:
+        encoded = json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()
+        assert len(encoded) <= 4096
+        page = await api.commit_info(cursor=page["next_cursor"], max_bytes=4096)
+        parts.append(page["patch"])
+    encoded = json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(encoded) <= 4096
+
+    complete = await api.commit_info(
+        commit, include_files=False, include_patch=True, max_bytes=16 * 1024 * 1024
+    )
+    assert "".join(parts) == complete["patch"]
+
+
+@pytest.mark.asyncio
+async def test_commit_info_initial_snapshot_id_is_included_in_budget(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "empty.txt").write_text("content\n", encoding="utf-8")
+    _commit(tmp_path, "description " + "a" * 1500, "Ada", "2020-06-01T12:00:00+0000")
+    api = Git(tmp_path, ShellRunner())
+    page = await api.commit_info(include_files=False, include_patch=False)
+    budget_without_snapshot_id = len(
+        json.dumps(
+            {key: value for key, value in page.items() if key != "snapshot_id"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    )
+
+    with pytest.raises(ValueError, match="metadata"):
+        await api.commit_info(
+            include_files=False,
+            include_patch=False,
+            max_bytes=budget_without_snapshot_id,
+        )
+
+    page = await api.commit_info()
+    exact_budget = len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode())
+    fitted = await api.commit_info(max_bytes=exact_budget)
+    assert fitted["files"] == page["files"]
+    encoded = json.dumps(fitted, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(encoded) == exact_budget
 
 
 @pytest.mark.asyncio

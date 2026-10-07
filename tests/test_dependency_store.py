@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.dependency_store import DependencyError, DependencyStore
+from mypr_mcp.dependency_store import DependencyError, DependencyStore, _run_version
 
 
 @pytest.fixture(autouse=True)
@@ -392,6 +392,32 @@ async def test_system_binary_newer_than_minimum_is_reused(tmp_path, monkeypatch)
     assert result["status"] == "installed"
     assert result["version"] == "15.2.0"
     await store.close()
+
+
+def test_version_probe_rejects_invalid_utf8_without_leaking_decode_errors(tmp_path):
+    executable = tmp_path / "version"
+    executable.write_bytes(b"#!/bin/sh\nprintf 'rg 15.2.0\\377\\n'\n")
+    executable.chmod(0o755)
+
+    with pytest.raises(OSError, match="invalid UTF-8"):
+        _run_version(executable)
+
+
+def test_version_probe_bounds_output_and_terminates_process(tmp_path):
+    executable = tmp_path / "version"
+    executable.write_bytes(b"#!/bin/sh\nhead -c 100000 /dev/zero\n")
+    executable.chmod(0o755)
+
+    with pytest.raises(OSError, match="output exceeded"):
+        _run_version(executable)
+
+
+def test_version_probe_waits_for_process_after_stdout_closes(tmp_path):
+    executable = tmp_path / "version"
+    executable.write_bytes(b"#!/bin/sh\nexec 1>&-\nsleep 0.2\n")
+    executable.chmod(0o755)
+
+    assert _run_version(executable) == ""
 
 
 @pytest.mark.asyncio

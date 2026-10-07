@@ -71,6 +71,22 @@ async def test_list_applies_read_path_policy_to_symlinks(tmp_path: Path):
         skills.read("external-link")
 
 
+async def test_list_preserves_names_when_skills_root_is_a_workspace_symlink(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    shared = workspace / "shared-skills"
+    write_skill(shared, "demo", "# Demo\n")
+    root = workspace / ".mypr" / "skills"
+    root.parent.mkdir(parents=True)
+    root.symlink_to(shared, target_is_directory=True)
+    skills = Skills(workspace)
+
+    items = await skills.list()
+
+    assert [item["name"] for item in items] == ["demo"]
+    assert items[0]["path"] == str(root / "demo" / "SKILL.md")
+    assert skills.read("demo") == "# Demo\n"
+
+
 async def test_list_bounds_metadata_and_marks_incomplete_front_matter(tmp_path: Path):
     root = tmp_path / ".mypr" / "skills"
     write_skill(root, "large-body", "---\ndescription: Small\n---\n" + "한글" * 100_000)

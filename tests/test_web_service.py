@@ -257,6 +257,32 @@ async def test_reset_and_final_detach_cancel_requests_and_clear_pages():
         await service.close()
 
 
+async def test_reset_replaces_transport_when_cleanup_fails_and_retries_old_transport():
+    created = []
+
+    def factory(config):
+        transport = CloseOnceTransport(config) if not created else Transport(config)
+        created.append(transport)
+        return transport
+
+    service = WebService(CONFIG, transport_factory=factory)
+    old = service.transport
+    try:
+        await service.dispatch("search", "alice", {"query": "first", "max_bytes": 4096})
+        await service.reset()
+        assert service.transport is not old
+        assert old.close_calls == 1
+        assert service._retired_transports == [old]
+        assert not service.snapshots._snapshots
+
+        applied = await service.apply_config(service.config)
+        assert not applied["errors"]
+        assert old.close_calls == 2
+        assert not service._retired_transports
+    finally:
+        await service.close()
+
+
 async def test_default_selection_does_not_fall_back_for_unsupported_operations():
     service = WebService(CONFIG, transport_factory=Transport)
     try:

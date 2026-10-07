@@ -73,9 +73,10 @@ class ConnectionBridge:
         if self._stopped or self.path is None:
             raise RuntimeError("Workspace manager connection is closed")
 
-    def _ticket(self):
+    def _ticket(self, generation=None):
         ticket = read_ticket(self.workspace)
-        if ticket and ticket.get("old_generation") == self.generation:
+        generation = self.generation if generation is None else generation
+        if ticket and ticket.get("old_generation") == generation:
             return ticket
         return None
 
@@ -175,10 +176,10 @@ class ConnectionBridge:
             finally:
                 timing["bridge_ready"] += (time.perf_counter() - started) * 1000
 
-        async def call_manager(connection_id):
+        async def call_manager(path, connection_id):
             started = time.perf_counter()
             try:
-                return await rpc(self.path, op=op, connection_id=connection_id, **fields)
+                return await rpc(path, op=op, connection_id=connection_id, **fields)
             finally:
                 timing["manager_rpc"] += (time.perf_counter() - started) * 1000
 
@@ -200,11 +201,12 @@ class ConnectionBridge:
             if ticket is not None:
                 raise RuntimeError(f"Workspace is restarting: {ticket['id']}")
         await ready()
+        path, generation = self.path, self.generation
         connection_id = self.connection_id
         try:
-            result = await call_manager(connection_id)
-        except (ConnectionError, OSError):
-            ticket = self._ticket()
+            result = await call_manager(path, connection_id)
+        except (ConnectionError, OSError, RPCError):
+            ticket = self._ticket(generation)
             origin = (ticket or {}).get("origin") or {}
             request_id = fields.get("request_id")
             if (
@@ -238,7 +240,7 @@ class ConnectionBridge:
                     return self._decorate(result)
                 if ticket["state"] == "succeeded":
                     await ready()
-                    result = await call_manager(self.connection_id)
+                    result = await call_manager(self.path, self.connection_id)
                     return self._decorate(result)
             raise
         if op == "init":

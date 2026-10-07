@@ -18,6 +18,7 @@ _MAX_HISTORY_SNAPSHOTS = 32
 _MAX_HISTORY_SNAPSHOT_BYTES = 16 * 1024 * 1024
 _DEFAULT_RESPONSE_BYTES = 32 * 1024
 _MAX_COMMIT_SCAN_BYTES = 16 * 1024 * 1024
+_COMMIT_PATCH_CHARS = 16
 _HISTORY_SNAPSHOT_LOCK = threading.Lock()
 
 
@@ -443,12 +444,10 @@ class Git:
             warnings.extend(patch_result.get("warnings", []))
         else:
             patch = None
-        items: list[dict[str, Any]] = [{"kind": "file", "value": item} for item in records]
+        items: list[Any] = [{"kind": "file", "value": item} for item in records]
+        patch_start = len(items)
         if patch is not None:
-            items.extend(
-                {"kind": "patch", "value": chunk}
-                for chunk in self._chunk_text(patch, chunk_bytes=16)
-            )
+            items.extend([0] * ((len(patch) + _COMMIT_PATCH_CHARS - 1) // _COMMIT_PATCH_CHARS))
         query = {
             "ref": ref,
             "include_files": include_files,
@@ -464,10 +463,19 @@ class Git:
             commit=metadata,
             truncated=scan_truncated,
             warnings=warnings,
+            **(
+                {
+                    "patch": patch,
+                    "patch_start": patch_start,
+                    "patch_chunk_chars": _COMMIT_PATCH_CHARS,
+                }
+                if patch is not None
+                else {}
+            ),
         )
-        page = await asyncio.to_thread(self._commit_info_page, snapshot, 0, max_bytes)
-        page["snapshot_id"] = ident
-        return page
+        return await asyncio.to_thread(
+            self._commit_info_page, snapshot, 0, max_bytes, snapshot_id=ident
+        )
 
     async def blame(
         self,
@@ -663,7 +671,12 @@ class Git:
         return output
 
     def _commit_info_page(
-        self, snapshot: dict[str, Any], offset: int, max_bytes: int
+        self,
+        snapshot: dict[str, Any],
+        offset: int,
+        max_bytes: int,
+        *,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         metadata = snapshot.get("commit")
         if not isinstance(metadata, dict):
@@ -682,48 +695,106 @@ class Git:
             "scan_truncated": bool(snapshot.get("truncated")),
             "warnings": list(snapshot.get("warnings", [])),
         }
-        if len(json_bytes(base, separators=(",", ":"))) > max_bytes:
+        if snapshot_id is not None:
+            base["snapshot_id"] = snapshot_id
+        empty_size = len(json_bytes(base, separators=(",", ":")))
+        if empty_size > max_bytes:
             raise ValueError("max_bytes is too small for commit metadata; increase the budget")
-        selected: list[dict[str, Any]] = []
-        cursor_reserve = "x" * 128
-        patch = ""
-        index = offset
-        while index < len(snapshot["items"]):
-            item = snapshot["items"][index]
-            candidate_files = list(base["files"])
-            candidate_patch = patch
-            if item.get("kind") == "file":
-                candidate_files.append(item["value"])
-            else:
-                candidate_patch += item.get("value", "")
-            provisional_cursor = cursor_reserve if index + 1 < len(snapshot["items"]) else None
-            candidate = {
-                **base,
-                "files": candidate_files,
-                "patch": candidate_patch,
-                "cursor": provisional_cursor,
-                "next_cursor": provisional_cursor,
-                "has_more": provisional_cursor is not None,
-            }
+
+        # Exclude files, patch, both cursors, and the two mutable page flags.
+        static_size = empty_size - 2 - 2 - 8 - 5 - (4 if base["truncated"] else 5)
+        files: list[Any] = []
+        files_size = 2
+        patch_parts: list[str] = []
+        patch_inner_size = 0
+
+        compact_patch = snapshot.get("patch")
+        if compact_patch is not None:
+            patch_start = snapshot.get("patch_start")
+            chunk_chars = snapshot.get("patch_chunk_chars")
             if (
-                len(json_bytes(candidate, separators=(",", ":")))
-                > max_bytes
+                not isinstance(compact_patch, str)
+                or type(patch_start) is not int
+                or patch_start < 0
+                or patch_start > len(snapshot["items"])
+                or type(chunk_chars) is not int
+                or chunk_chars < 1
             ):
-                if not selected:
+                raise RuntimeError("invalid persisted commit patch")
+            patch_count = (len(compact_patch) + chunk_chars - 1) // chunk_chars
+            if len(snapshot["items"]) != patch_start + patch_count:
+                raise RuntimeError("invalid persisted commit patch")
+            item_count = len(snapshot["items"])
+
+            def item_at(item_index: int) -> dict[str, Any]:
+                if item_index < patch_start:
+                    item = snapshot["items"][item_index]
+                    if not isinstance(item, dict):
+                        raise RuntimeError("invalid persisted commit file")
+                    return item
+                start = (item_index - patch_start) * chunk_chars
+                return {"kind": "patch", "value": compact_patch[start : start + chunk_chars]}
+
+        else:
+            item_count = len(snapshot["items"])
+
+            def item_at(item_index: int) -> dict[str, Any]:
+                item = snapshot["items"][item_index]
+                if not isinstance(item, dict):
+                    raise RuntimeError("invalid persisted commit item")
+                return item
+
+        index = offset
+        while index < item_count:
+            item = item_at(index)
+            if item.get("kind") == "file":
+                value = item.get("value")
+                encoded = len(json_bytes(value, separators=(",", ":")))
+                candidate_files_size = files_size + (1 if files else 0) + encoded
+                candidate_patch_inner_size = patch_inner_size
+            else:
+                value = item.get("value", "")
+                if not isinstance(value, str):
+                    raise RuntimeError("invalid persisted commit patch")
+                candidate_files_size = files_size
+                candidate_patch_inner_size = patch_inner_size + len(json_bytes(value)) - 2
+            more = index + 1 < item_count
+            provisional_cursor = (
+                self.history_snapshots.cursor(snapshot["id"], index + 1, "commit_info")
+                if more
+                else None
+            )
+            cursor_size = len(json_bytes(provisional_cursor)) if provisional_cursor else 4
+            candidate_size = (
+                static_size
+                + candidate_files_size
+                + 2
+                + candidate_patch_inner_size
+                + 2 * cursor_size
+                + (4 if more else 5)
+                + (4 if base["truncated"] or more else 5)
+            )
+            if candidate_size > max_bytes:
+                if not files and not patch_parts:
                     raise ValueError(
                         "max_bytes is too small for a commit record; increase the budget"
                     )
                 break
-            selected.append(item)
-            base = candidate
-            patch = candidate_patch
+            if item.get("kind") == "file":
+                files.append(value)
+                files_size = candidate_files_size
+            else:
+                patch_parts.append(value)
+                patch_inner_size = candidate_patch_inner_size
             index += 1
-        more = index < len(snapshot["items"])
+        more = index < item_count
         cursor = (
             self.history_snapshots.cursor(snapshot["id"], index, "commit_info")
             if more
             else None
         )
+        base["files"] = files
+        base["patch"] = "".join(patch_parts)
         base["cursor"] = cursor
         base["next_cursor"] = cursor
         base["has_more"] = more
@@ -736,7 +807,7 @@ class Git:
     def _create_history_snapshot(
         self,
         query: dict[str, Any],
-        items: list[dict[str, Any]],
+        items: list[Any],
         *,
         kind: str,
         root: str,
@@ -745,8 +816,18 @@ class Git:
         warnings: list[str],
         path: str | None = None,
         commit: dict[str, Any] | None = None,
+        patch: str | None = None,
+        patch_start: int | None = None,
+        patch_chunk_chars: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         with _HISTORY_SNAPSHOT_LOCK:
+            extra = {"commit": commit} if commit is not None else {}
+            if patch is not None:
+                extra.update(
+                    patch=patch,
+                    patch_start=patch_start,
+                    patch_chunk_chars=patch_chunk_chars,
+                )
             ident = self.history_snapshots.create(
                 query,
                 items,
@@ -756,7 +837,7 @@ class Git:
                 path=path,
                 truncated=truncated,
                 warnings=warnings,
-                **({"commit": commit} if commit is not None else {}),
+                **extra,
             )
             files = []
             for item in self.history_snapshots.root.glob("*.json"):
@@ -794,7 +875,7 @@ class Git:
                 "path": path,
                 "truncated": truncated,
                 "warnings": warnings,
-                **({"commit": commit} if commit is not None else {}),
+                **extra,
             }
 
     def _history_page(

@@ -222,6 +222,40 @@ async def test_input_limit_is_checked_before_worker_launch(http_tools: HTTPTools
         await http_tools.extract_html("x" * (MAX_INPUT_BYTES + 1))
 
 
+async def test_aclose_invalidates_inflight_html_snapshot(monkeypatch, tmp_path):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def worker(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {
+            "title": "Document",
+            "text": "Body",
+            "links": [],
+            "url": "https://example.test/page",
+            "source_hash": "a" * 64,
+            "warnings": [],
+            "complete": True,
+            "stop_reason": None,
+        }
+
+    monkeypatch.setattr(html_tools, "_run_worker", worker)
+    tools = HTTPTools(tmp_path, lambda: "html-close-race")
+    task = asyncio.create_task(tools.extract_html("<p>Body</p>"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await tools.aclose()
+        release.set()
+        with pytest.raises(RuntimeError, match="HTTP service is closed"):
+            await task
+        assert tools._html is not None
+        assert not tools._html._snapshots
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_worker_accepts_maximum_unicode_header(tmp_path, monkeypatch):
     worker = tmp_path / "header_worker.py"
     worker.write_text(

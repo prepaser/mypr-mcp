@@ -17,6 +17,7 @@ import os
 import secrets
 import subprocess
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -386,6 +387,7 @@ async def request_restart(
     *,
     force: bool = False,
     origin: dict[str, Any] | None = None,
+    prepare: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Reserve and launch a detached manager replacement coordinator."""
 
@@ -459,7 +461,15 @@ async def request_restart(
             "new_version": None,
         }
         _write_ticket(workspace, ticket)
-        log = open_regular(root / f"restart-{ticket['id']}.log", "ab")
+        try:
+            if prepare is not None:
+                await prepare(ticket)
+            log = open_regular(root / f"restart-{ticket['id']}.log", "ab")
+        except BaseException as exc:
+            ticket["state"] = "failed"
+            ticket["error"] = str(exc) or type(exc).__name__
+            _write_ticket(workspace, ticket)
+            raise
         launch = asyncio.create_task(
             asyncio.to_thread(
                 subprocess.Popen,

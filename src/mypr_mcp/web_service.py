@@ -238,10 +238,24 @@ class WebService:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                await self.transport.close()
-                await self._close_retired_transports()
-                self.transport = self._transport_factory(self.config)
+
+                try:
+                    await self._close_retired_transports()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+                new_transport = self._transport_factory(self.config)
+                old_transport, self.transport = self.transport, new_transport
                 self.snapshots.clear()
+                try:
+                    await old_transport.close()
+                except asyncio.CancelledError:
+                    self._retired_transports.append(old_transport)
+                    raise
+                except Exception:
+                    self._retired_transports.append(old_transport)
             finally:
                 self._applying = False
 

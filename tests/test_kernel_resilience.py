@@ -11,6 +11,39 @@ from mypr_mcp.cells import CellExecutor, CellHandle
 from mypr_mcp.diagnostics import safe_error, safe_error_details
 
 
+def test_lifecycle_recovery_does_not_release_another_request():
+    tasks = kernel_api.TaskManager()
+    tasks._begin_lifecycle("first")
+    tasks._abort_lifecycle("first")
+    tasks._begin_lifecycle("second")
+    tasks._abort_lifecycle("first")
+    with pytest.raises(RuntimeError, match="lifecycle transition"):
+        tasks._check_admission()
+    tasks._abort_lifecycle("second")
+    tasks._check_admission()
+
+
+@pytest.mark.parametrize("phase", ["before", "during"])
+async def test_remote_launch_rejects_or_cancels_during_lifecycle(monkeypatch, phase):
+    tasks = kernel_api.TaskManager()
+    calls = []
+
+    async def rpc(op, **fields):
+        calls.append(op)
+        if op == "shell_start":
+            tasks._begin_lifecycle("restart")
+            return {"id": "shell-job"}
+        assert fields["id"] == "shell-job"
+
+    monkeypatch.setattr(kernel_api, "_rpc", rpc)
+    if phase == "before":
+        tasks._begin_lifecycle("restart")
+    with pytest.raises(RuntimeError, match="lifecycle transition"):
+        await kernel_api.Shell(tasks).start(["true"])
+    assert calls == ([] if phase == "before" else ["shell_start", "shell_cancel"])
+    assert not tasks.active()
+
+
 def test_safe_error_handles_bad_repr_and_utf8_limit():
     class Bad(BaseException):
         def __str__(self):

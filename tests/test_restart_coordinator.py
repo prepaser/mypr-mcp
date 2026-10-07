@@ -151,3 +151,27 @@ async def test_coordinator_replaces_modern_manager_and_records_generation(
 
 def _descriptor():
     return {"version": target_installation()["version"], "protocol_version": 1, "capabilities": []}
+
+
+async def test_rejected_admission_does_not_launch_coordinator(tmp_path, monkeypatch):
+    async def descriptor(_target):
+        return _descriptor()
+
+    async def found(_workspace):
+        return Path("manager.sock"), _state(tmp_path)
+
+    async def prepare(ticket):
+        assert restart.read_ticket(tmp_path, ticket["id"]) is not None
+        raise RuntimeError("Workspace has active work")
+
+    launches = []
+    monkeypatch.setattr(restart, "target_descriptor", descriptor)
+    monkeypatch.setattr(restart, "find_runtime", found)
+    monkeypatch.setattr(
+        restart.subprocess, "Popen", lambda *args, **kwargs: launches.append(args)
+    )
+    with pytest.raises(RuntimeError, match="active work"):
+        await restart.request_restart(tmp_path, _target(), prepare=prepare)
+    assert not launches
+    assert restart.read_ticket(tmp_path)["state"] == "failed"
+    assert restart.active_ticket(tmp_path) is None

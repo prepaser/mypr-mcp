@@ -46,24 +46,24 @@ def _discovery_error(state: dict[str, Any], path: Path, error: OSError) -> None:
 
 
 def _iter_skill_paths(root: Path, state: dict[str, Any]):
-    root = Path(root)
+    logical_root = Path(root)
     try:
-        root_stat = root.stat()
+        root_stat = logical_root.stat()
     except FileNotFoundError:
         return
     except OSError as exc:
-        _discovery_error(state, root, exc)
+        _discovery_error(state, logical_root, exc)
         return
     if not stat.S_ISDIR(root_stat.st_mode):
         return
     try:
-        root = root.resolve()
+        resolved_root = logical_root.resolve()
     except OSError as exc:
-        _discovery_error(state, root, exc)
+        _discovery_error(state, logical_root, exc)
         return
-    pending = [(root, frozenset({root}))]
+    pending = [(resolved_root, logical_root, frozenset({resolved_root}))]
     while pending and not state["scan_truncated"]:
-        directory, ancestors = pending.pop()
+        directory, logical_directory, ancestors = pending.pop()
         try:
             with os.scandir(directory) as iterator:
                 entries = []
@@ -75,27 +75,29 @@ def _iter_skill_paths(root: Path, state: dict[str, Any]):
                     entries.append(entry)
             entries.sort(key=lambda entry: entry.name)
         except OSError as exc:
-            _discovery_error(state, directory, exc)
+            _discovery_error(state, logical_directory, exc)
             continue
         directories = []
         for entry in entries:
-            candidate = Path(entry.path)
+            candidate = logical_directory / entry.name
             try:
                 resolved = candidate.resolve()
-                resolved.relative_to(root)
+                resolved.relative_to(resolved_root)
                 entry_stat = entry.stat(follow_symlinks=True)
                 entry_is_file = stat.S_ISREG(entry_stat.st_mode)
                 entry_is_dir = stat.S_ISDIR(entry_stat.st_mode)
-                if directory != root and entry.name == "SKILL.md" and entry_is_file:
+                if directory != resolved_root and entry.name == "SKILL.md" and entry_is_file:
                     yield candidate
                 elif entry_is_dir and resolved not in ancestors:
                     if entry.is_symlink():
                         skill = candidate / "SKILL.md"
-                        skill.resolve().relative_to(root)
+                        skill.resolve().relative_to(resolved_root)
                         if stat.S_ISREG(skill.stat().st_mode):
                             yield skill
                     else:
-                        directories.append((candidate, ancestors | {resolved}))
+                        directories.append(
+                            (resolved, candidate, ancestors | {resolved})
+                        )
             except ValueError:
                 continue
             except OSError as exc:

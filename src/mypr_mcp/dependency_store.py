@@ -13,7 +13,9 @@ import json
 import os
 import platform
 import re
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
@@ -41,6 +43,8 @@ _CHUNK_SIZE = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 10_000
 _MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024
+_MAX_VERSION_OUTPUT_BYTES = 4096
+_VERSION_TIMEOUT = 5.0
 _VERSION_RE = re.compile(r"(?<!\d)(\d+)(?:\.(\d+))(?:\.(\d+))?(?!\d)")
 _MODEL_MARKER_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.:-]+$")
@@ -997,20 +1001,91 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def _run_version(path: Path) -> str:
-    import subprocess
-
-    result = subprocess.run(
-        [str(path), "--version"],
+    argv = [str(path), "--version"]
+    process = subprocess.Popen(
+        argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        check=False,
-        timeout=5,
-        text=True,
+        start_new_session=os.name == "posix",
     )
-    if result.returncode:
-        raise OSError(f"version command exited with {result.returncode}")
-    return result.stdout[:512]
+    assert process.stdout is not None
+    selector = None
+    output = bytearray()
+    deadline = time.monotonic() + _VERSION_TIMEOUT
+    timed_out = False
+    too_large = False
+    completed = False
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(
+                        key.fileobj.fileno(),
+                        min(64 * 1024, _MAX_VERSION_OUTPUT_BYTES + 1 - len(output)),
+                    )
+                except OSError as exc:
+                    raise OSError("version command output could not be read") from exc
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                output.extend(chunk)
+                if len(output) > _MAX_VERSION_OUTPUT_BYTES:
+                    too_large = True
+                    break
+            if timed_out or too_large:
+                break
+        if not timed_out and not too_large and process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+            else:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+        completed = not timed_out and not too_large
+    finally:
+        if not completed:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except OSError:
+                pass
+            process.wait()
+        if selector is not None:
+            selector.close()
+        if process.stdout and not process.stdout.closed:
+            process.stdout.close()
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, _VERSION_TIMEOUT)
+    if too_large:
+        raise OSError(f"version output exceeded {_MAX_VERSION_OUTPUT_BYTES} bytes")
+    if process.returncode:
+        raise OSError(f"version command exited with {process.returncode}")
+    try:
+        return bytes(output).decode("utf-8")[:512]
+    except UnicodeDecodeError as exc:
+        raise OSError("version command returned invalid UTF-8") from exc
 
 
 def _sha256(path: Path) -> str:

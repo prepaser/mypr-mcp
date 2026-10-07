@@ -149,7 +149,7 @@ uvx mypr-mcp@latest restart
 uvx mypr-mcp@latest restart --force
 ```
 
-The new manager starts only after the old one exits and passes its health check. The coordinator records its ID, phase, old and new generation, target installation, and failure details under `.mypr/`. A failed start is reported without automatic rollback or an unbounded restart loop; inspect `.mypr/manager.log`, `uvx` diagnostics, and the restart record before retrying. External browser processes and pre-existing tabs remain owned by their launcher. Managed resources close during a normal replacement. In-memory Python state is always lost, while files, skills, modules, the package environment, messages, history, saved output, and completed scan records persist.
+The new manager starts only after the old one exits and passes its health check. The coordinator records its ID, phase, old and new generation, target installation, and failure details under `.mypr/`. A rejected kernel restart does not launch a coordinator. If an accepted restart fails before stopping the old manager, its surviving kernel resumes accepting work once recovery completes. A failed start is reported without automatic rollback or an unbounded restart loop; inspect `.mypr/manager.log`, `uvx` diagnostics, and the restart record before retrying. External browser processes and pre-existing tabs remain owned by their launcher. Managed resources close during a normal replacement. Successful replacement clears in-memory Python state, while files, skills, modules, the package environment, messages, history, saved output, and completed scan records persist.
 
 The CLI also provides operational controls. Run them from the workspace:
 

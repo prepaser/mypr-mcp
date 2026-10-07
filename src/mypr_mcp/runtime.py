@@ -2668,8 +2668,12 @@ class Runtime:
                 "generation": self.generation,
                 "request_id": current.get("request_id"),
             }
-            ticket = await request_restart(self.workspace, target, force=force, origin=origin)
-            await self._reserve_restart(ticket["id"], current, force)
+            async def prepare(ticket):
+                await self._reserve_restart(ticket["id"], current, force)
+
+            ticket = await request_restart(
+                self.workspace, target, force=force, origin=origin, prepare=prepare,
+            )
             return {"accepted": True, "restart_id": ticket["id"]}
         if op == "restart_prepare":
             from .restart import read_ticket
@@ -2686,6 +2690,8 @@ class Runtime:
             if self.resetting or (self.restarting and self.restarting != ident):
                 raise RuntimeError("Workspace restart/reset already in progress")
             origin = ticket.get("origin") or {}
+            if origin and self.restarting != ident:
+                raise RuntimeError("Restart origin was not admitted")
             current = self.execs.get(origin.get("exec_id"))
             await self._reserve_restart(ident, current, ticket.get("force", False))
             return {"prepared": True, "restart_id": ident}
@@ -2887,15 +2893,22 @@ class Runtime:
                 raise RuntimeError("Workspace restart/reset already in progress")
             if self.restarting and self.restarting != ident:
                 raise RuntimeError("Workspace restart/reset already in progress")
+            if current is not None and current["state"] in TERMINAL and self.restarting != ident:
+                raise RuntimeError("Restart origin is no longer running")
             self._check_restart_busy(current, force)
             was_reserved = self.restarting == ident
             self.restarting = ident
-            if current is not None:
-                await self.update_execution(
-                    current,
-                    {"restart_id": ident, "state": "restarting"},
-                    event="restarting",
-                )
+            try:
+                if current is not None:
+                    await self.update_execution(
+                        current,
+                        {"restart_id": ident, "state": "restarting"},
+                        event="restarting",
+                    )
+            except BaseException:
+                if not was_reserved:
+                    self.restarting = None
+                raise
             if not was_reserved:
                 self.spawn(self._watch_restart(ident, current))
 
@@ -2921,22 +2934,55 @@ class Runtime:
                     if ticket is None or ticket.get("state") != "failed":
                         raise
             if ticket["state"] == "failed" and not self.stopping.is_set():
-                if current is not None:
-                    saved = await self.io(
-                        _load_execution, self.root / "runs" / f"{current['id']}.json"
-                    )
-                    current.update(
-                        {
-                            key: saved[key]
-                            for key in ("restart_finalized", "restart_result")
-                            if key in saved
-                        }
-                    )
-                    await self.finish(current, "failed", ticket.get("error"))
-                if self.restarting == ident:
-                    self.restarting = None
+                try:
+                    await self.abort_kernel_lifecycle(current)
+                    if current is not None:
+                        saved = await self.io(
+                            _load_execution, self.root / "runs" / f"{current['id']}.json"
+                        )
+                        current.update(
+                            {
+                                key: saved[key]
+                                for key in ("restart_finalized", "restart_result")
+                                if key in saved
+                            }
+                        )
+                        await self.finish(current, "failed", ticket.get("error"))
+                finally:
+                    if self.restarting == ident:
+                        self.restarting = None
         except Exception as exc:
+            self.healthy = False
             self.health_error = f"Restart monitoring failed: {safe_error(exc)}"
+
+    async def abort_kernel_lifecycle(self, current):
+        if current is None or not self.kc or not self.replies or self.replies.done():
+            return
+        generation = current["generation"]
+        if generation != self.generation:
+            return
+        message = self.kc.session.msg(
+            "execute_request",
+            {
+                "code": "", "silent": True, "store_history": False,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
+            },
+            metadata={
+                "mypr_control": "lifecycle_abort", "generation": generation,
+                "exec_id": current["id"],
+            },
+        )
+        ident = message["header"]["msg_id"]
+        waiter = asyncio.get_running_loop().create_future()
+        self.control_waiters[ident] = waiter
+        try:
+            self.kc.shell_channel.send(message)
+            async with asyncio.timeout(10):
+                result = await waiter
+            if result.get("status") != "ok":
+                raise RuntimeError(result.get("evalue", "Kernel lifecycle recovery failed"))
+        finally:
+            self.control_waiters.pop(ident, None)
 
     async def _register_manager(self):
         from .runtime_registry import register
@@ -3025,6 +3071,14 @@ class Runtime:
 
     async def shutdown_resources(self):
         async with self._lifecycle_lock:
+            failures = []
+
+            async def close(operation):
+                try:
+                    await operation()
+                except Exception as exc:
+                    failures.append(exc)
+
             for rec in list(self.execs.values()):
                 if rec["state"] not in TERMINAL and not rec.get("restart_id"):
                     with contextlib.suppress(Exception):
@@ -3034,16 +3088,18 @@ class Runtime:
                             "Workspace restarted" if self.restarting else "Manager stopped",
                         )
             if self.web is not None:
-                await self.web.close()
-            await self.close_kernel()
+                await close(self.web.close)
+            await close(self.close_kernel)
             with contextlib.suppress(Exception):
                 await self.lose_python_tasks("Manager stopped")
             if self.dependencies is not None:
-                await self.dependencies.close()
-            await self.close_shells()
-            await self.mcp.close()
+                await close(self.dependencies.close)
+            await close(self.close_shells)
+            await close(self.mcp.close)
             if self.mail is not None:
-                await self.mail.close()
+                await close(self.mail.close)
+            if failures:
+                raise ExceptionGroup("Manager resource cleanup failed", failures)
 
     async def cleanup_kernel_resources(self):
         if not self.kc or not self.km or not self.replies or self.replies.done():
@@ -3492,10 +3548,12 @@ class Runtime:
                 server.close()
                 for writer in list(self.attachments.values()):
                     writer.close()
-                await self.shutdown_resources()
-                server.close_clients()
-                await server.wait_closed()
-                await self.drain_background()
+                try:
+                    await self.shutdown_resources()
+                finally:
+                    server.close_clients()
+                    await server.wait_closed()
+                    await self.drain_background()
         finally:
             await self._unregister_manager()
             for writer in list(self.attachments.values()):

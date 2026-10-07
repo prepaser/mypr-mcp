@@ -289,6 +289,7 @@ class HTMLExtractor:
         self._http_tools = http_tools
         self._snapshots: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._snapshot_bytes = 0
+        self._generation = 0
 
     async def extract_html(
         self,
@@ -303,6 +304,8 @@ class HTMLExtractor:
         _validate_output_limit(max_bytes)
         if not isinstance(include_structure, bool):
             raise ValueError("include_structure must be a boolean")
+        if self._http_tools._closed:
+            raise RuntimeError("HTTP service is closed")
         owner = _client_id(self._http_tools._identity)
         if cursor is not None:
             if html is not None:
@@ -322,10 +325,15 @@ class HTMLExtractor:
         ensure = getattr(self._http_tools, "_ensure", None)
         if ensure is not None:
             await ensure("trafilatura", *("cssselect",) if selector else ())
+        generation = self._generation
+        if self._http_tools._closed:
+            raise RuntimeError("HTTP service is closed")
         result = await _run_worker(
             html, url=url, selector=selector, include_structure=include_structure
         )
         items = await asyncio.to_thread(_text_items, result.get("text", ""))
+        if self._http_tools._closed or generation != self._generation:
+            raise RuntimeError("HTTP service is closed")
         for link in result.get("links", []):
             items.append({"kind": "link", "url": link["url"], "text": link["text"]})
         ident = secrets.token_hex(16)
@@ -369,6 +377,7 @@ class HTMLExtractor:
         return self._page(snapshot, 0, max_bytes)
 
     def clear(self) -> None:
+        self._generation += 1
         self._snapshots.clear()
         self._snapshot_bytes = 0
 

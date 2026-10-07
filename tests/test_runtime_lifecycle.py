@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,33 @@ from mypr_mcp.runtime import Runtime
 class Bridge:
     async def close(self):
         pass
+
+
+async def test_shutdown_attempts_independent_cleanup_after_failure(tmp_path):
+    runtime = Runtime(tmp_path)
+    attempts = []
+
+    async def web_close():
+        attempts.append("web")
+        raise RuntimeError("web cleanup failed")
+
+    async def kernel_close():
+        attempts.append("kernel")
+
+    async def shells_close():
+        attempts.append("shells")
+
+    async def mcp_close():
+        attempts.append("mcp")
+
+    runtime.web = SimpleNamespace(close=web_close)
+    runtime.close_kernel = kernel_close
+    runtime.close_shells = shells_close
+    runtime.mcp = SimpleNamespace(close=mcp_close)
+    with pytest.raises(ExceptionGroup, match="Manager resource cleanup") as raised:
+        await runtime.shutdown_resources()
+    assert attempts == ["web", "kernel", "shells", "mcp"]
+    assert str(raised.value.exceptions[0]) == "web cleanup failed"
 
 
 async def test_shutdown_closes_kernel_started_by_in_progress_reset(tmp_path, monkeypatch):
