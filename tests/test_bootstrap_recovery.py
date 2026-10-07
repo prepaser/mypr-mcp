@@ -14,6 +14,7 @@ import pytest
 from mypr_mcp import bootstrap
 from mypr_mcp.bridge import ConnectionBridge
 from mypr_mcp.diagnostics import RPCError
+from mypr_mcp.json_utils import SOURCE_HASH_ENCODING, source_sha256
 from mypr_mcp.runtime import Runtime
 
 
@@ -223,6 +224,7 @@ def _runtime_for_dedup(history):
     runtime.stopping = asyncio.Event()
     runtime.resetting = False
     runtime.restarting = None
+    runtime.restart_pending = None
     runtime.healthy = True
     runtime._admission_lock = asyncio.Lock()
     runtime.generation = "generation"
@@ -255,6 +257,48 @@ async def test_request_dedup_reuses_old_record_by_code_or_digest(record_kind):
         "alice", "connection", {"code": "1 + 1", "request_id": "retry"}
     )
     assert result == {"duplicate": True, "id": record["id"]}
+
+
+@pytest.mark.asyncio
+async def test_request_dedup_uses_marked_surrogate_safe_digest():
+    source = "value = '\ud800'"
+    record = {
+        "id": "old",
+        "code_sha256": source_sha256(source),
+        "code_sha256_encoding": SOURCE_HASH_ENCODING,
+    }
+
+    class History:
+        def find_request(self, _client, _request_id):
+            return record
+
+    runtime = _runtime_for_dedup(History())
+    result = await runtime._admit_execution(
+        "alice", "connection", {"code": source, "request_id": "retry"}
+    )
+    assert result == {"duplicate": True, "id": "old"}
+    with pytest.raises(ValueError, match="different code"):
+        await runtime._admit_execution(
+            "alice", "connection", {"code": r"value = '\ud800'", "request_id": "retry"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_request_dedup_rejects_unknown_source_hash_encoding():
+    class History:
+        def find_request(self, _client, _request_id):
+            return {
+                "id": "old",
+                "code_sha256": "0" * 64,
+                "code_sha256_encoding": "unknown",
+            }
+
+    runtime = _runtime_for_dedup(History())
+    with pytest.raises(RPCError, match="hash encoding") as failure:
+        await runtime._admit_execution(
+            "alice", "connection", {"code": "same", "request_id": "retry"}
+        )
+    assert failure.value.code == "history_corrupt"
 
 
 @pytest.mark.asyncio

@@ -14,15 +14,18 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError, ConfigStore
+from .config import ConfigError, ConfigStore, global_config_path
 from .dependency_store import DependencyStore
 from .python_dependencies import (
+    PYTHON_MINIMUM,
     PYTHON_PACKAGE_REQUIREMENTS,
     PYTHON_PACKAGES,
+    python_version_satisfies,
     uv_diagnostics,
     version_satisfies,
 )
 from .startup import read_startup_failure
+from .web_credentials import web_credential_status
 
 _PYTHON_PACKAGES = dict(PYTHON_PACKAGES)
 _BINARIES = ("uv", "rg", "rga", "ast-grep", "sg", "tesseract", "pandoc", "pdftotext")
@@ -56,7 +59,7 @@ def _browser_cache_path(workspace: Path | None = None) -> Path | None:
 async def _probe_python(python: Path) -> dict[str, Any]:
     available = await asyncio.to_thread(lambda: python.is_file() and os.access(python, os.X_OK))
     if not available:
-        return {"path": str(python), "available": False, "packages": {}}
+        return {"path": str(python), "available": False, "version_compatible": None, "packages": {}}
     script = """import contextlib
 import importlib.metadata as m
 import importlib.util
@@ -100,15 +103,24 @@ for name, module in names.items():
         result[name] = {'version': version, 'imported': True, 'error': None}
 print(json.dumps({'version': platform.python_version(), 'packages': result}))
 """
-    process = await asyncio.create_subprocess_exec(
-        str(python),
-        "-I",
-        "-c",
-        script,
-        json.dumps(_PYTHON_PACKAGES),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(python),
+            "-I",
+            "-c",
+            script,
+            json.dumps(_PYTHON_PACKAGES),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return {
+            "path": str(python),
+            "available": False,
+            "version_compatible": None,
+            "error": f"{type(exc).__name__}: {exc}"[:512],
+            "packages": {},
+        }
     try:
         probe_stdout, probe_stderr, _ = await asyncio.wait_for(
             asyncio.gather(
@@ -126,6 +138,7 @@ print(json.dumps({'version': platform.python_version(), 'packages': result}))
         return {
             "path": str(python),
             "available": False,
+            "version_compatible": None,
             "error": "probe timeout",
             "packages": {},
         }
@@ -135,6 +148,7 @@ print(json.dumps({'version': platform.python_version(), 'packages': result}))
         return {
             "path": str(python),
             "available": False,
+            "version_compatible": None,
             "error": stderr.decode("utf-8", "replace")[:256] or "probe failed",
             "output_truncated": stderr_truncated,
             "packages": {},
@@ -145,17 +159,39 @@ print(json.dumps({'version': platform.python_version(), 'packages': result}))
         return {
             "path": str(python),
             "available": False,
+            "version_compatible": None,
             "error": "invalid probe output",
             "output_truncated": stdout_truncated,
             "packages": {},
         }
-    packages = result.get("packages") if isinstance(result, dict) else {}
-    if not isinstance(packages, dict):
-        packages = {}
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("version"), str)
+        or not isinstance(result.get("packages"), dict)
+    ):
+        return {
+            "path": str(python),
+            "available": False,
+            "version_compatible": None,
+            "error": "invalid probe output shape",
+            "output_truncated": stdout_truncated,
+            "packages": {},
+        }
+    packages = result["packages"]
+    version = result["version"]
+    version_compatible = python_version_satisfies(version)
+    error = None
+    if not version_compatible:
+        error = (
+            f"Python {version} is incompatible; Python >= {PYTHON_MINIMUM[0]}.{PYTHON_MINIMUM[1]} "
+            "is required"
+        )
     return {
         "path": str(python),
         "available": True,
-        "version": result.get("version"),
+        "version": version,
+        "version_compatible": version_compatible,
+        "error": error,
         "output_truncated": stdout_truncated,
         "packages": {
             name: _package_status(name, packages.get(name)) for name in _PYTHON_PACKAGES
@@ -385,7 +421,7 @@ def _web_readiness(config: dict[str, Any]) -> dict[str, Any]:
             and definition.get("enabled", True) is not False
         )
         variable = definition.get("api_key_env") if enabled else None
-        available = bool(variable and variable in os.environ)
+        available = bool(variable and web_credential_status(os.environ.get(variable)) == "valid")
         providers[name] = {
             "configured": enabled,
             "credentials": {
@@ -432,30 +468,40 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     startup_failure = await asyncio.to_thread(read_startup_failure, root)
     if startup_failure is not None:
         result["startup_error"] = startup_failure
-    config_store = ConfigStore(path)
-    dependency_config = {"auto_install": True}
-    result["config"]["paths"]["global"] = str(config_store.global_path)
     try:
-        snapshot = config_store.load()
-        dependency_config = snapshot.values.get("dependencies", dependency_config)
-        result["mail"] = _mail_readiness(snapshot.values.get("mail", {}))
-        result["web"] = _web_readiness(snapshot.values.get("web", {}))
-        result["config"].update(
-            valid=True,
-            revision=snapshot.revision,
-            sections=sorted(snapshot.values),
-            revisions=dict(snapshot.revisions),
-            sources={
-                scope: {
-                    "path": str(snapshot.paths[scope]),
-                    "revision": snapshot.revisions.get(scope),
-                }
-                for scope in ("global", "workspace")
-            },
-        )
-    except (OSError, ConfigError) as exc:
+        result["config"]["paths"]["global"] = str(global_config_path())
+    except OSError:
+        pass
+    dependency_config = {"auto_install": True}
+    try:
+        config_store = ConfigStore(path)
+        result["config"]["paths"]["global"] = str(config_store.global_path)
+    except (OSError, ConfigError, ValueError) as exc:
         result["config"].update(valid=False, error=f"{type(exc).__name__}: {exc}"[:512])
         result["warnings"].append("configuration is unavailable")
+    else:
+        try:
+            snapshot = config_store.load()
+        except (OSError, ConfigError, RuntimeError) as exc:
+            result["config"].update(valid=False, error=f"{type(exc).__name__}: {exc}"[:512])
+            result["warnings"].append("configuration is unavailable")
+        else:
+            dependency_config = snapshot.values.get("dependencies", dependency_config)
+            result["mail"] = _mail_readiness(snapshot.values.get("mail", {}))
+            result["web"] = _web_readiness(snapshot.values.get("web", {}))
+            result["config"].update(
+                valid=True,
+                revision=snapshot.revision,
+                sections=sorted(snapshot.values),
+                revisions=dict(snapshot.revisions),
+                sources={
+                    scope: {
+                        "path": str(snapshot.paths[scope]),
+                        "revision": snapshot.revisions.get(scope),
+                    }
+                    for scope in ("global", "workspace")
+                },
+            )
     python = _python_path(root)
     result["runtime"] = await _runtime_readiness(ws)
     result["storage"] = await _storage_readiness(path, ws)
@@ -515,6 +561,7 @@ async def doctor_workspace(workspace: str | os.PathLike[str], ws: Any = None) ->
     result["ready"] = bool(
         result["config"]["valid"]
         and result["python"].get("available")
+        and result["python"].get("version_compatible") is True
         and all(
             result["python"].get("packages", {}).get(name, {}).get("available")
             for name in ("ipykernel", "tomlkit")

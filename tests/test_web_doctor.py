@@ -35,6 +35,24 @@ def test_web_readiness_reports_provider_references_without_secret_values(monkeyp
     assert result["network_checked"] is False
 
 
+@pytest.mark.parametrize("value", ["", "token\n", "x" * 8193])
+def test_web_readiness_rejects_locally_invalid_credentials(monkeypatch, value):
+    monkeypatch.setenv("MYPR_WEB_KEY", value)
+
+    result = _web_readiness(
+        {
+            "default_provider": "kagi",
+            "providers": {"kagi": {"api_key_env": "MYPR_WEB_KEY"}},
+        }
+    )
+
+    assert result["providers"]["kagi"]["credentials"] == {
+        "source": "MYPR_WEB_KEY",
+        "available": False,
+    }
+    assert result["providers"]["kagi"]["ready"] is False
+
+
 @pytest.mark.asyncio
 async def test_live_doctor_checks_web_provider_status_without_search_request():
     calls = []

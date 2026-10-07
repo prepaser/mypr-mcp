@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -221,8 +222,6 @@ def test_existing_message_schema_is_migrated(tmp_path: Path):
     for client in ("alice", "bob"):
         history.reserve_client_id(client)
     history.close()
-    import sqlite3
-
     db = tmp_path / ".mypr" / "history.sqlite3"
     connection = sqlite3.connect(db)
     connection.execute(
@@ -242,3 +241,80 @@ def test_existing_message_schema_is_migrated(tmp_path: Path):
         assert page["messages"][0]["reply_to"] is None
     finally:
         store.close()
+
+
+def test_snapshot_existing_is_bounded_read_only_and_does_not_create_schema(tmp_path: Path):
+    workspace = tmp_path / "empty"
+    workspace.mkdir()
+    assert MessageStore.snapshot_existing(workspace, "alice") is None
+    assert not (workspace / ".mypr" / "history.sqlite3").exists()
+
+    history = History(workspace)
+    history.reserve_client_id("alice")
+    history.reserve_client_id("sender")
+    history.close()
+    assert MessageStore.snapshot_existing(workspace, "alice") is None
+    connection = sqlite3.connect(workspace / ".mypr" / "history.sqlite3")
+    try:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+    messages = MessageStore(workspace)
+    sent = messages.send("sender", "alice", "offline")
+    messages.close()
+    preview = MessageStore.snapshot_existing(workspace, "alice")
+    assert preview["messages"][0]["id"] == sent["id"]
+    assert MessageStore.snapshot_existing(workspace, "unknown") is None
+
+    readonly = MessageStore(workspace, initialize=False, read_only=True)
+    try:
+        assert readonly._db.execute("PRAGMA busy_timeout").fetchone()[0] == 100
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            readonly.send("sender", "alice", "must not write")
+    finally:
+        readonly.close()
+
+    durable = MessageStore(workspace)
+    try:
+        assert durable.read("alice")["messages"] == [sent]
+    finally:
+        durable.close()
+
+
+def test_snapshot_existing_handles_older_message_table(tmp_path: Path):
+    history = History(tmp_path)
+    history.reserve_client_id("alice")
+    history.reserve_client_id("sender")
+    history.close()
+    connection = sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3")
+    try:
+        connection.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "sender TEXT NOT NULL, recipient TEXT NOT NULL, text TEXT NOT NULL, "
+            "created REAL NOT NULL, acknowledged REAL)"
+        )
+        connection.execute(
+            "INSERT INTO messages(sender, recipient, text, created) "
+            "VALUES ('sender', 'alice', 'old', 1)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert MessageStore.snapshot_existing(tmp_path, "alice")["messages"][0]["text"] == "old"
+
+
+def test_snapshot_existing_ignores_read_errors(tmp_path: Path, monkeypatch):
+    history = History(tmp_path)
+    history.reserve_client_id("alice")
+    history.close()
+    messages = MessageStore(tmp_path)
+    messages.close()
+
+    def busy(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MessageStore, "inbox", busy)
+    assert MessageStore.snapshot_existing(tmp_path, "alice") is None

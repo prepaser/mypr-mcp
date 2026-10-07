@@ -394,6 +394,88 @@ async def test_system_binary_newer_than_minimum_is_reused(tmp_path, monkeypatch)
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_system_binary_uses_compatible_later_alias(tmp_path, monkeypatch):
+    from mypr_mcp import dependency_store
+
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    first = tmp_path / "ast-grep"
+    second = tmp_path / "sg"
+    paths = {"ast-grep": str(first), "sg": str(second)}
+    calls = []
+    monkeypatch.setattr(dependency_store.shutil, "which", paths.get)
+
+    def run_version(path):
+        calls.append(path)
+        return "ast-grep 0.10.0" if path == first else "ast-grep 0.45.3"
+
+    monkeypatch.setattr(dependency_store, "_run_version", run_version)
+    result = await store.inspect("ast-grep")
+    assert result["status"] == "installed"
+    assert result["path"] == str(second.resolve())
+    assert calls == [first.resolve(), second.resolve()]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_system_binary_keeps_first_unusable_alias_diagnostic(tmp_path, monkeypatch):
+    from mypr_mcp import dependency_store
+
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    first = tmp_path / "ast-grep"
+    second = tmp_path / "sg"
+    paths = {"ast-grep": str(first), "sg": str(second)}
+    calls = []
+    monkeypatch.setattr(dependency_store.shutil, "which", paths.get)
+
+    def run_version(path):
+        calls.append(path)
+        if path == first:
+            raise OSError("broken executable")
+        return "ast-grep 0.10.0"
+
+    monkeypatch.setattr(dependency_store, "_run_version", run_version)
+    result = await store.inspect("ast-grep")
+    assert result["status"] == "unusable"
+    assert result["path"] == str(first.resolve())
+    assert "cannot run system tool" in result["reason"]
+    assert calls == [first.resolve(), second.resolve()]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_download_blocks_http_redirect_before_second_request(tmp_path, monkeypatch):
+    import httpx2
+
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx2.Response(
+            302,
+            headers={"location": "http://invalid.example/payload"},
+            request=request,
+        )
+
+    client_class = httpx2.AsyncClient
+    transport = httpx2.MockTransport(handler)
+
+    def client(*args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs["trust_env"] = False
+        return client_class(*args, **kwargs)
+
+    monkeypatch.setattr(httpx2, "AsyncClient", client)
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    destination = tmp_path / "payload"
+    with pytest.raises(DependencyError, match="redirects must remain HTTPS") as failure:
+        await store._download_http("https://valid.example/payload", destination, 1024)
+    assert failure.value.code == "dependency_download_failed"
+    assert calls == ["https://valid.example/payload"]
+    assert not destination.exists()
+    await store.close()
+
+
 def test_version_probe_rejects_invalid_utf8_without_leaking_decode_errors(tmp_path):
     executable = tmp_path / "version"
     executable.write_bytes(b"#!/bin/sh\nprintf 'rg 15.2.0\\377\\n'\n")

@@ -21,6 +21,10 @@ _MAX_BODY_BYTES = 256 * 1024
 _DEFAULT_BODY_TIMEOUT = 5.0
 _MAX_REQUESTS = 256
 _MAX_PAGES = 64
+_MAX_WORKSPACE_EVENTS = 8192
+_MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
+_MAX_WORKSPACE_CLIENTS = 128
+_INACTIVE_TTL = 30 * 60
 _DEFAULT_PAGE_SIZE = 100
 _SENSITIVE_HEADER = re.compile(
     r"(?:auth|cookie|token|secret|api.?key|session|credential|password|passwd|pwd|^pass$)", re.I
@@ -188,6 +192,8 @@ class _RequestRecord:
 
 @dataclass(slots=True)
 class _ClientBuffer:
+    owner: str = ""
+    retained: bool = True
     events: deque[tuple[dict[str, Any], int]] = field(default_factory=deque)
     requests: OrderedDict[str, _RequestRecord] = field(default_factory=OrderedDict)
     pages: dict[int, BrowserObservation] = field(default_factory=dict)
@@ -197,6 +203,7 @@ class _ClientBuffer:
     next_page: int = 1
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+    on_access: Callable[[_ClientBuffer], None] | None = None
 
     def append(self, event: dict[str, Any]) -> None:
         event["cursor"] = self.next_event
@@ -219,6 +226,8 @@ class _ClientBuffer:
             request_id = old.get("request_id")
             if request_id is not None:
                 self.drop_request(request_id)
+        if self.on_access is not None:
+            self.on_access(self)
 
     def add_request(self, request_id: str, record: _RequestRecord) -> None:
         self.requests[request_id] = record
@@ -396,6 +405,10 @@ class BrowserObservation:
     def _check_owner(self) -> None:
         if self._identity() != self.owner:
             raise RuntimeError("browser observation belongs to a different client")
+        if not self._buffer.retained:
+            raise KeyError("browser observation is no longer retained for this client")
+        if self._buffer.on_access is not None:
+            self._buffer.on_access(self._buffer)
 
     def _remove_listeners(self) -> None:
         remove = getattr(self.page, "remove_listener", None) or getattr(
@@ -722,12 +735,21 @@ class BrowserObservations:
     def __init__(self, identity: Callable[[], str]) -> None:
         self._identity = identity
         self._clients: dict[str, _ClientBuffer] = {}
+        self._lru: OrderedDict[str, None] = OrderedDict()
+        self._accessed: dict[str, float] = {}
+        self._total_events = 0
+        self._total_bytes = 0
 
     async def observe(self, owner: str, page: Any, context: Any) -> BrowserObservation:
+        self._expire()
         buffer = self._clients.setdefault(owner, _ClientBuffer())
+        if not buffer.owner:
+            buffer.owner = owner
+            buffer.on_access = self._touch_buffer
         page_key = id(page)
         existing = buffer.pages.get(page_key)
         if existing is not None and not existing._closed:
+            self._touch_buffer(buffer)
             return existing
         if len(buffer.pages) >= _MAX_PAGES:
             raise RuntimeError(f"this client already observes {_MAX_PAGES} pages")
@@ -737,6 +759,8 @@ class BrowserObservations:
         buffer.next_page += 1
         observation = BrowserObservation(owner, page, context, buffer, page_id, self._identity)
         buffer.pages[page_key] = observation
+        self._touch_buffer(buffer)
+        self._enforce_workspace_budget()
         return observation
 
     def close_context(self, context: Any) -> None:
@@ -745,11 +769,103 @@ class BrowserObservations:
                 if observation.context is context:
                     observation._detach()
 
-    def close_all(self) -> None:
+    def clear(self) -> None:
         for buffer in self._clients.values():
+            buffer.retained = False
             for observation in tuple(buffer.pages.values()):
                 observation._detach()
         self._clients.clear()
+        self._lru.clear()
+        self._accessed.clear()
+        self._total_events = 0
+        self._total_bytes = 0
+
+    def close_all(self) -> None:
+        self.clear()
+
+    def gc(self) -> int:
+        before = len(self._clients)
+        self._expire()
+        self._enforce_workspace_budget()
+        return before - len(self._clients)
+
+    def _touch_buffer(self, buffer: _ClientBuffer) -> None:
+        owner = buffer.owner
+        if not owner or self._clients.get(owner) is not buffer:
+            return
+        self._lru[owner] = None
+        self._lru.move_to_end(owner)
+        self._accessed[owner] = asyncio.get_running_loop().time()
+        self._sync_totals()
+        self._enforce_workspace_budget()
+
+    def _sync_totals(self) -> None:
+        self._total_events = sum(len(buffer.events) for buffer in self._clients.values())
+        self._total_bytes = sum(buffer.bytes_used for buffer in self._clients.values())
+
+    def _remove_owner(self, owner: str) -> None:
+        buffer = self._clients.pop(owner, None)
+        if buffer is None:
+            return
+        buffer.retained = False
+        self._lru.pop(owner, None)
+        self._accessed.pop(owner, None)
+        for observation in tuple(buffer.pages.values()):
+            observation._detach()
+        self._sync_totals()
+
+    def _expire(self) -> None:
+        if _INACTIVE_TTL < 0:
+            return
+        deadline = asyncio.get_running_loop().time() - _INACTIVE_TTL
+        for owner in tuple(self._lru):
+            buffer = self._clients.get(owner)
+            if buffer is None:
+                self._lru.pop(owner, None)
+                self._accessed.pop(owner, None)
+                continue
+            if buffer.pages:
+                continue
+            if self._accessed.get(owner, 0) > deadline:
+                break
+            self._remove_owner(owner)
+
+    def _enforce_workspace_budget(self) -> None:
+        self._expire()
+        while (
+            len(self._clients) > _MAX_WORKSPACE_CLIENTS
+            or self._total_events > _MAX_WORKSPACE_EVENTS
+            or self._total_bytes > _MAX_WORKSPACE_BYTES
+        ):
+            inactive = next(
+                (
+                    owner
+                    for owner in self._lru
+                    if owner in self._clients and not self._clients[owner].pages
+                ),
+                None,
+            )
+            if inactive is not None:
+                self._remove_owner(inactive)
+                continue
+            oldest = next(iter(self._lru), None)
+            if oldest is None:
+                break
+            buffer = self._clients.get(oldest)
+            if buffer is None:
+                self._lru.pop(oldest, None)
+                continue
+            if buffer.events:
+                old, old_size = buffer.events.popleft()
+                buffer.bytes_used -= old_size
+                request_id = old.get("request_id")
+                if request_id is not None:
+                    buffer.drop_request(request_id)
+                self._sync_totals()
+            else:
+                self._lru.move_to_end(oldest)
+                if all(not item.events for item in self._clients.values()):
+                    break
 
 
 __all__ = ["BrowserObservation", "BrowserObservations"]

@@ -136,6 +136,42 @@ async def test_restart_rejects_busy_work_and_force_cancels_it(workspace, resourc
         assert forced["generation"] != forced["execution_generation"]
 
 
+async def test_cli_reset_rejects_live_task_before_its_manager_report(workspace):
+    async with mcp_session(workspace, client_id="delayed-task-report") as session:
+        started = await execute(
+            session,
+            "import asyncio\n"
+            "import mypr_mcp.kernel_api as api\n"
+            "original_report_rpc = api._rpc\n"
+            "async def delayed_report_rpc(op, **fields):\n"
+            "    if op == 'task_event' and fields.get('event', {}).get('state') == 'running':\n"
+            "        await asyncio.sleep(2)\n"
+            "    return await original_report_rpc(op, **fields)\n"
+            "api._rpc = delayed_report_rpc\n"
+            "task_started = asyncio.Event()\n"
+            "async def wait_forever():\n"
+            "    task_started.set()\n"
+            "    await asyncio.Event().wait()\n"
+            "delayed_task = ws.tasks.start(wait_forever())\n"
+            "await task_started.wait()\n"
+            "delayed_task.id",
+        )
+        assert "task-" in result_text(started)
+
+        process = await run_cli(workspace, "reset")
+        returncode, stdout, stderr = await communicate_cli(process)
+
+        assert returncode == 1, (stdout, stderr)
+        assert "active Python tasks" in stderr
+        assert result_text(await execute(session, "40 + 2")).strip() == "42"
+        await execute(
+            session,
+            "api._rpc = original_report_rpc\n"
+            "await delayed_task.cancel()\n"
+            "await asyncio.sleep(0)",
+        )
+
+
 async def test_cli_restart_rebinds_existing_sessions(workspace):
     async with (
         mcp_session(workspace, client_id="cli-first") as first,

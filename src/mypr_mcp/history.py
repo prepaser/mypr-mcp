@@ -24,7 +24,7 @@ from typing import Any
 from .client_ids import ADJECTIVES, ANIMALS
 from .file_io import read_bytes
 from .history_maintenance import vacuum_if_worthwhile
-from .json_utils import json_text
+from .json_utils import SOURCE_HASH_ENCODING, json_text, sha256_text, source_sha256
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
@@ -849,9 +849,10 @@ class History:
                     }
                     code = record.get("code")
                     if code is not None:
-                        compact["code_sha256"] = _sha256_text(
+                        compact["code_sha256"] = source_sha256(
                             code if isinstance(code, str) else _dump(code)
                         )
+                        compact["code_sha256_encoding"] = SOURCE_HASH_ENCODING
                     compact["body_evicted"] = True
                     compact["body_evicted_at"] = now
                     if row["kind"] == "execution":
@@ -1001,7 +1002,8 @@ class History:
                     if key not in _BULKY_ENTITY_FIELDS
                 }
                 if isinstance(code, str):
-                    compact["code_sha256"] = _sha256_text(code)
+                    compact["code_sha256"] = source_sha256(code)
+                    compact["code_sha256_encoding"] = SOURCE_HASH_ENCODING
                 compact["body_evicted"] = True
                 persisted_at = timestamps.get(ident, timestamp)
                 if (
@@ -1703,7 +1705,7 @@ def _dump(value: Any) -> str:
 
 
 def _sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8", "backslashreplace")).hexdigest()
+    return sha256_text(value)
 
 
 def _sha256_optional_text(value: Any) -> str | None:

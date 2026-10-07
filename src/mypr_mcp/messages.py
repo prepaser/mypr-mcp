@@ -18,28 +18,44 @@ _MAX_INBOX_MESSAGES = 5
 _MAX_READ_WARNINGS = 4
 _MAX_WARNING_TEXT = 256
 _MAX_ID = (1 << 63) - 1
+_READONLY_BUSY_TIMEOUT_MS = 100
 
 
 class MessageStore:
     """Store and deliver messages using the workspace history database."""
 
-    def __init__(self, root: Path):
-        self.root = Path(root).resolve()
+    def __init__(self, root: Path, *, initialize: bool = True, read_only: bool = False):
+        if initialize and read_only:
+            raise ValueError("read_only cannot be used while initializing MessageStore")
+        self.root = Path(root).expanduser().resolve()
         self.db_path = self.root / ".mypr" / "history.sqlite3"
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if initialize:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._closed = False
+        self._read_only = read_only
         self._db = sqlite3.connect(
-            self.db_path,
+            self.db_path
+            if initialize
+            else self.db_path.as_uri() + f"?mode={'ro' if read_only else 'rw'}",
+            uri=not initialize,
             isolation_level=None,
             check_same_thread=False,
-            timeout=30,
+            timeout=0.1 if read_only else 30,
         )
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.execute("PRAGMA busy_timeout=30000")
-        self._create_schema()
+        try:
+            self._db.row_factory = sqlite3.Row
+            self._db.execute(
+                f"PRAGMA busy_timeout={_READONLY_BUSY_TIMEOUT_MS if read_only else 30000}"
+            )
+            if initialize:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=NORMAL")
+                self._create_schema()
+        except BaseException:
+            self._db.close()
+            self._closed = True
+            raise
 
     def _create_schema(self) -> None:
         with self._lock:
@@ -271,6 +287,10 @@ class MessageStore:
         self._ensure_open()
         recipient = self._validate_client(recipient, "recipient")
         with self._lock:
+            columns = {
+                row[1] for row in self._db.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            reply_column = ", reply_to" if "reply_to" in columns else ""
             count = int(
                 self._db.execute(
                     "SELECT COUNT(*) FROM messages WHERE recipient = ? AND acknowledged IS NULL",
@@ -278,7 +298,7 @@ class MessageStore:
                 ).fetchone()[0]
             )
             rows = self._db.execute(
-                "SELECT id, sender, text, reply_to FROM messages "
+                f"SELECT id, sender, text{reply_column} FROM messages "
                 "WHERE recipient = ? AND acknowledged IS NULL ORDER BY id ASC LIMIT ?",
                 (recipient, _MAX_INBOX_MESSAGES),
             ).fetchall()
@@ -291,7 +311,7 @@ class MessageStore:
                 "text": row["text"],
                 "truncated": False,
             }
-            if row["reply_to"] is not None:
+            if "reply_to" in row.keys() and row["reply_to"] is not None:
                 full["reply_to"] = int(row["reply_to"])
             if _json_size([*messages, full]) <= _MAX_INBOX_BYTES:
                 messages.append(full)
@@ -301,6 +321,29 @@ class MessageStore:
                 messages.append(truncated)
             break
         return {"unacked": count, "messages": messages, "has_more": count > len(messages)}
+
+    @classmethod
+    def snapshot_existing(cls, root: Path, client_id: str) -> dict[str, Any] | None:
+        """Read a bounded inbox preview without creating or changing the database."""
+        path = Path(root).expanduser() / ".mypr" / "history.sqlite3"
+        if not path.is_file():
+            return None
+        try:
+            store = cls(root, initialize=False, read_only=True)
+        except OSError, sqlite3.Error:
+            return None
+        try:
+            exists = store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+            ).fetchone()
+            if exists is None:
+                return None
+            snapshot = store.inbox(client_id)
+            return snapshot if snapshot["unacked"] else None
+        except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            store.close()
 
     def close(self) -> None:
         if self._closed:

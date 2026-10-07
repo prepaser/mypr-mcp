@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+PYTHON_MINIMUM = (3, 14)
+
 
 @dataclass(frozen=True, slots=True)
 class PythonPackage:
@@ -45,6 +47,19 @@ PYTHON_PACKAGES = MappingProxyType({item.name: item.module for item in _CATALOG}
 PYTHON_PACKAGE_REQUIREMENTS = MappingProxyType({item.name: item.requirement for item in _CATALOG})
 PYTHON_PACKAGE_METADATA = MappingProxyType({item.name: item for item in _CATALOG})
 CORE_PACKAGES = tuple(item.name for item in _CATALOG if item.core)
+
+
+def python_version_satisfies(version: str | None) -> bool:
+    if not isinstance(version, str):
+        return False
+    parts = version.split(".")
+    if len(parts) < 2:
+        return False
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return (major, minor) >= PYTHON_MINIMUM
 
 
 def version_satisfies(version: str | None, requirement: str | None) -> bool:
@@ -151,6 +166,7 @@ def package_metadata(name: str) -> PythonPackage:
 
 __all__ = [
     "CORE_PACKAGES",
+    "PYTHON_MINIMUM",
     "PYTHON_PACKAGE_CATALOG",
     "PYTHON_PACKAGE_METADATA",
     "PYTHON_PACKAGE_REQUIREMENTS",
@@ -158,6 +174,7 @@ __all__ = [
     "PythonPackage",
     "package_environment",
     "package_metadata",
+    "python_version_satisfies",
     "uv_diagnostics",
     "version_satisfies",
 ]

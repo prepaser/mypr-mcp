@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import mypr_mcp.browser_observation as observation_module
+import mypr_mcp.browser_snapshots as snapshot_module
 from mypr_mcp.browser_observation import _safe_url
 from mypr_mcp.browser_snapshots import BrowserSnapshots
 from mypr_mcp.browser_tools import BrowserError, BrowserTools
@@ -581,6 +583,63 @@ async def test_snapshot_expiry_and_playwright_capability_errors(browser_tools):
 
 
 @pytest.mark.asyncio
+async def test_snapshot_workspace_budget_and_expiry(monkeypatch):
+    class Locator:
+        async def aria_snapshot(self):
+            return "snapshot"
+
+    class SnapshotPage:
+        url = "https://example.test"
+
+        def locator(self, _selector):
+            return Locator()
+
+        async def title(self):
+            return "title"
+
+    monkeypatch.setattr(snapshot_module, "_MAX_WORKSPACE_SNAPSHOTS", 2)
+    monkeypatch.setattr(snapshot_module, "_MAX_WORKSPACE_BYTES", 1_000_000)
+    snapshots = BrowserSnapshots()
+    first = await snapshots.snapshot("one", SnapshotPage())
+    await snapshots.snapshot("two", SnapshotPage())
+    await snapshots.snapshot("three", SnapshotPage())
+    assert snapshots._total_count == 2
+    assert snapshots._total_size == sum(snapshots._sizes.values())
+    with pytest.raises(KeyError):
+        snapshots._get("one", first["snapshot_id"])
+
+    monkeypatch.setattr(snapshot_module, "_INACTIVE_TTL", 0)
+    assert snapshots.gc() == 2
+    assert not snapshots._clients
+    assert snapshots._total_count == snapshots._total_size == 0
+
+
+@pytest.mark.asyncio
+async def test_observation_workspace_budget_evicts_inactive_owner(monkeypatch):
+    monkeypatch.setattr(observation_module, "_MAX_WORKSPACE_EVENTS", 1)
+    observations = observation_module.BrowserObservations(lambda: "one")
+    first_context = object()
+    first_page = EventEmitter()
+    first_page.context = first_context
+    first_page.closed = False
+    first_page.is_closed = lambda: False
+    first = await observations.observe("one", first_page, first_context)
+    first_page.emit("pageerror", "old")
+    first.close()
+
+    second_page = EventEmitter()
+    second_page.context = object()
+    second_page.closed = False
+    second_page.is_closed = lambda: False
+    await observations.observe("two", second_page, second_page.context)
+    second_page.emit("pageerror", "new")
+    assert "one" not in observations._clients
+    assert observations._total_events == 1
+    with pytest.raises(KeyError, match="no longer retained"):
+        await first.read()
+
+
+@pytest.mark.asyncio
 async def test_regex_timeout_isolated_from_kernel_and_worker_is_reaped(browser_tools, monkeypatch):
     import mypr_mcp.browser_snapshots as snapshot_module
 
@@ -621,4 +680,5 @@ async def test_invalid_regex_and_reset_remove_observers(browser_tools):
     observation = await tools.observe(page)
     await tools.aclose()
     assert not any(page.listeners.values())
-    assert (await observation.read())["closed"]
+    with pytest.raises(KeyError, match="no longer retained"):
+        await observation.read()

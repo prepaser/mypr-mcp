@@ -25,6 +25,36 @@ def _json(value: object) -> bytes:
 
 
 @pytest.mark.asyncio
+async def test_metadata_blocks_http_redirect_before_second_request(monkeypatch):
+    import httpx2
+
+    from mypr_mcp import dependency_catalog
+
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx2.Response(
+            302,
+            headers={"location": "http://invalid.example/metadata"},
+            request=request,
+        )
+
+    client_class = httpx2.AsyncClient
+    transport = httpx2.MockTransport(handler)
+
+    def client(*args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs["trust_env"] = False
+        return client_class(*args, **kwargs)
+
+    monkeypatch.setattr(httpx2, "AsyncClient", client)
+    with pytest.raises(CatalogResolutionError, match="redirect is not HTTPS"):
+        await dependency_catalog._read_url("https://valid.example/metadata", 1024)
+    assert calls == ["https://valid.example/metadata"]
+
+
+@pytest.mark.asyncio
 async def test_catalog_descriptors_do_not_pin_release_metadata():
     for artifact in (CATALOG["rg"], CATALOG["ast-grep"], CATALOG["rga"], CATALOG["pandoc"]):
         assert artifact.version == ""

@@ -32,7 +32,7 @@ from .file_io import open_regular, read_bytes
 from .git_api import Git
 from .history import History
 from .journal import append_events, read_page
-from .json_utils import json_bytes
+from .json_utils import SOURCE_HASH_ENCODING, json_bytes, sha256_text, source_sha256
 from .mail_service import MailService
 from .managed_commands import ManagedCommands
 from .messages import MessageStore
@@ -225,7 +225,8 @@ def _recover_runs(root, history):
                     if key not in {"code", "output", "events"}
                 }
                 if isinstance(code, str):
-                    compact["code_sha256"] = hashlib.sha256(code.encode()).hexdigest()
+                    compact["code_sha256"] = source_sha256(code)
+                    compact["code_sha256_encoding"] = SOURCE_HASH_ENCODING
                 compact["body_evicted"] = True
                 if "body_evicted_at" in existing:
                     compact["body_evicted_at"] = existing["body_evicted_at"]
@@ -309,6 +310,8 @@ class Runtime:
         self.stopping = asyncio.Event()
         self.resetting = False
         self.restarting = None
+        self.restart_pending = None
+        self._reset_reservation = None
         self.healthy = False
         self.health_error = None
         self.registry_error = None
@@ -1485,7 +1488,13 @@ class Runtime:
 
     async def _admit_execution(self, client, connection_id, req):
         async with self._admission_lock:
-            if self.stopping.is_set() or self.resetting or self.restarting or not self.healthy:
+            if (
+                self.stopping.is_set()
+                or self.resetting
+                or self.restarting
+                or getattr(self, "restart_pending", None)
+                or not self.healthy
+            ):
                 raise RuntimeError("Kernel unavailable; use CLI reset")
             code = req["code"]
             request_id = req.get("request_id")
@@ -1494,11 +1503,23 @@ class Runtime:
                 if request_id is not None
                 else None
             )
-            if self.stopping.is_set() or self.resetting or self.restarting or not self.healthy:
+            if (
+                self.stopping.is_set()
+                or self.resetting
+                or self.restarting
+                or getattr(self, "restart_pending", None)
+                or not self.healthy
+            ):
                 raise RuntimeError("Kernel unavailable; use CLI reset")
             if old is not None:
                 original = old.get("code")
                 stored_digest = old.get("code_sha256")
+                digest_encoding = old.get("code_sha256_encoding")
+                if digest_encoding is not None and digest_encoding != SOURCE_HASH_ENCODING:
+                    raise RPCError(
+                        "Cannot verify request deduplication: source hash encoding is unknown",
+                        code="history_corrupt", details={"exec_id": old.get("id")},
+                    )
                 if not isinstance(original, str) and (
                     not isinstance(stored_digest, str)
                     or re.fullmatch(r"[0-9a-f]{64}", stored_digest) is None
@@ -1509,7 +1530,11 @@ class Runtime:
                     )
                 matches = (
                     original == code if isinstance(original, str)
-                    else stored_digest == hashlib.sha256(code.encode()).hexdigest()
+                    else stored_digest == (
+                        source_sha256(code)
+                        if digest_encoding == SOURCE_HASH_ENCODING
+                        else sha256_text(code)
+                    )
                 )
                 if not matches:
                     raise ValueError("request_id already used for different code")
@@ -1739,11 +1764,15 @@ class Runtime:
             raise RuntimeError("Configuration reload is in progress; retry after it completes")
         if getattr(self, "resetting", False) and op in LIFECYCLE_START_OPS:
             raise RuntimeError("Workspace restart/reset already in progress")
-        if self.restarting and op in {
-            "execute", "reset", "shell_start", "packages_add",
-            "scan_start", "browser_server",
-        }:
+        restarting_ops = {
+            "execute", "reset", "restart",
+            "shell_start", "packages_add", "scan_start", "browser_server",
+        }
+        if self.restarting and op in restarting_ops:
             raise RuntimeError(f"Workspace is restarting: {self.restarting}")
+        pending_ops = restarting_ops | {"stop", "restart_prepare"}
+        if getattr(self, "restart_pending", None) and op in pending_ops:
+            raise RuntimeError("Workspace restart is being prepared")
         if self.stopping.is_set() and (
             op in {"init", "execute", "reset", "mcp"} or op in LIFECYCLE_START_OPS
         ):
@@ -2648,19 +2677,37 @@ class Runtime:
                 or generation != self.generation
             ):
                 raise RuntimeError("Restart must originate from a running foreground cell")
-            if self.restarting or self.resetting:
-                raise RuntimeError(
-                    f"Workspace restart/reset already in progress: {self.restarting}"
-                )
             force = req.get("force", False)
             if type(force) is not bool:
                 raise TypeError("force must be a boolean")
-            self._check_restart_busy(current, force)
-            target = self.clients.get(connection_id, {}).get("target")
-            if target is None:
-                raise RuntimeError(
-                    "This MCP connection cannot restart; reconnect using the new client"
-                )
+            async with self._admission_lock:
+                if self.restarting or self.resetting or self.restart_pending:
+                    raise RuntimeError(
+                        f"Workspace restart/reset already in progress: {self.restarting}"
+                    )
+                self._check_restart_busy(current, force)
+                target = self.clients.get(connection_id, {}).get("target")
+                if target is None:
+                    raise RuntimeError(
+                        "This MCP connection cannot restart; reconnect using the new client"
+                    )
+                pending = {
+                    "token": current["id"],
+                    "generation": self.generation,
+                    "current": current,
+                    "force": force,
+                    "restart_id": None,
+                    "kernel_reserved": False,
+                }
+                self.restart_pending = pending
+                try:
+                    reservation = await self.reserve_kernel_lifecycle(
+                        token=pending["token"], current=current, force=force
+                    )
+                    pending["kernel_reserved"] = reservation.get("reserved", False)
+                except BaseException:
+                    self.restart_pending = None
+                    raise
             origin = {
                 "exec_id": current["id"],
                 "client_id": client,
@@ -2671,9 +2718,13 @@ class Runtime:
             async def prepare(ticket):
                 await self._reserve_restart(ticket["id"], current, force)
 
-            ticket = await request_restart(
-                self.workspace, target, force=force, origin=origin, prepare=prepare,
-            )
+            try:
+                ticket = await request_restart(
+                    self.workspace, target, force=force, origin=origin, prepare=prepare,
+                )
+            except BaseException:
+                await self._release_restart_pending(pending)
+                raise
             return {"accepted": True, "restart_id": ticket["id"]}
         if op == "restart_prepare":
             from .restart import read_ticket
@@ -2707,6 +2758,9 @@ class Runtime:
                     or current["generation"] != self.generation
                 ):
                     raise RuntimeError("Reset must originate from a running cell")
+                force = req.get("force", False)
+                if type(force) is not bool:
+                    raise TypeError("force must be a boolean")
                 busy = any(
                     rec is not current and rec["state"] not in TERMINAL
                     for rec in self.execs.values()
@@ -2719,13 +2773,25 @@ class Runtime:
                     raise RuntimeError("Reset already in progress")
                 if self.restarting:
                     raise RuntimeError("Workspace restart/reset already in progress")
-                if not req.get("force", False) and (
-                    busy or python_busy or self.shells.active
-                    or (self.web is not None and self.web.active_count)
-                    or (getattr(self, "dependencies", None) is not None
-                        and self.dependencies.active_count)
-                ):
+                manager_busy = False
+                if not force:
+                    manager_busy = (
+                        busy or python_busy or self.shells.active
+                        or (self.web is not None and self.web.active_count)
+                        or (getattr(self, "dependencies", None) is not None
+                            and self.dependencies.active_count)
+                    )
+                if not force and manager_busy:
                     raise RuntimeError("Workspace has active work; pass force=True to reset")
+                token = current["id"] if current is not None else uuid.uuid4().hex
+                reservation = await self.reserve_kernel_lifecycle(
+                    token=token, current=current, force=force
+                )
+                self._reset_reservation = (
+                    {"generation": self.generation, "token": token, "current": current}
+                    if reservation.get("reserved")
+                    else None
+                )
                 self.resetting = True
             if from_kernel:
                 self.spawn(self.reset(current))
@@ -2750,10 +2816,12 @@ class Runtime:
                     raise RuntimeError("Restart reservation does not match")
                 if req.get("manager_pid", os.getpid()) != os.getpid():
                     raise RuntimeError("Workspace manager changed before stop")
-                if (
-                    not planned
-                    and not req.get("force")
-                    and (
+                force = req.get("force", False)
+                if type(force) is not bool:
+                    raise TypeError("force must be a boolean")
+                manager_busy = False
+                if not force:
+                    manager_busy = (
                         any(rec["state"] not in TERMINAL for rec in self.execs.values())
                         or any(
                             rec["kind"] == "python" and rec["state"] not in TERMINAL
@@ -2765,8 +2833,12 @@ class Runtime:
                         or (getattr(self, "dependencies", None) is not None
                             and self.dependencies.active_count)
                     )
-                ):
+                if not planned and not force and manager_busy:
                     raise RuntimeError("Workspace has active work; pass --force")
+                if not planned:
+                    await self.reserve_kernel_lifecycle(
+                        token=uuid.uuid4().hex, force=force
+                    )
                 self.stopping.set()
             return {"stopping": True, "pid": os.getpid()}
         return _UNHANDLED
@@ -2884,6 +2956,21 @@ class Runtime:
         task = asyncio.create_task(self._reserve_restart_locked(ident, current, force))
         return await await_completion(task)
 
+    async def _release_restart_pending(self, pending):
+        async with self._admission_lock:
+            if self.restart_pending is not pending:
+                return
+            if pending.get("kernel_reserved"):
+                with contextlib.suppress(Exception):
+                    await self.abort_kernel_lifecycle(
+                        pending["current"],
+                        token=pending["token"],
+                        generation=pending["generation"],
+                        timeout=1,
+                    )
+            if self.restart_pending is pending:
+                self.restart_pending = None
+
     async def _reserve_restart_locked(self, ident, current, force):
         async with self._admission_lock:
             self._ensure_workspace_identity()
@@ -2893,11 +2980,33 @@ class Runtime:
                 raise RuntimeError("Workspace restart/reset already in progress")
             if self.restarting and self.restarting != ident:
                 raise RuntimeError("Workspace restart/reset already in progress")
+            pending = self.restart_pending
+            if pending is not None and (
+                pending.get("generation") != self.generation
+                or pending.get("current") is not current
+                or pending.get("token") != (current["id"] if current is not None else ident)
+                or (
+                    pending.get("restart_id") is not None
+                    and pending["restart_id"] != ident
+                )
+            ):
+                raise RuntimeError("Workspace restart/reset already in progress")
             if current is not None and current["state"] in TERMINAL and self.restarting != ident:
                 raise RuntimeError("Restart origin is no longer running")
             self._check_restart_busy(current, force)
             was_reserved = self.restarting == ident
+            token = current["id"] if current is not None else ident
+            if not was_reserved:
+                reservation = await self.reserve_kernel_lifecycle(
+                    token=token, current=current, force=force
+                )
+            else:
+                reservation = None
+            if pending is not None:
+                pending["restart_id"] = ident
             self.restarting = ident
+            if self.restart_pending is pending:
+                self.restart_pending = None
             try:
                 if current is not None:
                     await self.update_execution(
@@ -2908,6 +3017,11 @@ class Runtime:
             except BaseException:
                 if not was_reserved:
                     self.restarting = None
+                    if reservation and reservation.get("reserved"):
+                        with contextlib.suppress(Exception):
+                            await self.abort_kernel_lifecycle(
+                                current, token=token, generation=self.generation
+                            )
                 raise
             if not was_reserved:
                 self.spawn(self._watch_restart(ident, current))
@@ -2935,7 +3049,11 @@ class Runtime:
                         raise
             if ticket["state"] == "failed" and not self.stopping.is_set():
                 try:
-                    await self.abort_kernel_lifecycle(current)
+                    await self.abort_kernel_lifecycle(
+                        current,
+                        token=current["id"] if current is not None else ident,
+                        generation=self.generation,
+                    )
                     if current is not None:
                         saved = await self.io(
                             _load_execution, self.root / "runs" / f"{current['id']}.json"
@@ -2952,16 +3070,97 @@ class Runtime:
                     if self.restarting == ident:
                         self.restarting = None
         except Exception as exc:
+            with contextlib.suppress(Exception):
+                await self.abort_kernel_lifecycle(
+                    current,
+                    token=current["id"] if current is not None else ident,
+                    generation=self.generation,
+                    timeout=1,
+                )
+            if self.restarting == ident:
+                self.restarting = None
             self.healthy = False
             self.health_error = f"Restart monitoring failed: {safe_error(exc)}"
 
-    async def abort_kernel_lifecycle(self, current):
-        if current is None or not self.kc or not self.replies or self.replies.done():
+    async def reserve_kernel_lifecycle(self, *, token, current=None, force=False):
+        generation = self.generation
+        kc = getattr(self, "kc", None)
+        replies = getattr(self, "replies", None)
+        available = kc is not None and replies is not None and not replies.done()
+        if not available:
+            if force:
+                return {"reserved": False, "generation": generation, "token": token}
+            raise RuntimeError("Cannot verify live Python tasks; retry with force=True")
+        message = kc.session.msg(
+            "execute_request",
+            {
+                "code": "", "silent": True, "store_history": False,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
+            },
+            metadata={
+                "mypr_control": "lifecycle_reserve",
+                "generation": generation,
+                "exec_id": current["id"] if current is not None else None,
+                "token": token,
+                "force": force,
+            },
+        )
+        ident = message["header"]["msg_id"]
+        waiter = asyncio.get_running_loop().create_future()
+        self.control_waiters[ident] = waiter
+        cleanup_needed = True
+        try:
+            kc.shell_channel.send(message)
+            timeout = 1 if force else 10
+            async with asyncio.timeout(timeout):
+                result = await waiter
+            if result.get("status") != "ok":
+                error = result.get("evalue", "Kernel lifecycle reservation failed")
+                cleanup_needed = False
+                raise RuntimeError(error)
+            lifecycle = result.get("lifecycle")
+            if not isinstance(lifecycle, dict) or lifecycle.get("generation") != generation:
+                raise RuntimeError("Kernel lifecycle reservation returned invalid state")
+            cleanup_needed = False
+            return lifecycle
+        except BaseException as exc:
+            if cleanup_needed:
+                cleanup = asyncio.create_task(
+                    self.abort_kernel_lifecycle(
+                        current, token=token, generation=generation, timeout=1
+                    )
+                )
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(cleanup)
+            if not isinstance(exc, Exception):
+                raise
+            if force:
+                return {"reserved": False, "generation": generation, "token": token}
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "Workspace has active Python tasks"
+            ):
+                raise
+            raise RuntimeError("Cannot verify live Python tasks; retry with force=True") from exc
+        finally:
+            self.control_waiters.pop(ident, None)
+
+    async def abort_kernel_lifecycle(
+        self, current=None, *, token=None, generation=None, timeout=10  # noqa: ASYNC109
+    ):
+        if generation is None and current is not None:
+            generation = current["generation"]
+        if generation is None:
+            generation = self.generation
+        kc = getattr(self, "kc", None)
+        replies = getattr(self, "replies", None)
+        if not kc or not replies or replies.done():
             return
-        generation = current["generation"]
         if generation != self.generation:
             return
-        message = self.kc.session.msg(
+        exec_id = current["id"] if current is not None else None
+        if token is None:
+            token = exec_id
+        message = kc.session.msg(
             "execute_request",
             {
                 "code": "", "silent": True, "store_history": False,
@@ -2969,15 +3168,15 @@ class Runtime:
             },
             metadata={
                 "mypr_control": "lifecycle_abort", "generation": generation,
-                "exec_id": current["id"],
+                "exec_id": exec_id, "token": token,
             },
         )
         ident = message["header"]["msg_id"]
         waiter = asyncio.get_running_loop().create_future()
         self.control_waiters[ident] = waiter
         try:
-            self.kc.shell_channel.send(message)
-            async with asyncio.timeout(10):
+            kc.shell_channel.send(message)
+            async with asyncio.timeout(timeout):
                 result = await waiter
             if result.get("status") != "ok":
                 raise RuntimeError(result.get("evalue", "Kernel lifecycle recovery failed"))
@@ -3018,6 +3217,7 @@ class Runtime:
 
     async def reset(self, current):
         async with self._lifecycle_lock:
+            reservation = self._reset_reservation
             try:
                 self._ensure_workspace_identity()
                 if self.stopping.is_set():
@@ -3067,6 +3267,14 @@ class Runtime:
                 else:
                     raise
             finally:
+                self._reset_reservation = None
+                if reservation and self.generation == reservation["generation"]:
+                    with contextlib.suppress(Exception):
+                        await self.abort_kernel_lifecycle(
+                            reservation.get("current"),
+                            token=reservation["token"],
+                            generation=reservation["generation"],
+                        )
                 self.resetting = False
 
     async def shutdown_resources(self):

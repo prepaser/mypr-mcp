@@ -16,6 +16,7 @@ import httpx2
 from .config import validate_web_config
 from .diagnostics import RPCError, safe_text
 from .http_transport import RetryableTransport, close_client, retryable_transports
+from .web_credentials import web_credential_status
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_RESULT_URL_BYTES = 8 * 1024
@@ -128,14 +129,16 @@ class WebTransport:
         value = self.config["providers"].get(provider)
         name = value.get("api_key_env", "") if isinstance(value, Mapping) else ""
         key = os.environ.get(name) if name else None
-        if not key:
+        status = web_credential_status(key)
+        if status == "missing":
             raise _web_error(
                 "web provider credentials are missing", "credentials_missing", provider=provider
             )
-        if len(key) > 8192 or any(ord(char) < 0x20 or ord(char) > 0x7E for char in key):
+        if status == "invalid":
             raise _web_error(
                 "web provider credentials are invalid", "credentials_invalid", provider=provider
             )
+        assert isinstance(key, str)
         return key
 
     async def _client(self, provider: str):

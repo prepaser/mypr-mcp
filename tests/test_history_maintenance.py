@@ -11,6 +11,7 @@ import pytest
 from mypr_mcp import history_maintenance
 from mypr_mcp.history import History
 from mypr_mcp.history_maintenance import vacuum_if_worthwhile
+from mypr_mcp.json_utils import SOURCE_HASH_ENCODING, source_sha256
 from mypr_mcp.mail_store import MailStore
 
 
@@ -77,6 +78,36 @@ def test_history_gc_preview_apply_compacts_body_and_reports_watermark(tmp_path):
     assert [item["seq"] for item in logs["events"]] == [current["seq"]]
     assert logs["history_truncated"] is True
     assert logs["pruned_through_seq"] == event["seq"]
+    history.close()
+
+
+def test_history_gc_uses_collision_free_source_digest_for_retry(tmp_path):
+    history = History(tmp_path)
+    ident = "surrogate-source"
+    source = "value = '\ud800'"
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    (runs / f"{ident}.json").write_text(
+        json.dumps({"id": ident, "state": "succeeded", "code": source})
+    )
+    history.record(
+        "execution",
+        {"id": ident, "state": "succeeded", "code": source, "output": "body"},
+    )
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        database.execute(
+            "UPDATE entities SET updated=? WHERE id=?",
+            (time.time() - 90 * 86400, ident),
+        )
+        database.commit()
+
+    history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+    compacted = history.get(ident)
+    assert compacted["code_sha256"] == source_sha256(source)
+    assert compacted["code_sha256_encoding"] == SOURCE_HASH_ENCODING
+    persisted = json.loads((runs / f"{ident}.json").read_text())
+    assert persisted["code_sha256"] == source_sha256(source)
+    assert persisted["code_sha256_encoding"] == SOURCE_HASH_ENCODING
     history.close()
 
 
@@ -491,6 +522,32 @@ def test_recovery_repairs_legacy_evicted_body_without_refreshing_age(tmp_path):
     assert "code" not in recovered
     assert recovered["body_evicted"] is True
     assert updated == 10
+    history.close()
+
+
+def test_recovery_writes_surrogate_safe_source_digest_marker(tmp_path):
+    history = History(tmp_path)
+    ident = "d" * 32
+    source = "value = '\ud800'"
+    history.record(
+        "execution",
+        {"id": ident, "state": "succeeded", "body_evicted": True, "code": source},
+    )
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / f"{ident}.json").write_text(
+        json.dumps({"id": ident, "state": "succeeded", "code": source})
+    )
+
+    from mypr_mcp.runtime import _recover_runs
+
+    _recover_runs(tmp_path, history)
+    recovered = history.get(ident)
+    assert recovered["code_sha256"] == source_sha256(source)
+    assert recovered["code_sha256_encoding"] == SOURCE_HASH_ENCODING
+    persisted = json.loads((runs / f"{ident}.json").read_text())
+    assert persisted["code_sha256"] == source_sha256(source)
+    assert persisted["code_sha256_encoding"] == SOURCE_HASH_ENCODING
     history.close()
 
 

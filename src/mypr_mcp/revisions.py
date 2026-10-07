@@ -53,6 +53,16 @@ class RevisionIndexOutcomeUnknown(RuntimeError):
         super().__init__(message)
 
 
+class MutationOutcome:
+    __slots__ = ("committed",)
+
+    def __init__(self) -> None:
+        self.committed = False
+
+    def mark_committed(self) -> None:
+        self.committed = True
+
+
 def _empty_index(kind: str, resource: str, version: int) -> dict[str, Any]:
     index: dict[str, Any] = {
         "version": version,
@@ -242,15 +252,30 @@ class RevisionStore:
         new_revision = _hash_text(new)
         await self.ensure_capacity(resource, (old, new))
         await self.prepare(resource, (old, new))
+        outcome = MutationOutcome()
         try:
-            result = await self.fs.write(
-                resource,
-                new,
-                expected_hash=expected_hash,
-                create_parents=True,
-                history=False,
-            )
+            write_owned = getattr(type(self.fs), "_write_owned", None)
+            if write_owned is None:
+                result = await self.fs.write(
+                    resource,
+                    new,
+                    expected_hash=expected_hash,
+                    create_parents=True,
+                    history=False,
+                )
+            else:
+                result = await write_owned(
+                    self.fs,
+                    resource,
+                    new,
+                    outcome,
+                    expected_hash=expected_hash,
+                    create_parents=True,
+                    history=False,
+                )
         except BaseException as exc:
+            if not outcome.committed:
+                raise
             try:
                 current = await self._target_revision(resource)
             except BaseException as check_error:

@@ -119,6 +119,42 @@ async def test_module_history_restore_is_cas_and_does_not_reload(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [False, True])
+async def test_revision_write_conflict_preserves_identical_external_content(
+    tmp_path: Path, monkeypatch, existing: bool
+):
+    import mypr_mcp.filesystem as filesystem_module
+
+    fs = Filesystem(tmp_path)
+    modules = module_manager(tmp_path, fs)
+    target = tmp_path / ".mypr" / "lib" / "ws_lib" / "demo.py"
+    old = "VALUE = 1\n"
+    new = "VALUE = 2\n"
+    expected_hash = None
+    if existing:
+        first = await modules.write("demo", old)
+        expected_hash = first["revision"]
+
+    original = filesystem_module._atomic_write
+    injected = False
+
+    def race(path, data, old_data, old_stat, **kwargs):
+        nonlocal injected
+        if path == target and not injected:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(new.encode())
+            injected = True
+        return original(path, data, old_data, old_stat, **kwargs)
+
+    monkeypatch.setattr(filesystem_module, "_atomic_write", race)
+    with pytest.raises(RuntimeError if existing else FileExistsError):
+        await modules.write("demo", new, expected_hash=expected_hash)
+
+    assert injected
+    assert target.read_text(encoding="utf-8") == new
+
+
+@pytest.mark.asyncio
 async def test_skill_history_restore_and_utf8_page_boundary(tmp_path: Path):
     skills = Skills(tmp_path, Filesystem(tmp_path))
     old = "# 한글 skill\n"

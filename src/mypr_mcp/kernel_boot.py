@@ -58,6 +58,34 @@ def _kernel_class():
     class WorkspaceKernel(IPythonKernel):
         async def execute_request(self, stream, ident, parent):
             metadata = (parent or {}).get("metadata", {})
+            if isinstance(metadata, dict) and metadata.get("mypr_control") == "lifecycle_reserve":
+                result = {
+                    "status": "ok", "execution_count": 0,
+                    "user_expressions": {}, "payload": [],
+                }
+                try:
+                    generation = metadata.get("generation")
+                    if generation != os.environ.get("MYPR_GENERATION"):
+                        raise RuntimeError("Expired lifecycle generation")
+                    exec_id = metadata.get("exec_id")
+                    if exec_id is not None and (not isinstance(exec_id, str) or not exec_id):
+                        raise ValueError("Lifecycle reservation has an invalid execution ID")
+                    token = metadata.get("token")
+                    if token is not None and (not isinstance(token, str) or not token):
+                        raise ValueError("Lifecycle reservation has an invalid token")
+                    force = metadata.get("force", False)
+                    if type(force) is not bool:
+                        raise ValueError("Lifecycle reservation has an invalid force flag")
+                    result["lifecycle"] = self._mypr_workspace.tasks._reserve_lifecycle(
+                        exec_id,
+                        generation=generation,
+                        token=token,
+                        force=force,
+                    )
+                except Exception as exc:
+                    result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
+                self.session.send(stream, "execute_reply", result, parent, ident=ident)
+                return
             if isinstance(metadata, dict) and metadata.get("mypr_control") == "lifecycle_abort":
                 result = {
                     "status": "ok", "execution_count": 0,
@@ -67,9 +95,14 @@ def _kernel_class():
                     if metadata.get("generation") != os.environ.get("MYPR_GENERATION"):
                         raise RuntimeError("Expired lifecycle generation")
                     exec_id = metadata.get("exec_id")
-                    if not isinstance(exec_id, str) or not exec_id:
+                    if exec_id is not None and (not isinstance(exec_id, str) or not exec_id):
                         raise ValueError("Lifecycle recovery requires an execution ID")
-                    self._mypr_workspace.tasks._abort_lifecycle(exec_id)
+                    token = metadata.get("token")
+                    if token is not None and (not isinstance(token, str) or not token):
+                        raise ValueError("Lifecycle recovery has an invalid token")
+                    self._mypr_workspace.tasks._abort_lifecycle(
+                        exec_id, generation=metadata.get("generation"), token=token
+                    )
                 except Exception as exc:
                     result.update(status="error", ename=type(exc).__name__, evalue=str(exc)[:1024])
                 self.session.send(stream, "execute_reply", result, parent, ident=ident)

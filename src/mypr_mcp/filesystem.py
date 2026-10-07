@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import codecs
+import contextvars
 import difflib
 import errno
 import hashlib
@@ -22,10 +23,13 @@ from weakref import WeakValueDictionary
 
 from .async_utils import finish_owned, wait_owned
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES
-from .revisions import RevisionIndexOutcomeUnknown
+from .revisions import MutationOutcome, RevisionIndexOutcomeUnknown
 
 _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
 _PATH_LOCKS_GUARD = Lock()
+_MUTATION_OUTCOME: contextvars.ContextVar[MutationOutcome | None] = contextvars.ContextVar(
+    "mypr_filesystem_mutation_outcome", default=None
+)
 
 
 class _LspPathPins:
@@ -289,6 +293,7 @@ class Filesystem:
                     overwrite,
                     create_parents,
                     history_enabled,
+                    _MUTATION_OUTCOME.get(),
                 )
             )
             old = result.pop("_old", None)
@@ -307,6 +312,19 @@ class Filesystem:
             if operation_cancelled:
                 raise asyncio.CancelledError
             return result
+
+    async def _write_owned(
+        self,
+        path: str | os.PathLike[str],
+        text: str,
+        outcome: MutationOutcome,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        token = _MUTATION_OUTCOME.set(outcome)
+        try:
+            return await self.write(path, text, **kwargs)
+        finally:
+            _MUTATION_OUTCOME.reset(token)
 
     async def read_bytes(
         self,
@@ -383,6 +401,7 @@ class Filesystem:
                     overwrite,
                     create_parents,
                     history_enabled,
+                    _MUTATION_OUTCOME.get(),
                 )
             )
             old = result.pop("_old", None)
@@ -2081,6 +2100,7 @@ def _write_file(
     overwrite: bool,
     create_parents: bool,
     history: bool = False,
+    mutation_outcome: MutationOutcome | None = None,
 ) -> dict[str, Any]:
     try:
         old_stat = path.stat()
@@ -2109,13 +2129,23 @@ def _write_file(
         path.parent.mkdir(parents=True, exist_ok=True)
     elif not path.parent.exists():
         raise FileNotFoundError(str(path.parent))
-    info = _atomic_write(
-        path,
-        data,
-        old,
-        old_stat,
-        max_bytes=_history_blob_limit() if history else None,
-    )
+    if mutation_outcome is None:
+        info = _atomic_write(
+            path,
+            data,
+            old,
+            old_stat,
+            max_bytes=_history_blob_limit() if history else None,
+        )
+    else:
+        info = _atomic_write(
+            path,
+            data,
+            old,
+            old_stat,
+            on_commit=mutation_outcome.mark_committed,
+            max_bytes=_history_blob_limit() if history else None,
+        )
     result = _write_result(display, data, info, old is not None)
     result["_old"] = old
     result["_old_stat"] = old_stat

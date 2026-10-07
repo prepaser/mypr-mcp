@@ -13,6 +13,7 @@ from .async_utils import wait_owned
 from .config import DEFAULT_LIMITS, ConfigError, ConfigStore
 from .diagnostics import RPCError
 from .mail_store import MailStore
+from .messages import MessageStore
 from .protocol import check_compatibility, runtime_info, target_installation
 from .restart import active_ticket, read_ticket, recover_ticket, wait_ticket
 from .restart_records import (
@@ -108,6 +109,9 @@ class ConnectionBridge:
         mail = MailStore.snapshot_existing(self.workspace, self.client_id, offline=True)
         if mail is not None:
             result["mail"] = mail
+        inbox = MessageStore.snapshot_existing(self.workspace, self.client_id)
+        if inbox is not None:
+            result["inbox"] = inbox
         return result, due_at
 
     async def _poll_restart(self, exec_id, cursor, wait_ms, max_bytes=None):
@@ -142,6 +146,7 @@ class ConnectionBridge:
                 or result["output"]
                 or result.get("timers")
                 or result.get("mail")
+                or (result.get("inbox") or {}).get("unacked", 0) > 0
                 or time.monotonic() >= deadline
             ):
                 return result

@@ -14,6 +14,7 @@ import mypr_mcp.timers as timers_module
 from mypr_mcp.bridge import ConnectionBridge
 from mypr_mcp.diagnostics import RPCError
 from mypr_mcp.history import History
+from mypr_mcp.messages import MessageStore
 from mypr_mcp.protocol import descriptor, target_installation
 from mypr_mcp.timers import TimerStore
 from mypr_mcp.transport import workspace_id
@@ -110,6 +111,47 @@ async def test_disconnected_initial_poll_returns_only_client_timer(timer_workspa
 
     assert result["state"] == "succeeded"
     assert [item["id"] for item in result["timers"]["items"]] == [alice_timer["id"]]
+
+
+@pytest.mark.parametrize("state", ["succeeded", "failed"])
+async def test_restart_poll_includes_offline_message_preview(timer_workspace, state, monkeypatch):
+    workspace, store = timer_workspace
+    messages = MessageStore(workspace)
+    sent = messages.send("bob", "alice", f"restart {state}")
+    messages.close()
+    exec_id, _ = _restart_fixture(workspace, state=state)
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+    monkeypatch.setattr(bridge, "_recover_restart", _noop)
+
+    result = await bridge.request("poll", exec_id=exec_id, wait_ms=0)
+
+    assert result["state"] == state
+    assert result["inbox"]["unacked"] == 1
+    assert result["inbox"]["messages"][0]["id"] == sent["id"]
+
+
+async def test_running_restart_poll_wakes_for_offline_message(timer_workspace, monkeypatch):
+    workspace, store = timer_workspace
+    messages = MessageStore(workspace)
+    exec_id, _ = _restart_fixture(workspace, state="starting")
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+    monkeypatch.setattr(bridge, "_recover_restart", _noop)
+
+    async def deliver():
+        await asyncio.sleep(0.1)
+        messages.send("bob", "alice", "arrived")
+        messages.close()
+
+    delivery = asyncio.create_task(deliver())
+    try:
+        result = await asyncio.wait_for(bridge._poll_restart(exec_id, 0, 3000), 2)
+    finally:
+        await delivery
+        messages.close()
+    assert result["state"] == "running"
+    assert result["inbox"]["messages"][0]["text"] == "arrived"
 
 
 async def test_restart_poll_does_not_leak_timer_before_init(timer_workspace, monkeypatch):

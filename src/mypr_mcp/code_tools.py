@@ -83,6 +83,53 @@ class CodeError(RuntimeError):
     """A language server or code navigation operation failed."""
 
 
+class _OperationLock:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._admitted = 0
+        self._replacing = False
+
+    @property
+    def admitted(self) -> int:
+        return self._admitted
+
+    async def acquire(self) -> bool:
+        if self._replacing:
+            raise CodeError("language server changed during operation")
+        self._admitted += 1
+        try:
+            await self._lock.acquire()
+        except BaseException:
+            self._admitted -= 1
+            raise
+        return True
+
+    def release(self) -> None:
+        self._lock.release()
+        self._admitted -= 1
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def reserve_replacement(self, *, force: bool) -> bool:
+        if self._replacing:
+            return True
+        if self._admitted and not force:
+            return False
+        self._replacing = True
+        return True
+
+    def release_replacement(self) -> None:
+        self._replacing = False
+
+    async def __aenter__(self) -> _OperationLock:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.release()
+
+
 class _DiagnosticOutputLimitError(EditError):
     """A diagnostic page needs a larger budget to make progress."""
 
@@ -313,7 +360,7 @@ class _LanguageServer:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 0
         self._write_lock = asyncio.Lock()
-        self._operation_lock = asyncio.Lock()
+        self._operation_lock = _OperationLock()
         self._closed = False
         self._closing = False
         self._failure: str | None = None
@@ -1674,12 +1721,18 @@ class _LanguageServer:
 
     async def aclose(self) -> None:
         if self._close_task is None:
+            reserve = getattr(self._operation_lock, "reserve_replacement", None)
+            if callable(reserve):
+                reserve(force=True)
             self._close_task = asyncio.create_task(self._close())
         await wait_owned(self._close_task)
 
     async def _close(self) -> None:
         if self._closed:
             return
+        reserve = getattr(self._operation_lock, "reserve_replacement", None)
+        if callable(reserve):
+            reserve(force=True)
         self._closing = True
         self.diagnostics_cache.clear()
         self._diag_generation.clear()
@@ -1778,6 +1831,38 @@ class CodeTools:
         return command_values, frozenset(language_values)
 
     @staticmethod
+    def _reserve_server_replacement(server: Any, *, force: bool) -> bool:
+        operation_lock = getattr(server, "_operation_lock", None)
+        reserve = getattr(operation_lock, "reserve_replacement", None)
+        if callable(reserve):
+            return bool(reserve(force=force))
+        if operation_lock is None:
+            return True
+        return force or not operation_lock.locked()
+
+    @staticmethod
+    def _release_server_replacement(server: Any) -> None:
+        release = getattr(getattr(server, "_operation_lock", None), "release_replacement", None)
+        if callable(release):
+            release()
+
+    @classmethod
+    def _reserve_servers(
+        cls, targets: list[tuple[str, Any]], *, force: bool
+    ) -> list[str]:
+        reserved: list[Any] = []
+        busy: list[str] = []
+        for name, server in targets:
+            if cls._reserve_server_replacement(server, force=force):
+                reserved.append(server)
+            else:
+                busy.append(name)
+        if busy:
+            for server in reserved:
+                cls._release_server_replacement(server)
+        return busy
+
+    @staticmethod
     def _lsp_snapshot(
         value: ConfigSnapshot | dict[str, Any],
     ) -> tuple[dict[str, dict[str, Any]], str | None]:
@@ -1857,6 +1942,7 @@ class CodeTools:
         report_applied = False
         operation_cancelled = False
         reused = False
+        replacement_reserved = False
         result: dict[str, Any]
         async with self._lock:
             if self._closed:
@@ -1888,14 +1974,18 @@ class CodeTools:
             if not reused:
                 if existing is None and len(self._servers) >= MAX_SERVERS:
                     raise CodeError(f"at most {MAX_SERVERS} language servers may be configured")
+                replacement_reserved = existing is not None and self._reserve_server_replacement(
+                    existing, force=True
+                )
                 replacement = _LanguageServer(
                     self.workspace, name, command_value, language_values, float(timeout)
                 )
-                await replacement.start()
-                result = replacement.status()
-                persist_cancelled = False
-                if persist:
-                    try:
+                published = False
+                try:
+                    await replacement.start()
+                    result = replacement.status()
+                    persist_cancelled = False
+                    if persist:
                         _, persist_cancelled = await finish_owned(
                             self._persist_definition(
                                 name,
@@ -1907,16 +1997,20 @@ class CodeTools:
                             )
                         )
                         report_applied = True
-                    except BaseException:
+                    self._servers[name] = replacement
+                    published = True
+                    self._clear_workspace_diagnostics(name)
+                    close_cancelled = False
+                    if existing is not None:
+                        close_cancelled = (await finish_owned(existing.aclose()))[1]
+                    operation_cancelled = persist_cancelled or close_cancelled
+                except BaseException:
+                    if not published:
                         with suppress(BaseException):
                             await replacement.aclose()
-                        raise
-                self._servers[name] = replacement
-                self._clear_workspace_diagnostics(name)
-                close_cancelled = False
-                if existing is not None:
-                    close_cancelled = (await finish_owned(existing.aclose()))[1]
-                operation_cancelled = persist_cancelled or close_cancelled
+                        if replacement_reserved and self._servers.get(name) is existing:
+                            self._release_server_replacement(existing)
+                    raise
         if report_applied:
             _, report_cancelled = await finish_owned(self._report_applied_lsp())
             operation_cancelled = operation_cancelled or report_cancelled
@@ -3010,13 +3104,12 @@ class CodeTools:
             for name in set(self._definitions) | set(definitions)
             if self._definitions.get(name) != definitions.get(name)
         }
-        busy = sorted(
-            name
-            for name in changed
+        targets = [
+            (name, self._servers[name])
+            for name in sorted(changed)
             if name in self._servers
-            and getattr(self._servers[name], "_operation_lock", None) is not None
-            and self._servers[name]._operation_lock.locked()
-        )
+        ]
+        busy = self._reserve_servers(targets, force=force)
         if busy and not force:
             return {
                 "changed": sorted(changed),
@@ -3027,11 +3120,7 @@ class CodeTools:
                 "generation": self._kernel_generation,
                 "servers": self.status()["servers"],
             }
-        targets = [
-            (name, self._servers.pop(name))
-            for name in changed
-            if name in self._servers
-        ]
+        targets = [(name, self._servers.pop(name)) for name, _ in targets]
         for name in changed:
             self._clear_workspace_diagnostics(name)
         self._definitions = definitions
@@ -3108,18 +3197,26 @@ class CodeTools:
         async with self._lock:
             server = self._servers.get(key)
             exists = key in self._definitions or server is not None
-            if persist and key in self._definitions:
-                _, persist_cancelled = await finish_owned(
-                    self._persist_definition(key, None)
-                )
-                report_applied = self._config_rpc is not None
-                operation_cancelled = operation_cancelled or persist_cancelled
-            if server is not None:
-                self._servers.pop(key, None)
-                _, close_cancelled = await finish_owned(server.aclose())
-                operation_cancelled = operation_cancelled or close_cancelled
-            self._clear_workspace_diagnostics(key)
-            removed = exists if persist else server is not None
+            replacement_reserved = server is not None and self._reserve_server_replacement(
+                server, force=True
+            )
+            try:
+                if persist and key in self._definitions:
+                    _, persist_cancelled = await finish_owned(
+                        self._persist_definition(key, None)
+                    )
+                    report_applied = self._config_rpc is not None
+                    operation_cancelled = operation_cancelled or persist_cancelled
+                if server is not None:
+                    self._servers.pop(key, None)
+                    _, close_cancelled = await finish_owned(server.aclose())
+                    operation_cancelled = operation_cancelled or close_cancelled
+                self._clear_workspace_diagnostics(key)
+                removed = exists if persist else server is not None
+            except BaseException:
+                if replacement_reserved and self._servers.get(key) is server:
+                    self._release_server_replacement(server)
+                raise
         if not exists:
             raise CodeError(f"language server {key!r} is not configured")
         if report_applied:
@@ -3167,6 +3264,9 @@ class CodeTools:
 
     @staticmethod
     async def _close_servers(targets: list[tuple[str, Any]]) -> None:
+        for _, server in targets:
+            if server is not None:
+                CodeTools._reserve_server_replacement(server, force=True)
         results = await asyncio.gather(
             *(server.aclose() for _, server in targets if server is not None),
             return_exceptions=True,

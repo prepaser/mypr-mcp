@@ -199,6 +199,40 @@ async def test_lifecycle_gate_rejects_new_tasks_until_aborted():
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_reservation_checks_handles_and_generation(monkeypatch):
+    monkeypatch.setenv("MYPR_GENERATION", "generation")
+    async def fake_rpc(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
+    manager = kernel_api.TaskManager()
+    manager._handles["cell"] = SimpleNamespace(
+        id="cell", status=lambda: {"status": "running"}
+    )
+    background = manager.start(asyncio.Event().wait())
+    with pytest.raises(RuntimeError, match="active Python tasks"):
+        manager._reserve_lifecycle(
+            "cell", generation="generation", token="cell", force=False
+        )
+    assert not manager._lifecycle_blocked
+
+    reservation = manager._reserve_lifecycle(
+        "cell", generation="generation", token="cell", force=True
+    )
+    assert reservation["active"] == [background.id]
+    pending = asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="lifecycle transition"):
+        manager.start(pending)
+    manager._abort_lifecycle("cell", generation="other", token="cell")
+    assert manager._lifecycle_blocked
+    manager._abort_lifecycle("cell", generation="generation", token="cell")
+    await background.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await background
+    await asyncio.gather(*manager._reporters, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_remote_task_does_not_poll_with_opaque_read_cursor(monkeypatch):
     calls = []
 

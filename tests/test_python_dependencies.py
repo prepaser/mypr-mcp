@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from mypr_mcp import bootstrap
-from mypr_mcp.python_dependencies import package_environment, version_satisfies
+from mypr_mcp.python_dependencies import (
+    package_environment,
+    python_version_satisfies,
+    version_satisfies,
+)
 
 _EXPECTED_HOME = os.path.expanduser("~")
 
@@ -29,6 +33,14 @@ _EXPECTED_HOME = os.path.expanduser("~")
 )
 def test_version_satisfies_uses_packaging_constraints(version, requirement, expected):
     assert version_satisfies(version, requirement) is expected
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("3.14.0", True), ("3.14.0rc1", True), ("3.13.5", False), ("invalid", False)],
+)
+def test_python_version_satisfies_runtime_minimum(version, expected):
+    assert python_version_satisfies(version) is expected
 
 
 def test_catalogue_import_is_stdlib_only_until_version_check():

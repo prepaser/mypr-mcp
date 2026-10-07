@@ -33,6 +33,8 @@ from .dependency_catalog import (
     CATALOG,
     MODEL_NAMES,
     Artifact,
+    _https_request_hook,
+    _is_https_url,
     resolve_artifact,
 )
 from .file_io import read_bytes
@@ -624,9 +626,7 @@ class DependencyStore:
         (self.cache_root / "downloads").mkdir(parents=True, exist_ok=True)
 
     async def _download_http(self, url: str, destination: Path, maximum: int) -> None:
-        from urllib.parse import urlparse
-
-        if urlparse(url).scheme != "https":
+        if not _is_https_url(url):
             raise DependencyError(
                 "dependency downloads require HTTPS", code="dependency_download_failed"
             )
@@ -634,7 +634,20 @@ class DependencyStore:
 
         received = 0
         try:
-            async with httpx2.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            async with httpx2.AsyncClient(
+                follow_redirects=True,
+                timeout=30.0,
+                event_hooks={
+                    "request": [
+                        _https_request_hook(
+                            lambda: DependencyError(
+                                "dependency redirects must remain HTTPS",
+                                code="dependency_download_failed",
+                            )
+                        )
+                    ]
+                },
+            ) as client:
                 async with client.stream("GET", url) as response:
                     if response.url.scheme != "https":
                         raise DependencyError(
@@ -663,39 +676,52 @@ class DependencyStore:
         candidates = (artifact.name, *names)
         if artifact.name == "ast-grep":
             candidates += ("sg",)
+        seen_names: set[str] = set()
+        seen_paths: set[Path] = set()
+        problem: dict[str, Any] | None = None
         for executable in candidates:
+            if executable in seen_names:
+                continue
+            seen_names.add(executable)
             path = shutil.which(executable)
             if path is None:
                 continue
             raw_path = Path(path).absolute()
             candidate = raw_path.resolve()
+            if candidate in seen_paths:
+                continue
+            seen_paths.add(candidate)
             if _inside(raw_path, self.data_root) or _inside(candidate, self.data_root):
                 continue
             try:
                 result = _run_version(candidate)
             except (OSError, subprocess.TimeoutExpired) as exc:
-                return self._state(
-                    artifact,
-                    "unusable",
-                    source="system",
-                    path=candidate,
-                    reason=f"cannot run system tool: {exc}",
-                )
+                if problem is None:
+                    problem = self._state(
+                        artifact,
+                        "unusable",
+                        source="system",
+                        path=candidate,
+                        reason=f"cannot run system tool: {exc}",
+                    )
+                continue
             if not _compatible(
                 result,
                 _SYSTEM_MINIMUMS.get(artifact.name, artifact.version),
             ):
-                return self._state(
-                    artifact,
-                    "unusable",
-                    source="system",
-                    reason=f"system {candidate} reports an incompatible version",
-                    path=candidate,
-                )
+                if problem is None:
+                    problem = self._state(
+                        artifact,
+                        "unusable",
+                        source="system",
+                        reason=f"system {candidate} reports an incompatible version",
+                        path=candidate,
+                    )
+                continue
             return self._state(
                 artifact, "installed", source="system", path=candidate, version=result
             )
-        return None
+        return problem
 
     def _inspect_shared_binary(self, artifact: Artifact) -> dict[str, Any]:
         assert self._platform is not None

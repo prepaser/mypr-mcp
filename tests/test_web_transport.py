@@ -44,6 +44,25 @@ def test_invalid_native_options_are_rejected_before_network(provider, operation,
     assert not transport._clients
 
 
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("", "credentials_missing"),
+        ("token\n", "credentials_invalid"),
+        ("x" * 8193, "credentials_invalid"),
+    ],
+)
+def test_invalid_local_credentials_are_rejected_before_network(monkeypatch, value, code):
+    monkeypatch.setenv("WEB_KEY", value)
+    transport = WebTransport(_config("kagi"))
+
+    with pytest.raises(RPCError) as raised:
+        transport._api_key("kagi")
+
+    assert raised.value.code == code
+    assert not transport._clients
+
+
 async def test_native_lens_extraction_and_trace_are_preserved(monkeypatch):
     async def handler(request):
         body = json.loads(request.content)

@@ -805,18 +805,87 @@ class TaskManager:
         self._closing = False
         self._lifecycle_blocked = False
         self._lifecycle_origin: str | None = None
+        self._lifecycle_generation: str | None = None
+        self._lifecycle_token: str | None = None
 
-    def _begin_lifecycle(self, exec_id: str | None = None) -> None:
+    def _active_lifecycle_handles(self, exclude: str | None = None) -> list[TaskHandle]:
+        return [handle for handle in self.active() if handle.id != exclude]
+
+    def _begin_lifecycle(
+        self,
+        exec_id: str | None = None,
+        *,
+        generation: str | None = None,
+        token: str | None = None,
+    ) -> None:
+        current_generation = os.environ.get("MYPR_GENERATION", "local")
+        if generation is not None and generation != current_generation:
+            raise RuntimeError("Expired lifecycle generation")
+        token = exec_id if token is None else token
         if self._lifecycle_blocked:
+            if (
+                self._lifecycle_generation == current_generation
+                and self._lifecycle_origin == exec_id
+                and self._lifecycle_token == token
+            ):
+                return
             raise RuntimeError("Workspace lifecycle transition is in progress")
         self._lifecycle_blocked = True
         self._lifecycle_origin = exec_id
+        self._lifecycle_generation = current_generation
+        self._lifecycle_token = token
 
-    def _abort_lifecycle(self, exec_id: str | None = None) -> None:
+    def _reserve_lifecycle(
+        self,
+        exec_id: str | None = None,
+        *,
+        generation: str | None = None,
+        token: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        current_generation = os.environ.get("MYPR_GENERATION", "local")
+        token = exec_id if token is None else token
+        self._begin_lifecycle(
+            exec_id, generation=generation, token=token
+        )
+        try:
+            active = self._active_lifecycle_handles(exec_id)
+        except BaseException:
+            self._abort_lifecycle(
+                exec_id, generation=current_generation, token=token
+            )
+            raise
+        if active and not force:
+            self._abort_lifecycle(
+                exec_id, generation=current_generation, token=token
+            )
+            raise RuntimeError(
+                "Workspace has active Python tasks; pass force=True to continue"
+            )
+        return {
+            "reserved": True,
+            "generation": current_generation,
+            "token": token,
+            "active": [handle.id for handle in active],
+        }
+
+    def _abort_lifecycle(
+        self,
+        exec_id: str | None = None,
+        *,
+        generation: str | None = None,
+        token: str | None = None,
+    ) -> None:
+        if generation is not None and generation != self._lifecycle_generation:
+            return
         if exec_id is not None and self._lifecycle_origin != exec_id:
+            return
+        if token is not None and self._lifecycle_token != token:
             return
         self._lifecycle_blocked = False
         self._lifecycle_origin = None
+        self._lifecycle_generation = None
+        self._lifecycle_token = None
 
     def _check_admission(self) -> None:
         if self._closing:

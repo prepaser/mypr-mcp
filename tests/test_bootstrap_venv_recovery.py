@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import shlex
 import sys
 from pathlib import Path
 
 import pytest
 
-from mypr_mcp.bootstrap import ensure_workspace_python
+from mypr_mcp.bootstrap import _workspace_python_probe, ensure_workspace_python
 
 
 def _write_valid_venv(path: Path) -> None:
@@ -114,3 +117,79 @@ async def test_external_bin_symlink_is_repaired(tmp_path: Path):
     assert result == root / "venv/bin/python"
     assert calls == [("uv", "venv", str(root / "venv"), "--python", sys.executable)]
     assert external.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_existing_older_python_is_rejected_without_replacement(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    venv = root / "venv"
+    python = venv / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '3.13.5' 'True'\n", encoding="utf-8"
+    )
+    python.chmod(0o700)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    before = (venv / "pyvenv.cfg").read_bytes()
+    calls = []
+
+    async def command(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    with pytest.raises(RuntimeError, match=r"3\.13\.5.*3\.14.*preserved"):
+        await ensure_workspace_python(root, command=command)
+
+    assert calls == []
+    assert (venv / "pyvenv.cfg").read_bytes() == before
+    assert venv.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_python_probe_cancellation_reaps_child(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    python = root / "venv" / "bin" / "python"
+    marker = tmp_path / "child.pid"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        "#!/bin/sh\n"
+        f"sleep 30 &\nprintf '%s\\n' \"$!\" > {shlex.quote(str(marker))}\n"
+        "wait\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    (root / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    task = asyncio.create_task(_workspace_python_probe(root))
+    for _ in range(100):
+        if marker.is_file():
+            break
+        await asyncio.sleep(0.01)
+    assert marker.is_file()
+    child_pid = int(marker.read_text(encoding="utf-8"))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        os.kill(child_pid, 9)
+        pytest.fail(f"probe descendant {child_pid} survived cancellation")
+
+
+@pytest.mark.asyncio
+async def test_python_probe_rejects_unbounded_output(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    python = root / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        "#!/bin/sh\nwhile :; do printf '%04096d' 0; done\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    (root / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    assert await asyncio.wait_for(_workspace_python_probe(root), 2) is None

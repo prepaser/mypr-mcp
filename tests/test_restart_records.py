@@ -6,7 +6,13 @@ import pytest
 
 import mypr_mcp.restart as restart
 from mypr_mcp.history import History
-from mypr_mcp.restart_records import _output_evicted, finalize_origin, poll_restart
+from mypr_mcp.json_utils import SOURCE_HASH_ENCODING, sha256_text, source_sha256
+from mypr_mcp.restart_records import (
+    _output_evicted,
+    finalize_origin,
+    poll_restart,
+    restart_request_matches,
+)
 
 
 @pytest.mark.parametrize("state", ["succeeded", "failed"])
@@ -56,6 +62,47 @@ def test_origin_result_is_durable_and_finalization_is_idempotent(tmp_path, monke
         assert history.recover() == 0
     finally:
         history.close()
+
+
+def test_restart_request_matches_uses_surrogate_safe_source_digest(tmp_path):
+    ident = "f" * 32
+    source = "await ws.tasks.start(asyncio.sleep(0))\ud800"
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    (root / f"{ident}.json").write_text(
+        json.dumps(
+            {
+                "id": ident,
+                "code_sha256": source_sha256(source),
+                "code_sha256_encoding": SOURCE_HASH_ENCODING,
+            }
+        )
+    )
+
+    assert restart_request_matches(tmp_path, ident, source)
+    assert not restart_request_matches(tmp_path, ident, source.replace("\ud800", r"\ud800"))
+
+
+def test_restart_request_matches_preserves_legacy_digest_encoding(tmp_path):
+    ident = "e" * 32
+    source = "print('legacy')"
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    (root / f"{ident}.json").write_text(
+        json.dumps({"id": ident, "code_sha256": sha256_text(source)})
+    )
+
+    assert restart_request_matches(tmp_path, ident, source)
+    (root / f"{ident}.json").write_text(
+        json.dumps(
+            {
+                "id": ident,
+                "code_sha256": sha256_text(source),
+                "code_sha256_encoding": "unknown",
+            }
+        )
+    )
+    assert not restart_request_matches(tmp_path, ident, source)
 
 
 async def test_historical_restart_poll_reports_current_manager_generation(tmp_path, monkeypatch):

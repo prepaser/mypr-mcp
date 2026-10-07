@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import mypr_mcp.config_runtime as config_runtime
+import mypr_mcp.restart as restart
 from mypr_mcp.runtime import Runtime
 from mypr_mcp.services import MCPBridge
 
@@ -128,6 +129,74 @@ async def test_reload_releases_manager_locks_before_kernel_control(configured_ru
     result = await reloading
     assert result["errors"] == {}
     assert runtime.settings.applied["lsp"]["servers"]["demo"]["command"] == ["demo-lsp"]
+
+
+async def test_native_restart_pending_blocks_new_execution_until_preparation_finishes(
+    configured_runtime, monkeypatch
+):
+    runtime = configured_runtime
+    runtime.healthy = True
+    connection_id = "connection"
+    exec_id = "e" * 32
+    runtime.clients[connection_id] = {
+        "client_id": "client",
+        "target": {"python": "/usr/bin/python", "package_root": "/tmp"},
+    }
+    current = {
+        "id": exec_id,
+        "state": "running",
+        "generation": runtime.generation,
+        "connection_id": connection_id,
+    }
+    runtime.execs[exec_id] = current
+    reserved = asyncio.Event()
+    release = asyncio.Event()
+    aborted = []
+
+    async def reserve(**_fields):
+        reserved.set()
+        return {"reserved": True}
+
+    async def request_restart(*_args, **_kwargs):
+        await release.wait()
+        raise RuntimeError("target preparation failed")
+
+    async def abort(*_args, **_kwargs):
+        aborted.append(True)
+
+    monkeypatch.setattr(runtime, "reserve_kernel_lifecycle", reserve)
+    monkeypatch.setattr(runtime, "abort_kernel_lifecycle", abort)
+    monkeypatch.setattr(restart, "request_restart", request_restart)
+    request = asyncio.create_task(
+        runtime._dispatch(
+            {
+                "op": "restart",
+                "exec_id": exec_id,
+                "connection_id": connection_id,
+                "client_id": "client",
+                "generation": runtime.generation,
+                "force": False,
+            }
+        )
+    )
+    await reserved.wait()
+    with pytest.raises(RuntimeError, match="restart is being prepared"):
+        runtime._check_dispatch_admission("execute")
+    release.set()
+    with pytest.raises(RuntimeError, match="target preparation failed"):
+        await request
+    assert runtime.restart_pending is None
+    assert aborted == [True]
+
+
+def test_planned_restart_stop_reaches_reservation_validation(configured_runtime):
+    runtime = configured_runtime
+    runtime.restarting = "restart-id"
+
+    runtime._check_dispatch_admission("stop")
+    runtime._check_dispatch_admission("restart_prepare")
+    with pytest.raises(RuntimeError, match="Workspace is restarting"):
+        runtime._check_dispatch_admission("execute")
 
 
 async def test_reload_keeps_deferred_lsp_definitions_applied(configured_runtime):

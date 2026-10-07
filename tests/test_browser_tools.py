@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import types
 import zipfile
 from pathlib import Path
@@ -513,6 +514,66 @@ async def test_plain_har_capture_is_published_after_context_close(tmp_path, fake
     await tools.aclose()
 
 
+@pytest.mark.asyncio
+async def test_har_event_before_native_export_waits_for_close_completion(tmp_path, fake_playwright):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context("har", record_har_path="recording.har")
+
+    async def close_after_event():
+        context.closed = True
+        for callback in context.listeners.get("close", ()):
+            callback()
+        with zipfile.ZipFile(f"{context.options['record_har_path']}.tmp", "w") as archive:
+            archive.writestr("har.har", '{"captured": true}')
+
+    context.close = close_after_event
+    await tools.close("har")
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    assert not tools._contexts
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
+async def test_har_publication_runs_off_loop_and_close_waits(
+    tmp_path, fake_playwright, monkeypatch
+):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    context = await tools.context("har", record_har_path="recording.har")
+    with zipfile.ZipFile(f"{context.options['record_har_path']}.tmp", "w") as archive:
+        archive.writestr("har.har", '{"captured": true}')
+    original = BrowserTools._finalize_context_artifacts
+
+    def slow_finalize(item):
+        time.sleep(0.05)
+        return original(item)
+
+    monkeypatch.setattr(BrowserTools, "_finalize_context_artifacts", staticmethod(slow_finalize))
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        await tools.close("har")
+    finally:
+        beat.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await beat
+    assert ticks >= 5
+    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    await tools.aclose()
+
+
 @pytest.mark.parametrize("disconnect", [False, True])
 async def test_failed_har_publication_keeps_capture_before_context_replacement(
     tmp_path, fake_playwright, monkeypatch, disconnect
@@ -596,6 +657,11 @@ async def test_browser_disconnect_publishes_retained_har(tmp_path, fake_playwrig
     record = next(iter(tools._connections.values()))
     record.browser.closed = True
     tools._connection_disconnected(record)
+    item = tools._contexts[("client", "har")]
+    assert item.artifact_task is not None
+    assert item.context is context
+    await tools._wait_artifact(item)
+    await asyncio.sleep(0)
     assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
     assert not await asyncio.to_thread(temporary.exists)
     assert not tools.list()
@@ -637,6 +703,7 @@ async def test_cancelled_context_creation_forgets_context_when_publication_fails
         await task
     temporary = next(tmp_path.glob(".mypr-har-*"))
     assert ("client", "har") not in tools._contexts
+    assert not tools._artifact_tasks
     assert await asyncio.to_thread(temporary.exists)
     monkeypatch.setattr(BrowserTools, "_atomic_write", staticmethod(original_write))
     temporary.unlink()

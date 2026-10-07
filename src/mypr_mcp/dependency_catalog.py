@@ -13,7 +13,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Final
+from typing import Any, Final
 from urllib.parse import quote, urlsplit
 
 
@@ -312,6 +312,20 @@ def artifact_for(name: str, *, system: str | None = None) -> Artifact | None:
 Fetch = Callable[[str, int], Awaitable[bytes]]
 
 
+def _is_https_url(url: object) -> bool:
+    return urlsplit(str(url)).scheme.lower() == "https"
+
+
+def _https_request_hook(
+    reject: Callable[[], Exception],
+) -> Callable[[Any], Awaitable[None]]:
+    async def validate(request: Any) -> None:
+        if not _is_https_url(request.url):
+            raise reject()
+
+    return validate
+
+
 def _github_headers() -> dict[str, str]:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -326,7 +340,7 @@ def _github_headers() -> dict[str, str]:
 
 async def _read_url(url: str, maximum: int) -> bytes:
     parsed = urlsplit(url)
-    if parsed.scheme != "https":
+    if not _is_https_url(url):
         raise CatalogResolutionError("dependency metadata requires HTTPS")
     headers = (
         _github_headers()
@@ -339,7 +353,18 @@ async def _read_url(url: str, maximum: int) -> bytes:
         import httpx2
 
         async with httpx2.AsyncClient(
-            follow_redirects=True, timeout=30.0, headers=headers
+            follow_redirects=True,
+            timeout=30.0,
+            headers=headers,
+            event_hooks={
+                "request": [
+                    _https_request_hook(
+                        lambda: CatalogResolutionError(
+                            "dependency metadata redirect is not HTTPS"
+                        )
+                    )
+                ]
+            },
         ) as client:
             async with client.stream("GET", url) as response:
                 if response.url.scheme != "https":

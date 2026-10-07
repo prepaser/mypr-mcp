@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from jupyter_client.session import Session
 
-from mypr_mcp.code_tools import CodeTools
+from mypr_mcp.code_tools import CodeTools, _LanguageServer
 from mypr_mcp.kernel_boot import _kernel_class
 
 
@@ -84,6 +84,49 @@ async def test_apply_definitions_retries_deferred_component(tmp_path, monkeypatc
         assert server.closed is True
         assert code._servers == {}
     finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_apply_definitions_defers_queued_operation_after_holder_release(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MYPR_GLOBAL_CONFIG", str(tmp_path / "global.toml"))
+    code = CodeTools(tmp_path)
+    old = {"fake": _definition()}
+    new = {"fake": _definition(timeout=20)}
+    server = _LanguageServer(
+        tmp_path, "fake", ("fake-lsp",), frozenset({"python"}), 10.0
+    )
+    code._definitions = old
+    code._servers["fake"] = server
+    await server._operation_lock.acquire()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def queued_operation():
+        async with server._operation_lock:
+            entered.set()
+            await release.wait()
+
+    task = asyncio.create_task(queued_operation())
+    await asyncio.sleep(0)
+    assert server._operation_lock.admitted == 2
+    server._operation_lock.release()
+    try:
+        result = await code.apply_definitions(new, "new")
+        assert result["applied"] is False
+        assert result["deferred"] == ["fake"]
+        assert server._closed is False
+        assert not entered.is_set()
+        release.set()
+        await task
+        result = await code.apply_definitions(new, "new")
+        assert result["applied"] is True
+    finally:
+        release.set()
+        if not task.done():
+            await task
         await code.aclose()
 
 

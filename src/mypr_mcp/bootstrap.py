@@ -11,16 +11,21 @@ import secrets
 import shutil
 import signal
 import stat
-import subprocess
 import sys
 from pathlib import Path
 
 from .async_utils import wait_owned
 from .diagnostics import RPCError
 from .file_io import open_regular, read_bytes
-from .python_dependencies import CORE_PACKAGES, package_environment
+from .python_dependencies import (
+    CORE_PACKAGES,
+    PYTHON_MINIMUM,
+    package_environment,
+    python_version_satisfies,
+)
 
 _INVALID_VENV_IGNORE = b".venv-invalid-*/"
+_PYTHON_PROBE_OUTPUT_LIMIT = 4096
 
 
 def _workspace_python_paths(root: Path) -> tuple[Path, Path, Path]:
@@ -61,20 +66,102 @@ def _workspace_python_structure(root: Path) -> bool:
         python_info = python.stat()
         if not stat.S_ISREG(python_info.st_mode) or not os.access(python, os.X_OK):
             return False
-        result = subprocess.run(
-            [
-                str(python), "-I", "-c",
-                "import sys; raise SystemExit(sys.prefix == sys.base_prefix)",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, RuntimeError):
         return False
-    return result.returncode == 0
+    return True
+
+
+async def _workspace_python_probe(root: Path) -> str | None:
+    python = _workspace_python_paths(root)[2]
+    probe = "import platform, sys; print(platform.python_version()); " \
+        "print(sys.prefix != sys.base_prefix)"
+    command = [str(python), "-I", "-c", probe]
+    if sys.platform == "linux":
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("process_guard.py")),
+            "--parent-pid",
+            str(os.getpid()),
+            "--tree",
+            "--",
+            *command,
+        ]
+    launch = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=sys.platform != "win32",
+        )
+    )
+    process = None
+    try:
+        process = await asyncio.shield(launch)
+        stdout = await asyncio.wait_for(_read_python_probe(process), 5)
+    except asyncio.CancelledError:
+        if process is None:
+            process = await wait_owned(launch, propagate=False)
+        await _kill_probe_process(process)
+        raise
+    except OSError:
+        if process is not None:
+            await _kill_probe_process(process)
+        return None
+    except TimeoutError:
+        await _kill_probe_process(process)
+        return None
+    except BaseException:
+        await _kill_probe_process(process)
+        raise
+    if process.returncode != 0:
+        return None
+    lines = stdout.decode("utf-8", "replace").splitlines()
+    if len(lines) != 2 or lines[1] != "True":
+        return None
+    return lines[0] or None
+
+
+async def _read_python_probe(process: asyncio.subprocess.Process) -> bytes:
+    assert process.stdout is not None
+    output = bytearray()
+    while True:
+        remaining = _PYTHON_PROBE_OUTPUT_LIMIT + 1 - len(output)
+        chunk = await process.stdout.read(min(4096, remaining))
+        if not chunk:
+            await process.wait()
+            return bytes(output)
+        output.extend(chunk)
+        if len(output) > _PYTHON_PROBE_OUTPUT_LIMIT:
+            await _kill_probe_process(process)
+            return b""
+
+
+async def _kill_probe_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.send_signal(signal.SIGTERM)
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), 5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+    with contextlib.suppress(ProcessLookupError):
+        await asyncio.shield(process.wait())
+
+
+def _incompatible_python_error(version: str | None) -> RuntimeError:
+    found = version or "an unknown version"
+    return RuntimeError(
+        f"Workspace Python {found} is incompatible; Python >= {PYTHON_MINIMUM[0]}."
+        f"{PYTHON_MINIMUM[1]} is required. Recreate .mypr/venv with a compatible "
+        "interpreter; the existing environment was preserved."
+    )
+
+
+def _ensure_workspace_python_compatible(version: str | None) -> None:
+    if not python_version_satisfies(version):
+        raise _incompatible_python_error(version)
 
 
 def _remove_workspace_venv(path: Path) -> None:
@@ -105,9 +192,13 @@ async def _repair_workspace_python(root: Path, command) -> Path:
         os.replace(venv, backup)
     try:
         await command("uv", "venv", str(venv), "--python", sys.executable)
-        if not await wait_owned(asyncio.to_thread(_workspace_python_structure, root)):
+        if not _workspace_python_structure(root):
             raise RuntimeError("uv created an unusable workspace Python environment")
-        await wait_owned(asyncio.to_thread(_ensure_recovery_ignore, root))
+        version = await _workspace_python_probe(root)
+        if version is None:
+            raise RuntimeError("uv created an unusable workspace Python environment")
+        _ensure_workspace_python_compatible(version)
+        _ensure_recovery_ignore(root)
     except BaseException:
         with contextlib.suppress(OSError):
             _remove_workspace_venv(venv)
@@ -123,8 +214,11 @@ async def ensure_workspace_python(root: Path, *, command=None) -> Path:
     root = Path(root)
     if command is None:
         command = run_command
-    if await wait_owned(asyncio.to_thread(_workspace_python_structure, root)):
-        return _workspace_python_paths(root)[2]
+    if _workspace_python_structure(root):
+        version = await _workspace_python_probe(root)
+        if version is not None:
+            _ensure_workspace_python_compatible(version)
+            return _workspace_python_paths(root)[2]
     return await wait_owned(_repair_workspace_python(root, command))
 
 

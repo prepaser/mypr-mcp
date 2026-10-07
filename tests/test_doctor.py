@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import venv
+from pathlib import Path
 
 import pytest
 
+import mypr_mcp.doctor as doctor_module
 from mypr_mcp.doctor import _probe_python, doctor_workspace
 
 
@@ -71,3 +73,84 @@ async def test_doctor_python_probe_suppresses_fd_level_import_output(tmp_path):
 
     assert result["available"] is True
     assert result["packages"]["tomlkit"]["status"] == "installed"
+
+
+@pytest.mark.asyncio
+async def test_doctor_python_probe_reports_startup_and_shape_failures(tmp_path, monkeypatch):
+    async def direct(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(doctor_module.asyncio, "to_thread", direct)
+    corrupt = tmp_path / "corrupt-python"
+    corrupt.write_bytes(b"not an executable\n")
+    corrupt.chmod(0o700)
+    startup = await _probe_python(corrupt)
+    assert startup["available"] is False
+    assert "Exec format error" in startup["error"]
+
+    malformed = tmp_path / "malformed-python"
+    malformed.write_text("#!/bin/sh\nprintf '%s\\n' '[1, 2, 3]'\n", encoding="utf-8")
+    malformed.chmod(0o700)
+    shape = await _probe_python(malformed)
+    assert shape["available"] is False
+    assert shape["error"] == "invalid probe output shape"
+
+
+@pytest.mark.asyncio
+async def test_doctor_python_probe_reports_incompatible_interpreter(tmp_path, monkeypatch):
+    async def direct(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(doctor_module.asyncio, "to_thread", direct)
+    old_python = tmp_path / "old-python"
+    old_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '{\"version\":\"3.13.5\",\"packages\":{}}'\n",
+        encoding="utf-8",
+    )
+    old_python.chmod(0o700)
+    result = await _probe_python(old_python)
+
+    assert result["available"] is True
+    assert result["version"] == "3.13.5"
+    assert result["version_compatible"] is False
+    assert "Python >= 3.14 is required" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["constructor", "load"])
+async def test_doctor_contains_configuration_failures_and_continues(
+    tmp_path: Path, monkeypatch, failure
+):
+    async def direct(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    class EmptyStore:
+        data_root = tmp_path / "data"
+        cache_root = tmp_path / "cache"
+
+        def names(self, kind):
+            return ()
+
+        async def close(self):
+            return None
+
+    class BrokenConfig:
+        global_path = tmp_path / "global.toml"
+
+        def __init__(self, workspace):
+            if failure == "constructor":
+                raise ValueError("global and workspace configuration paths must differ")
+
+        def load(self):
+            raise RuntimeError("configuration changed while being read; retry")
+
+    monkeypatch.setattr(doctor_module.asyncio, "to_thread", direct)
+    monkeypatch.setattr(doctor_module, "ConfigStore", BrokenConfig)
+    monkeypatch.setattr(doctor_module, "DependencyStore", EmptyStore)
+
+    result = await doctor_workspace(tmp_path / "workspace")
+
+    assert result["config"]["valid"] is False
+    assert "configuration is unavailable" in result["warnings"]
+    assert result["storage"]["available"] is True
+    assert "python" in result and "binaries" in result

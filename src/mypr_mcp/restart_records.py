@@ -1,6 +1,5 @@
 """Durable execution results for cells that replace their own manager."""
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -11,6 +10,7 @@ from .diagnostics import RPCError
 from .file_io import read_bytes
 from .history import History
 from .journal import read_page
+from .json_utils import SOURCE_HASH_ENCODING, sha256_text, source_sha256
 
 _MAX_RECORD_BYTES = 32 * 1024 * 1024
 
@@ -53,6 +53,9 @@ def restart_request_matches(workspace, exec_id, code):
         record = _read_record(path)
     except (OSError, ValueError, TypeError):
         return False
+    digest_encoding = record.get("code_sha256_encoding")
+    if digest_encoding is not None and digest_encoding != SOURCE_HASH_ENCODING:
+        return False
     source = record.get("code")
     if isinstance(source, str):
         return source == code
@@ -61,7 +64,11 @@ def restart_request_matches(workspace, exec_id, code):
         isinstance(digest, str)
         and len(digest) == 64
         and all(character in "0123456789abcdef" for character in digest)
-        and hashlib.sha256(code.encode("utf-8", "backslashreplace")).hexdigest() == digest
+        and (
+            source_sha256(code)
+            if digest_encoding == SOURCE_HASH_ENCODING
+            else sha256_text(code)
+        ) == digest
     )
 
 

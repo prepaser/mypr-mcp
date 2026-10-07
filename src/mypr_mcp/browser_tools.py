@@ -68,6 +68,9 @@ class _Context:
     har_recording_path: Path | None
     har_content: str | None
     closed: bool = False
+    close_in_progress: bool = False
+    native_close: Callable[..., Awaitable[Any]] | None = None
+    artifact_task: asyncio.Task[None] | None = None
 
 
 async def _shielded(awaitable: Awaitable[Any]) -> tuple[Any, bool]:
@@ -101,6 +104,9 @@ class BrowserTools:
         self._snapshots = BrowserSnapshots()
         self._closed = False
         self._cleanup_task: asyncio.Task[None] | None = None
+        self._artifact_tasks: set[asyncio.Task[None]] = set()
+        self._har_publish_locks: dict[Path, asyncio.Lock] = {}
+        self._har_path_tasks: dict[Path, set[asyncio.Task[None]]] = {}
 
     async def _driver(self) -> Any:
         if self._closed:
@@ -372,9 +378,11 @@ class BrowserTools:
                 raise BrowserError("browser manager is closed")
             existing = self._contexts.get(key)
             if existing is not None:
+                if existing.close_in_progress:
+                    raise BrowserError(f"browser context {name!r} is closing; wait for it to close")
                 record = self._connections.get(existing.connection_key)
                 if record is None or not self._browser_alive(record):
-                    self._finalize_context_artifacts(existing)
+                    await self._wait_artifact(existing, retry=True)
                     self._contexts.pop(key, None)
                     if record is not None:
                         self._forget_connection(record)
@@ -384,7 +392,7 @@ class BrowserTools:
                             "reconnect it before creating a context"
                         )
                 elif existing.closed:
-                    self._finalize_context_artifacts(existing)
+                    await self._wait_artifact(existing, retry=True)
                     self._contexts.pop(key, None)
                 elif getattr(existing.context, "is_closed", lambda: False)():
                     raise BrowserError(f"browser context {name!r} is closing; wait for it to close")
@@ -451,13 +459,22 @@ class BrowserTools:
             on_close = getattr(native_context, "on", None)
             if callable(on_close):
                 on_close("close", lambda *_args: self._context_closed(key, native_context))
+            self._wrap_context_close(item)
             if self._closed or cancelled or connection_lost:
                 try:
+                    if cancelled and item.native_close is not None:
+                        item.close_in_progress = True
+                        item.context.close = item.native_close
                     with suppress(Exception):
                         await _shielded(native_context.close())
-                    with suppress(Exception):
-                        self._finalize_context_artifacts(item)
+                    if cancelled:
+                        with suppress(BaseException):
+                            await self._wait_artifact(item, retry=True)
+                    else:
+                        with suppress(Exception):
+                            await self._wait_artifact(item, retry=True)
                 finally:
+                    item.close_in_progress = False
                     self._forget_context(key, native_context)
                 if cancelled:
                     raise asyncio.CancelledError
@@ -475,16 +492,99 @@ class BrowserTools:
         if item is not None and item.context is context:
             item.closed = True
             self._observations.close_context(context)
-            try:
-                self._finalize_context_artifacts(item)
-            except Exception:
+            if item.close_in_progress:
                 return
-            self._forget_context(key, context)
+            if self._start_artifact_finalization(item) is None:
+                self._forget_context(key, context)
+
+    def _wrap_context_close(self, item: _Context) -> None:
+        native_close = getattr(item.context, "close", None)
+        if not callable(native_close):
+            return
+        item.native_close = native_close
+
+        async def close(*args: Any, **kwargs: Any) -> Any:
+            item.close_in_progress = True
+            try:
+                result = await native_close(*args, **kwargs)
+            except BaseException:
+                raise
+            else:
+                succeeded = True
+            finally:
+                item.close_in_progress = False
+            if succeeded and self._contexts.get(item.key) is item and item.closed:
+                await self._wait_artifact(item)
+            return result
+
+        try:
+            item.context.close = close
+        except (AttributeError, TypeError):
+            return
 
     def _forget_context(self, key: tuple[object, str], context: Any) -> None:
         item = self._contexts.get(key)
         if item is not None and item.context is context:
             self._contexts.pop(key, None)
+
+    def _start_artifact_finalization(
+        self, item: _Context, *, retry: bool = False
+    ) -> asyncio.Task[None] | None:
+        if item.har_path is None or item.har_recording_path is None:
+            return None
+        task = item.artifact_task
+        if task is not None:
+            if not task.done():
+                return task
+            if task.cancelled():
+                if not retry:
+                    return task
+            else:
+                with suppress(BaseException):
+                    error = task.exception()
+                if error is None:
+                    return task
+                if not retry:
+                    return task
+        task = asyncio.create_task(
+            self._finalize_context_artifacts_owned(item),
+            name=f"mypr:browser-har:{item.name}",
+        )
+        item.artifact_task = task
+        self._artifact_tasks.add(task)
+        assert item.har_path is not None
+        self._har_path_tasks.setdefault(item.har_path, set()).add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._artifact_tasks.discard(completed)
+            path = item.har_path
+            if path is not None:
+                tasks = self._har_path_tasks.get(path)
+                if tasks is not None:
+                    tasks.discard(completed)
+                    if not tasks:
+                        self._har_path_tasks.pop(path, None)
+                        self._har_publish_locks.pop(path, None)
+            if not completed.cancelled() and completed.exception() is None and item.closed:
+                self._forget_context(item.key, item.context)
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _finalize_context_artifacts_owned(self, item: _Context) -> None:
+        assert item.har_path is not None
+        await asyncio.sleep(0)
+        lock = self._har_publish_locks.setdefault(item.har_path, asyncio.Lock())
+        async with lock:
+            await asyncio.to_thread(self._finalize_context_artifacts, item)
+
+    async def _wait_artifact(self, item: _Context, *, retry: bool = False) -> None:
+        task = self._start_artifact_finalization(item, retry=retry)
+        if task is None:
+            return
+        _, cancelled = await _shielded(task)
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _finalize_context_artifacts(item: _Context) -> None:
@@ -796,24 +896,34 @@ class BrowserTools:
                 ]
                 orphan_candidates = {item.connection_key for item in context_items}
                 for item in context_items:
+                    if not item.closed:
+                        item.close_in_progress = True
+                        try:
+                            _, operation_cancelled = await _shielded(item.context.close())
+                        except asyncio.CancelledError:
+                            cancelled = True
+                        except BaseException as exc:
+                            errors.append(
+                                RuntimeError(f"context {item.name!r} close failed: {exc}")
+                            )
+                            continue
+                        else:
+                            cancelled |= operation_cancelled
+                            item.closed = True
+                            self._observations.close_context(item.context)
+                        finally:
+                            item.close_in_progress = False
                     try:
-                        _, operation_cancelled = await _shielded(item.context.close())
+                        await self._wait_artifact(item, retry=True)
                     except asyncio.CancelledError:
                         cancelled = True
                     except BaseException as exc:
-                        errors.append(RuntimeError(f"context {item.name!r} close failed: {exc}"))
+                        errors.append(
+                            RuntimeError(f"context {item.name!r} artifact flush failed: {exc}")
+                        )
                     else:
-                        cancelled |= operation_cancelled
-                        self._observations.close_context(item.context)
-                        try:
-                            self._finalize_context_artifacts(item)
-                        except BaseException as exc:
-                            errors.append(
-                                RuntimeError(f"context {item.name!r} artifact flush failed: {exc}")
-                            )
-                        else:
-                            self._forget_context(item.key, item.context)
-                            closed_contexts += 1
+                        self._forget_context(item.key, item.context)
+                        closed_contexts += 1
                 candidate_keys = set(orphan_candidates)
                 if connection or name is None:
                     candidate_keys.update(
@@ -981,6 +1091,7 @@ class BrowserTools:
                 contexts = list(self._contexts.values())
                 for item in contexts:
                     if not item.closed:
+                        item.close_in_progress = True
                         try:
                             _, operation_cancelled = await _shielded(item.context.close())
                         except asyncio.CancelledError:
@@ -992,15 +1103,28 @@ class BrowserTools:
                         else:
                             cancelled |= operation_cancelled
                             item.closed = True
+                        finally:
+                            item.close_in_progress = False
                     if item.closed:
                         try:
-                            self._finalize_context_artifacts(item)
+                            await self._wait_artifact(item, retry=True)
+                        except asyncio.CancelledError:
+                            cancelled = True
                         except BaseException as exc:
                             errors.append(
                                 RuntimeError(f"context {item.name!r} artifact flush failed: {exc}")
                             )
                         else:
                             self._forget_context(item.key, item.context)
+                for task in tuple(self._artifact_tasks):
+                    if task.done():
+                        continue
+                    try:
+                        await _shielded(task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except BaseException as exc:
+                        errors.append(RuntimeError(f"browser artifact cleanup failed: {exc}"))
                 connections = list(self._connections.values())
                 for item in connections:
                     try:

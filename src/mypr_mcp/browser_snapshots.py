@@ -22,6 +22,9 @@ from .browser_observation import _safe_url
 
 _MAX_SNAPSHOTS = 32
 _MAX_STORE_BYTES = 16 * 1024 * 1024
+_MAX_WORKSPACE_SNAPSHOTS = 256
+_MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
+_INACTIVE_TTL = 30 * 60
 _MAX_CAPTURE_BYTES = _MAX_STORE_BYTES
 _MAX_OUTPUT_BYTES = 32 * 1024
 _MAX_LIMIT = _MAX_OUTPUT_BYTES
@@ -55,6 +58,10 @@ class BrowserSnapshots:
     def __init__(self) -> None:
         self._clients: dict[str, OrderedDict[str, _Snapshot]] = {}
         self._sizes: dict[str, int] = {}
+        self._lru: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._accessed: dict[tuple[str, str], float] = {}
+        self._total_size = 0
+        self._total_count = 0
         self._generation = 0
         self._owner_generations: dict[str, int] = {}
 
@@ -125,13 +132,17 @@ class BrowserSnapshots:
             or owner_generation != self._owner_generations.get(owner, 0)
         ):
             raise RuntimeError("browser snapshots were cleared during capture")
+        self._expire()
         snapshots = self._clients.setdefault(owner, OrderedDict())
         snapshots[ident] = item
         total = self._sizes.get(owner, 0) + size
         while len(snapshots) > _MAX_SNAPSHOTS or total > _MAX_STORE_BYTES:
             _, removed = snapshots.popitem(last=False)
             total -= removed.size
+            self._remove_tracking(owner, removed.ident, removed.size)
         self._sizes[owner] = total
+        self._track(owner, item)
+        self._enforce_workspace_budget()
         return self._page(item, 0, limit)
 
     async def find(
@@ -347,16 +358,88 @@ class BrowserSnapshots:
             self._owner_generations.clear()
             self._clients.clear()
             self._sizes.clear()
+            self._lru.clear()
+            self._accessed.clear()
+            self._total_size = 0
+            self._total_count = 0
         else:
             self._owner_generations[owner] = self._owner_generations.get(owner, 0) + 1
-            self._clients.pop(owner, None)
+            snapshots = self._clients.pop(owner, None)
             self._sizes.pop(owner, None)
+            if snapshots is not None:
+                for ident, item in snapshots.items():
+                    self._remove_tracking(owner, ident, item.size)
+
+    def gc(self) -> int:
+        before = self._total_count
+        self._expire()
+        self._enforce_workspace_budget()
+        return before - self._total_count
 
     def _get(self, owner: str, ident: str) -> _Snapshot:
+        self._expire()
         snapshots = self._clients.get(owner)
         if snapshots is None or ident not in snapshots:
             raise KeyError(f"snapshot {ident!r} is no longer retained for this client")
-        return snapshots[ident]
+        item = snapshots[ident]
+        self._touch(owner, ident)
+        return item
+
+    def _track(self, owner: str, item: _Snapshot) -> None:
+        key = (owner, item.ident)
+        self._lru[key] = None
+        self._accessed[key] = time.monotonic()
+        self._total_size += item.size
+        self._total_count += 1
+
+    def _touch(self, owner: str, ident: str) -> None:
+        key = (owner, ident)
+        if key in self._lru:
+            self._lru.move_to_end(key)
+            self._accessed[key] = time.monotonic()
+
+    def _remove_tracking(self, owner: str, ident: str, size: int) -> None:
+        key = (owner, ident)
+        if key in self._lru:
+            self._lru.pop(key, None)
+            self._accessed.pop(key, None)
+            self._total_size -= size
+            self._total_count -= 1
+
+    def _remove(self, owner: str, ident: str) -> None:
+        snapshots = self._clients.get(owner)
+        if snapshots is None:
+            return
+        item = snapshots.pop(ident, None)
+        if item is None:
+            return
+        self._remove_tracking(owner, ident, item.size)
+        if not snapshots:
+            self._clients.pop(owner, None)
+            self._sizes.pop(owner, None)
+        else:
+            self._sizes[owner] -= item.size
+
+    def _expire(self) -> None:
+        if _INACTIVE_TTL < 0:
+            return
+        deadline = time.monotonic() - _INACTIVE_TTL
+        for key in tuple(self._lru):
+            if self._accessed.get(key, 0) > deadline:
+                break
+            self._remove(*key)
+
+    def _enforce_workspace_budget(self) -> None:
+        self._expire()
+        while (
+            self._total_count > _MAX_WORKSPACE_SNAPSHOTS
+            or self._total_size > _MAX_WORKSPACE_BYTES
+        ):
+            try:
+                owner, ident = next(iter(self._lru))
+            except StopIteration:
+                break
+            self._remove(owner, ident)
 
     @staticmethod
     def _encoded_size(value: dict[str, Any]) -> int:
