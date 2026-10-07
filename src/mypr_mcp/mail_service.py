@@ -104,16 +104,26 @@ class MailService:
         await self.client_changed()
 
     async def close(self) -> None:
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close())
-        await wait_owned(self._close_task)
+        close_task = self._close_task
+        if close_task is not None and close_task.done() and (
+            close_task.cancelled() or close_task.exception() is not None
+        ):
+            close_task = None
+        if close_task is None:
+            close_task = asyncio.create_task(self._close())
+            self._close_task = close_task
+        await wait_owned(close_task)
 
     async def _close(self) -> None:
         self._closed = True
         tasks = [*self._watch_tasks.values(), *self._send_tasks.values()]
         for task in tasks:
             task.cancel()
-        await asyncio.to_thread(self.transport.close)
+        transport_error = None
+        try:
+            await asyncio.to_thread(self.transport.close)
+        except BaseException as exc:
+            transport_error = exc
         await asyncio.gather(*tasks, return_exceptions=True)
         requests = tuple(self._request_accounts)
         if requests:
@@ -123,12 +133,26 @@ class MailService:
             await asyncio.gather(*late, return_exceptions=True)
         self._watch_tasks.clear()
         self._send_tasks.clear()
+        store_error = None
         if self.store is not None:
             try:
                 await self._persist(self.store.close)
-            except Exception:
-                await asyncio.to_thread(self.store.close)
-        self._refresh_status_cache()
+            except BaseException:
+                try:
+                    await asyncio.to_thread(self.store.close)
+                except BaseException as exc:
+                    store_error = exc
+        status_error = None
+        try:
+            self._refresh_status_cache()
+        except BaseException as exc:
+            status_error = exc
+        if transport_error is not None:
+            raise transport_error
+        if store_error is not None:
+            raise store_error
+        if status_error is not None:
+            raise status_error
 
     async def dispatch(self, method: str, client_id: str, params=None):
         if self._closed or self._config_applying:

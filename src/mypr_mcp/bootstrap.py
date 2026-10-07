@@ -31,15 +31,19 @@ def _workspace_python_paths(root: Path) -> tuple[Path, Path, Path]:
 def _workspace_python_structure(root: Path) -> bool:
     """Check the files that make a workspace virtual environment usable."""
 
-    venv, bin_dir, python = _workspace_python_paths(root)
     try:
-        if not venv.is_dir():
+        root = root.resolve()
+        venv, bin_dir, python = _workspace_python_paths(root)
+        if venv.is_symlink() or not venv.is_dir():
             return False
         if not bin_dir.is_dir():
             return False
+        bin_target = bin_dir.resolve() if bin_dir.is_symlink() else bin_dir
+        if not bin_target.is_relative_to(root):
+            return False
         config_candidates = [venv / "pyvenv.cfg"]
         if bin_dir.is_symlink():
-            config_candidates.append(bin_dir.resolve().parent / "pyvenv.cfg")
+            config_candidates.append(bin_target.parent / "pyvenv.cfg")
         config_info = next(
             (
                 candidate.stat()
@@ -68,7 +72,7 @@ def _workspace_python_structure(root: Path) -> bool:
             timeout=5,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
 

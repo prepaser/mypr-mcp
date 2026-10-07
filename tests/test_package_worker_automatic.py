@@ -86,6 +86,27 @@ def test_probe_suppresses_registered_module_import_output(tmp_path):
     assert result["imports"]["tomlkit"] == {"ok": True}
 
 
+def test_probe_suppresses_fd_level_registered_module_output(tmp_path):
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    sites = list((environment / "lib").glob("python*/site-packages"))
+    assert len(sites) == 1
+    (sites[0] / "tomlkit.py").write_text(
+        "import os\nos.write(1, b'package native banner\\n')\n"
+    )
+    metadata = sites[0] / "tomlkit-0.15.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: tomlkit\nVersion: 0.15.0\n"
+    )
+
+    result = package_worker._probe_environment(
+        environment / "bin" / "python", ["tomlkit"]
+    )
+
+    assert result["imports"]["tomlkit"] == {"ok": True}
+
+
 def test_automatic_install_pins_existing_distributions(tmp_path, monkeypatch):
     root = tmp_path / ".mypr"
     root.mkdir()

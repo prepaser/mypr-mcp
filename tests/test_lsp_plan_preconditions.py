@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.code_tools import _uri_path
+from mypr_mcp.code_tools import _Document, _LanguageServer, _uri_path
 from mypr_mcp.lsp_edits import (
     EditError,
     EditPlan,
@@ -195,3 +196,37 @@ else:
         timeout=5,
         check=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_pull_diagnostics_keeps_result_id_from_unchanged_response(tmp_path: Path):
+    path = tmp_path / "sample.py"
+    path.write_text("x\n", encoding="utf-8")
+    server = _LanguageServer(
+        tmp_path, "mock", ("mock",), frozenset({"python"}), timeout=1
+    )
+    document = _Document(path, path.as_uri(), "python", "x\n", 1)
+    server.documents[document.uri] = document
+    server.capabilities = {"diagnosticProvider": {}}
+    server._document = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=(document, server._diag_generation.get(document.uri, 0))
+    )
+    requests = []
+    responses = iter(
+        [
+            {"kind": "full", "items": [], "resultId": "old"},
+            {"kind": "unchanged", "resultId": "new"},
+            {"kind": "unchanged", "resultId": "new"},
+        ]
+    )
+
+    async def request(_method, params=None, **_kwargs):
+        requests.append(params)
+        return next(responses)
+
+    server._request = request
+    await server.diagnostics(path)
+    await server.diagnostics(path)
+    await server.diagnostics(path)
+    assert [item.get("previousResultId") for item in requests] == [None, "old", "new"]
+    assert server.diagnostics_cache[document.uri]["resultId"] == "new"

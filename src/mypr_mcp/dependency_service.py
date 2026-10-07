@@ -33,6 +33,23 @@ _PROBE_DRAIN_LIMIT = 128 * 1024
 _PACKAGE_PROBE = """import contextlib, importlib, importlib.metadata as m, importlib.util
 import json, os, sys
 result = {}
+
+def quiet_import(module, stdout, stderr):
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, 1)
+        os.dup2(null, 2)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            return importlib.import_module(module)
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+        os.close(null)
+
 for name, module in json.loads(sys.argv[1]).items():
     version = None
     try:
@@ -47,14 +64,14 @@ for name, module in json.loads(sys.argv[1]).items():
         else:
             with (open(os.devnull, 'w') as out, contextlib.redirect_stdout(out),
                   contextlib.redirect_stderr(out)):
-                imported = importlib.import_module(module)
+                imported = quiet_import(module, out, out)
             state, reason = 'installed', None
         result[name] = {'status': state, 'version': version, 'reason': reason}
     except Exception as exc:
         result[name] = {'status': 'unusable', 'version': version, 'reason': str(exc)[:512]}
 print(json.dumps(result))
 """
-_BROWSER_PROBE = """import importlib.metadata, json, os
+_BROWSER_PROBE = """import contextlib, importlib.metadata, json, os
 result = {}
 names = json.loads(__import__('sys').argv[1])
 try:
@@ -65,15 +82,29 @@ except importlib.metadata.PackageNotFoundError:
                         'reason': 'playwright package is missing'}
 else:
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            for name in names:
-                path = getattr(p, name).executable_path
-                result[name] = {
-                    'path': path,
-                    'status': 'installed' if os.path.isfile(path) else 'missing',
-                    'version': version,
-                }
+        saved_stdout = os.dup(1)
+        saved_stderr = os.dup(2)
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            with (open(os.devnull, 'w') as out, contextlib.redirect_stdout(out),
+                  contextlib.redirect_stderr(out)):
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    for name in names:
+                        path = getattr(p, name).executable_path
+                        result[name] = {
+                            'path': path,
+                            'status': 'installed' if os.path.isfile(path) else 'missing',
+                            'version': version,
+                        }
+        finally:
+            os.dup2(saved_stdout, 1)
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stdout)
+            os.close(saved_stderr)
+            os.close(null)
     except Exception as exc:
         for name in names:
             result[name] = {'path': None, 'status': 'unusable', 'version': version,

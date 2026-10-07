@@ -57,9 +57,11 @@ async def _probe_python(python: Path) -> dict[str, Any]:
     available = await asyncio.to_thread(lambda: python.is_file() and os.access(python, os.X_OK))
     if not available:
         return {"path": str(python), "available": False, "packages": {}}
-    script = """import importlib.metadata as m
+    script = """import contextlib
+import importlib.metadata as m
 import importlib.util
 import json
+import os
 import platform
 import sys
 names = json.loads(sys.argv[1])
@@ -76,7 +78,21 @@ for name, module in names.items():
             result[name] = {'version': version, 'imported': False,
                             'error': 'module is unavailable'}
             continue
-        __import__(module)
+        saved_stdout = os.dup(1)
+        saved_stderr = os.dup(2)
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            with (open(os.devnull, 'w') as out, contextlib.redirect_stdout(out),
+                  contextlib.redirect_stderr(out)):
+                __import__(module)
+        finally:
+            os.dup2(saved_stdout, 1)
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stdout)
+            os.close(saved_stderr)
+            os.close(null)
     except BaseException as exc:
         result[name] = {'version': version, 'imported': False,
                         'error': f'{type(exc).__name__}: {exc}'[:512]}

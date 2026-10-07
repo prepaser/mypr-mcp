@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import threading
 from pathlib import Path
 
 import pytest
 
 from mypr_mcp.filesystem import Filesystem
+from mypr_mcp.storage import Storage
 
 
 @pytest.mark.asyncio
@@ -41,6 +44,53 @@ async def test_workspace_file_history_and_binary_lifecycle(tmp_path: Path):
     deleted = await fs.delete("moved.bin", expected_hash=binary["revision"])
     assert deleted["deleted"]
     assert not (tmp_path / "moved.bin").exists()
+
+
+@pytest.mark.asyncio
+async def test_file_revision_read_serializes_with_gc(tmp_path: Path, monkeypatch):
+    fs = Filesystem(tmp_path)
+    first = await fs.write("value.txt", "first")
+    await fs.write("value.txt", "second", expected_hash=first["revision"])
+    store = fs._history_store()
+    index_loaded = asyncio.Event()
+    release = asyncio.Event()
+    original_load = store._load_index
+
+    async def blocked_load(*args, **kwargs):
+        result = await original_load(*args, **kwargs)
+        index_loaded.set()
+        await release.wait()
+        return result
+
+    store._load_index = blocked_load
+    monkeypatch.setattr(fs, "_history_store", lambda: store)
+
+    read_task = asyncio.create_task(
+        fs.read_revision("value.txt", first["revision"], max_bytes=32)
+    )
+    await asyncio.wait_for(index_loaded.wait(), 2)
+
+    gc_started = threading.Event()
+    original_plan = Storage._plan_sync
+
+    def observe_plan(storage, options, active_ids):
+        gc_started.set()
+        return original_plan(storage, options, active_ids)
+
+    monkeypatch.setattr(Storage, "_plan_sync", observe_plan)
+    gc_task = asyncio.create_task(
+        Storage(tmp_path).gc(dry_run=False, max_bytes=0, revision_keep=1)
+    )
+    await asyncio.wait_for(asyncio.to_thread(gc_started.wait, 2), 2)
+    await asyncio.sleep(0)
+    assert not gc_task.done()
+
+    release.set()
+    page = await asyncio.wait_for(read_task, 2)
+    result = await asyncio.wait_for(gc_task, 2)
+
+    assert page["text"] == "first"
+    assert result["revision_pruned"]
 
 
 @pytest.mark.asyncio
@@ -241,3 +291,40 @@ async def test_file_history_records_absence_and_restores_it(tmp_path: Path):
         "absent",
         empty["revision"],
     }
+
+
+@pytest.mark.asyncio
+async def test_restore_history_can_be_disabled_inside_revision_transaction(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    first = await fs.write("value.txt", "one")
+    second = await fs.write("value.txt", "two", expected_hash=first["revision"])
+    before_data_restore = await fs.history("value.txt")
+
+    result = await fs.restore(
+        "value.txt",
+        first["revision"],
+        expected_hash=second["revision"],
+        history=False,
+    )
+
+    assert result.get("history_recorded", False) is False
+    assert (tmp_path / "value.txt").read_text() == "one"
+    assert await fs.history("value.txt") == before_data_restore
+
+    await fs.delete("value.txt", expected_hash=first["revision"])
+    absent = next(
+        item for item in (await fs.history("value.txt"))["items"] if item["revision"] == "absent"
+    )
+    recreated = await fs.write("value.txt", "two")
+    before = await fs.history("value.txt")
+
+    result = await fs.restore(
+        "value.txt",
+        absent["revision"],
+        expected_hash=recreated["revision"],
+        history=False,
+    )
+
+    assert result.get("history_recorded", False) is False
+    assert not (tmp_path / "value.txt").exists()
+    assert await fs.history("value.txt") == before

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
+
+import pytest
 
 from mypr_mcp import history_maintenance
 from mypr_mcp.history import History
@@ -261,6 +264,61 @@ def test_history_gc_revalidates_event_owner_state(tmp_path):
     result = history.storage_history_apply(plan)
     assert result["events"] == 0
     assert history.logs(cursor=0)["events"][0]["seq"] == event["seq"]
+    history.close()
+
+
+def test_history_gc_prunes_old_ownerless_telemetry_and_exec_owned_events(tmp_path):
+    history = History(tmp_path)
+    history.record("execution", {"id": "exec", "state": "succeeded", "code": "x"})
+    web = history.append("web", "search", {"client_id": "client"})
+    mcp = history.append(
+        "mcp", "configure", {"exec_id": "exec", "state": "succeeded"}
+    )
+    lifecycle = history.append("execution", "output", {"text": "ownerless"})
+    _age_database(tmp_path, entity_id="exec", event_seq=mcp["seq"])
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        old = time.time() - 90 * 86400
+        database.execute("UPDATE events SET time=?", (old,))
+        database.commit()
+
+    plan = history.storage_history_snapshot(retention_days=30)
+    assert {item["seq"] for item in plan["events"]} == {web["seq"], mcp["seq"]}
+    result = history.storage_history_apply(plan)
+
+    assert result["events"] == 2
+    logs = history.logs(cursor=0)
+    assert [item["seq"] for item in logs["events"]] == [lifecycle["seq"]]
+    assert logs["history_truncated"] is True
+    assert logs["pruned_through_seq"] == mcp["seq"]
+    history.close()
+
+
+def test_history_gc_preserves_old_ownerless_lifecycle_event(tmp_path):
+    history = History(tmp_path)
+    event = history.append("execution", "output", {"text": "ownerless"})
+    with sqlite3.connect(tmp_path / ".mypr" / "history.sqlite3") as database:
+        database.execute("UPDATE events SET time=?", (time.time() - 90 * 86400,))
+        database.commit()
+
+    result = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+
+    assert result["events"] == 0
+    assert history.logs(cursor=0)["events"][0]["seq"] == event["seq"]
+    history.close()
+
+
+@pytest.mark.parametrize("cutoff", [math.nan, math.inf, -math.inf, 10**1000])
+def test_history_gc_rejects_nonfinite_cutoff(tmp_path, cutoff):
+    history = History(tmp_path)
+    history.record("shell", {"id": "job", "state": "succeeded", "output": "body"})
+    with pytest.raises(ValueError, match="cutoff"):
+        history.storage_history_snapshot(retention_days=10**1000)
+    plan = history.storage_history_snapshot(retention_days=1)
+    plan["cutoff"] = cutoff
+
+    with pytest.raises(ValueError, match="cutoff"):
+        history.storage_history_apply(plan)
+    assert history.get("job")["output"] == "body"
     history.close()
 
 

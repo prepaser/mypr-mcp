@@ -55,6 +55,8 @@ class BrowserSnapshots:
     def __init__(self) -> None:
         self._clients: dict[str, OrderedDict[str, _Snapshot]] = {}
         self._sizes: dict[str, int] = {}
+        self._generation = 0
+        self._owner_generations: dict[str, int] = {}
 
     async def snapshot(
         self,
@@ -86,6 +88,8 @@ class BrowserSnapshots:
             raise TypeError("boxes must be a boolean or None")
         if getattr(page, "is_closed", lambda: False)():
             raise RuntimeError("cannot snapshot a closed page")
+        generation = self._generation
+        owner_generation = self._owner_generations.get(owner, 0)
         locator = page.locator(selector) if selector is not None else page.locator("body")
         capture = locator.aria_snapshot
         requested = {"depth": depth, "mode": mode, "boxes": boxes}
@@ -116,6 +120,11 @@ class BrowserSnapshots:
             title=str(await page.title())[:512],
             captured_at=time.time(),
         )
+        if (
+            generation != self._generation
+            or owner_generation != self._owner_generations.get(owner, 0)
+        ):
+            raise RuntimeError("browser snapshots were cleared during capture")
         snapshots = self._clients.setdefault(owner, OrderedDict())
         snapshots[ident] = item
         total = self._sizes.get(owner, 0) + size
@@ -334,9 +343,12 @@ class BrowserSnapshots:
 
     def clear(self, owner: str | None = None) -> None:
         if owner is None:
+            self._generation += 1
+            self._owner_generations.clear()
             self._clients.clear()
             self._sizes.clear()
         else:
+            self._owner_generations[owner] = self._owner_generations.get(owner, 0) + 1
             self._clients.pop(owner, None)
             self._sizes.pop(owner, None)
 

@@ -269,6 +269,50 @@ async def test_external_connection_race_with_close_is_disconnected(tmp_path, fak
 
 
 @pytest.mark.asyncio
+async def test_external_disconnect_during_context_creation_does_not_orphan_context(
+    tmp_path, fake_playwright
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    tools = BrowserTools(tmp_path, lambda: "client", lambda **_: None)
+    browser = await tools.connect("ws://external", name="remote")
+    original = browser.new_context
+
+    async def slow_new_context(**options):
+        started.set()
+        await release.wait()
+        context = await original(**options)
+
+        async def fail_close():
+            raise RuntimeError("context close failed")
+
+        context.close = fail_close
+        return context
+
+    browser.new_context = slow_new_context
+    task = asyncio.create_task(tools.context("ctx", connection="remote"))
+    await started.wait()
+    browser.closed = True
+    tools._connection_disconnected(next(iter(tools._connections.values())))
+    release.set()
+    with pytest.raises(BrowserError, match="no longer available"):
+        await task
+    assert not tools._contexts
+    assert not tools.list()
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recording_paths_must_stay_below_workspace(tmp_path, fake_playwright):
+    tools = BrowserTools(tmp_path, lambda: "client", lambda **_: None)
+    outside = tmp_path.parent / "outside"
+    with pytest.raises(ValueError, match="path must stay below"):
+        tools._context_options_for_playwright({"record_har_path": outside / "capture.har"})
+    with pytest.raises(ValueError, match="path must stay below"):
+        tools._context_options_for_playwright({"record_video_dir": outside / "video"})
+
+
+@pytest.mark.asyncio
 async def test_state_is_private_and_screenshot_uses_workspace(tmp_path, fake_playwright):
     async def rpc(op, **fields):
         return "ws://127.0.0.1:1234/pw"
@@ -558,7 +602,7 @@ async def test_browser_disconnect_publishes_retained_har(tmp_path, fake_playwrig
     await tools.aclose()
 
 
-async def test_cancelled_context_creation_retains_har_when_publication_fails(
+async def test_cancelled_context_creation_forgets_context_when_publication_fails(
     tmp_path, fake_playwright, monkeypatch
 ):
     async def rpc(op, **fields):
@@ -569,11 +613,9 @@ async def test_cancelled_context_creation_retains_har_when_publication_fails(
     browser = fake_playwright.chromium.browsers[0]
     original_create = browser.new_context
     started, release = asyncio.Event(), asyncio.Event()
-    captures = []
 
     async def create(**options):
         context = await original_create(**options)
-        captures.append(context)
         with zipfile.ZipFile(f"{options['record_har_path']}.tmp", "w") as archive:
             archive.writestr("har.har", '{"captured": true}')
         started.set()
@@ -593,10 +635,11 @@ async def test_cancelled_context_creation_retains_har_when_publication_fails(
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert tools._contexts[("client", "har")].context is captures[0]
+    temporary = next(tmp_path.glob(".mypr-har-*"))
+    assert ("client", "har") not in tools._contexts
+    assert await asyncio.to_thread(temporary.exists)
     monkeypatch.setattr(BrowserTools, "_atomic_write", staticmethod(original_write))
-    await tools.close("har")
-    assert json.loads((tmp_path / "recording.har").read_text()) == {"captured": True}
+    temporary.unlink()
     assert not list(tmp_path.glob(".mypr-har-*"))
     await tools.aclose()
 

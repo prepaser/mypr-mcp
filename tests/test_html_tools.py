@@ -222,6 +222,27 @@ async def test_input_limit_is_checked_before_worker_launch(http_tools: HTTPTools
         await http_tools.extract_html("x" * (MAX_INPUT_BYTES + 1))
 
 
+async def test_worker_accepts_maximum_unicode_header(tmp_path, monkeypatch):
+    worker = tmp_path / "header_worker.py"
+    worker.write_text(
+        "import sys\n"
+        "header = sys.stdin.buffer.readline(64 * 1024 + 2)\n"
+        "assert len(header) == 64 * 1024 + 1 and header.endswith(b'\\n')\n"
+        "sys.stdin.buffer.read()\n"
+        "sys.stdout.write('{\"ok\":true,\"result\":{}}')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(html_tools, "_WORKER", worker)
+    url = "😀" * 4096
+    selector = "😀" * 4096
+    initial = html_tools.json_bytes(
+        {"url": url, "selector": selector, "include_structure": False}, separators=(",", ":")
+    )
+    url += "x" * (html_tools._MAX_HEADER_BYTES - len(initial))
+    result = await html_tools._run_worker("<p>header</p>", url=url, selector=selector)
+    assert result == {}
+
+
 async def test_cancellation_terminates_guarded_worker_tree(
     http_tools: HTTPTools, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

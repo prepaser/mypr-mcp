@@ -333,6 +333,26 @@ class Filesystem:
         create_parents: bool = False,
         history: bool = True,
     ) -> dict[str, Any]:
+        return await self._write_bytes(
+            path,
+            data,
+            expected_hash=expected_hash,
+            overwrite=overwrite,
+            create_parents=create_parents,
+            history=history,
+        )
+
+    async def _write_bytes(
+        self,
+        path: str | os.PathLike[str],
+        data: bytes,
+        *,
+        expected_hash: str | None = None,
+        overwrite: bool = False,
+        create_parents: bool = False,
+        history: bool = True,
+        history_transaction: bool = False,
+    ) -> dict[str, Any]:
         """Atomically write raw bytes using an optional CAS."""
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
@@ -348,7 +368,7 @@ class Filesystem:
         resource = self._history_resource(resolved) if history else None
         history_enabled = resource is not None
         async with AsyncExitStack() as stack:
-            if resource is not None:
+            if resource is not None and not history_transaction:
                 await stack.enter_async_context(self._history_store().transaction(resource))
             lock = self._lock(resolved)
             await lock.acquire()
@@ -755,7 +775,9 @@ class Filesystem:
         resource = self._history_resource_for_input(path)
         if resource is None:
             raise ValueError("file history requires a regular workspace file path")
-        return await self._history_store().history(resource, limit=limit, cursor=cursor)
+        store = self._history_store()
+        async with store.transaction(resource):
+            return await store.history(resource, limit=limit, cursor=cursor)
 
     async def read_revision(
         self,
@@ -768,9 +790,11 @@ class Filesystem:
         resource = self._history_resource_for_input(path)
         if resource is None:
             raise ValueError("file history requires a workspace file path")
-        return await self._history_store().read_revision(
-            resource, revision, start_byte=start_byte, max_bytes=max_bytes
-        )
+        store = self._history_store()
+        async with store.transaction(resource):
+            return await store.read_revision(
+                resource, revision, start_byte=start_byte, max_bytes=max_bytes
+            )
 
     async def restore(
         self,
@@ -786,35 +810,42 @@ class Filesystem:
         if type(history) is not bool:
             raise TypeError("history must be a boolean")
         store = self._history_store()
-        data = await store.restore_bytes(resource, revision)
-        if data is None:
-            resolved, display = self._path(path)
-            current = await _to_thread_uncancelled(
-                _read_history_optional_bytes if history else _read_optional_bytes,
-                resolved,
-                display,
+        async with store.transaction(resource):
+            data = await store.restore_bytes(resource, revision)
+            if data is None:
+                resolved, display = self._path(path)
+                current = await _to_thread_uncancelled(
+                    _read_history_optional_bytes if history else _read_optional_bytes,
+                    resolved,
+                    display,
+                )
+                if current is None:
+                    if expected_hash is not None:
+                        raise ValueError(f"Revision mismatch: expected {expected_hash}, got None")
+                    return {
+                        "path": display,
+                        "restored": True,
+                        "absent": True,
+                        "changed": False,
+                        "history_recorded": False,
+                    }
+                result = await self._delete(
+                    path,
+                    expected_hash=expected_hash,
+                    history=history,
+                    history_transaction=True,
+                )
+                result.update({"restored": True, "absent": True, "changed": True})
+                return result
+            return await self._write_bytes(
+                path,
+                data,
+                expected_hash=expected_hash,
+                overwrite=expected_hash is not None,
+                create_parents=True,
+                history=history,
+                history_transaction=True,
             )
-            if current is None:
-                if expected_hash is not None:
-                    raise ValueError(f"Revision mismatch: expected {expected_hash}, got None")
-                return {
-                    "path": display,
-                    "restored": True,
-                    "absent": True,
-                    "changed": False,
-                    "history_recorded": False,
-                }
-            result = await self.delete(path, expected_hash=expected_hash, history=history)
-            result.update({"restored": True, "absent": True, "changed": True})
-            return result
-        return await self.write_bytes(
-            path,
-            data,
-            expected_hash=expected_hash,
-            overwrite=expected_hash is not None,
-            create_parents=True,
-            history=history,
-        )
 
     async def delete(
         self,
@@ -822,6 +853,18 @@ class Filesystem:
         *,
         expected_hash: str | None = None,
         history: bool = True,
+    ) -> dict[str, Any]:
+        return await self._delete(
+            path, expected_hash=expected_hash, history=history
+        )
+
+    async def _delete(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        expected_hash: str | None = None,
+        history: bool = True,
+        history_transaction: bool = False,
     ) -> dict[str, Any]:
         if expected_hash is None:
             raise ValueError("delete requires expected_hash")
@@ -832,7 +875,7 @@ class Filesystem:
         resource = self._history_resource(resolved) if history else None
         history_enabled = resource is not None
         async with AsyncExitStack() as stack:
-            if resource is not None:
+            if resource is not None and not history_transaction:
                 await stack.enter_async_context(self._history_store().transaction(resource))
             lock = self._lock(resolved)
             await lock.acquire()

@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
+_MAX_HEADER_BYTES = 64 * 1024
 _MAX_TEXT_BYTES = 8 * 1024 * 1024
 _MAX_LINK_BYTES = 1024 * 1024
 _MAX_LINKS = 10_000
@@ -310,8 +311,8 @@ def _extract(request: dict) -> dict:
 def main() -> None:
     _limits()
     try:
-        header = sys.stdin.buffer.readline(16 * 1024)
-        if not header.endswith(b"\n"):
+        header = sys.stdin.buffer.readline(_MAX_HEADER_BYTES + 2)
+        if len(header) > _MAX_HEADER_BYTES + 1 or not header.endswith(b"\n"):
             raise _Failure("ValueError", "Invalid HTML worker request header")
         request = json.loads(header)
         if not isinstance(request, dict):

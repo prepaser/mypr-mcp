@@ -38,6 +38,7 @@ _MAX_SCAN_METADATA_BYTES = 1 * 1024 * 1024
 _DAY = 24 * 60 * 60
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
 _BULKY_ENTITY_FIELDS = {"code", "output", "events"}
+_TELEMETRY_KINDS = {"web", "mcp", "dependency", "connection", "config", "runtime"}
 
 
 def _python_history_id(record: Mapping[str, Any]) -> str | None:
@@ -611,7 +612,12 @@ class History:
         self._ensure_open()
         if type(retention_days) is not int or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
-        cutoff = time.time() - retention_days * _DAY
+        try:
+            cutoff = time.time() - retention_days * _DAY
+        except OverflowError as exc:
+            raise ValueError("history retention cutoff is not finite") from exc
+        if not _finite_number(cutoff):
+            raise ValueError("history retention cutoff is not finite")
         entities: list[dict[str, Any]] = []
         body_bytes = 0
         terminal_marks = ",".join("?" for _ in _TERMINAL_STATES)
@@ -693,10 +699,11 @@ class History:
             owner_sql = (
                 "CASE WHEN json_valid(e.data) AND json_type(e.data)='object' "
                 "AND json_type(e.data,'$.history_id')='text' "
-                "THEN json_extract(e.data,'$.history_id') ELSE e.id END"
+                "THEN json_extract(e.data,'$.history_id') "
+                "WHEN e.id IS NOT NULL THEN e.id ELSE e.exec_id END"
             )
             event_rows = self._db.execute(
-                "SELECT e.seq,e.time,e.id,e.data," + owner_sql + " AS owner "
+                "SELECT e.seq,e.time,e.id,e.exec_id,e.kind,e.data," + owner_sql + " AS owner "
                 "FROM events e JOIN entities owner ON owner.id=" + owner_sql + " "
                 "WHERE e.time <= ? AND (e.data IS NULL OR json_valid(e.data)) "
                 "AND json_valid(owner.data) AND json_type(owner.data)='object' "
@@ -713,6 +720,7 @@ class History:
                         "seq": int(row["seq"]),
                         "time": float(row["time"]),
                         "id": row["id"],
+                        "kind": row["kind"],
                         "owner": owner,
                         "data_sha256": _sha256_optional_text(row["data"]),
                     }
@@ -720,6 +728,36 @@ class History:
                 body_bytes += len(str(row["data"] or "").encode("utf-8"))
                 if len(events) >= _MAX_HISTORY_GC_ITEMS:
                     break
+            remaining_events = _MAX_HISTORY_GC_ITEMS - len(events)
+            if remaining_events:
+                telemetry_marks = ",".join("?" for _ in _TELEMETRY_KINDS)
+                telemetry_rows = self._db.execute(
+                    "SELECT e.seq,e.time,e.id,e.exec_id,e.kind,e.data," + owner_sql + " AS owner "
+                    "FROM events e "
+                    "WHERE e.time <= ? AND e.kind IN (" + telemetry_marks + ") "
+                    "AND (e.data IS NULL OR json_valid(e.data)) "
+                    "AND NOT EXISTS (SELECT 1 FROM entities owner WHERE owner.id="
+                    + owner_sql
+                    + ") ORDER BY e.seq LIMIT ?",
+                    (cutoff, *sorted(_TELEMETRY_KINDS), remaining_events),
+                ).fetchall()
+                for row in telemetry_rows:
+                    owner = _event_owner(row)
+                    if owner is not None and row["owner"] is not None and owner != row["owner"]:
+                        continue
+                    events.append(
+                        {
+                            "seq": int(row["seq"]),
+                            "time": float(row["time"]),
+                            "id": row["id"],
+                            "kind": row["kind"],
+                            "owner": owner,
+                            "data_sha256": _sha256_optional_text(row["data"]),
+                        }
+                    )
+                    body_bytes += len(str(row["data"] or "").encode("utf-8"))
+                    if len(events) >= _MAX_HISTORY_GC_ITEMS:
+                        break
             watermark = int(self._meta_value("pruned_through_seq") or 0)
             last_vacuum = self._meta_value("last_vacuum_at")
         return {
@@ -747,9 +785,19 @@ class History:
             raise ValueError("history GC batches are limited to 1000 entities and events")
         now = time.time()
         cutoff = plan.get("cutoff")
-        if cutoff is None and isinstance(plan.get("retention_days"), int):
-            cutoff = now - int(plan["retention_days"]) * _DAY
-        if not isinstance(cutoff, (int, float)) or isinstance(cutoff, bool):
+        if cutoff is None:
+            retention_days = plan.get("retention_days")
+            if type(retention_days) is not int or retention_days < 1:
+                raise ValueError("history plan retention_days is invalid")
+            try:
+                cutoff = now - retention_days * _DAY
+            except OverflowError as exc:
+                raise ValueError("history plan cutoff is invalid") from exc
+        if (
+            not isinstance(cutoff, (int, float))
+            or isinstance(cutoff, bool)
+            or not _finite_number(cutoff)
+        ):
             raise ValueError("history plan cutoff is invalid")
         compacted = 0
         deleted_events = 0
@@ -824,8 +872,14 @@ class History:
                         continue
                     seq = int(item["seq"])
                     row = self._db.execute(
-                        "SELECT seq,time,id,data FROM events WHERE seq=?", (seq,)
+                        "SELECT seq,time,id,exec_id,kind,data FROM events WHERE seq=?", (seq,)
                     ).fetchone()
+                    if row is not None and row["data"] is not None:
+                        try:
+                            json.loads(row["data"])
+                        except (TypeError, ValueError, UnicodeError):
+                            skipped.append({"seq": seq, "reason": "corrupt"})
+                            continue
                     if (
                         row is None
                         or float(row["time"]) > float(cutoff)
@@ -834,26 +888,35 @@ class History:
                         skipped.append({"seq": seq, "reason": "changed_since_plan"})
                         continue
                     owner = _event_owner(row)
-                    if owner is None or owner != item.get("owner"):
+                    if owner is None and row["kind"] not in _TELEMETRY_KINDS:
                         skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
                         continue
-                    owner_row = self._db.execute(
-                        "SELECT kind,updated,data FROM entities WHERE id=?", (owner,)
-                    ).fetchone()
-                    if owner_row is None:
+                    if item.get("kind") is not None and row["kind"] != item.get("kind"):
+                        skipped.append({"seq": seq, "reason": "changed_since_plan"})
+                        continue
+                    if owner is not None and owner != item.get("owner"):
                         skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
                         continue
-                    try:
-                        owner_record = _load(owner_row["data"])
-                    except (TypeError, ValueError, UnicodeError):
-                        skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
-                        continue
-                    if (
-                        owner_record.get("state") not in _TERMINAL_STATES
-                        or float(owner_row["updated"]) > float(cutoff)
-                    ):
-                        skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
-                        continue
+                    if owner is not None:
+                        owner_row = self._db.execute(
+                            "SELECT kind,updated,data FROM entities WHERE id=?", (owner,)
+                        ).fetchone()
+                        if owner_row is None:
+                            if row["kind"] not in _TELEMETRY_KINDS:
+                                skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                                continue
+                        else:
+                            try:
+                                owner_record = _load(owner_row["data"])
+                            except (TypeError, ValueError, UnicodeError):
+                                skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                                continue
+                            if (
+                                owner_record.get("state") not in _TERMINAL_STATES
+                                or float(owner_row["updated"]) > float(cutoff)
+                            ):
+                                skipped.append({"seq": seq, "reason": "active_or_ambiguous"})
+                                continue
                     self._db.execute("DELETE FROM events WHERE seq=?", (seq,))
                     deleted_events += 1
                     pruned_bytes += len(str(row["data"] or "").encode("utf-8"))
@@ -1647,6 +1710,13 @@ def _sha256_optional_text(value: Any) -> str | None:
     return None if value is None else _sha256_text(str(value))
 
 
+def _finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 def _event_owner(row: sqlite3.Row) -> str | None:
     data = row["data"]
     if data is not None:
@@ -1654,10 +1724,26 @@ def _event_owner(row: sqlite3.Row) -> str | None:
             payload = json.loads(data)
         except (TypeError, ValueError, UnicodeError):
             return None
-        if isinstance(payload, Mapping) and isinstance(payload.get("history_id"), str):
-            return payload["history_id"]
+        if isinstance(payload, Mapping):
+            history_id = payload.get("history_id")
+            if isinstance(history_id, str) and history_id:
+                return history_id
     ident = row["id"]
-    return str(ident) if ident is not None else None
+    if ident is not None:
+        return str(ident)
+    exec_id = _row_value(row, "exec_id")
+    if exec_id is not None:
+        return str(exec_id)
+    if data is not None:
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        if isinstance(payload, Mapping):
+            payload_exec_id = payload.get("exec_id")
+            if isinstance(payload_exec_id, str) and payload_exec_id:
+                return payload_exec_id
+    return None
 
 
 def _history_entity_matches(row: sqlite3.Row, item: Mapping[str, Any]) -> bool:
@@ -1673,6 +1759,7 @@ def _history_event_matches(row: sqlite3.Row, item: Mapping[str, Any]) -> bool:
     return (
         float(row["time"]) == float(item.get("time"))
         and row["id"] == item.get("id")
+        and (item.get("kind") is None or row["kind"] == item.get("kind"))
         and _sha256_optional_text(row["data"]) == item.get("data_sha256")
     )
 

@@ -4,12 +4,13 @@ import asyncio
 import os
 import signal
 import sys
+import venv
 from pathlib import Path
 
 import pytest
 
 from mypr_mcp.bootstrap import prepare_core
-from mypr_mcp.dependency_service import DependencyService
+from mypr_mcp.dependency_service import _BROWSER_PROBE, DependencyService
 from mypr_mcp.diagnostics import RPCError
 from mypr_mcp.python_dependencies import CORE_PACKAGES
 
@@ -90,6 +91,47 @@ async def test_list_is_read_only_and_cursor_is_bound_to_kind(tmp_path):
     with pytest.raises(ValueError, match="invalid dependency cursor"):
         await service.list(kind="model", limit=1, cursor=first["next_cursor"])
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_probe_suppresses_import_output(tmp_path):
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    sites = list((environment / "lib").glob("python*/site-packages"))
+    assert len(sites) == 1
+    browser = tmp_path / "chromium"
+    browser.write_text("browser")
+    package = sites[0] / "playwright"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "import os\nos.write(1, b'playwright native banner\\n')\n"
+    )
+    (package / "sync_api.py").write_text(
+        "class Browser:\n"
+        f"    executable_path = {str(browser)!r}\n"
+        "class Playwright:\n"
+        "    chromium = Browser()\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *args): return None\n"
+        "def sync_playwright(): return Playwright()\n"
+    )
+    metadata = sites[0] / "playwright-1.58.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: playwright\nVersion: 1.58.0\n"
+    )
+    service = DependencyService(
+        tmp_path,
+        environment / "bin" / "python",
+        {},
+        _missing_package_install,
+        _missing_browser_install,
+    )
+    try:
+        result = await service._probe(_BROWSER_PROBE, ["chromium"])
+        assert result["chromium"]["status"] == "installed"
+    finally:
+        await service.close()
 
 
 @pytest.mark.asyncio

@@ -207,7 +207,7 @@ class BrowserTools:
         for key in ("record_har_path", "record_video_dir"):
             value = normalized.get(key)
             if value is not None:
-                target = self._path(value)
+                target = self._path(value, directory=self.workspace)
                 if key == "record_video_dir":
                     target.mkdir(parents=True, exist_ok=True)
                 else:
@@ -424,9 +424,12 @@ class BrowserTools:
                     record.browser.new_context(**native_options)
                 )
             except Exception as exc:
-                if not record.external and not self._browser_alive(record):
+                if not self._browser_alive(record):
                     self._forget_connection(record)
                 raise BrowserError(f"unable to create browser context: {exc}") from exc
+            connection_lost = self._connections.get(record.key) is not record
+            if not connection_lost:
+                connection_lost = not self._browser_alive(record)
             item = _Context(
                 key=key,
                 name=name,
@@ -448,13 +451,22 @@ class BrowserTools:
             on_close = getattr(native_context, "on", None)
             if callable(on_close):
                 on_close("close", lambda *_args: self._context_closed(key, native_context))
-            if self._closed or cancelled:
-                with suppress(Exception):
-                    await _shielded(native_context.close())
-                    self._finalize_context_artifacts(item)
+            if self._closed or cancelled or connection_lost:
+                try:
+                    with suppress(Exception):
+                        await _shielded(native_context.close())
+                    with suppress(Exception):
+                        self._finalize_context_artifacts(item)
+                finally:
                     self._forget_context(key, native_context)
                 if cancelled:
                     raise asyncio.CancelledError
+                if connection_lost:
+                    if self._connections.get(record.key) is record:
+                        self._forget_connection(record)
+                    raise BrowserError(
+                        f"browser connection {record.name!r} is no longer available"
+                    )
                 raise BrowserError("browser manager is closed")
             return native_context
 

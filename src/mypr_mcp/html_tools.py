@@ -16,11 +16,13 @@ from typing import Any
 
 from .async_utils import wait_owned
 from .http_tools import _client_id
+from .json_utils import json_bytes
 
 _WORKER = Path(__file__).with_name("html_worker.py")
 _WORKER_PYTHON = sys.executable
 _WORKERS = asyncio.Semaphore(2)
 MAX_INPUT_BYTES = 16 * 1024 * 1024
+_MAX_HEADER_BYTES = 64 * 1024
 _MAX_WORKER_OUTPUT = 24 * 1024 * 1024
 _MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 _MAX_SNAPSHOTS = 32
@@ -126,15 +128,16 @@ async def _run_worker(
     include_structure: bool = False,
 ) -> dict[str, Any]:
     encoded = _encode_html(html)
-    header = json.dumps(
+    header = json_bytes(
         {
             "url": url,
             "selector": selector,
             "include_structure": include_structure,
         },
-        ensure_ascii=False,
         separators=(",", ":"),
-    ).encode("utf-8")
+    )
+    if len(header) > _MAX_HEADER_BYTES:
+        raise ValueError(f"HTML worker request header exceeds {_MAX_HEADER_BYTES} bytes")
     request = header + b"\n" + encoded
 
     env = {

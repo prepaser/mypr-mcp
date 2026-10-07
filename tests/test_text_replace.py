@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 import mypr_mcp.patching as patching
-from mypr_mcp.change_plans import ChangePlanStore
+import mypr_mcp.text_replace as text_replace
+from mypr_mcp.change_plans import ChangePlanError, ChangePlanStore
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.text_replace_worker import replace as worker_replace
 
@@ -45,6 +46,39 @@ async def test_replace_preview_and_apply_is_cas_checked(tmp_path: Path):
     (tmp_path / "two.txt").write_text("changed\n")
     with pytest.raises(ValueError, match="source changed"):
         await fs.apply_replace(preview["plan_id"])
+
+
+@pytest.mark.asyncio
+async def test_apply_replace_bounds_stale_source_reads(tmp_path: Path, monkeypatch):
+    target = tmp_path / "value.txt"
+    with target.open("wb") as stream:
+        stream.truncate(20 * 1024 * 1024)
+    plan_id = ChangePlanStore(tmp_path, "replace").create(
+        {
+            "history": False,
+            "operations": [
+                {
+                    "input": "value.txt",
+                    "display": "value.txt",
+                    "old": b"x",
+                    "new": b"y",
+                    "matches": 1,
+                }
+            ],
+        }
+    )
+    calls = []
+    original = text_replace._read_state
+
+    def instrument(path, display, *args, **kwargs):
+        calls.append(kwargs.get("max_bytes", args[0] if args else None))
+        return original(path, display, *args, **kwargs)
+
+    monkeypatch.setattr(text_replace, "_read_state", instrument)
+    fs = Filesystem(tmp_path)
+    with pytest.raises(ChangePlanError, match="source changed"):
+        await fs.apply_replace(plan_id)
+    assert calls == [1]
 
 
 @pytest.mark.asyncio

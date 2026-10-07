@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .api_help import workspace_help
-from .async_utils import wait_owned
+from .async_utils import finish_owned, wait_owned
 from .browser_tools import BrowserTools
 from .code_tools import CodeTools
 from .config_api import ConfigAPI
@@ -803,6 +803,15 @@ class TaskManager:
         self._completed_ids: set[str] = set()
         self._explicit_ids: set[str] = set()
         self._closing = False
+        self._lifecycle_blocked = False
+
+    def _begin_lifecycle(self) -> None:
+        if self._lifecycle_blocked:
+            raise RuntimeError("Workspace lifecycle transition is in progress")
+        self._lifecycle_blocked = True
+
+    def _abort_lifecycle(self) -> None:
+        self._lifecycle_blocked = False
 
     async def _drain_reporters(self) -> None:
         reporters = set(self._reporters)
@@ -865,6 +874,10 @@ class TaskManager:
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
             raise RuntimeError("Workspace tasks are closing")
+        if self._lifecycle_blocked:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise RuntimeError("Workspace lifecycle transition is in progress")
         if type(persist_result) is not bool or (persist_result and not visible):
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
@@ -1258,6 +1271,27 @@ class RemoteTask(TaskHandle):
         self._monitor = manager.start(self._watch(), visible=False)
         manager._track(self, generated=True)
 
+    async def _read_remote(self, cursor: int | str, *, wait_ms: int = 30000) -> Any:
+        try:
+            return await _rpc(
+                "shell_read",
+                id=self.id,
+                cursor=cursor,
+                max_bytes=1024 * 1024,
+                wait_ms=wait_ms,
+            )
+        except (RPCError, AssertionError) as error:
+            if type(cursor) is not int:
+                if isinstance(error, RPCError):
+                    raise
+                raise RPCError("shell output read failed") from error
+            try:
+                return await _rpc("shell_poll", id=self.id, cursor=cursor)
+            except (RPCError, AssertionError) as fallback:
+                if isinstance(fallback, RPCError):
+                    raise
+                raise RPCError("shell output poll failed") from fallback
+
     async def _watch(self) -> None:
         try:
             while True:
@@ -1268,16 +1302,7 @@ class RemoteTask(TaskHandle):
                     return
                 try:
                     cursor = self._cursor
-                    try:
-                        result = await _rpc(
-                            "shell_read",
-                            id=self.id,
-                            cursor=cursor,
-                            max_bytes=1024 * 1024,
-                            wait_ms=30000,
-                        )
-                    except RPCError, AssertionError:
-                        result = await _rpc("shell_poll", id=self.id, cursor=cursor)
+                    result = await self._read_remote(cursor)
                     if cursor == self._cursor:
                         self._merge(result)
                 except RPCError as exc:
@@ -1413,10 +1438,7 @@ class RemoteTask(TaskHandle):
         async with self._lock:
             await _rpc("shell_cancel", id=self.id)
             cursor = self._cursor
-            try:
-                result = await _rpc("shell_read", id=self.id, cursor=cursor)
-            except RPCError, AssertionError:
-                result = await _rpc("shell_poll", id=self.id, cursor=cursor)
+            result = await self._read_remote(cursor, wait_ms=0)
             if cursor == self._cursor:
                 self._merge(result)
         return True
@@ -2129,18 +2151,33 @@ class Workspace:
         current = self.tasks._handles.get(exec_id)
         if current is None or getattr(current, "_task", None) is not asyncio.current_task():
             raise RuntimeError("Request reset from a foreground Python cell")
-        active = [handle for handle in self.tasks.active() if handle.id != exec_id]
+        self.tasks._begin_lifecycle()
+        try:
+            active = [handle for handle in self.tasks.active() if handle.id != exec_id]
+        except BaseException:
+            self.tasks._abort_lifecycle()
+            raise
         if active and not force:
+            self.tasks._abort_lifecycle()
             raise RuntimeError("Workspace has active tasks; pass force=True to reset")
-        result = await _rpc(
-            "reset",
-            force=force,
-            from_kernel=True,
-            generation=os.environ.get("MYPR_GENERATION"),
-            exec_id=exec_id,
+        request = asyncio.create_task(
+            _rpc(
+                "reset",
+                force=force,
+                from_kernel=True,
+                generation=os.environ.get("MYPR_GENERATION"),
+                exec_id=exec_id,
+            )
         )
+        try:
+            result, cancelled = await finish_owned(request)
+        except BaseException:
+            self.tasks._abort_lifecycle()
+            raise
         if force:
             await asyncio.gather(*(handle.cancel() for handle in active), return_exceptions=True)
+        if cancelled:
+            raise asyncio.CancelledError
         raise ResetRequested(result)
 
     async def restart(self, force: bool = False) -> Any:
@@ -2154,15 +2191,30 @@ class Workspace:
             or getattr(current, "_task", None) is not asyncio.current_task()
         ):
             raise RuntimeError("Request restart from a foreground Python cell")
-        active = [handle for handle in self.tasks.active() if handle.id != exec_id]
+        self.tasks._begin_lifecycle()
+        try:
+            active = [handle for handle in self.tasks.active() if handle.id != exec_id]
+        except BaseException:
+            self.tasks._abort_lifecycle()
+            raise
         if active and not force:
+            self.tasks._abort_lifecycle()
             raise RuntimeError("Workspace has active tasks; pass force=True to restart")
-        result = await _rpc(
-            "restart",
-            force=force,
-            exec_id=exec_id,
-            generation=os.environ.get("MYPR_GENERATION"),
+        request = asyncio.create_task(
+            _rpc(
+                "restart",
+                force=force,
+                exec_id=exec_id,
+                generation=os.environ.get("MYPR_GENERATION"),
+            )
         )
+        try:
+            result, cancelled = await finish_owned(request)
+        except BaseException:
+            self.tasks._abort_lifecycle()
+            raise
+        if cancelled:
+            raise asyncio.CancelledError
         raise ResetRequested(result)
 
     def help(self, topic: str | None = None) -> str:

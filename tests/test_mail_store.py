@@ -4,6 +4,8 @@ import json
 import os
 import time
 
+import pytest
+
 from mypr_mcp.mail_store import MailStore
 
 
@@ -38,6 +40,30 @@ def test_default_send_request_id_is_bound_to_draft(tmp_path):
         assert first["id"] == second["id"]
         assert first["request_id"] == f"draft:{value['id']}"
         assert len(store.sends("client")["items"]) == 1
+    finally:
+        store.close()
+
+
+def test_send_request_replays_when_mime_is_missing(tmp_path):
+    store = MailStore(tmp_path)
+    try:
+        value = draft(store)
+        first = store.create_send("client", value["id"], "request")
+        store.update_send(first["id"], state="accepted")
+        os.unlink(value["mime_path"])
+
+        assert store.create_send("client", value["id"], "request")["id"] == first["id"]
+
+        with pytest.raises(ValueError, match="draft MIME is unavailable"):
+            store.create_send("client", value["id"], "new-request")
+
+        other = draft(store)
+        with pytest.raises(ValueError, match="already associated"):
+            store.create_send("client", other["id"], "request")
+
+        other_client = draft(store, "other")
+        second = store.create_send("other", other_client["id"], "request")
+        assert second["id"] != first["id"]
     finally:
         store.close()
 

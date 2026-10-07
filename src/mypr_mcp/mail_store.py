@@ -1104,8 +1104,6 @@ class MailStore:
                     raise ValueError(f"unknown draft ID: {draft_id}")
                 if draft["client_id"] != client_id:
                     raise ValueError("draft belongs to another client")
-                if not self._draft_mime_exists(draft["mime_path"]):
-                    raise ValueError("draft MIME is unavailable")
                 if request_id is None:
                     request_id = f"draft:{draft_id}"
                 if request_id is not None:
@@ -1117,6 +1115,8 @@ class MailStore:
                         if old["draft_id"] != draft_id:
                             raise ValueError("request_id is already associated with another draft")
                         return self._send_row(old)
+                if not self._draft_mime_exists(draft["mime_path"]):
+                    raise ValueError("draft MIME is unavailable")
                 existing = self._db.execute(
                     (
                         "SELECT * FROM mail_sends WHERE draft_id=? AND state IN "

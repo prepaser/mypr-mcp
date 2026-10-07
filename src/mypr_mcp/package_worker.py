@@ -107,6 +107,7 @@ import contextlib
 import importlib.metadata as metadata
 import io
 import json
+import os
 import sys
 
 class _Capture(io.StringIO):
@@ -132,6 +133,22 @@ class _Capture(io.StringIO):
     def text(self):
         return ''.join(self.parts)
 
+def _import_quiet(module, stdout, stderr):
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, 1)
+        os.dup2(null, 2)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            __import__(module)
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+        os.close(null)
+
 requested = json.loads(sys.argv[1])
 dist = {}
 for item in metadata.distributions():
@@ -148,8 +165,7 @@ for name in requested:
     stdout = _Capture()
     stderr = _Capture()
     try:
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            __import__(name)
+        _import_quiet(name, stdout, stderr)
     except BaseException as exc:
         detail = f"{type(exc).__name__}: {exc}"
         diagnostic = (stdout.text() + stderr.text()).strip()

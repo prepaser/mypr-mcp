@@ -50,6 +50,46 @@ async def draft(service):
     )
 
 
+async def test_close_retries_failed_transport_after_finishing_cleanup(tmp_path, monkeypatch):
+    from mypr_mcp.mail_store import MailStore
+
+    service = MailService(tmp_path)
+    service.store = MailStore(tmp_path)
+    transport_calls = []
+    store_calls = []
+
+    class Transport:
+        def close(self):
+            transport_calls.append(None)
+            if len(transport_calls) == 1:
+                raise RuntimeError("transport close failed")
+
+        def cached_status(self):
+            return {"imap": [], "smtp": [], "watches": []}
+
+    original_store_close = service.store.close
+
+    def close_store():
+        store_calls.append(None)
+        original_store_close()
+
+    service.transport = Transport()
+    service.store.close = close_store
+
+    async def inline(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", inline)
+    with pytest.raises(RuntimeError, match="transport close failed"):
+        await service.close()
+    assert service.store._closed
+    assert len(store_calls) == 1
+
+    await service.close()
+    assert len(transport_calls) == 2
+    assert len(store_calls) == 2
+
+
 async def test_concurrent_send_replays_start_only_one_smtp_worker(tmp_path, monkeypatch):
     service, notices = await make_service(tmp_path)
     entered = threading.Event()

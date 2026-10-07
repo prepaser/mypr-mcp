@@ -1429,7 +1429,7 @@ class _LanguageServer:
                         result = {
                             "kind": "full",
                             "items": cached.get("diagnostics", []),
-                            "resultId": previous,
+                            "resultId": result["resultId"],
                             "myprTruncated": cached.get("truncated", False),
                         }
                 if not isinstance(result, dict) or result.get("kind") != "full":

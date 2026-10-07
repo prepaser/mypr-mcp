@@ -198,6 +198,15 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
     entries = payload.get("operations")
     if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_FILES:
         raise ChangePlanError("invalid replacement plan")
+
+    async def read_state(path: Path, display: str, expected: bytes) -> _State:
+        try:
+            return await asyncio.to_thread(
+                _read_state, path, display, max(1, len(expected))
+            )
+        except (OSError, ValueError) as exc:
+            raise ChangePlanError(f"replacement source changed: {display}") from exc
+
     resolved: list[tuple[dict[str, Any], Path, str, bytes, _State]] = []
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("input"), str):
@@ -223,7 +232,7 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
             raise ChangePlanError("replacement plan contains duplicate paths")
         if actual_display != display:
             raise ChangePlanError("replacement path changed since preview")
-        state = await asyncio.to_thread(_read_state, path, display)
+        state = await read_state(path, display, old)
         if not state.exists or state.data != old:
             raise ChangePlanError(f"replacement source changed: {display}")
         resolved.append((entry, path, display, new, state))
@@ -254,7 +263,7 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
             for _, path, display, new, state in resolved
         ]
         for _, (_, path, display, _, state) in zip(plans, resolved, strict=True):
-            current = await asyncio.to_thread(_read_state, path, display)
+            current = await read_state(path, display, state.data or b"")
             if current.data != state.data:
                 raise ChangePlanError(f"replacement source changed: {display}")
         if history_store is not None:

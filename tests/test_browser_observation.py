@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from mypr_mcp.browser_observation import _safe_url
+from mypr_mcp.browser_snapshots import BrowserSnapshots
 from mypr_mcp.browser_tools import BrowserError, BrowserTools
 
 
@@ -474,6 +475,39 @@ asyncio.run(main())
         text=True,
         timeout=3,
     )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_clear_discards_capture_completed_after_clear():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowLocator:
+        async def aria_snapshot(self):
+            started.set()
+            await release.wait()
+            return "snapshot"
+
+    class SlowPage:
+        url = ""
+
+        def is_closed(self):
+            return False
+
+        def locator(self, _selector):
+            return SlowLocator()
+
+        async def title(self):
+            return "title"
+
+    snapshots = BrowserSnapshots()
+    task = asyncio.create_task(snapshots.snapshot("owner", SlowPage()))
+    await started.wait()
+    snapshots.clear()
+    release.set()
+    with pytest.raises(RuntimeError, match="cleared during capture"):
+        await task
+    assert not snapshots._clients
 
 
 @pytest.mark.asyncio

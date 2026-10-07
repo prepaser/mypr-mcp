@@ -151,6 +151,114 @@ async def test_hidden_explicit_ids_remain_reserved(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_gate_rejects_new_tasks_until_aborted():
+    manager = kernel_api.TaskManager()
+    manager._begin_lifecycle()
+    pending = asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="lifecycle transition"):
+        manager.start(pending)
+    assert pending.cr_frame is None
+
+    manager._abort_lifecycle()
+    handle = manager.start(asyncio.sleep(0))
+    await handle
+    await asyncio.gather(*manager._reporters)
+
+
+@pytest.mark.asyncio
+async def test_remote_task_does_not_poll_with_opaque_read_cursor(monkeypatch):
+    calls = []
+
+    async def fake_rpc(op, **fields):
+        calls.append((op, fields))
+        if op == "shell_read" and len(calls) == 1:
+            return {
+                "state": "running",
+                "output": [],
+                "cursor": "mypr-shell1.cursor",
+                "has_more": False,
+            }
+        if op == "shell_read":
+            raise kernel_api.RPCError("manager temporarily unavailable")
+        raise AssertionError(f"unexpected {op}")
+
+    monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
+    handle = kernel_api.RemoteTask("a" * 32, kernel_api.TaskManager())
+
+    await asyncio.wait_for(handle._monitor, 1)
+
+    assert [op for op, _ in calls] == ["shell_read", "shell_read"]
+    assert handle.status()["status"] == "lost"
+    with pytest.raises(kernel_api.RPCError, match="manager temporarily unavailable"):
+        await handle
+
+
+@pytest.mark.parametrize(("method", "operation"), [("reset", "reset"), ("restart", "restart")])
+@pytest.mark.asyncio
+async def test_workspace_lifecycle_gate_blocks_task_start_during_rpc(
+    monkeypatch, tmp_path, method, operation
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_rpc(op, **fields):
+        if op == operation:
+            entered.set()
+            await release.wait()
+            return {"accepted": True}
+        return None
+
+    monkeypatch.setattr(kernel_api, "_rpc", fake_rpc)
+    workspace = kernel_api.Workspace(tmp_path)
+
+    async def current_cell():
+        workspace.tasks._handles["cell"] = SimpleNamespace(
+            id="cell", _task=asyncio.current_task(), status=lambda: {"status": "running"}
+        )
+        with kernel_api.execution_context({"client_id": "client", "exec_id": "cell"}):
+            try:
+                await getattr(workspace, method)()
+            except kernel_api.ResetRequested:
+                return
+
+    current = asyncio.create_task(current_cell())
+    await entered.wait()
+    pending = asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="lifecycle transition"):
+        workspace.tasks.start(pending)
+    assert pending.cr_frame is None
+    release.set()
+    await current
+
+
+@pytest.mark.parametrize(("method", "operation"), [("reset", "reset"), ("restart", "restart")])
+@pytest.mark.asyncio
+async def test_workspace_lifecycle_gate_aborts_on_rpc_failure(
+    monkeypatch, tmp_path, method, operation
+):
+    async def failed_rpc(op, **fields):
+        if op == operation:
+            raise kernel_api.RPCError("manager rejected lifecycle request")
+        return None
+
+    monkeypatch.setattr(kernel_api, "_rpc", failed_rpc)
+    workspace = kernel_api.Workspace(tmp_path)
+
+    async def current_cell():
+        workspace.tasks._handles["cell"] = SimpleNamespace(
+            id="cell", _task=asyncio.current_task(), status=lambda: {"status": "running"}
+        )
+        with kernel_api.execution_context({"client_id": "client", "exec_id": "cell"}):
+            with pytest.raises(kernel_api.RPCError, match="manager rejected"):
+                await getattr(workspace, method)()
+
+    await asyncio.create_task(current_cell())
+    handle = workspace.tasks.start(asyncio.sleep(0))
+    await handle
+    await asyncio.gather(*workspace.tasks._reporters)
+
+
+@pytest.mark.asyncio
 async def test_cell_terminal_uses_manager_rpc_fallback(monkeypatch):
     calls = []
 

@@ -18,7 +18,7 @@ from mypr_mcp.runtime import (
     _recover_runs,
 )
 from mypr_mcp.runtime_registry import list_managers
-from mypr_mcp.services import MCPBridge
+from mypr_mcp.services import MCPBridge, Shells
 from mypr_mcp.transport import workspace_id
 
 
@@ -282,6 +282,42 @@ async def test_unreadable_cold_execution_poll_does_not_poison_runtime(tmp_path):
     assert failed.value.code == "execution_metadata_corrupt"
     assert runtime.healthy
     assert runtime.health_error is None
+
+
+@pytest.mark.asyncio
+async def test_evicted_shell_responses_validate_cursors_and_streams(tmp_path):
+    runtime = Runtime(tmp_path)
+    runtime.shells = Shells(tmp_path)
+    runtime.history = SimpleNamespace(get=lambda _ident: {"output_evicted": True})
+
+    async def direct_io(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    runtime.io = direct_io
+    ident = "a" * 32
+    try:
+        with pytest.raises(ValueError, match="invalid shell output cursor"):
+            await runtime._dispatch_shell(
+                "shell_poll",
+                {"id": ident, "cursor": "mypr-shell1.bad"},
+                client="client",
+                connection_id=None,
+                connection=None,
+                requested_client=None,
+                generation=None,
+            )
+        with pytest.raises(ValueError, match="stream"):
+            await runtime._dispatch_shell(
+                "shell_read",
+                {"id": ident, "cursor": 0, "stream": "invalid"},
+                client="client",
+                connection_id=None,
+                connection=None,
+                requested_client=None,
+                generation=None,
+            )
+    finally:
+        await runtime.shells.close()
 
 
 async def test_attach_rejects_corrupt_history_before_creating_handle(monkeypatch):

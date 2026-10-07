@@ -2538,21 +2538,35 @@ class Runtime:
             return job
         if op == "shell_poll":
             self._ensure_workspace_identity()
+            cursor = req.get("cursor", 0)
+            self.shells._validate_cursor(cursor, cursor if type(cursor) is int else 0)
             history_record = await self.io(self.history.get, req["id"])
             if history_record and history_record.get("output_evicted"):
-                return self.expired_output(history_record, cursor=req.get("cursor", 0))
-            return await self.shells.poll(req["id"], req.get("cursor", 0))
+                return self.expired_output(history_record, cursor=cursor)
+            return await self.shells.poll(req["id"], cursor)
         if op == "shell_read":
             self._ensure_workspace_identity()
+            ident = req["id"]
+            cursor = req.get("cursor", 0)
+            self.shells._decode_read_cursor(cursor, ident)
+            stream = req.get("stream")
+            if stream not in (None, "all", "stdout", "stderr"):
+                raise ValueError("stream must be 'all', 'stdout', 'stderr'")
+            max_bytes = req.get("max_bytes", 32768)
+            if type(max_bytes) is not int or not 0 <= max_bytes <= 32 * 1024 * 1024:
+                raise ValueError("max_bytes must be an integer between 0 and 33554432")
+            wait_ms = req.get("wait_ms", 0)
+            if type(wait_ms) is not int or not 0 <= wait_ms <= 30000:
+                raise ValueError("wait_ms must be an integer between 0 and 30000")
             history_record = await self.io(self.history.get, req["id"])
             if history_record and history_record.get("output_evicted"):
-                return self.expired_output(history_record, cursor=req.get("cursor", 0))
+                return self.expired_output(history_record, cursor=cursor)
             return await self.shells.read(
-                req["id"],
-                req.get("cursor", 0),
-                stream=req.get("stream"),
-                max_bytes=req.get("max_bytes", 32768),
-                wait_ms=req.get("wait_ms", 0),
+                ident,
+                cursor,
+                stream=stream,
+                max_bytes=max_bytes,
+                wait_ms=wait_ms,
             )
         if op == "shell_wait":
             self._ensure_workspace_identity()

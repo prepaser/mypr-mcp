@@ -72,3 +72,45 @@ async def test_valid_symlinked_bin_directory_is_reused(tmp_path: Path):
 
     assert result == venv / "bin/python"
     assert result.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_symlinked_venv_is_repaired(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    external = tmp_path / "external-venv"
+    _write_valid_venv(external)
+    root.mkdir()
+    (root / "venv").symlink_to(external, target_is_directory=True)
+    calls = []
+
+    async def command(*args, **_kwargs):
+        calls.append(args)
+        _write_valid_venv(Path(args[2]))
+
+    result = await ensure_workspace_python(root, command=command)
+
+    assert result == root / "venv/bin/python"
+    assert calls == [("uv", "venv", str(root / "venv"), "--python", sys.executable)]
+    assert external.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_external_bin_symlink_is_repaired(tmp_path: Path):
+    root = tmp_path / ".mypr"
+    external = tmp_path / "external-bin"
+    _write_valid_venv(external)
+    venv = root / "venv"
+    venv.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (venv / "bin").symlink_to(external / "bin", target_is_directory=True)
+    calls = []
+
+    async def command(*args, **_kwargs):
+        calls.append(args)
+        _write_valid_venv(Path(args[2]))
+
+    result = await ensure_workspace_python(root, command=command)
+
+    assert result == root / "venv/bin/python"
+    assert calls == [("uv", "venv", str(root / "venv"), "--python", sys.executable)]
+    assert external.is_dir()
