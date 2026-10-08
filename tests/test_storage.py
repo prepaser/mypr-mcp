@@ -423,6 +423,61 @@ async def test_gc_keeps_document_result_pair_together(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_gc_collects_json_only_document_result(tmp_path: Path):
+    result = tmp_path / ".mypr" / "document-results" / "doc.json"
+    old(result, "result")
+
+    storage = Storage(tmp_path)
+    plan = await storage.gc(max_bytes=0)
+
+    assert [item["path"] for item in plan["candidates"]] == [
+        ".mypr/document-results/doc.json"
+    ]
+    applied = await storage.gc_apply(plan["plan_id"])
+
+    assert not result.exists()
+    assert [item["path"] for item in applied["deleted"]] == [
+        ".mypr/document-results/doc.json"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gc_collects_orphan_document_resume_when_inventory_is_complete(
+    tmp_path: Path,
+):
+    resume = tmp_path / ".mypr" / "document-results" / "doc.resume"
+    old(resume, "resume")
+
+    storage = Storage(tmp_path)
+    plan = await storage.gc(max_bytes=None)
+
+    assert [item["path"] for item in plan["candidates"]] == [
+        ".mypr/document-results/doc.resume"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gc_protects_orphan_document_resume_when_inventory_is_truncated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    resume = tmp_path / ".mypr" / "document-results" / "doc.resume"
+    old(resume, "resume")
+    storage = Storage(tmp_path)
+    original_entries = storage._entries
+
+    def truncated_entries():
+        entries, _ = original_entries()
+        return entries, True
+
+    monkeypatch.setattr(storage, "_entries", truncated_entries)
+    plan = await storage.gc(max_bytes=0)
+
+    assert ".mypr/document-results/doc.resume" not in {
+        item["path"] for item in plan["candidates"]
+    }
+
+
+@pytest.mark.asyncio
 async def test_gc_does_not_mark_changed_output(tmp_path: Path):
     output = tmp_path / ".mypr" / "runs" / "a.jsonl"
     metadata = output.with_suffix(".json")

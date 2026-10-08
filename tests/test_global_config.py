@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -62,6 +63,19 @@ def test_config_reads_do_not_create_lock_files(tmp_path: Path):
     assert not global_path.with_suffix(".lock").exists()
     assert not store.workspace_path.with_suffix(".lock").exists()
     assert not store._profile_lock_path().exists()
+
+
+def test_global_config_with_non_utf8_filename_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    global_path = tmp_path / os.fsdecode(b"config-\xff.toml")
+    global_path.write_text("[limits]\nresponse_bytes = 4096\n")
+    monkeypatch.setenv("MYPR_GLOBAL_CONFIG", str(global_path))
+    store = ConfigStore(None)
+
+    assert store.get("limits.response_bytes") == 4096
+    store.set("limits.response_bytes", 65536, scope="global")
+    assert store.get("limits.response_bytes") == 65536
+    assert store._profile_lock_path().exists()
 
 
 def test_initial_global_and_workspace_writes_share_profile_lock(tmp_path: Path, monkeypatch):

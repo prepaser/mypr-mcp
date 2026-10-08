@@ -1441,7 +1441,7 @@ class ConfigStore:
     def _profile_lock_path(self) -> Path:
         state_home = os.environ.get("XDG_STATE_HOME")
         base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
-        name = hashlib.sha256(str(self.global_path).encode("utf-8")).hexdigest()
+        name = hashlib.sha256(os.fsencode(self.global_path)).hexdigest()
         return base / "mypr" / "config-locks" / f"{name}.lock"
 
     @contextmanager

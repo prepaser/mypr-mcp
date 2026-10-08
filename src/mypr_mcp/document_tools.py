@@ -101,41 +101,66 @@ class _ResultStore:
             raise DocumentToolError("Document result exceeds its 7 MiB snapshot limit")
         with self._store_locked():
             cache_temporary = None
-            fd, temporary = tempfile.mkstemp(prefix=f".{ident}.", suffix=".tmp", dir=self.root)
+            temporary = None
+            json_path = self.root / f"{ident}.json"
+            resume_path = self.root / f"{ident}.resume"
+            published: list[Path] = []
             try:
-                with os.fdopen(fd, "wb") as stream:
+                fd, temporary = tempfile.mkstemp(prefix=f".{ident}.", suffix=".tmp", dir=self.root)
+                try:
+                    stream = os.fdopen(fd, "wb")
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise
+                with stream:
                     stream.write(encoded)
                     stream.flush()
                     os.fsync(stream.fileno())
-                os.replace(temporary, self.root / f"{ident}.json")
+                os.replace(temporary, json_path)
+                published.append(json_path)
                 if resume_cache is not None:
-                    cache_path = self.root / f"{ident}.resume"
                     cache_fd, cache_temporary = tempfile.mkstemp(
                         prefix=f".{ident}.", suffix=".resume.tmp", dir=self.root
                     )
                     try:
-                        with os.fdopen(cache_fd, "wb") as stream:
-                            stream.write(resume_cache)
-                            stream.flush()
-                            os.fsync(stream.fileno())
-                        os.replace(cache_temporary, cache_path)
-                        cache_temporary = None
+                        stream = os.fdopen(cache_fd, "wb")
                     except BaseException:
-                        with contextlib.suppress(FileNotFoundError):
-                            (self.root / f"{ident}.json").unlink()
+                        with contextlib.suppress(OSError):
+                            os.close(cache_fd)
                         raise
-                    finally:
-                        if cache_temporary is not None:
-                            with contextlib.suppress(FileNotFoundError):
-                                os.unlink(cache_temporary)
-                directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    with stream:
+                        stream.write(resume_cache)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(cache_temporary, resume_path)
+                    published.append(resume_path)
+                    cache_temporary = None
+                directory_fd = None
                 try:
+                    directory_fd = os.open(
+                        self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    )
                     os.fsync(directory_fd)
-                finally:
+                except BaseException:
+                    if directory_fd is not None:
+                        with contextlib.suppress(OSError):
+                            os.close(directory_fd)
+                    raise
+                else:
                     os.close(directory_fd)
+            except BaseException:
+                for path in reversed(published):
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                raise
             finally:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(temporary)
+                if temporary is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(temporary)
+                if cache_temporary is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(cache_temporary)
             files = []
             for path in self.root.glob("[0-9a-f]" * 32 + ".json"):
                 with contextlib.suppress(FileNotFoundError):

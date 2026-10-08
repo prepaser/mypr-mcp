@@ -626,7 +626,14 @@ class Storage:
             history_state["active_ids"] = active
             records = self._records(entries, active)
             protected = self._protected(entries, records, history_state)
-            candidates = self._candidates(entries, records, protected, options, history_state)
+            candidates = self._candidates(
+                entries,
+                records,
+                protected,
+                options,
+                history_state,
+                inventory_truncated=truncated,
+            )
             files, files_truncated = self._usage_files()
             usage = self._usage(entries, truncated, files, files_truncated)
             selected = self._select(candidates, usage["total_bytes"], options["max_bytes"])
@@ -738,7 +745,12 @@ class Storage:
             current_candidates = {
                 item["path"]: item
                 for item in self._candidates(
-                    entries, records, protected, plan["options"], history_state
+                    entries,
+                    records,
+                    protected,
+                    plan["options"],
+                    history_state,
+                    inventory_truncated=scan_truncated,
                 )
             }
             apply_items = {item["path"]: item for item in plan["candidates"]}
@@ -1140,6 +1152,8 @@ class Storage:
         protected: dict[str, Any],
         options: dict[str, Any],
         history_state: Mapping[str, Any],
+        *,
+        inventory_truncated: bool = False,
     ) -> list[dict[str, Any]]:
         if history_state.get("error"):
             return []
@@ -1240,12 +1254,12 @@ class Storage:
                     else:
                         continue
                     partner_entry = entries_by_path.get(partner)
-                    if (
-                        partner_entry is None
-                        or partner in protected_paths
-                    ):
+                    if partner_entry is None and inventory_truncated:
                         continue
-                    group = min(entry.relative, partner)
+                    if partner in protected_paths:
+                        continue
+                    if partner_entry is not None:
+                        group = min(entry.relative, partner)
                 reason = f"expired_{entry.category}"
                 requires_tombstone = False
             elif entry.category == "mail":

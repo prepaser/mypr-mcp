@@ -241,15 +241,20 @@ async def recover_ticket(
             ticket = current
             if ticket["state"] in TERMINAL_STATES:
                 _write_ticket(workspace, ticket)
+                await _finalize_origin(workspace, ticket)
                 return ticket
         if current is not None and current["id"] == ticket["id"]:
             selected = _newer_ticket(current, ticket)
             if selected["state"] in TERMINAL_STATES:
                 if selected is not current or selected != ticket:
                     _write_ticket(workspace, selected)
+                await _finalize_origin(workspace, selected)
                 return selected
             ticket = selected
-        if ticket["state"] in TERMINAL_STATES or _ticket_active(workspace, ticket):
+        if ticket["state"] in TERMINAL_STATES:
+            await _finalize_origin(workspace, ticket)
+            return ticket
+        if _ticket_active(workspace, ticket):
             return ticket
         original_time = _ticket_time(ticket)
         ticket = dict(ticket)
@@ -262,6 +267,7 @@ async def recover_ticket(
         latest = read_ticket(workspace)
         if latest is not None and latest["id"] == ticket["id"]:
             if latest["state"] in TERMINAL_STATES:
+                await _finalize_origin(workspace, latest)
                 return latest
             if _ticket_time(latest) > original_time and _ticket_active(workspace, latest):
                 return latest
@@ -524,7 +530,7 @@ async def _finalize_origin(workspace: Path, ticket: dict[str, Any]) -> None:
         from .restart_records import finalize_origin
     except ImportError:
         return
-    result = finalize_origin(workspace, ticket)
+    result = await wait_owned(asyncio.to_thread(finalize_origin, workspace, ticket))
     if inspect.isawaitable(result):
         await result
 

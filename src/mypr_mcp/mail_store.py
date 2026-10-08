@@ -1050,12 +1050,17 @@ class MailStore:
         directory.mkdir(parents=True, exist_ok=True)
         with StorageLock(self.root / ".mypr" / "storage.lock"):
             path = directory / f"{ident}.eml"
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(mime)
-                stream.flush()
-                os.fsync(stream.fileno())
+            fd: int | None = None
+            created = False
             try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+                stream = os.fdopen(fd, "wb")
+                fd = None
+                with stream:
+                    stream.write(mime)
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 with self._tx():
                     self._db.execute(
                         (
@@ -1077,10 +1082,16 @@ class MailStore:
                         ),
                     )
             except BaseException:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if created:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
                 raise
         return self.get_draft(ident, client_id)
 

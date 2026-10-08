@@ -82,32 +82,39 @@ def finalize_origin(workspace, ticket):
         record = _read_record(path)
     except (OSError, ValueError, TypeError):
         return
-    if record.get("restart_finalized") == ticket["id"]:
-        return
     state = ticket["state"]
     if state not in {"succeeded", "failed"}:
         return
-    error = ticket.get("error") if state == "failed" else None
-    text = (
-        f"Workspace restart completed: {ticket.get('new_version', 'unknown')} "
-        f"(generation {ticket.get('new_generation', 'unknown')})"
-        if state == "succeeded"
-        else f"Workspace restart failed: {error}"
-    )
-    record.update(
-        state=state,
-        error=error,
-        finished=time.time(),
-        restart_id=ticket["id"],
-        restart_finalized=ticket["id"],
-        restart_result=text,
-    )
-    temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(record))
-    os.replace(temporary, path)
+    if record.get("restart_finalized") != ticket["id"]:
+        error = ticket.get("error") if state == "failed" else None
+        text = (
+            f"Workspace restart completed: {ticket.get('new_version', 'unknown')} "
+            f"(generation {ticket.get('new_generation', 'unknown')})"
+            if state == "succeeded"
+            else f"Workspace restart failed: {error}"
+        )
+        record.update(
+            state=state,
+            error=error,
+            finished=time.time(),
+            restart_id=ticket["id"],
+            restart_finalized=ticket["id"],
+            restart_result=text,
+        )
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(record))
+        os.replace(temporary, path)
     history = History(Path(workspace))
     try:
-        history.record("execution", record, event=state)
+        current = history.get(ident)
+        if (
+            current is None
+            or current.get("restart_finalized") != ticket["id"]
+            or current.get("state") != record["state"]
+        ):
+            history.record(
+                "execution", record, event=record["state"], updated_at=record.get("finished")
+            )
     finally:
         history.close()
 

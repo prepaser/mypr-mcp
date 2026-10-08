@@ -39,7 +39,7 @@ class _LspPathPins:
         self._fds: dict[tuple[str, ...], int] = {}
         self._target_fds: dict[Path, int] = {}
         self._absent_targets: set[Path] = set()
-        self._created: list[tuple[int, str]] = []
+        self._created: list[tuple[int, str, tuple[int, int]]] = []
         self._committed = False
 
     def __enter__(self) -> _LspPathPins:
@@ -66,11 +66,17 @@ class _LspPathPins:
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         if not self._committed:
-            for parent_fd, name in reversed(self._created):
+            for parent_fd, name, identity in reversed(self._created):
                 try:
-                    os.rmdir(name, dir_fd=parent_fd)
+                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 except OSError:
                     pass
+                else:
+                    if stat.S_ISDIR(info.st_mode) and _inode(info) == identity:
+                        try:
+                            os.rmdir(name, dir_fd=parent_fd)
+                        except OSError:
+                            pass
         for fd in reversed(tuple(self._fds.values())):
             try:
                 os.close(fd)
@@ -136,9 +142,30 @@ class _LspPathPins:
             try:
                 fd = os.open(name, flags, dir_fd=parent_fd)
             except FileNotFoundError:
-                os.mkdir(name, dir_fd=parent_fd)
-                self._created.append((parent_fd, name))
-                fd = os.open(name, flags, dir_fd=parent_fd)
+                created_identity: tuple[int, int] | None = None
+                try:
+                    os.mkdir(name, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                else:
+                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    created_identity = _inode(info)
+                    self._created.append((parent_fd, name, created_identity))
+                try:
+                    fd = os.open(name, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise ValueError("LSP edit path must not contain symlinks") from exc
+                    raise
+                if created_identity is not None:
+                    try:
+                        if _inode(os.fstat(fd)) != created_identity:
+                            raise RuntimeError(
+                                "LSP edit parent directory changed while applying"
+                            )
+                    except BaseException:
+                        os.close(fd)
+                        raise
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
                     raise ValueError("LSP edit path must not contain symlinks") from exc
@@ -164,7 +191,11 @@ class _LspPathPins:
             if exc.errno == getattr(errno, "ELOOP", 40):
                 raise ValueError(f"LSP edit path must not be a symlink: {path}") from exc
             raise
-        info = os.fstat(fd)
+        try:
+            info = os.fstat(fd)
+        except BaseException:
+            os.close(fd)
+            raise
         if not stat.S_ISREG(info.st_mode):
             os.close(fd)
             return

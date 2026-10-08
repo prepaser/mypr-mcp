@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mypr_mcp import patching
 from mypr_mcp.code_tools import MAX_DOCUMENT_BYTES, CodeTools, _LanguageServer
 from mypr_mcp.lsp_edits import EditError
 
@@ -409,5 +410,39 @@ async def test_workspace_edit_rename_regenerate_source_update_applies(tmp_path: 
         assert result["applied"] is True
         assert source.read_text(encoding="utf-8") == "new\n"
         assert destination.read_text(encoding="utf-8") == "old\n"
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lsp_pin_cleanup_keeps_replaced_created_parent(tmp_path: Path, monkeypatch):
+    origin = tmp_path / "origin.py"
+    parent = tmp_path / "newdir"
+    target = parent / "nested.py"
+    old_parent = tmp_path / "old-parent"
+    origin.write_text("origin\n", encoding="utf-8")
+    edit = {"documentChanges": [{"kind": "create", "uri": target.as_uri()}]}
+    code = CodeTools(tmp_path)
+    code._servers["fake"] = _server(origin, edit)
+    original_read_state = patching._read_state
+    swapped = False
+
+    def read_state(*args, **kwargs):
+        nonlocal swapped
+        state = original_read_state(*args, **kwargs)
+        if not swapped and state.display == "newdir/nested.py":
+            swapped = True
+            parent.rename(old_parent)
+            parent.mkdir()
+        return state
+
+    monkeypatch.setattr(patching, "_read_state", read_state)
+    try:
+        listed = await code.actions("fake", origin, 1, 1)
+        prepared = await code.prepare_action(listed["actions"][0]["action_id"])
+        with pytest.raises(RuntimeError, match="parent directory changed"):
+            await code.apply_edit(prepared["plan_id"])
+        assert parent.is_dir()
+        assert old_parent.is_dir()
     finally:
         await code.aclose()

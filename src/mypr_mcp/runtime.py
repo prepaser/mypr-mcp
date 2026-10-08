@@ -2445,6 +2445,17 @@ class Runtime:
                 or history_record.get("scan_output_evicted")
             ):
                 expired = self.expired_output(history_record, cursor=req.get("cursor"))
+                warnings = expired["warnings"]
+                if not any(
+                    isinstance(warning, dict) and warning.get("code") == "scan_output_unavailable"
+                    for warning in warnings
+                ):
+                    warnings.append({
+                        "code": "scan_output_unavailable",
+                        "text": (
+                            "Saved scan output is missing; an empty page is not a complete result."
+                        ),
+                    })
                 return {
                     "id": req["id"],
                     "results": [],
@@ -2454,7 +2465,10 @@ class Runtime:
                     "state": history_record.get("state", "unknown"),
                     "truncated": True,
                     "expired": True,
-                    "warnings": expired["warnings"],
+                    "complete": False,
+                    "output_unavailable": True,
+                    "stop_reason": history_record.get("stop_reason"),
+                    "warnings": warnings,
                 }
             return await self.scans.results(
                 req["id"],

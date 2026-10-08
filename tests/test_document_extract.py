@@ -1,8 +1,11 @@
 import asyncio
+import base64
 import io
 import json
 import os
+import stat
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -319,3 +322,34 @@ def test_result_store_retains_new_snapshot_before_pruning(tmp_path, monkeypatch)
         store.load(first)
     assert store.load(second)["items"] == ["middle"]
     assert store.load(third)["items"] == ["new"]
+
+
+@pytest.mark.parametrize("with_resume", [False, True])
+def test_result_store_cleans_published_files_when_directory_fsync_fails(
+    tmp_path, monkeypatch, with_resume
+):
+    from mypr_mcp import document_tools
+
+    store = document_tools._ResultStore(tmp_path)
+    original_fsync = document_tools.os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory sync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(document_tools.os, "fsync", fail_directory_fsync)
+    payload = {"kind": "ocr", "source": {"path": "scan.png"}, "items": []}
+    if with_resume:
+        payload["resume"] = {
+            "tsv": base64.b64encode(zlib.compress(b"tsv\n")).decode(),
+            "page": 1,
+            "word_offset": 0,
+        }
+
+    with pytest.raises(OSError, match="directory sync failed"):
+        store.create(payload)
+
+    assert not list(store.root.glob("*.json"))
+    assert not list(store.root.glob("*.resume"))
+    assert not list(store.root.glob(".*.tmp"))

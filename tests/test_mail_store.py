@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+import mypr_mcp.mail_store as mail_store
 from mypr_mcp.mail_store import MailStore
 
 
@@ -29,6 +30,75 @@ def age_send(store: MailStore, send_id: str, draft_id: str) -> None:
             "UPDATE mail_drafts SET created=? WHERE id=?",
             (old, draft_id),
         )
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_persist_draft_cleans_mime_when_file_write_fails(tmp_path, monkeypatch, failure):
+    store = MailStore(tmp_path)
+    try:
+        if failure == "write":
+            original_fdopen = mail_store.os.fdopen
+
+            class FailingStream:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def write(self, _data):
+                    raise OSError("write failed")
+
+                def flush(self):
+                    return self.stream.flush()
+
+                def fileno(self):
+                    return self.stream.fileno()
+
+                def close(self):
+                    return self.stream.close()
+
+            def fdopen(fd, *args, **kwargs):
+                return FailingStream(original_fdopen(fd, *args, **kwargs))
+
+            monkeypatch.setattr(mail_store.os, "fdopen", fdopen)
+        else:
+            monkeypatch.setattr(
+                mail_store.os,
+                "fsync",
+                lambda _fd: (_ for _ in ()).throw(OSError("fsync failed")),
+            )
+
+        with pytest.raises(OSError, match=failure):
+            draft(store)
+        assert list((store.mail_root / "drafts").glob("draft-*.eml")) == []
+        assert store._db.execute("SELECT COUNT(*) FROM mail_drafts").fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_persist_draft_preserves_file_error_when_cleanup_fails(tmp_path, monkeypatch):
+    store = MailStore(tmp_path)
+    try:
+        monkeypatch.setattr(
+            mail_store.os,
+            "fsync",
+            lambda _fd: (_ for _ in ()).throw(OSError("fsync failed")),
+        )
+        monkeypatch.setattr(
+            mail_store.Path,
+            "unlink",
+            lambda _path: (_ for _ in ()).throw(OSError("cleanup failed")),
+        )
+
+        with pytest.raises(OSError, match="fsync failed"):
+            draft(store)
+        assert store._db.execute("SELECT COUNT(*) FROM mail_drafts").fetchone()[0] == 0
+    finally:
+        store.close()
 
 
 def test_default_send_request_id_is_bound_to_draft(tmp_path):
