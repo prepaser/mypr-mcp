@@ -56,12 +56,6 @@ Alternatively, register the launch command through the CLI:
 codex mcp add mypr -- uvx mypr-mcp serve
 ```
 
-This creates a user-wide entry. Add the timeout and `required` settings above to its `[mcp_servers.mypr]` table in `~/.codex/config.toml`; do not add the same table twice. A user-wide entry can serve different projects using each launch directory; use project-scoped configuration for project-specific settings.
-
-Restart the Codex client after changing its configuration. Check registration with `codex mcp get mypr` or `codex mcp list`, then use `/mcp` in the Codex CLI to inspect the live connection. After connecting, the agent must call `init` once to bind the connection to a logical client identity before it can run Python code.
-
-Codex's `[mcp_servers.mypr]` launches this Python layer. External MCP servers called from Python can be set as global defaults in `~/.config/mypr/config.toml`, overridden in the workspace's `.mypr/config.toml`, or registered dynamically with `await ws.mcp.configure(...)`. Start with [config.example.toml](config.example.toml); the [configuration reference](docs/config.md) covers every field, its default and allowed values, and how to apply changes.
-
 ## Workspace runtime
 
 The first start creates `.mypr/` in the launch workspace, its Python environment, and a manager process. The manager and kernel continue running after an MCP client disconnects, so another client for the same workspace reconnects to the same in-memory environment.
@@ -77,7 +71,6 @@ Stop the manager before moving a workspace, then start it at the new location. A
 Three tools are exposed to the agent:
 
 - `init(client_id=None)` binds this MCP connection to a logical client. With no argument, it allocates a new readable ID such as `calm-otter`; with an argument, it creates or resumes that ID. The returned ID is bound to the connection, so later calls do not repeat it.
-
 - `execute(code, wait_ms=None, request_id=None, max_bytes=None)` submits a Python cell and returns its execution state and output. The connection must be initialized first. An omitted `wait_ms` uses `limits.execute_wait_ms` (1,000 ms by default); an explicit value, including `0`, overrides it for that call. `wait_ms` only controls how long the MCP call waits; it does not set a Python timeout.
 - `poll(exec_id, cursor=None, wait_ms=None, max_bytes=None)` reads a submitted cell's state and output. Use the returned cursor to read later output. Polling an existing execution is allowed before `init`, since the execution ID identifies the target. An omitted `wait_ms` uses `limits.poll_wait_ms` (1,000 ms by default); an explicit value, including `0`, overrides it for that call. `max_bytes` controls one response page and accepts 1 KiB–1 MiB; when omitted, the workspace's configured response limit is used.
 
