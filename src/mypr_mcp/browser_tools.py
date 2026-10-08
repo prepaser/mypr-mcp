@@ -515,6 +515,8 @@ class BrowserTools:
                 item.close_in_progress = False
             if succeeded and self._contexts.get(item.key) is item and item.closed:
                 await self._wait_artifact(item)
+                if item.artifact_task is None:
+                    self._forget_context(item.key, item.context)
             return result
 
         try:

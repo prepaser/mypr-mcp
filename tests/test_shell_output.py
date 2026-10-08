@@ -84,6 +84,53 @@ async def test_missing_persisted_journal_is_reported_as_truncated_output(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_persisted_journal_without_metadata_recovers_lost_job(tmp_path: Path):
+    shells = Shells(tmp_path)
+    job_id = "c" * 32
+    journal = shells.jobs_root / f"{job_id}.jsonl"
+    journal.write_text(
+        json.dumps({"stream": "stdout", "text": "before-crash"}) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        polled = await shells.poll(job_id)
+        read = await shells.read(job_id)
+        unknown = await shells.poll("d" * 32)
+        with pytest.raises(ValueError, match="unknown job"):
+            await shells.read("d" * 32)
+    finally:
+        await shells.close()
+
+    for result in (polled, read):
+        assert result["state"] == "lost"
+        assert result["outcome_unknown"] is True
+        assert result["output"] == [{"stream": "stdout", "text": "before-crash"}]
+        assert result["warnings"][0]["code"] == "shell_outcome_unknown"
+    assert unknown["state"] == "unknown"
+    assert unknown["output"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_errors", ["replace", "surrogateescape"])
+async def test_shell_output_cap_flushes_counted_decoder_fragment(tmp_path: Path, output_errors):
+    shells = Shells(tmp_path, output_limit=4)
+    payload = b"a" * 3 + b"\xc3"
+    try:
+        started = await shells.start(
+            [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({payload!r})"],
+            output_errors=output_errors,
+        )
+        await shells.wait(started["id"])
+        result = await shells.poll(started["id"])
+    finally:
+        await shells.close()
+
+    expected = payload.decode("utf-8", output_errors)
+    assert "".join(event["text"] for event in result["output"]) == expected
+    assert result["truncated"] is False
+
+
+@pytest.mark.asyncio
 async def test_shell_persistence_rejects_replaced_workspace(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

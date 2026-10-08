@@ -751,6 +751,24 @@ async def test_native_context_close_is_removed_from_registry(tmp_path, fake_play
 
 
 @pytest.mark.asyncio
+async def test_native_context_close_removes_only_that_context_without_har(
+    tmp_path, fake_playwright
+):
+    async def rpc(op, **fields):
+        return "ws://127.0.0.1:1234/pw"
+
+    tools = BrowserTools(tmp_path, lambda: "client", rpc)
+    first = await tools.context("first")
+    second = await tools.context("second")
+
+    await first.close()
+
+    assert ("client", "first") not in tools._contexts
+    assert tools._contexts[("client", "second")].context is second
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_context_creation_closes_native_context(tmp_path, fake_playwright):
     async def rpc(op, **fields):
         return "ws://127.0.0.1:1234/pw"

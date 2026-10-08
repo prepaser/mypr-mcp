@@ -445,10 +445,12 @@ class Shells:
             ):
                 raise ValueError("invalid shell job ID")
             metadata_path = self.jobs_root / f"{job_id}.json"
+            metadata_missing = False
             try:
                 metadata, metadata_warning = self._load_persisted_metadata(metadata_path)
             except FileNotFoundError:
-                raise ValueError("unknown job") from None
+                metadata_missing = True
+                metadata, metadata_warning = {}, None
             state, state_warnings, outcome_unknown = self._persisted_state(
                 metadata, metadata_warning
             )
@@ -461,6 +463,8 @@ class Shells:
                 stream=stream,
                 max_bytes=max_bytes,
             )
+            if metadata_missing and missing:
+                raise ValueError("unknown job") from None
             expected_count = metadata.get("output_count")
             missing = missing or (
                 type(expected_count) is int
@@ -477,6 +481,19 @@ class Shells:
                         "text": "Saved shell output journal is missing.",
                     },
                 )
+            warnings_truncated = bool(metadata.get("warnings_truncated", False))
+            for event in page:
+                if event.get("type") != "warning":
+                    continue
+                warning = {
+                    "code": event.get("code", "journal_warning"),
+                    "text": event.get("text", "Output journal warning"),
+                }
+                if warning not in persisted_warnings:
+                    if len(persisted_warnings) < _MAX_SHELL_WARNINGS:
+                        persisted_warnings.append(warning)
+                    else:
+                        warnings_truncated = True
             return {
                 "id": job_id,
                 "state": state,
@@ -489,7 +506,7 @@ class Shells:
                 or (missing and self._journal_expected(metadata)),
                 "warnings": persisted_warnings[:_MAX_SHELL_WARNINGS],
                 "outcome_unknown": outcome_unknown,
-                "warnings_truncated": bool(metadata.get("warnings_truncated", False))
+                "warnings_truncated": warnings_truncated
                 or len(persisted_warnings) > _MAX_SHELL_WARNINGS,
                 "pty": bool(metadata.get("pty", False)),
                 "rows": metadata.get("rows", 24),
@@ -670,9 +687,14 @@ class Shells:
             raise ValueError("invalid shell job ID")
         metadata_path = self.jobs_root / f"{job_id}.json"
         journal_path = self.jobs_root / f"{job_id}.jsonl"
+        metadata_missing = False
         try:
             metadata, metadata_warning = self._load_persisted_metadata(metadata_path)
         except FileNotFoundError:
+            metadata_missing = True
+            metadata, metadata_warning = {}, None
+        output, missing = self._read_journal(journal_path, report_missing=True)
+        if metadata_missing and missing:
             return {
                 "id": job_id,
                 "state": "unknown",
@@ -682,7 +704,6 @@ class Shells:
                 "error": "unknown job",
                 "warnings": [],
             }
-        output, missing = self._read_journal(journal_path, report_missing=True)
         output_count = metadata.get("output_count", len(output))
         if type(output_count) is not int or output_count < len(output):
             output_count = len(output)
@@ -1107,7 +1128,7 @@ class Shells:
                 package_decoder.decode(b"", final=True),
                 package_discarding,
             )
-        if text and job.output_bytes < job.output_limit:
+        if text:
             event = {"stream": name, "text": text}
             job.output.append(event)
             job.memory_bytes += len(json_bytes(event))

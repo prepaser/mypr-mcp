@@ -12,6 +12,7 @@ import mypr_mcp.kernel_api as api
 from mypr_mcp.persistence import PersistenceWorker
 from mypr_mcp.runtime import Runtime, _close_stores, _open_stores
 from mypr_mcp.services import MCPBridge
+from mypr_mcp.storage import Storage
 from mypr_mcp.task_results import encode_result, load_result, store_result
 
 
@@ -102,6 +103,37 @@ async def test_fast_task_result_survives_terminal_event_and_attach(tmp_path, mon
         attached = await api.TaskManager().attach(history_id)
         assert attached.result() == {"answer": 42}
         assert attached.status()["result_persisted"]
+
+
+@pytest.mark.parametrize("value", [None, {"answer": 42}])
+async def test_wait_saved_rechecks_gc_without_losing_cached_result(tmp_path, monkeypatch, value):
+    async with manager(tmp_path) as runtime:
+        monkeypatch.setenv("MYPR_GENERATION", runtime.generation)
+
+        async def rpc(op, **fields):
+            return await runtime.dispatch({
+                "op": op, "client_id": "reader", "generation": runtime.generation, **fields
+            })
+
+        monkeypatch.setattr(api, "_rpc", rpc)
+        with api.execution_context({"client_id": "reader", "exec_id": "cell"}):
+            handle = api.TaskManager().start(
+                asyncio.sleep(0, result=value), task_id="saved", persist_result=True
+            )
+        await handle.wait_saved()
+        history_id = f"python:{runtime.generation}:saved"
+        historical = await api.TaskManager().attach(history_id)
+        await historical.wait_saved()
+        storage = Storage(
+            tmp_path, history=runtime.history, active_ids=runtime.storage_active_ids
+        )
+        result = await storage.gc(dry_run=False, max_bytes=0)
+        assert any(item["category"] == "task_results" for item in result["deleted"])
+        for task in (handle, historical):
+            with pytest.raises(api.ResultUnavailable) as failure:
+                await task.wait_saved()
+            assert failure.value.operation == "tasks.wait_saved"
+            assert task.result() == value
 
 
 async def test_saved_lsp_config_cas_and_managed_mcp_write(tmp_path):

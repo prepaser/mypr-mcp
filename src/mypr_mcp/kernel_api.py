@@ -283,10 +283,7 @@ async def _rpc(op: str, **fields: Any) -> Any:
         payload["exec_id"] = exec_id
     generation = os.environ.get("MYPR_GENERATION")
     if generation is not None:
-        try:
-            payload["generation"] = int(generation)
-        except ValueError:
-            payload["generation"] = generation
+        payload["generation"] = generation
     try:
         reader, writer = await asyncio.open_unix_connection(socket_name, limit=RPC_LIMIT)
         try:
@@ -771,6 +768,18 @@ class TaskHandle:
                 operation="tasks.wait_saved",
                 details={"task_id": self.id},
             )
+        await self._check_saved_result(f"python:{self._generation}:{self.id}")
+
+    async def _check_saved_result(self, history_id: str) -> None:
+        try:
+            await _report_rpc("task_result_get", id=history_id)
+        except Exception as exc:
+            raise ResultUnavailable(
+                f"Saved result for task {self.id} is unavailable: {safe_error(exc)}",
+                code="result_unavailable",
+                operation="tasks.wait_saved",
+                details={"task_id": self.id, "history_id": history_id},
+            ) from exc
 
     async def _wait(self) -> Any:
         if asyncio.current_task() is self._task:
@@ -1311,6 +1320,7 @@ class HistoricalTask(TaskHandle):
 
     async def wait_saved(self) -> None:
         self.result()
+        await self._check_saved_result(self._history_id)
 
     def status(self) -> dict[str, Any]:
         return {

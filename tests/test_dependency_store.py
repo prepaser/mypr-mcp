@@ -619,6 +619,83 @@ async def test_cancellation_while_waiting_for_lock_does_not_leak_lock(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_lock_acquire_race_closes_stream_after_cancellation(tmp_path, monkeypatch):
+    from mypr_mcp import dependency_store
+
+    lock_path = tmp_path / "install.lock"
+    original_try_open_lock = dependency_store._try_open_lock
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_try_open_lock(path):
+        started.set()
+        release.wait(2)
+        return original_try_open_lock(path)
+
+    monkeypatch.setattr(dependency_store, "_try_open_lock", delayed_try_open_lock)
+    task = asyncio.create_task(
+        dependency_store._open_lock_async(lock_path, time.monotonic() + 2)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    monkeypatch.setattr(dependency_store, "_try_open_lock", original_try_open_lock)
+    probe = await asyncio.to_thread(dependency_store._open_lock, lock_path, time.monotonic() + 2)
+    await asyncio.to_thread(dependency_store._close_lock, probe)
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_wait_for_peer_dependency_lock(tmp_path, monkeypatch):
+    from mypr_mcp import dependency_store
+
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=None)
+    _patch_resolver(monkeypatch, artifact)
+    store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
+    monkeypatch.setattr(store, "_inspect_system", lambda _artifact: None)
+    store._locks_root.mkdir(parents=True)
+    lock_path = store._locks_root / "rg.lock"
+    held = await asyncio.to_thread(dependency_store._open_lock, lock_path, time.monotonic() + 2)
+    original_try_open_lock = dependency_store._try_open_lock
+    contended = threading.Event()
+
+    def observed_try_open_lock(path):
+        stream = original_try_open_lock(path)
+        if stream is None:
+            contended.set()
+        return stream
+
+    monkeypatch.setattr(dependency_store, "_try_open_lock", observed_try_open_lock)
+    task = None
+    closing = None
+    try:
+        task = asyncio.create_task(store.install("rg"))
+        assert await asyncio.wait_for(asyncio.to_thread(contended.wait, 1), 1)
+
+        closing = asyncio.create_task(store.close())
+        completed = True
+        try:
+            await asyncio.wait_for(asyncio.shield(closing), 1)
+        except TimeoutError:
+            completed = False
+        assert completed
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await asyncio.to_thread(dependency_store._close_lock, held)
+        if task is not None and closing is None:
+            task.cancel()
+        await asyncio.gather(
+            *(pending for pending in (task, closing) if pending is not None),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_cancellation_of_last_waiter_releases_completed_install(tmp_path, monkeypatch):
     store = DependencyStore(tmp_path / "data", tmp_path / "cache", platform_key="x86_64")
     started = asyncio.Event()

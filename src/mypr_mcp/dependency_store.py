@@ -243,29 +243,42 @@ def _find_executable(root: Path, names: tuple[str, ...]) -> dict[str, Path]:
     return found
 
 
-def _open_lock(path: Path, deadline: float):
-    import fcntl
-
+def _lock_stream(path: Path):
     descriptor = os.open(
         path,
         os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
-    stream = os.fdopen(descriptor, "a+")
     try:
-        while True:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return stream
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "timed out waiting for dependency installation lock"
-                    ) from None
-                time.sleep(min(0.1, max(0.001, deadline - time.monotonic())))
+        return os.fdopen(descriptor, "a+")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _try_open_lock(path: Path):
+    import fcntl
+
+    stream = _lock_stream(path)
+    try:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return stream
+    except BlockingIOError:
+        stream.close()
+        return None
     except BaseException:
         stream.close()
         raise
+
+
+def _open_lock(path: Path, deadline: float):
+    while True:
+        stream = _try_open_lock(path)
+        if stream is not None:
+            return stream
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for dependency installation lock")
+        time.sleep(min(0.1, max(0.001, deadline - time.monotonic())))
 
 
 def _close_lock(stream) -> None:
@@ -274,6 +287,20 @@ def _close_lock(stream) -> None:
     with contextlib.suppress(OSError):
         fcntl.flock(stream, fcntl.LOCK_UN)
     stream.close()
+
+
+async def _open_lock_async(path: Path, deadline: float):
+    while True:
+        stream, cancelled = await finish_owned(asyncio.to_thread(_try_open_lock, path))
+        if cancelled:
+            if stream is not None:
+                await wait_owned(asyncio.to_thread(_close_lock, stream), propagate=False)
+            raise asyncio.CancelledError
+        if stream is not None:
+            return stream
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for dependency installation lock")
+        await asyncio.sleep(min(0.1, max(0.001, deadline - time.monotonic())))
 
 
 class DependencyStore:
@@ -410,12 +437,10 @@ class DependencyStore:
                     asyncio.to_thread(self._locks_root.mkdir, parents=True, exist_ok=True)
                 )
                 lock_path = self._locks_root / f"{_lock_name(name)}.lock"
-                stream, lock_cancelled = await finish_owned(
-                    asyncio.to_thread(_open_lock, lock_path, time.monotonic() + _INSTALL_TIMEOUT)
+                stream = await _open_lock_async(
+                    lock_path, time.monotonic() + _INSTALL_TIMEOUT
                 )
                 try:
-                    if lock_cancelled:
-                        raise asyncio.CancelledError
                     current = await wait_owned(
                         asyncio.to_thread(
                             self._inspect_shared_binary

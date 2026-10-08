@@ -9,6 +9,29 @@ import mypr_mcp.cells as cells
 import mypr_mcp.kernel_api as kernel_api
 from mypr_mcp.cells import CellExecutor, CellHandle
 from mypr_mcp.diagnostics import safe_error, safe_error_details
+from mypr_mcp.runtime import Runtime
+
+
+@pytest.mark.parametrize("generation", [
+    "12345678901242348901234567890123",
+    "02345678901242348901234567890123",
+    "a2345678901242348901234567890123",
+])
+async def test_kernel_rpc_preserves_uuid_generation(tmp_path, monkeypatch, generation):
+    runtime = Runtime(tmp_path)
+    runtime.generation = generation
+    socket = tmp_path / "rpc.sock"
+    monkeypatch.setenv("MYPR_SOCKET", str(socket))
+    monkeypatch.setenv("MYPR_GENERATION", generation)
+    server = await asyncio.start_unix_server(runtime.connection, path=str(socket))
+    try:
+        assert await kernel_api._rpc(
+            "config", method="get", path="limits.output_bytes"
+        ) == runtime.output_limit
+    finally:
+        server.close()
+        await server.wait_closed()
+        await runtime.shells.close()
 
 
 def test_lifecycle_recovery_does_not_release_another_request():
