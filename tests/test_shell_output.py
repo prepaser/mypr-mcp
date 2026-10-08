@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import mypr_mcp.services as services_module
 from mypr_mcp.services import Shells
 
 
@@ -81,6 +82,60 @@ async def test_missing_persisted_journal_is_reported_as_truncated_output(tmp_pat
         assert result["truncated"] is True
         assert result["warnings"][0]["code"] == "journal_unavailable"
         assert result["warnings_truncated"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cursor", [0, 1])
+async def test_read_journal_eviction_race_reports_missing_output(
+    monkeypatch, tmp_path: Path, cursor: int
+):
+    shells = Shells(tmp_path)
+    job_id = "e" * 32
+    journal = shells.jobs_root / f"{job_id}.jsonl"
+    shells.jobs_root.mkdir(parents=True, exist_ok=True)
+    journal.write_text(
+        "{\"stream\":\"stdout\",\"text\":\"one\"}\n"
+        "{\"stream\":\"stdout\",\"text\":\"two\"}\n",
+        encoding="utf-8",
+    )
+    (shells.jobs_root / f"{job_id}.json").write_text(
+        json.dumps({"id": job_id, "state": "succeeded", "output_count": 2}),
+        encoding="utf-8",
+    )
+    original = services_module.read_page
+
+    def delete_before_read(path, *args):
+        journal.unlink()
+        return original(path, *args)
+
+    monkeypatch.setattr(services_module, "read_page", delete_before_read)
+    try:
+        result = await shells.read(job_id, cursor=cursor)
+    finally:
+        await shells.close()
+
+    assert result["output"] == []
+    assert result["truncated"] is True
+    assert result["warnings"][0]["code"] == "journal_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_read_journal_forged_cursor_still_fails_when_file_exists(tmp_path: Path):
+    shells = Shells(tmp_path)
+    job_id = "f" * 32
+    shells.jobs_root.mkdir(parents=True, exist_ok=True)
+    (shells.jobs_root / f"{job_id}.jsonl").write_text(
+        '{"stream":"stdout","text":"saved"}\n', encoding="utf-8"
+    )
+    (shells.jobs_root / f"{job_id}.json").write_text(
+        json.dumps({"id": job_id, "state": "succeeded", "output_count": 1}),
+        encoding="utf-8",
+    )
+    try:
+        with pytest.raises(ValueError, match="Invalid output cursor"):
+            await shells.read(job_id, cursor=2)
+    finally:
+        await shells.close()
 
 
 @pytest.mark.asyncio

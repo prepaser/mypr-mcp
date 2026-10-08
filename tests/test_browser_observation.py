@@ -625,6 +625,10 @@ async def test_observation_workspace_budget_evicts_inactive_owner(monkeypatch):
     first_page.is_closed = lambda: False
     first = await observations.observe("one", first_page, first_context)
     first_page.emit("pageerror", "old")
+    request = Request()
+    first_page.emit("request", request)
+    request_id = first._requests[id(request)]
+    first_buffer = first._buffer
     first.close()
 
     second_page = EventEmitter()
@@ -635,8 +639,33 @@ async def test_observation_workspace_budget_evicts_inactive_owner(monkeypatch):
     second_page.emit("pageerror", "new")
     assert "one" not in observations._clients
     assert observations._total_events == 1
+    assert not first_buffer.events
+    assert not first_buffer.requests
+    assert first_buffer.bytes_used == 0
     with pytest.raises(KeyError, match="no longer retained"):
         await first.read()
+    with pytest.raises(KeyError, match="no longer retained"):
+        await first.request(request_id)
+
+
+@pytest.mark.asyncio
+async def test_observation_clear_releases_detached_buffer(browser_tools):
+    tools, _identity = browser_tools
+    context = await tools.context()
+    observation = await tools.observe(context.pages[0])
+    request = Request()
+    context.pages[0].emit("request", request)
+    request_id = observation._requests[id(request)]
+    buffer = observation._buffer
+    observation.close()
+
+    tools._observations.clear()
+
+    assert not buffer.events
+    assert not buffer.requests
+    assert buffer.bytes_used == 0
+    with pytest.raises(KeyError, match="no longer retained"):
+        await observation.request(request_id)
 
 
 @pytest.mark.asyncio

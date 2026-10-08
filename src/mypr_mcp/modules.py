@@ -603,16 +603,35 @@ def _diff(path: str, old: str, new: str, limit: int) -> tuple[str, bool]:
 
 
 _CHECK_SCRIPT = r"""
-import base64, importlib.machinery, importlib.util, json, sys
+import base64, importlib, importlib.util, json, sys
 payload = json.loads(base64.b64decode(sys.stdin.read()))
 sys.path.insert(0, payload["lib"])
 name = payload["name"]
-loader = importlib.machinery.SourceFileLoader(name, payload["path"])
-spec = importlib.util.spec_from_loader(name, loader, origin=payload["path"])
-module = importlib.util.module_from_spec(spec)
-module.__file__ = payload["path"]
-sys.modules[name] = module
-exec(compile(payload["source"], payload["path"], "exec"), module.__dict__)
+
+class PinnedLoader:
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        module.__file__ = payload["path"]
+        exec(compile(payload["source"], payload["path"], "exec"), module.__dict__)
+
+class PinnedFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != name:
+            return None
+        loader = PinnedLoader()
+        return importlib.util.spec_from_loader(fullname, loader, origin=payload["path"])
+
+finder = PinnedFinder()
+sys.meta_path.insert(0, finder)
+try:
+    parent, _, _ = name.rpartition(".")
+    if parent:
+        importlib.import_module(parent)
+    module = importlib.import_module(name)
+finally:
+    sys.meta_path.remove(finder)
 if payload["test_code"] is not None:
     exec(compile(payload["test_code"], "<module-check>", "exec"), module.__dict__)
 """

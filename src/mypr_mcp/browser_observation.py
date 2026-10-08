@@ -772,8 +772,7 @@ class BrowserObservations:
     def clear(self) -> None:
         for buffer in self._clients.values():
             buffer.retained = False
-            for observation in tuple(buffer.pages.values()):
-                observation._detach()
+            self._release_buffer(buffer)
         self._clients.clear()
         self._lru.clear()
         self._accessed.clear()
@@ -803,6 +802,18 @@ class BrowserObservations:
         self._total_events = sum(len(buffer.events) for buffer in self._clients.values())
         self._total_bytes = sum(buffer.bytes_used for buffer in self._clients.values())
 
+    @staticmethod
+    def _release_buffer(buffer: _ClientBuffer) -> None:
+        for observation in tuple(buffer.pages.values()):
+            observation._detach()
+        buffer.pages.clear()
+        buffer.events.clear()
+        buffer.requests.clear()
+        buffer.bytes_used = 0
+        buffer.owner = ""
+        buffer.on_access = None
+        buffer.changed.set()
+
     def _remove_owner(self, owner: str) -> None:
         buffer = self._clients.pop(owner, None)
         if buffer is None:
@@ -810,8 +821,7 @@ class BrowserObservations:
         buffer.retained = False
         self._lru.pop(owner, None)
         self._accessed.pop(owner, None)
-        for observation in tuple(buffer.pages.values()):
-            observation._detach()
+        self._release_buffer(buffer)
         self._sync_totals()
 
     def _expire(self) -> None:

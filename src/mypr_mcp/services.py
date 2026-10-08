@@ -619,7 +619,12 @@ class Shells:
             raise ValueError("invalid shell output cursor")
         if not path.is_file():
             return [], event_index, event_offset, False, True
-        events, total = read_page(path, event_index, max_bytes + event_offset)
+        try:
+            events, total = read_page(path, event_index, max_bytes + event_offset)
+        except (FileNotFoundError, ValueError):
+            if path.is_file():
+                raise
+            return [], event_index, event_offset, False, True
         page, consumed, offset = cls._page_events(
             events,
             0,
@@ -628,7 +633,8 @@ class Shells:
             max_bytes=max_bytes,
         )
         next_index = event_index + consumed
-        return page, next_index, offset, next_index < total, False
+        missing = not path.is_file()
+        return page, next_index, offset, next_index < total and not missing, missing
 
     @staticmethod
     def _encode_read_cursor(job_id: str, event: int, offset: int) -> str:

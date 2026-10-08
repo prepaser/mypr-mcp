@@ -116,6 +116,29 @@ async def test_check_provides_import_metadata_for_candidate_source(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_check_nested_parent_reexport_uses_pinned_candidate_source(tmp_path: Path):
+    modules = manager(tmp_path)
+    package = modules.root / "pkg"
+    package.mkdir()
+    marker = tmp_path / "check-runs"
+    (package / "__init__.py").write_text("from .helper import answer\n", encoding="utf-8")
+    (package / "common.py").write_text("VALUE = 42\n", encoding="utf-8")
+    result = await modules.check(
+        "pkg.helper",
+        "from pathlib import Path\n"
+        f"marker = Path({str(marker)!r})\n"
+        "marker.write_text(marker.read_text() + 'x' if marker.exists() else 'x')\n"
+        "from .common import VALUE\n"
+        "def answer():\n"
+        "    return VALUE\n",
+        test_code="assert answer() == 42",
+    )
+
+    assert result["valid"], result["stderr"]
+    assert marker.read_text(encoding="utf-8") == "x"
+
+
+@pytest.mark.asyncio
 async def test_check_rejects_truncated_existing_source(tmp_path: Path):
     class TruncatedFilesystem(Filesystem):
         async def read(self, *args, **kwargs):
