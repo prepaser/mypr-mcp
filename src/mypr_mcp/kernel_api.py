@@ -1497,6 +1497,8 @@ class RemoteTask(TaskHandle):
         }
         if self._finished_at is not None:
             status["finished_at"] = self._finished_at
+        if isinstance(self._result, Mapping) and type(self._result.get("returncode")) is int:
+            status["returncode"] = self._result["returncode"]
         return status
 
     def output(self, cursor: int | None = None) -> str | dict[str, Any]:
@@ -1528,7 +1530,14 @@ class RemoteTask(TaskHandle):
         if self._remote_has_more or self._state in {"queued", "running", "cancelling"}:
             raise NotReady(f"task {self.id} is still running")
         if self._state in {"failed", "lost"}:
-            raise RPCError(self._error or f"task {self.id} failed")
+            details = {"id": self.id, "state": self._state}
+            status = self.status()
+            message = f"task {self.id} failed"
+            if "returncode" in status:
+                details["returncode"] = status["returncode"]
+                if self._state == "failed":
+                    message += f" (exit {status['returncode']})"
+            raise RPCError(self._error or message, details=details)
         if self._state == "cancelled":
             raise asyncio.CancelledError
         return self._result

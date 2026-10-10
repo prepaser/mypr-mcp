@@ -346,6 +346,18 @@ def _render_result(
         lines.append("error: " + str(result["error"]))
     if result.get("error_truncated"):
         lines.append("error_truncated=true")
+    error_info = result.get("error_info")
+    if isinstance(error_info, dict):
+        if "code" in error_info and error_info["code"] is not None:
+            lines.append(f"error_code={error_info['code']}")
+        if "operation" in error_info and error_info["operation"] is not None:
+            lines.append(f"error_operation={error_info['operation']}")
+        details = error_info.get("details")
+        if isinstance(details, dict):
+            if details.get("outcome_unknown") is True:
+                lines.append("outcome_unknown=true")
+    if result.get("output_evicted") is True:
+        lines.append("output_evicted=true")
     if "runtime" in result and result["runtime"].get("instructions"):
         lines.extend(_render_runtime(result["runtime"]))
     output = result.get("output", [])

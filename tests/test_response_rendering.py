@@ -114,6 +114,88 @@ async def test_response_without_timer_alerts_has_no_timer_text():
     assert "timer" not in result.content[0].text
 
 
+async def test_error_info_metadata_is_rendered_without_inventing_missing_fields():
+    result = await cli.tool_result(
+        {
+            "exec_id": "exec-error-info",
+            "state": "failed",
+            "error": "bounded failure",
+            "error_truncated": True,
+            "error_info": {"code": "invalid_request", "operation": "cell.execute"},
+        }
+    )
+
+    text = result.content[0].text
+    assert "error: bounded failure" in text
+    assert "error_truncated=true" in text
+    assert "error_code=invalid_request" in text
+    assert "error_operation=cell.execute" in text
+    assert "outcome_unknown=true" not in text
+    assert "output_evicted=true" not in text
+
+
+async def test_error_info_details_render_only_true_outcome_flags():
+    payload = {
+        "exec_id": "exec-error-details",
+        "state": "failed",
+        "error_info": {
+            "code": "outcome_unknown",
+            "operation": "history.get",
+            "details": {
+                "outcome_unknown": True,
+                "output_evicted": True,
+                "stream": "stderr",
+                "repr": "secret details stay structured",
+            },
+        },
+    }
+
+    result = await cli.tool_result(payload)
+
+    text = result.content[0].text
+    assert "error_code=outcome_unknown" in text
+    assert "error_operation=history.get" in text
+    assert "outcome_unknown=true" in text
+    assert "output_evicted=true" not in text
+    assert "secret details stay structured" not in text
+    assert "stream=stderr" not in text
+    assert result.structured_content == payload
+
+
+async def test_error_info_ignores_non_boolean_outcome_flags():
+    result = await cli.tool_result(
+        {
+            "exec_id": "exec-error-flags",
+            "state": "failed",
+            "error_info": {
+                "details": {
+                    "outcome_unknown": 1,
+                }
+            },
+            "output_evicted": "true",
+        }
+    )
+
+    text = result.content[0].text
+    assert "outcome_unknown=true" not in text
+    assert "output_evicted=true" not in text
+
+
+async def test_output_evicted_success_preserves_result_contract():
+    payload = {
+        "exec_id": "exec-expired-output",
+        "state": "succeeded",
+        "output_evicted": True,
+        "output": [],
+    }
+
+    result = await cli.tool_result(payload)
+
+    assert result.structured_content == payload
+    assert result.is_error is False
+    assert "output_evicted=true" in result.content[0].text
+
+
 async def test_inline_images_obey_aggregate_budget_and_keep_omitted_path(tmp_path, monkeypatch):
     first = tmp_path / "first.png"
     second = tmp_path / "second.jpg"

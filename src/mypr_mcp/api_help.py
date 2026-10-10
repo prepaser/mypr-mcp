@@ -16,8 +16,18 @@ Read bounded text and retain its revision when you plan an edit:
 
 Long lines may return next_cursor. Continue using its line as start_line and byte as start_byte. await ws.fs.tree(path) lists a bounded directory tree; await ws.fs.stat(path) returns file metadata.
 
-await ws.fs.write(path, text, history=True) creates a file; use create_parents=True if parent directories do not exist. To replace an existing file, pass expected_hash from a prior read or explicitly set overwrite=True. Set history=False only to opt out of the recovery entry. patch(path, edits, expected_hash=..., history=True) applies exact text replacements with conflict detection; each old value must match once unless count is given, and dry_run=True previews the diff.
-    await ws.fs.patch("src/app.py", [{"old": "before", "new": "after"}], expected_hash=ws.local["page"]["revision"])
+await ws.fs.write(path, text, history=True) creates a file; use create_parents=True if parent directories do not exist. To replace an existing file, pass expected_hash from a prior read or explicitly set overwrite=True. Set history=False only to opt out of the recovery entry. patch(path, edits, expected_hash=..., history=True) applies exact text replacements with conflict detection; each old value must match once unless count is given, and dry_run=True previews the diff. The normal edit flow is read, retain revision, preview with dry_run=True, then apply with expected_hash=revision. If the revision conflicts, read the file again and review the edit instead of forcing an old patch.
+    ws.local["preview"] = await ws.fs.patch(
+        "src/app.py", [{"old": "before", "new": "after"}],
+        expected_hash=ws.local["page"]["revision"], dry_run=True,
+    )
+    print(ws.local["preview"]["diff"])
+
+After reviewing the preview, apply in a later cell:
+    await ws.fs.patch(
+        "src/app.py", [{"old": "before", "new": "after"}],
+        expected_hash=ws.local["page"]["revision"],
+    )
 
 await ws.fs.apply_patch(patch_text, dry_run=False) applies multi-file Add, Update, Delete, and Move operations using *** Begin Patch / *** End Patch and @@ hunks. All targets are checked before changes are applied. expected_hashes maps paths to revisions; use None for a path that must not exist. There is no fuzzy matching.
 
@@ -33,7 +43,7 @@ await ws.fs.image(path) returns a PNG or JPEG as inline image content; the defau
         "Inspect, extract text from, and render PDF pages.",
         """PDF helpers prepare PyMuPDF in the workspace Python environment when it is missing. Image transformations also prepare "pillow". Automatic preparation is enabled by default; use await ws.dependencies.ensure("pymupdf", "pillow") for an explicit install, including when dependencies.auto_install is false. Installing packages only in the MCP client's environment does not install them in the workspace kernel.
 
-await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; text extraction does not perform OCR. Use await ws.docs.ocr(path, ...) explicitly for scanned PDF pages or PNG/JPEG images. OCR accepts resume_cursor for continuing a bounded cached page result; it cannot be combined with the ordinary result cursor. A resume returns cached words first, then OCRs the next unprocessed page. Cached words remain readable after a source edit, while the next unprocessed page rechecks the source revision before OCR. The original page budget is preserved when resuming. await ws.docs.extract(path, ...) reads DOCX paragraphs/tables, PPTX slides, or XLSX cells. await ws.docs.backends() checks optional packages and OCR language data. These operations run outside the kernel, preserve source files, and return bounded pages tied to the source revision.
+await ws.docs.info(path, page=1) returns PDF metadata, revision, and optional page geometry. await ws.docs.read(path, start_page=1, max_pages=5, max_chars=20000) extracts bounded page text. Page numbers are one-based. Inspect truncation and continuation fields; ordinary next_cursor continuation reads the next result page. Text extraction does not perform OCR. Use await ws.docs.ocr(path, ...) explicitly for scanned PDF pages or PNG/JPEG images. OCR accepts resume_cursor for continuing a bounded cached page result; it cannot be combined with the ordinary result cursor. A resume returns cached words first, then OCRs the next unprocessed page. Cached words remain readable after a source edit, while the next unprocessed page rechecks the source revision before OCR. The original page budget is preserved when resuming. resume_cursor and next_cursor are different contracts. await ws.docs.extract(path, ...) reads DOCX paragraphs/tables, PPTX slides, or XLSX cells. await ws.docs.backends() checks optional packages and OCR language data. These operations run outside the kernel, preserve source files, and return bounded pages tied to the source revision.
 
 await ws.docs.render_page(path, page=1, dpi=120) returns an inline page image. clip=(left, top, right, bottom) selects a region in PDF points. Source path, page, revision, geometry, and rendering details accompany the result. Workers bound input size, output size, pixel count, and execution time. Read ws.help("docs.render_page") for the current method signature.""",
     ),
@@ -41,10 +51,11 @@ await ws.docs.render_page(path, page=1, dpi=120) returns an inline page image. c
         "Search code, documents, and syntax trees.",
         """ws.fs.search(pattern, paths=..., glob=...) searches source with ripgrep. Patterns are regular expressions by default; use fixed=True for literal text. Omit pattern to list files. Patterns may be a string or list. Set mode="files", "counts", or "exists" to avoid returning match text. Options include word=True, multiline=True, and before/after context.
 
-Search work and each returned page are bounded. timeout, scan_bytes, and scan_limit bound the search; max_matches and max_bytes bound a page. Follow next_cursor with the same search method and cursor=... while has_more. Pages use a saved snapshot. Use page_cursor to reread the current page with a larger output budget. Check complete, stop_reason, and scan_truncated before assuming there are no matches or that counts are complete. For an incomplete existence search, exists is None unless a hit is already known.
+Search work and each returned page are bounded. timeout, scan_bytes, and scan_limit bound the search; max_matches and max_bytes bound a page. Follow next_cursor with the same search method and cursor=... while has_more. Use ws.pages.iter(...) only when every page is needed; for an exploratory search, inspect the first page and continue deliberately. Pages use a saved snapshot. Use page_cursor to reread the current page with a larger output budget. has_more only describes unread results in the current snapshot; complete, stop_reason, and scan_truncated describe whether the search itself finished. Check all of them before assuming there are no matches or that counts are complete. For an incomplete existence search, exists is None unless a hit is already known.
 
     ws.local["hits"] = await ws.fs.search("TODO", paths="src", glob="*.py")
     print(ws.local["hits"]["matches"][:5])
+    print(ws.local["hits"]["complete"], ws.local["hits"]["stop_reason"], ws.local["hits"]["has_more"])
 
 await ws.fs.search_docs(pattern, paths=...) uses rga to search documents and archives. Missing registered search tools and selected converters are prepared automatically by default. Returned locations refer to extracted text, not editable source positions; document converters remain optional.
 
@@ -80,14 +91,25 @@ await ws.git.log(...) returns structured commit history and await ws.git.blame(p
         "Run commands and manage interactive or long-lived processes.",
         """run(command, ...) waits for a process and returns bounded stdout, stderr, returncode, and job id:
     ws.local["result"] = await ws.shell.run(["git", "status", "--short"])
-    print(ws.local["result"]["stdout"])
+    print(ws.local["result"]["state"], ws.local["result"]["returncode"])
+    print(ws.local["result"]["stdout"], ws.local["result"]["stderr"], sep="")
 
-timeout cancels the process. check=True raises when it exits unsuccessfully. Use input="text" to provide stdin. Full retained output is available from ws.tasks.get(ws.local["result"]["id"]).output().
+state is the shell state; returncode is the process exit code when known. A non-zero exit is returned as a failed result by default. Pass check=True when an unsuccessful command should raise ShellError, then inspect the exception's result. timeout cancels the process. Use input="text" to provide stdin. Retained output is bounded by task limits; inspect truncated and warnings on the result or handle. ws.tasks.get(ws.local["result"]["id"]).output() reads the retained text.
 
 env overlays the calling kernel's environment by default. Use env={"NO_COLOR": "1", "VARIABLE_TO_REMOVE": None} to set or remove variables without losing PATH. inherit_env=False starts with an empty environment and applies only env. Both run and start use these rules.
 
-For long-running work, start a job and keep its handle in client-local state:
+For long-running work, start a job, reset a job-scoped cursor, keep both its handle and ID in client-local state, and print the ID:
     ws.local["job"] = await ws.shell.start("command")
+    ws.local["job_cursor"] = None
+    ws.local["job_id"] = ws.local["job"].id
+    print(ws.local["job_id"])
+
+In a later cell, read bounded pages and keep the opaque cursor:
+    page = await ws.local["job"].read(cursor=ws.local["job_cursor"])
+    ws.local["job_cursor"] = page["cursor"]
+    print(page["state"], page["has_more"], page["truncated"], page.get("warnings"), page["output"])
+
+has_more only describes unread retained output and may be false while the job is still running. Continue reading until a page reports a terminal state and has_more is false, then await the job or call result(). A successful result returns the command result; failed or lost results raise RPCError with the task state and known returncode, while cancellation raises asyncio.CancelledError. Check the task before repeating a state-changing command.
 
 For an interactive pipe, use ws.local["job"] = await ws.shell.start(command, stdin=True), then await ws.local["job"].write("input\\n"); await ws.local["job"].write(eof=True) closes stdin. For a terminal, use ws.local["job"] = await ws.shell.start(command, pty=True, rows=24, cols=80). Use await ws.local["job"].resize(rows, cols) to change its size and await ws.local["job"].write("\\x03") to send Ctrl-C. PTY stdout and stderr are combined; terminal echo and ANSI output are preserved. In PTY mode eof=True sends the terminal EOF character. await ws.local["job"].cancel() terminates the job.
 
@@ -95,13 +117,35 @@ Persisted shell metadata and output journals are validated when read. A malforme
     ),
     "tasks": (
         "Track Python cells and detached background jobs.",
-        """Cells run as independent asyncio tasks in one shared kernel, including cells from the same client. An await yields to other cells; synchronous code, synchronous IPython magics, and CPU-heavy work block the event loop. Cells can finish out of order, so wait for dependencies before submitting dependent code. MCP wait_ms limits notification waiting, not total request latency or task lifetime. Poll returns available output immediately and wakes for new output or completion.
+        """Choose the smallest task flow that matches the work.
 
-ws.tasks.start(coroutine) starts detached async work and returns a handle. Store handles in ws.local. Raw asyncio.create_task() output after its parent cell finishes is not retained. Every cell is also a task handle: ws.tasks.get(exec_id) exposes its status (kind="cell") and actual last-expression result. A cell cannot await its own handle; use MCP poll for cell output.
+For a short command, await ws.shell.run(...) and inspect state, returncode, stdout, stderr, and truncated. Use check=True only when a non-zero exit is exceptional; otherwise inspect the returned state, returncode, and stdout.
 
-For a retained job handle, status(), output(), and result() are synchronous; read(), expect(), cancel(), and wait_saved() must be awaited. status() reports state and optional warnings, plus result_persisted when persistence was requested; output() reads retained text, and result() raises NotReady until computation completes; it remains a synchronous computation result even when persistence was requested. read(cursor=None, stream=None, max_bytes=32768, wait_ms=0) returns bounded pages; its opaque cursor is separate from output() character offsets. expect(text, timeout=30, regex=False) waits for output; a failed match preserves its starting cursor, and reason identifies EOF, timeout, or limit. Cancelling an expect/read/wait_saved wait does not cancel the job or its reporter. cancel() requests cancellation and returns False for a terminal handle. Filesystem surrogate-escaped path strings are preserved in saved JSON; other invalid Unicode strings are rejected. The 256 KiB limit counts serialized bytes, including escapes. Awaiting a persist_result=True handle waits for computation and the persistence attempt to settle while returning the original in-memory value; other async cells continue.
+For long-running work, await ws.shell.start(...), reset a job-scoped cursor, save the handle and its id in ws.local, and print the id so the job can be found again. In later cells, call await handle.read(cursor=...) with bounded max_bytes, save the opaque cursor, and inspect state, has_more, truncated, and warnings. has_more only describes unread retained output; it can be false while the job is still running. Continue until a page reports a terminal state and has_more is false, then await the handle or call result(). Shell and package failures or lost results raise RPCError; cancellation raises asyncio.CancelledError.
 
-Use ws.tasks.list() and ws.tasks.get(task_id) to find handles. Completed handles are cached up to limits.completed_tasks (default 128); keep important handles in ws.local. Set persist_result=True when starting a visible Python task to retain a strict JSON result up to 256 KiB after handle eviction or reconnect; await job.wait_saved() returns None after confirmed persistence and raises ResultUnavailable for an unavailable, unserializable, unknown, or garbage-collected saved result. Calling it for a live job that was not started with persist_result=True raises ValueError. Persistence warnings do not change task success. Python tasks drain their retained output before terminal publication; task_output_persistence_unknown warns when an output append was not confirmed, without replaying an uncertain append. await ws.tasks.attach(task_id) reopens a saved job after reconnecting. Shell and cell handles do not provide a persistent result contract. Shell storage warnings appear in status() and output(cursor=0). Damaged saved output is replaced by warning events while readable output and event cursors are preserved. Corrupt persisted run metadata is likewise surfaced as a warning and does not hide later valid records.""",
+Handle methods:
+
+| Method | Call | Purpose |
+| --- | --- | --- |
+| status() | synchronous | Read status, warnings, persistence state, and known returncode. |
+| output(cursor=None) | synchronous | Read retained text using a character offset. |
+| result() | synchronous | Return a terminal result; remote failures use RPCError, scans return summaries, and Python exceptions propagate. |
+| read(...) | await | Read bounded output pages using an opaque task cursor. |
+| expect(...) | await | Wait for matching output without cancelling the job. |
+| cancel() | await | Request cancellation; returns false for a terminal task. |
+| wait_saved() | await | Wait for a persisted Python result when persist_result=True. |
+
+status() uses the key status for the handle state. read() uses state in its page, and shell.run() also uses state. For shell and package remote jobs, terminal status includes returncode when known and failure details accompany RPCError; scan result() returns its summary. Python task exceptions propagate their original exception, while a missing persisted Python result raises ResultUnavailable. Inspect warnings, error, truncated, and outcome_unknown before deciding whether an operation can be retried.
+
+Use ws.tasks.get(task_id) for a handle in the current kernel. Use await ws.tasks.attach(task_id) for a live or persisted shell, package, or scan record after reconnecting or losing local state. attach() restores the operation view, not arbitrary Python globals. The same client ID preserves ws.local across disconnect while the kernel remains alive; reset and restart clear it, so keep important IDs outside ws.local when either may occur.
+
+Cells run as independent asyncio tasks in one shared kernel, including cells from the same client. An await yields to other cells; synchronous or CPU-heavy code blocks the event loop. Cells can finish out of order, so wait for dependencies. MCP wait_ms only limits notification waiting; poll returns available output and wakes for new output or completion.
+
+ws.tasks.start(coroutine) starts detached async work and returns a handle; store it in ws.local. Raw asyncio.create_task() output after its parent cell finishes is not retained. Every cell is also a handle: ws.tasks.get(exec_id) exposes its status (kind="cell") and last-expression result. A cell cannot await its own handle; use MCP poll for cell output.
+
+Completed handles are cached up to limits.completed_tasks (default 128); keep important handles in ws.local. Set persist_result=True for a visible Python task to retain a strict JSON result up to 256 KiB after eviction or reconnect. await job.wait_saved() returns None after confirmed persistence and raises ResultUnavailable for unavailable, unserializable, unknown, or garbage-collected results; calling it without persist_result=True raises ValueError. Persistence warnings do not change task success. Python tasks drain retained output before terminal publication; task_output_persistence_unknown warns when an append was not confirmed. Shell and cell handles do not provide a persistent result contract. Shell storage warnings appear in status() and output(cursor=0); damaged output becomes warning events while readable output and cursors remain, and corrupt run metadata is surfaced without hiding later valid records.
+
+Cursor details live with their owning APIs: see ws.help("pages") for next_cursor/page_cursor iteration, ws.help("search") for complete versus has_more, and ws.help("fs") for revision and file-read cursors. Shell read() and output() cursor meanings are shown above.""",
     ),
     "system": (
         "Inspect workstation specifications, limits, and resource usage.",
@@ -147,7 +191,7 @@ await ws.web.search(query, provider=None, limit=10, options=None, max_bytes=3276
 
 await ws.web.context(query, provider=None, limit=10, max_tokens=4096, options=None, max_bytes=32768) requests bounded source excerpts from a provider that supports contextual search. The common limit accepts 1–50 sources and the selected provider may enforce a lower limit. await ws.web.extract(urls, provider=None, options=None, max_bytes=32768) extracts content from one or more URLs where the selected provider supports it. Use await ws.http.read_html(url) when you want direct local HTTP fetching and HTML extraction, including cookies or browser-rendered page.content().
 
-Search and extraction responses are immutable client-owned snapshots. Read a returned page with await ws.web.page(cursor, max_bytes=...) without making another network request; page_cursor replays the current page with a different budget and next_cursor advances the snapshot. Additional provider result pages require a new search call. Content fragments repeat source metadata and include Unicode character offsets. Normal pages set truncated=False; use has_more and next_cursor for continuation. If the initial page budget cannot fit its metadata, follow error_info.details.page_cursor with a larger max_bytes instead of repeating the provider request. Inspect failed_results and provider usage before assuming a response is complete. The manager enforces request timeouts, concurrency, response size, and five-minute snapshot retention. Authentication, quota, rate-limit, timeout, and provider errors remain distinct from an empty result.""",
+Search and extraction responses are immutable client-owned snapshots. Read a returned page with await ws.web.page(cursor, max_bytes=...) without making another network request; page_cursor replays the current page with a different budget and next_cursor advances the local snapshot. Additional provider result pages require a new search call. Content fragments repeat source metadata and include Unicode character offsets. Normal pages set truncated=False; use has_more and next_cursor for local continuation. provider_has_more, when present, means the selected provider has more results than this request returned; it is not a local cursor and requires a new search request. If the initial page budget cannot fit its metadata, follow error_info.details.page_cursor with a larger max_bytes instead of repeating the provider request. Inspect failed_results and provider usage before assuming a response is complete. The manager enforces request timeouts, concurrency, response size, and five-minute snapshot retention. Authentication, quota, rate-limit, timeout, and provider errors remain distinct from an empty result.""",
     ),
     "locks": (
         "Coordinate cooperating Python tasks with named async locks.",
@@ -242,7 +286,7 @@ Binary tools and OCR models are shared under the XDG data directory, with downlo
     ),
     "pages": (
         "Consume paged workspace results without repeating queries.",
-        """ws.pages.iter(method, *args, max_pages=100, **kwargs) is an async iterator for APIs that return next_cursor/has_more pages. It calls the supplied bound workspace method with the first arguments, then forwards each cursor using that method's cursor parameter. When max_pages is reached with more data available, PageLimitReached exposes method, pages_read, next_cursor, and next_kwargs; resume with ws.pages.iter(error.method, *args, **error.next_kwargs). An explicit loop break is normal. A stalled cursor or an expired snapshot raises instead of silently restarting the query.""",
+        """ws.pages.iter(method, *args, max_pages=100, **kwargs) is an async iterator for APIs that return next_cursor/has_more pages. Use it when all pages are needed; inspect the first page directly for exploratory work. It calls the supplied bound workspace method with the first arguments, then forwards each cursor using that method's cursor parameter. When max_pages is reached with more data available, PageLimitReached exposes method, pages_read, next_cursor, and next_kwargs; resume with ws.pages.iter(error.method, *args, **error.next_kwargs). An explicit loop break is normal. A stalled cursor or an expired snapshot raises instead of silently restarting the query.""",
     ),
     "performance": (
         "Inspect recent manager, storage, kernel, and bridge timings.",
@@ -291,12 +335,13 @@ _INDEX = (
 
 _METHOD_NOTES = {
     "shell.run": "Returns a dict with id, state, returncode, stdout, stderr, timed_out, and truncated. timeout cancels the process; check=True raises on unsuccessful exit. Retained output is accessible through ws.tasks.get(id).",
-    "shell.start": "Returns a job handle. Await it to wait for completion; status/output/result are synchronous and read/write/expect/cancel are async. env overlays inherited variables by default; None removes a variable. inherit_env=False replaces the environment.",
+    "shell.start": "Returns a job handle; save the handle and its id before the cell ends, then use ws.help(\"tasks\") for bounded read cursors, terminal state, returncode, result, and cancellation behavior. Await it to wait for completion; status/output/result are synchronous and read/write/expect/cancel are async. env overlays inherited variables by default; None removes a variable. inherit_env=False replaces the environment.",
+    "tasks.attach": "Returns a handle for a live task or persisted shell, package, or scan record after reconnecting or losing local state. It restores the saved operation view, not arbitrary Python globals; use tasks.get() for a handle still in the current kernel. See ws.help(\"tasks\") for the preferred flow.",
     "fs.read": "Returns text, revision (SHA-256), and range/paging metadata. Follow next_cursor for bounded or long-line reads. Keep revision for expected_hash when editing.",
     "fs.write": "Returns path and revision metadata. Existing files require expected_hash or overwrite=True. A mismatched revision rejects the write. The helper follows a symlink while preserving the link.",
-    "fs.patch": "Returns revision and bounded diff metadata. Each old string must match exactly; dry_run previews without writing. The helper follows a symlink while preserving the link.",
+    "fs.patch": "Returns revision and bounded diff metadata. Read and retain the source revision, preview with dry_run=True, then apply with expected_hash=revision. Each old string must match exactly; a revision conflict requires rereading the file. The helper follows a symlink while preserving the link.",
     "fs.apply_patch": "Returns per-file changes and a bounded diff. expected_hashes validates target revisions; dry_run previews without writing. Symlink paths are rejected.",
-    "fs.search": "Returns a bounded result page. Continue with cursor or page_cursor and page budgets, omitting the original pattern and query options. Follow next_cursor while has_more; inspect complete and stop_reason before treating absence or counts as definitive.",
+    "fs.search": "Returns a bounded result page. Continue with cursor or page_cursor and page budgets, omitting the original pattern and query options. Use ws.pages.iter(...) only when all pages are needed. Follow next_cursor while has_more; inspect complete and stop_reason before treating absence or counts as definitive.",
     "fs.search_docs": "Returns document search matches in extracted text, not editable file coordinates. Continue with cursor or page_cursor and page budgets, omitting query options. Follow next_cursor and inspect complete/stop_reason.",
     "fs.search_ast": "Returns structural matches with source ranges and captures. Continue with cursor or page_cursor and page budgets, omitting the pattern, lang, and other query options. Follow next_cursor; inspect details_truncated and complete.",
     "mcp.call_tool": "Returns the external server's MCP result; inspect isError and structuredContent/content. Arguments follow that tool's inputSchema from list_tools.",
@@ -322,7 +367,7 @@ _METHOD_NOTES = {
     "dependencies.list": "Returns a paged dependency inventory without installing anything.",
     "dependencies.ensure": "Prepares registered dependencies and waits for completion; explicit ensure bypasses dependencies.auto_install.",
     "web.providers": "Lists provider readiness and capabilities without making a billable web request.",
-    "web.search": "Returns a bounded normalized result snapshot. Provider-specific options are checked by the manager; no provider fallback or implicit additional page request occurs.",
+    "web.search": "Returns a bounded normalized local snapshot. has_more/next_cursor page that snapshot; provider_has_more, when present, requires a new search request. Provider-specific options are checked by the manager; no provider fallback or implicit additional page request occurs.",
     "web.context": "Returns bounded source excerpts where the selected provider supports contextual search. Check content fragments, has_more, and usage.",
     "web.extract": "Extracts bounded content from one or more URLs through a selected provider. Partial failures appear in failed_results and are not treated as an empty result.",
     "web.page": "Reads a client-owned web snapshot without another network request. The cursor expires with the snapshot and cannot be shared across clients.",

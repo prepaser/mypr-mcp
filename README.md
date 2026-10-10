@@ -80,6 +80,8 @@ Clients must parse `structuredContent` (the Python MCP SDK exposes `result.struc
 
 When an operation fails, inspect both the bounded `error` string and the optional `error_info` object. `error_info.code` identifies categories such as `conflict`, `dependency_missing`, `timeout`, `invalid_cursor`, `outcome_unknown`, and `python_exception`; `operation` and bounded `details` provide machine-readable context. Branch on the code and inspect the execution or transaction ID before retrying a state-changing operation.
 
+For a failed shell or package job, the error details may also include its task `id`, `state`, and known `returncode`. A missing return code means the command's exit status was not confirmed; do not infer success from an empty output page.
+
 `execute` waits for completion, inbox activity, or its wait deadline so short cells normally need only one call. `poll` returns immediately when the requested output is available or the execution is terminal; otherwise it waits for output, completion, inbox activity, or its wait deadline. `wait_ms` bounds this notification wait, not total request latency or Python execution time. The configured defaults are `limits.execute_wait_ms` and `limits.poll_wait_ms`, each an integer from 0 through 30,000 milliseconds. Continue polling running cells, and read remaining pages while `has_more` is true even after execution finishes.
 
 The `init`, `execute`, and `poll` responses include small previews of the current client's unacknowledged inbox and expired timers. Message previews contain up to five messages and fit within a 4 KiB JSON budget; timer previews contain up to five alerts in the same budget. Reading a preview or receiving a timer alert does not acknowledge it. Use `ws.messages.read()` and `ws.timers.list()` for full records. Before `init`, `poll` omits the inbox and timer previews.
@@ -124,6 +126,42 @@ await ws.fs.write("notes.txt", "Hello from Python.\n")
 ```
 
 The [Python workspace API guide](docs/workspace-api.md) covers entry points, examples, dependency preparation, and result paging. Detailed guides cover [configuration](docs/config.md), [code navigation](docs/code.md), [media and documents](docs/media.md), and [workspace storage](docs/storage.md).
+
+### Common workflows
+
+Use `shell.run()` for a short command. Pass an argument list when shell syntax is not needed; a nonzero exit is returned in `returncode`, while `check=True` raises `ShellError`.
+
+```python
+result = await ws.shell.run(["git", "status", "--short"])
+print({
+    "state": result["state"],
+    "returncode": result["returncode"],
+    "truncated": result["truncated"],
+    "warnings": result.get("warnings", []),
+})
+print(result["stdout"])
+print(result["stderr"])
+```
+
+Use `shell.start()` for long work. Keep the handle and its bounded `read()` cursor in `ws.local`, print the task ID for later reconnection, and inspect the terminal status before awaiting the final result. A cell completing only means that the nested job was started or inspected.
+
+```python
+ws.local["job"] = await ws.shell.start(["pytest", "-q"])
+print(ws.local["job"].id)
+page = await ws.local["job"].read(max_bytes=32768, wait_ms=1000)
+ws.local["job_cursor"] = page["cursor"]
+print({
+    "state": page["state"],
+    "has_more": page["has_more"],
+    "truncated": page["truncated"],
+    "warnings": page.get("warnings", []),
+})
+print(page["output"])
+```
+
+For search, inspect the first page's `complete` and `stop_reason`; use `ws.pages.iter(...)` only when every page is needed. For file edits, read and retain `revision`, preview a `patch(dry_run=True)`, then apply with that revision. If it conflicts, reread the file before creating a new patch.
+
+If the handle is still in the current kernel, use `ws.tasks.get(task_id)`. After reset, reconnect with `await ws.tasks.attach(task_id)` using the ID you saved. Reconnection restores persisted status and output, not Python memory or arbitrary local variables. See the [canonical workflows and cursor glossary](docs/workspace-api.md#common-workflows).
 
 ## Reset and lifecycle
 
