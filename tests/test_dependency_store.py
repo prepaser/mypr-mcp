@@ -122,6 +122,58 @@ async def test_binary_install_extracts_and_publishes_aliases(tmp_path, monkeypat
     assert await asyncio.to_thread(Path(result["path"]).is_file)
     assert (store.bin_root / "rg").is_symlink()
     assert os.access(store.bin_root / "rg", os.X_OK)
+    assert not list(store._tools_root.glob(".rg-*"))
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_binary_install_failure_cleans_staging_directory(tmp_path, monkeypatch):
+    archive = tmp_path / "rg.tar.gz"
+    _archive(archive, "tar.gz", {"rg-15.2.0/not-rg": b"fixture"})
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=digest)
+    _patch_resolver(monkeypatch, artifact)
+
+    async def download(_url: str, destination: Path, _maximum: int) -> None:
+        data = await asyncio.to_thread(archive.read_bytes)
+        await asyncio.to_thread(destination.write_bytes, data)
+
+    store = DependencyStore(
+        tmp_path / "data", tmp_path / "cache", downloader=download, platform_key="x86_64"
+    )
+    monkeypatch.setattr(store, "_inspect_system", lambda _artifact: None)
+    with pytest.raises(DependencyError, match="did not contain: rg"):
+        await store.install("rg")
+    assert not list(store._tools_root.glob(".rg-*"))
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_binary_install_cleans_staging_when_archive_cleanup_fails(tmp_path, monkeypatch):
+    archive = tmp_path / "rg.tar.gz"
+    _archive(archive, "tar.gz", {"rg-15.2.0/rg": b"#!/bin/sh\necho rg 15.2.0\n"})
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    artifact = _fixture_artifact("rg", version="15.2.0", url="fixture://rg", sha256=digest)
+
+    async def download(_url: str, destination: Path, _maximum: int) -> None:
+        data = await asyncio.to_thread(archive.read_bytes)
+        await asyncio.to_thread(destination.write_bytes, data)
+
+    store = DependencyStore(
+        tmp_path / "data", tmp_path / "cache", downloader=download, platform_key="x86_64"
+    )
+    original_unlink = Path.unlink
+
+    def fail_download_unlink(path: Path, *args, **kwargs):
+        if path.parent == store.cache_root / "downloads":
+            raise OSError("fixture archive cleanup failed")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_download_unlink)
+    with pytest.raises(OSError, match="fixture archive cleanup failed"):
+        await store._install_binary(artifact)
+    assert not list(store._tools_root.glob(".rg-*"))
+    assert (store._tools_root / "rg" / "15.2.0" / "x86_64").is_dir()
     await store.close()
 
 

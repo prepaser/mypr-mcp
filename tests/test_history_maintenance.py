@@ -13,6 +13,7 @@ from mypr_mcp.history import History
 from mypr_mcp.history_maintenance import vacuum_if_worthwhile
 from mypr_mcp.json_utils import SOURCE_HASH_ENCODING, source_sha256
 from mypr_mcp.mail_store import MailStore
+from mypr_mcp.transport import MAX_MESSAGE
 
 
 def _age_database(root, *, entity_id: str, event_seq: int, age: float = 90 * 86400) -> None:
@@ -160,6 +161,100 @@ def test_history_gc_retries_failed_execution_json_compaction(tmp_path, monkeypat
     assert persisted["body_evicted_at"] == compacted["body_evicted_at"]
     assert persisted["body_evicted"] is True
     assert "output" not in persisted
+    history.close()
+
+
+def test_history_gc_reclaims_stale_execution_json_temp(tmp_path):
+    history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    ident = "stale-temp"
+    (runs / f"{ident}.json").write_text(
+        '{"id":"stale-temp","state":"succeeded","code":"print(1)",'
+        '"output":"body"}'
+    )
+    (runs / f"{ident}.json.tmp").write_text("interrupted")
+    compacted_ident = "compacted-temp"
+    (runs / f"{compacted_ident}.json").write_text(
+        '{"id":"compacted-temp","state":"succeeded","body_evicted":true}'
+    )
+    (runs / f"{compacted_ident}.json.tmp").write_text("interrupted")
+    history.record(
+        "execution",
+        {"id": ident, "state": "succeeded", "code": "print(1)", "output": "body"},
+        updated_at=time.time() - 90 * 86400,
+    )
+    history.record(
+        "execution",
+        {
+            "id": compacted_ident,
+            "state": "succeeded",
+            "body_evicted": True,
+            "json_compaction_pending": True,
+        },
+        updated_at=time.time() - 90 * 86400,
+    )
+
+    result = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+
+    assert result["json_compacted"] == 1
+    assert result.get("json_compaction_errors") is None
+    assert not (runs / f"{ident}.json.tmp").exists()
+    assert not (runs / f"{compacted_ident}.json.tmp").exists()
+    assert "json_compaction_pending" not in history.get(ident)
+    assert "json_compaction_pending" not in history.get(compacted_ident)
+    history.close()
+
+
+def test_history_gc_removes_stale_temp_when_execution_body_is_gone(tmp_path):
+    history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    ident = "missing-body"
+    (runs / f"{ident}.json.tmp").write_text("interrupted")
+    history.record(
+        "execution",
+        {
+            "id": ident,
+            "state": "succeeded",
+            "body_evicted": True,
+            "json_compaction_pending": True,
+        },
+        updated_at=time.time() - 90 * 86400,
+    )
+
+    result = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+
+    assert result["json_compacted"] == 0
+    assert result.get("json_compaction_errors") is None
+    assert not (runs / f"{ident}.json.tmp").exists()
+    assert "json_compaction_pending" not in history.get(ident)
+    history.close()
+
+
+def test_history_gc_accepts_execution_records_above_old_compaction_limit(tmp_path):
+    history = History(tmp_path)
+    runs = tmp_path / ".mypr" / "runs"
+    runs.mkdir(parents=True)
+    ident = "large-source"
+    source = "x" * (16 * 1024 * 1024 + 1)
+    assert len(source.encode()) < MAX_MESSAGE
+    (runs / f"{ident}.json").write_text(
+        json.dumps({"id": ident, "state": "succeeded", "code": source, "output": "body"})
+    )
+    history.record(
+        "execution",
+        {"id": ident, "state": "succeeded", "code": source, "output": "body"},
+        updated_at=time.time() - 90 * 86400,
+    )
+
+    result = history.storage_history_apply(history.storage_history_snapshot(retention_days=30))
+
+    assert result["json_compacted"] == 1
+    assert result.get("json_compaction_errors") is None
+    compacted = history.get(ident)
+    assert compacted["code_sha256"] == source_sha256(source)
+    assert "json_compaction_pending" not in compacted
     history.close()
 
 

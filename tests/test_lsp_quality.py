@@ -459,6 +459,41 @@ async def test_apply_consumes_admitted_plan_if_durable_file_disappears(tmp_path)
         await code.aclose()
 
 
+@pytest.mark.asyncio
+async def test_apply_returns_success_when_plan_cleanup_fails(tmp_path, monkeypatch):
+    path = tmp_path / "sample.py"
+    path.write_bytes(b"old")
+
+    class Filesystem:
+        async def _apply_lsp_plan(self, plan):
+            path.write_bytes(plan.operations[0].new or b"")
+            return {"changed": [str(path)]}
+
+    code = CodeTools(tmp_path, fs=Filesystem())
+    server = _running_server(("fake-lsp",))
+    server.generation = "generation"
+    code._servers["fake"] = server
+    plan = code._plans.create(
+        tmp_path,
+        [PlannedOperation("update", path, b"old", b"new", sha256(b"old"))],
+        "generation",
+        "replace",
+        server="fake",
+    )
+
+    def fail_remove(_ident):
+        raise OSError("injected plan cleanup failure")
+
+    monkeypatch.setattr(code._plans._durable, "remove", fail_remove)
+    try:
+        result = await code.apply_edit(plan.ident)
+    finally:
+        await code.aclose()
+    assert result["applied"] is True
+    assert path.read_bytes() == b"new"
+    assert any("cleanup failed" in warning for warning in result["warnings"])
+
+
 def test_lsp_plan_cache_drops_durable_evictions(tmp_path, monkeypatch):
     monkeypatch.setattr(change_plans, "MAX_PLANS", 2)
     store = EditPlanStore(tmp_path, max_plans=8)

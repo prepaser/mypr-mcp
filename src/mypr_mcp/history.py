@@ -26,6 +26,7 @@ from .file_io import read_bytes
 from .history_maintenance import vacuum_if_worthwhile
 from .json_utils import SOURCE_HASH_ENCODING, json_text, sha256_text, source_sha256
 from .shell_records import load_metadata, recovery_warnings, terminal_fields
+from .transport import MAX_MESSAGE
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
@@ -34,7 +35,7 @@ _MAX_HISTORY_WARNINGS = 8
 _MAX_WARNING_TEXT = 256
 _MAX_HISTORY_GC_ITEMS = 1000
 _MAX_HISTORY_JSON_RETRIES = 64
-_MAX_EXECUTION_RECORD_BYTES = 16 * 1024 * 1024
+_MAX_EXECUTION_RECORD_BYTES = MAX_MESSAGE
 _MAX_SCAN_METADATA_BYTES = 1 * 1024 * 1024
 _DAY = 24 * 60 * 60
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
@@ -977,6 +978,7 @@ class History:
                     mark_failed(ident, "execution ID cannot be used as a run filename")
                 continue
             path = self.root / ".mypr" / "runs" / f"{ident}.json"
+            temporary = path.with_suffix(path.suffix + ".tmp")
             try:
                 payload = json.loads(
                     read_bytes(
@@ -995,6 +997,10 @@ class History:
                     mark_failed(ident, "execution JSON is not terminal")
                     continue
                 if not any(field in payload for field in _BULKY_ENTITY_FIELDS):
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError as exc:
+                        mark_failed(ident, f"{type(exc).__name__}: {exc}")
                     continue
                 code = payload.get("code")
                 compact = {
@@ -1014,12 +1020,25 @@ class History:
                 ):
                     persisted_at = timestamp
                 compact["body_evicted_at"] = persisted_at
-                temporary = path.with_suffix(path.suffix + ".tmp")
-                descriptor = os.open(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                )
+                try:
+                    descriptor = os.open(
+                        temporary,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                except FileExistsError:
+                    temporary.unlink(missing_ok=True)
+                    descriptor = os.open(
+                        temporary,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
                 try:
                     with os.fdopen(descriptor, "wb") as stream:
                         descriptor = -1
@@ -1040,6 +1059,10 @@ class History:
                     temporary.unlink(missing_ok=True)
                 compacted += 1
             except FileNotFoundError:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    mark_failed(ident, f"{type(exc).__name__}: {exc}")
                 continue
             except (OSError, TypeError, ValueError, UnicodeError) as exc:
                 mark_failed(ident, f"{type(exc).__name__}: {exc}")

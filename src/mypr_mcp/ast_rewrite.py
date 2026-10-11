@@ -22,7 +22,14 @@ from typing import Any
 
 from .file_io import PersistedFileError, read_bytes
 from .filesystem import _diff_lines, _require_regular, _sha256, _to_thread_uncancelled
-from .patching import _commit, _plan, _reject_symlink_alias, _signature, _State
+from .patching import (
+    _commit,
+    _plan,
+    _reject_symlink_alias,
+    _set_history_status,
+    _signature,
+    _State,
+)
 from .search_backends import _inline_rule, _verify_sg
 
 _MAX_FILES = 100
@@ -317,13 +324,20 @@ async def apply_rewrite(fs: Any, plan_id: str) -> dict[str, Any]:
                 "applied": True,
                 "original_bytes": payload.get("original_bytes"),
                 "planned_bytes": payload.get("planned_bytes"),
-                "history_recorded": history_store is not None,
             }
         )
+        if history_store is not None:
+            _set_history_status(result, history_store, plans)
+        else:
+            result["history_recorded"] = False
         try:
             await _to_thread_uncancelled(store.remove, plan_id)
         except OSError as exc:
-            result["warnings"] = [f"rewrite plan cleanup failed: {exc}"]
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+                result["warnings"] = warnings
+            warnings.append(f"rewrite plan cleanup failed: {str(exc)[:512]}")
         return result
 
 

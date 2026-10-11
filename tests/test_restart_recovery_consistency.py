@@ -29,6 +29,39 @@ def _ticket(workspace: Path, ident: str, *, state: str = "starting") -> dict:
     }
 
 
+@pytest.mark.parametrize("state", [[], {}])
+def test_read_ticket_rejects_unhashable_state(tmp_path: Path, state):
+    ticket = _ticket(tmp_path, "a" * 32)
+    ticket["state"] = state
+    restart._atomic_write(restart._ticket_path(tmp_path), ticket)
+
+    assert restart.read_ticket(tmp_path) is None
+
+
+def test_ticket_activity_falls_back_to_legacy_created_at(tmp_path: Path):
+    ticket = _ticket(tmp_path, "a" * 32)
+    ticket.pop("updated_at")
+    ticket["created_at"] = restart.time.time()
+    ticket["coordinator_pid"] = None
+    restart._atomic_write(restart._ticket_path(tmp_path), ticket)
+
+    assert restart.active_ticket(tmp_path)["id"] == ticket["id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp", [10**400, float("nan"), float("inf"), float("-inf")])
+async def test_invalid_ticket_timestamp_is_recovered_as_abandoned(tmp_path: Path, timestamp):
+    ticket = _ticket(tmp_path, "a" * 32)
+    ticket["updated_at"] = timestamp
+    restart._atomic_write(restart._ticket_path(tmp_path), ticket)
+
+    assert restart.active_ticket(tmp_path) is None
+    recovered = await restart.recover_ticket(tmp_path)
+
+    assert recovered["state"] == "failed"
+    assert restart.read_ticket(tmp_path)["state"] == "failed"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit", [False, True])
 async def test_recovery_prefers_terminal_current_ticket_over_stale_archive(

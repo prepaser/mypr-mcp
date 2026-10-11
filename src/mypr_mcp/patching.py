@@ -504,7 +504,7 @@ def _apply_locked(
         history_store.prepare_changes_sync(plans)
     result = _commit(plans, states, max_diff_bytes, history_store=history_store)
     if history_store is not None:
-        result["history_recorded"] = True
+        _set_history_status(result, history_store, plans)
     return result
 
 
@@ -994,6 +994,25 @@ def _mode_changed(plan: dict[str, Any]) -> bool:
 
 def _is_noop_update(plan: dict[str, Any]) -> bool:
     return plan["operation"] == "update" and plan["old"] == plan["new"] and not _mode_changed(plan)
+
+
+def _set_history_status(
+    result: dict[str, Any], history_store: Any, plans: list[dict[str, Any]]
+) -> None:
+    resources = {
+        history_store._resource_for_path(path)
+        for plan in plans
+        for path in (plan["path"], plan["source"])
+        if path is not None
+    }
+    recorded = bool(resources - {None})
+    result["history_recorded"] = recorded
+    if None in resources:
+        if recorded:
+            result["history_partial"] = True
+        result.setdefault("warnings", []).append(
+            "History was not recorded for paths outside the workspace history scope."
+        )
 
 
 def _restore(path: Path, data: bytes, info: os.stat_result | None) -> None:

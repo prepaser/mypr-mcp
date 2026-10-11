@@ -2857,7 +2857,14 @@ class CodeTools:
                     raise EditError("LSP edit plan is stale")
                 virtual[operation.path] = operation.new
             result = await self._apply_edit_plan(plan)
-        await self._plans.aconsume(plan)
+        try:
+            await self._plans.aconsume(plan)
+        except OSError as exc:
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+                result["warnings"] = warnings
+            warnings.append(f"LSP edit plan cleanup failed: {str(exc)[:512]}")
         result.update({"plan_id": plan.ident, "applied": True})
         return result
 

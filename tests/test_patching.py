@@ -108,6 +108,62 @@ async def test_patch_handles_max_length_target_name(tmp_path: Path):
     assert target.read_text() == "after\n"
 
 
+async def test_patch_history_status_reports_untracked_and_partial_targets(tmp_path: Path):
+    inside = tmp_path / "inside.txt"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    inside.write_text("inside\n")
+    outside.write_text("outside\n")
+    fs = Filesystem(tmp_path)
+    outside_only = await apply_patch(
+        fs,
+        patch_body(
+            f"*** Update File: {outside}",
+            "@@ -1,1 +1,1 @@",
+            "-outside",
+            "+changed",
+        ),
+    )
+    assert outside_only["history_recorded"] is False
+    assert outside_only["warnings"]
+
+    mixed = await apply_patch(
+        fs,
+        patch_body(
+            "*** Update File: inside.txt",
+            "@@ -1,1 +1,1 @@",
+            "-inside",
+            "+changed",
+            f"*** Update File: {outside}",
+            "@@ -1,1 +1,1 @@",
+            "-changed",
+            "+again",
+        ),
+    )
+    assert mixed["history_recorded"] is True
+    assert mixed["history_partial"] is True
+    assert mixed["warnings"]
+
+    noop_inside = tmp_path / "noop-inside.txt"
+    noop_outside = tmp_path.parent / f"{tmp_path.name}-noop-outside.txt"
+    noop_inside.write_text("noop\n")
+    noop_outside.write_text("outside\n")
+    noop_mixed = await apply_patch(
+        fs,
+        patch_body(
+            "*** Update File: noop-inside.txt",
+            "@@ -1,1 +1,1 @@",
+            " noop",
+            f"*** Update File: {noop_outside}",
+            "@@ -1,1 +1,1 @@",
+            "-outside",
+            "+changed",
+        ),
+    )
+    assert noop_mixed["history_recorded"] is True
+    assert noop_mixed["history_partial"] is True
+    assert (await fs.history("noop-inside.txt"))["items"]
+
+
 async def test_failed_hunk_and_stale_hash_are_preflight_atomic(tmp_path: Path):
     (tmp_path / "one.txt").write_text("one\n")
     (tmp_path / "two.txt").write_text("two\n")

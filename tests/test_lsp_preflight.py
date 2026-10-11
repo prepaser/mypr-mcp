@@ -2,10 +2,36 @@ import asyncio
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from mypr_mcp import patching
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.lsp_edits import PlannedOperation, sha256
 from mypr_mcp.revisions import RevisionStore
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+async def test_lsp_history_reports_actual_scope(tmp_path, mixed):
+    protected = tmp_path / ".mypr" / "untracked.py"
+    protected.parent.mkdir()
+    paths = [protected]
+    if mixed:
+        paths.append(tmp_path / "tracked.py")
+    for path in paths:
+        path.write_bytes(b"old")
+    plan = SimpleNamespace(
+        operations=[
+            PlannedOperation("update", path, b"old", b"new", sha256(b"old"))
+            for path in paths
+        ]
+    )
+
+    result = await Filesystem(tmp_path)._apply_lsp_plan(plan)
+
+    assert result["history_recorded"] is mixed
+    assert result.get("history_partial", False) is mixed
+    assert any("outside the workspace history scope" in warning for warning in result["warnings"])
+    assert all(path.read_bytes() == b"new" for path in paths)
 
 
 async def test_lsp_history_preflight_keeps_other_cells_responsive(tmp_path, monkeypatch):

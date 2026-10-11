@@ -3622,34 +3622,39 @@ class Runtime:
             await asyncio.sleep(0.25)
 
     async def refresh_shell(self, shells, record):
-        full = await shells.poll(record["id"])
-        if full["state"] not in TERMINAL:
+        task = asyncio.create_task(self._refresh_shell(shells, record))
+        return await await_completion(task)
+
+    async def _refresh_shell(self, shells, record):
+        async with self.task_lock(record["id"]):
+            full = await shells.poll(record["id"])
+            if full["state"] not in TERMINAL:
+                return record
+            previous = record["state"]
+            text = "".join(item["text"] for item in full["output"])
+            raw = text.encode("utf-8", "surrogateescape")
+            fields = dict(
+                state=full["state"],
+                finished=record.get("finished", time.time()),
+                error=full.get("error"),
+                result=full.get("result"),
+                output=raw[:65536].decode("utf-8", "surrogateescape"),
+                output_truncated=full.get("truncated") or len(raw) > 65536,
+                **({key: full[key] for key in ("pty", "rows", "cols") if key in full}),
+                **({"warnings": full["warnings"]} if full.get("warnings") else {}),
+                **({"warnings_truncated": True} if full.get("warnings_truncated") else {}),
+            )
+            candidate = {**record, **fields}
+            await self.io(
+                self.history.record,
+                record["kind"],
+                candidate,
+                event=full["state"] if previous != full["state"] else None,
+                critical=True,
+            )
+            record.update(fields)
+            self.retain_completed(record["kind"], record)
             return record
-        previous = record["state"]
-        text = "".join(item["text"] for item in full["output"])
-        raw = text.encode("utf-8", "surrogateescape")
-        fields = dict(
-            state=full["state"],
-            finished=record.get("finished", time.time()),
-            error=full.get("error"),
-            result=full.get("result"),
-            output=raw[:65536].decode("utf-8", "surrogateescape"),
-            output_truncated=full.get("truncated") or len(raw) > 65536,
-            **({key: full[key] for key in ("pty", "rows", "cols") if key in full}),
-            **({"warnings": full["warnings"]} if full.get("warnings") else {}),
-            **({"warnings_truncated": True} if full.get("warnings_truncated") else {}),
-        )
-        candidate = {**record, **fields}
-        await self.io(
-            self.history.record,
-            record["kind"],
-            candidate,
-            event=full["state"] if previous != full["state"] else None,
-            critical=True,
-        )
-        record.update(fields)
-        self.retain_completed(record["kind"], record)
-        return record
 
     async def lose_python_tasks(self, error, state="lost"):
         task = asyncio.create_task(self._lose_python_tasks(error, state))

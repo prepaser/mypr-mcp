@@ -1079,10 +1079,8 @@ class Storage:
             entry.relative for entry in entries if entry.relative.endswith(".lock")
         }
         protected_paths.update(history_state.get("protected_paths", set()))
-        active_ids = {
-            *history_state.get("active_ids", ()),
-            *(record.ident for record in records if record.active),
-        }
+        active_record_ids = {record.ident for record in records if record.active}
+        active_ids = {*history_state.get("active_ids", ()), *active_record_ids}
         known_owner_ids = {
             *history_state.get("known_owner_ids", ()),
             *(record.ident for record in records),
@@ -1129,12 +1127,7 @@ class Storage:
                 if not entry.relative.endswith((".summary.json", ".request.json")):
                     protected_paths.add(entry.relative)
             if entry.category in {"runs", "jobs", "scans"}:
-                if any(
-                    record.active
-                    and entry.path.stem == record.ident
-                    and entry.category == self._category(f".mypr/{entry.category}")
-                    for record in records
-                ):
+                if entry.path.stem in active_record_ids:
                     active_references.add(entry.relative)
         return {
             "paths": sorted(protected_paths | active_references),

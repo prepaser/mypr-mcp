@@ -108,6 +108,48 @@ async def test_destructive_lifecycle_requires_cas_and_destination_overwrite_is_r
 
 
 @pytest.mark.asyncio
+async def test_copy_outside_workspace_reports_unrecorded_history(tmp_path: Path):
+    fs = Filesystem(tmp_path)
+    source = await fs.write("source.txt", "source")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-copy.txt"
+
+    result = await fs.copy("source.txt", outside, expected_hash=source["revision"])
+
+    assert result["history_recorded"] is False
+    assert outside.read_text() == "source"
+    disabled = tmp_path.parent / f"{tmp_path.name}-outside-disabled.txt"
+    result = await fs.copy("source.txt", disabled, history=False)
+    assert result["history_recorded"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_inside", [True, False])
+async def test_move_outside_workspace_reports_partial_history(
+    tmp_path: Path, source_inside: bool
+):
+    fs = Filesystem(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-move.txt"
+    if source_inside:
+        source = await fs.write("source.txt", "source")
+        source_path = "source.txt"
+        destination = outside
+    else:
+        source_path = tmp_path.parent / f"{tmp_path.name}-outside-source.txt"
+        source = await fs.write(source_path, "source", history=False)
+        destination = "destination.txt"
+
+    result = await fs.move(source_path, destination, expected_hash=source["revision"])
+
+    assert result["history_recorded"] is True
+    assert result["history_partial"] is True
+    assert result["warnings"]
+    source_path = Path(source_path)
+    destination_path = destination if isinstance(destination, Path) else tmp_path / destination
+    assert not await asyncio.to_thread(source_path.exists)
+    assert await asyncio.to_thread(destination_path.read_text) == "source"
+
+
+@pytest.mark.asyncio
 async def test_delete_rejects_terminal_symlink_without_touching_target_or_history(tmp_path: Path):
     target = tmp_path / "target.txt"
     target.write_text("keep")

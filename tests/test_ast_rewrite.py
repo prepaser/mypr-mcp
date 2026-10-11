@@ -100,6 +100,17 @@ async def test_rule_rewrite_and_stale_source_rejection(tmp_path: Path):
     assert source.read_text(encoding="utf-8") == "external()\n"
 
 
+async def test_rewrite_history_status_reports_external_target(tmp_path: Path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.py"
+    outside.write_text("foo()\n", encoding="utf-8")
+    result = await local_fs(tmp_path).rewrite_ast(
+        "foo()", replacement="bar()", lang="python", paths=str(outside)
+    )
+    applied = await local_fs(tmp_path).apply_rewrite(result["plan_id"])
+    assert applied["history_recorded"] is False
+    assert applied["warnings"]
+
+
 async def test_multifile_commit_failure_rolls_back(tmp_path: Path, monkeypatch):
     first = tmp_path / "first.py"
     second = tmp_path / "second.py"

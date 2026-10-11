@@ -542,7 +542,7 @@ class Filesystem:
 
     async def _apply_lsp_plan(self, plan: Any) -> dict[str, Any]:
         """Apply a validated LSP WorkspaceEdit as one CAS transaction."""
-        from .patching import _commit, _plan, _read_state, _State
+        from .patching import _commit, _plan, _read_state, _set_history_status, _State
 
         operations = getattr(plan, "operations", None)
         if not isinstance(operations, list) or not operations:
@@ -816,7 +816,7 @@ class Filesystem:
                 no_symlink=True,
             )
             pins.committed()
-            result["history_recorded"] = True
+            _set_history_status(result, history_store, plans)
             return result
 
     async def history(
@@ -1214,17 +1214,21 @@ class Filesystem:
                     ) from exc
                 if history_cancelled:
                     raise asyncio.CancelledError
-            return {
+            result = {
                 "source": source_display,
                 "path": destination_display,
                 "operation": "move" if move else "copy",
                 "old_revision": _sha256(old),
                 "revision": _sha256(old),
                 "size": len(old),
-                "history_recorded": history_enabled
-                and (self._history_resource(source_path) is not None
-                     or self._history_resource(destination_path) is not None),
+                "history_recorded": False,
             }
+            if history_store is not None:
+                from .patching import _set_history_status
+
+                coverage = [{"path": path, "source": None} for path, *_ in physical_transitions]
+                _set_history_status(result, history_store, coverage)
+            return result
 
     def _history_store(self):
         from .revisions import RevisionStore

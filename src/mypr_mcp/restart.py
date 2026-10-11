@@ -80,14 +80,19 @@ def _write_ticket(workspace: Path, ticket: dict[str, Any]) -> None:
 
 
 def _ticket_time(ticket: dict[str, Any]) -> float:
-    value = ticket.get("updated_at")
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return float("-inf")
+    value = _ticket_timestamp(ticket)
+    return value if value is not None else float("-inf")
+
+
+def _ticket_timestamp(ticket: dict[str, Any]) -> float | None:
+    value = ticket.get("updated_at", ticket.get("created_at"))
+    if type(value) not in (int, float):
+        return None
     try:
         value = float(value)
     except (OverflowError, ValueError):
-        return float("-inf")
-    return value if math.isfinite(value) else float("-inf")
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _newer_ticket(current: dict[str, Any], archived: dict[str, Any]) -> dict[str, Any]:
@@ -128,7 +133,8 @@ def _valid_ticket(workspace: Path, value: Any, ident: str | None = None) -> dict
         return None
     if ticket.get("workspace_id") != workspace_id(workspace):
         return None
-    if ticket.get("state") not in STATES:
+    state = ticket.get("state")
+    if not isinstance(state, str) or state not in STATES:
         return None
     target = ticket.get("target")
     if not isinstance(target, dict):
@@ -195,10 +201,10 @@ def _process_alive(pid: Any, expected_starttime: Any) -> bool:
 def _ticket_active(workspace: Path, ticket: dict[str, Any]) -> bool:
     if ticket["state"] in TERMINAL_STATES:
         return False
-    try:
-        age = max(0.0, time.time() - float(ticket.get("updated_at", ticket["created_at"])))
-    except KeyError, TypeError, ValueError:
+    timestamp = _ticket_timestamp(ticket)
+    if timestamp is None:
         return False
+    age = max(0.0, time.time() - timestamp)
     pid = ticket.get("coordinator_pid")
     if pid is None and age <= COORDINATOR_START_GRACE:
         return True

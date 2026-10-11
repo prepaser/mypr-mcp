@@ -571,15 +571,16 @@ class DependencyStore:
                 alias = self.bin_root / executable
                 source = target / found[executable].relative_to(payload)
                 self._publish_alias(alias, source)
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                shutil.rmtree(temporary_root)
-            raise
         finally:
-            with contextlib.suppress(FileNotFoundError):
-                await wait_owned(
-                    asyncio.to_thread(temporary_download.unlink, missing_ok=True), propagate=False
-                )
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    await wait_owned(
+                        asyncio.to_thread(temporary_download.unlink, missing_ok=True),
+                        propagate=False,
+                    )
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.rmtree(temporary_root)
 
     async def _install_model(self, artifact: Artifact) -> None:
         model_dir = self._model_dir(artifact)
