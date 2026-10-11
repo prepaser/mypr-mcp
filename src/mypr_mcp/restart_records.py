@@ -6,20 +6,59 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .diagnostics import RPCError
-from .file_io import read_bytes
+from .diagnostics import RPCError, safe_text
+from .execution_records import execution_record_bytes, read_execution_record
 from .history import History
 from .journal import read_page
 from .json_utils import SOURCE_HASH_ENCODING, sha256_text, source_sha256
 
-_MAX_RECORD_BYTES = 32 * 1024 * 1024
+_MAX_RESTART_WARNINGS = 4
+_MAX_WARNING_TEXT = 256
+_JOURNAL_WARNING_CODES = {"journal_truncated", "journal_corrupt"}
 
 
 def _read_record(path):
-    value = json.loads(read_bytes(path, max_bytes=_MAX_RECORD_BYTES))
-    if not isinstance(value, dict):
-        raise ValueError("persisted execution record must be an object")
-    return value
+    return read_execution_record(path)
+
+
+def _restart_warnings(record, events, *, output_evicted):
+    stored = record.get("warnings")
+    stored = stored if isinstance(stored, list) else []
+    warnings = []
+    truncated = bool(record.get("warnings_truncated")) or len(stored) > _MAX_RESTART_WARNINGS
+
+    def add(value):
+        nonlocal truncated
+        if not isinstance(value, dict):
+            return
+        code = value.get("code")
+        text = value.get("text")
+        if not isinstance(code, str) or not code or not isinstance(text, str):
+            return
+        item = {"code": safe_text(code, 64), "text": safe_text(text, _MAX_WARNING_TEXT)}
+        truncated |= item["code"] != code or item["text"] != text
+        if item in warnings:
+            return
+        if len(warnings) >= _MAX_RESTART_WARNINGS:
+            truncated = True
+            return
+        warnings.append(item)
+
+    for warning in stored:
+        if isinstance(warning, dict) and warning.get("code") == "output_incomplete":
+            add(warning)
+    if output_evicted:
+        add({
+            "code": "output_expired",
+            "text": "Restart execution output has expired",
+        })
+    for event in events:
+        if isinstance(event, dict) and event.get("code") in _JOURNAL_WARNING_CODES:
+            add(event)
+    for warning in stored:
+        if not (isinstance(warning, dict) and warning.get("code") == "output_incomplete"):
+            add(warning)
+    return warnings, truncated
 
 
 def restart_id_for_execution(workspace, exec_id):
@@ -102,7 +141,7 @@ def finalize_origin(workspace, ticket):
             restart_result=text,
         )
         temporary = path.with_suffix(f".{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(record))
+        temporary.write_bytes(execution_record_bytes(record))
         os.replace(temporary, path)
     history = History(Path(workspace))
     try:
@@ -176,6 +215,9 @@ def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None, strict_budget=
                         _check_budget(final, error_size, budget, cursor)
                     events.append(final)
         count = logical_total if not evicted else cursor
+    warnings, warnings_truncated = _restart_warnings(
+        record, events, output_evicted=evicted
+    )
     return {
         "exec_id": exec_id,
         "client_id": record.get("client_id"),
@@ -188,9 +230,9 @@ def poll_restart(workspace, exec_id, cursor=0, *, max_bytes=None, strict_budget=
         "has_more": cursor + len(events) < count,
         "truncated": evicted or record.get("truncated", False),
         "error": error,
-        **({"output_evicted": True, "warnings": [
-            {"code": "output_expired", "text": "Restart execution output has expired"}
-        ]} if evicted else {}),
+        **({"output_evicted": True} if evicted else {}),
+        **({"warnings": warnings} if warnings else {}),
+        **({"warnings_truncated": True} if warnings_truncated else {}),
         "restart": {
             key: ticket[key]
             for key in ("id", "state", "new_version", "new_generation")

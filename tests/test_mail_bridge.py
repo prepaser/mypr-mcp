@@ -53,3 +53,42 @@ async def test_restart_fallback_returns_only_owned_cached_mail(tmp_path, monkeyp
         assert result["mail"]["watches"][0]["state"] == "offline"
     else:
         assert "mail" not in result
+
+
+@pytest.mark.parametrize("payload", ["{", "[]"])
+async def test_restart_fallback_survives_corrupt_cached_mail(tmp_path, monkeypatch, payload):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    history = History(workspace)
+    history.reserve_client_id("alice")
+    history.close()
+    store = MailStore(workspace)
+    watch = store.create_watch("alice", "work", "INBOX", uidvalidity=41)
+    notice = store.add_notification(
+        client_id="alice",
+        watch_id=watch["id"],
+        account="work",
+        mailbox="INBOX",
+        uidvalidity=41,
+        uid=1,
+        kind="new_mail",
+        payload={"message_id": "ref"},
+    )
+    store._db.execute(
+        "UPDATE mail_notifications SET payload=? WHERE id=?", (payload, notice["id"])
+    )
+    store.close()
+    exec_id, _ = _restart_fixture(workspace)
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+
+    async def no_network(*args):
+        return None
+
+    monkeypatch.setattr(bridge, "_recover_restart", no_network)
+    result = await bridge.request("poll", exec_id=exec_id, wait_ms=0)
+
+    assert result["state"] == "succeeded"
+    assert result["mail"]["items"][0]["id"] == notice["id"]
+    assert result["mail"]["items"][0]["payload_corrupt"] is True
+    assert result["mail"]["warnings"][0]["code"] == "mail_notification_payload_corrupt"

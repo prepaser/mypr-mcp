@@ -243,7 +243,7 @@ The result reports `applied`, `deferred`, `errors`, `restart_required`, and the 
 
 Manager response and completed-record/cache limits can be changed by reload. `limits.output_bytes` and `limits.completed_tasks` require a manager and kernel restart; reload reports them as restart-required and does not perform an implicit reset. Storage policy changes are picked up by the next storage-maintenance pass. The workspace namespace and saved Python state remain workspace-specific even when global defaults are shared.
 
-`mypr-mcp config reload --all` reloads every registered manager in the same profile after a global file change. A normal workspace reload affects only the selected manager. Inspect `explain()` after reload when another manager or an external editor may have changed a layer concurrently.
+`mypr-mcp config reload --all` reloads every registered manager in the same profile after a global file change. The registry is read in bounded pages, so profiles with more than 1,024 retained registrations are continued instead of silently truncated. A normal workspace reload affects only the selected manager. Inspect `explain()` after reload when another manager or an external editor may have changed a layer concurrently.
 
 ## CLI
 

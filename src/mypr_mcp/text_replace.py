@@ -285,7 +285,11 @@ async def apply_replace(fs: Any, plan_id: str) -> dict[str, Any]:
     try:
         await _to_thread_uncancelled(store.remove, plan_id)
     except OSError as exc:
-        result["warnings"] = [f"replacement plan cleanup failed: {exc}"]
+        warnings = result.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+            result["warnings"] = warnings
+        warnings.append(f"replacement plan cleanup failed: {str(exc)[:512]}")
     return result
 
 

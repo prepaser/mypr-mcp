@@ -22,6 +22,8 @@ from .storage_lock import StorageLock
 MAIL_RETENTION_DAYS = 30
 _DAY = 24 * 60 * 60
 _UNSET = object()
+_MAX_NOTIFICATION_WARNINGS = 4
+_MAX_WARNING_TEXT = 256
 
 
 class MailStore:
@@ -970,14 +972,37 @@ class MailStore:
                 + " ORDER BY notification_seq LIMIT ?",
                 (*values, limit + 1),
             ).fetchall()
-        items = [self._notification_row(row) for row in rows[:limit]]
-        return {
+        items = []
+        warnings = []
+        warnings_truncated = False
+        for row in rows[:limit]:
+            item = self._notification_row(row)
+            items.append(item)
+            if not item.get("payload_corrupt"):
+                continue
+            warning = {
+                "code": "mail_notification_payload_corrupt",
+                "text": (
+                    f"Mail notification {item['id']} payload is invalid and was omitted."
+                    [: _MAX_WARNING_TEXT]
+                ),
+            }
+            if len(warnings) < _MAX_NOTIFICATION_WARNINGS:
+                warnings.append(warning)
+            else:
+                warnings_truncated = True
+        result = {
             "items": items,
             "has_more": len(rows) > limit,
             "next_cursor": int(rows[limit - 1]["notification_seq"])
             if len(rows) > limit and items
             else None,
         }
+        if warnings:
+            result["warnings"] = warnings
+        if warnings_truncated:
+            result["warnings_truncated"] = True
+        return result
 
     def ack_notifications(self, client_id: str, ids: list[str]) -> int:
         if not ids:
@@ -1609,6 +1634,10 @@ class MailStore:
             "watches_more": len(watches) > 5,
             "sends_more": len(sends) > 3,
         }
+        if notifications.get("warnings"):
+            preview["warnings"] = notifications["warnings"]
+        if notifications.get("warnings_truncated"):
+            preview["warnings_truncated"] = True
         while len(_json_bytes(preview)) > 4096 and preview["items"]:
             preview["items"].pop()
             preview["has_more"] = True
@@ -1627,6 +1656,10 @@ class MailStore:
                 "watches_more": len(watches) > 0,
                 "sends_more": len(sends) > 0,
             }
+            if notifications.get("warnings"):
+                preview["warnings"] = notifications["warnings"]
+            if notifications.get("warnings_truncated"):
+                preview["warnings_truncated"] = True
         return preview
 
     @classmethod
@@ -1680,8 +1713,16 @@ class MailStore:
     def _notification_row(row: sqlite3.Row | None) -> dict[str, Any]:
         if row is None:
             raise ValueError("notification no longer exists")
-        payload = json.loads(row["payload"])
-        return {
+        payload_corrupt = False
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError, UnicodeError):
+            payload = {}
+            payload_corrupt = True
+        if not isinstance(payload, Mapping):
+            payload = {}
+            payload_corrupt = True
+        result = {
             "id": row["id"],
             "client_id": row["client_id"],
             "watch_id": row["watch_id"],
@@ -1695,6 +1736,9 @@ class MailStore:
             "created_at": row["created"],
             "acknowledged": row["acknowledged"] is not None,
         }
+        if payload_corrupt:
+            result["payload_corrupt"] = True
+        return result
 
     def _draft_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:

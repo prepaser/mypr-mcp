@@ -236,6 +236,42 @@ def test_notification_dedup_includes_endpoint_identity_for_same_uid_namespace(tm
         store.close()
 
 
+@pytest.mark.parametrize("payload", ["{", "[]"])
+def test_corrupt_notification_payload_is_omitted_with_bounded_warning(tmp_path, payload):
+    store = MailStore(tmp_path)
+    try:
+        notice = store.add_notification(
+            client_id="client",
+            watch_id="watch",
+            account="work",
+            mailbox="INBOX",
+            uidvalidity=1,
+            uid=1,
+            kind="new_mail",
+            payload={"message_id": "msg"},
+        )
+        store._db.execute(
+            "UPDATE mail_notifications SET payload=? WHERE id=?", (payload, notice["id"])
+        )
+
+        result = store.notifications("client")
+        item = result["items"][0]
+        assert item["id"] == notice["id"]
+        assert item["payload_corrupt"] is True
+        assert "message_id" not in item
+        assert result["warnings"] == [
+            {
+                "code": "mail_notification_payload_corrupt",
+                "text": f"Mail notification {notice['id']} payload is invalid and was omitted.",
+            }
+        ]
+        assert store._db.execute(
+            "SELECT payload FROM mail_notifications WHERE id=?", (notice["id"],)
+        ).fetchone()[0] == payload
+    finally:
+        store.close()
+
+
 def test_snapshot_existing_offline_view_does_not_mutate_watch_state(tmp_path):
     store = MailStore(tmp_path)
     try:

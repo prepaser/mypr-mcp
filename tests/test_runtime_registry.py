@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from mypr_mcp.runtime_registry import RegistryError, list_managers, register, unregister
+from mypr_mcp.runtime_registry import (
+    RegistryError,
+    list_managers,
+    list_managers_page,
+    register,
+    unregister,
+)
 
 
 def test_registry_records_and_filters_global_path(tmp_path: Path, monkeypatch):
@@ -75,6 +81,34 @@ def test_registry_cap_counts_valid_records_after_invalid_entries(tmp_path: Path,
     record = register(workspace, tmp_path / "manager.sock", "generation", None)
 
     assert list_managers(None) == [record]
+
+
+def test_registry_pages_continue_after_the_bounded_page(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    global_path = (tmp_path / "config.toml").resolve()
+    directory = tmp_path / "state" / "mypr" / "managers"
+    directory.mkdir(parents=True)
+    for index in range(3):
+        record = {
+            "workspace": str(tmp_path / f"workspace-{index}"),
+            "workspace_id": f"identity-{index}",
+            "pid": os.getpid(),
+            "generation": f"generation-{index}",
+            "socket": str(tmp_path / f"manager-{index}.sock"),
+            "global_path": str(global_path),
+            "capabilities": ["config"],
+        }
+        (directory / f"{index:04d}.json").write_text(json.dumps(record))
+
+    first = list_managers_page(global_path, limit=2)
+    second = list_managers_page(
+        global_path, cursor=first["next_cursor"], limit=2
+    )
+
+    assert len(first["records"]) == 2
+    assert first["next_cursor"] == "0001.json"
+    assert [record["workspace_id"] for record in second["records"]] == ["identity-2"]
+    assert second["next_cursor"] is None
 
 
 @pytest.mark.asyncio

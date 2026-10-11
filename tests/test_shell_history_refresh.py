@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -83,3 +84,25 @@ async def test_cancelled_shell_refresh_finishes_the_shared_transition(shell_hist
     finally:
         release.set()
         await asyncio.gather(refresh, return_exceptions=True)
+
+
+async def test_terminal_shell_history_read_preserves_retention_age(shell_history):
+    runtime, record = shell_history
+    await runtime.refresh_shell(runtime.shells, record)
+    old = time.time() - 90 * 86400
+    record["finished"] = old
+    await runtime.io(runtime.history.record, "shell", record, updated_at=old)
+    before = await runtime.io(runtime.history.storage_history_snapshot, retention_days=30)
+
+    await runtime._dispatch_history("history_get", {"id": record["id"]})
+
+    after = await runtime.io(runtime.history.storage_history_snapshot, retention_days=30)
+    assert [item["id"] for item in before["entities"]] == [record["id"]]
+    assert [item["id"] for item in after["entities"]] == [record["id"]]
+    updated = await runtime.io(
+        lambda: runtime.history._db.execute(
+            "SELECT updated FROM entities WHERE id=?", (record["id"],)
+        ).fetchone()[0]
+    )
+    assert updated == old
+    assert record["finished"] == old

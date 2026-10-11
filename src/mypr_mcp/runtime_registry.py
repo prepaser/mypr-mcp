@@ -173,6 +173,26 @@ def unregister(
 def list_managers(
     global_path: str | os.PathLike[str] | None,
 ) -> list[dict[str, Any]]:
+    """Return the first bounded page of matching manager records.
+
+    Use :func:`list_managers_page` when every matching record is required.
+    """
+    return list_managers_page(global_path)["records"]
+
+
+def list_managers_page(
+    global_path: str | os.PathLike[str] | None,
+    *,
+    cursor: str | None = None,
+    limit: int = _MAX_RECORDS,
+) -> dict[str, Any]:
+    """Read one bounded, filename-ordered page of matching records."""
+    if type(limit) is not int or not 1 <= limit <= _MAX_RECORDS:
+        raise ValueError(f"limit must be between 1 and {_MAX_RECORDS}")
+    if cursor is not None and (
+        not isinstance(cursor, str) or not cursor or len(cursor) > 255 or "\x00" in cursor
+    ):
+        raise ValueError("cursor must be a non-empty filename")
     selected = _canonical_path(global_path)
     directory = registry_dir()
     try:
@@ -182,18 +202,18 @@ def list_managers(
     try:
         def candidates():
             for path in directory.iterdir():
-                if path.suffix != ".json":
+                if path.suffix != ".json" or (cursor is not None and path.name <= cursor):
                     continue
                 record = _read_record(path)
                 if record is not None and record.get("global_path") == selected:
                     yield path.name, record
 
-        return [
-            record
-            for _, record in heapq.nsmallest(
-                _MAX_RECORDS, candidates(), key=lambda item: item[0]
-            )
-        ]
+        page = heapq.nsmallest(limit + 1, candidates(), key=lambda item: item[0])
+        records = [record for _, record in page[:limit]]
+        return {
+            "records": records,
+            "next_cursor": page[limit - 1][0] if len(page) > limit else None,
+        }
     except RegistryError:
         raise
     except OSError as exc:
@@ -203,4 +223,11 @@ def list_managers(
         lock.close()
 
 
-__all__ = ["RegistryError", "list_managers", "register", "registry_dir", "unregister"]
+__all__ = [
+    "RegistryError",
+    "list_managers",
+    "list_managers_page",
+    "register",
+    "registry_dir",
+    "unregister",
+]

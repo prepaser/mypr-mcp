@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import threading
 from pathlib import Path
 
@@ -44,6 +45,27 @@ async def test_workspace_file_history_and_binary_lifecycle(tmp_path: Path):
     deleted = await fs.delete("moved.bin", expected_hash=binary["revision"])
     assert deleted["deleted"]
     assert not (tmp_path / "moved.bin").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["write", "patch"])
+async def test_fresh_unchanged_file_reports_missing_history(operation: str, tmp_path: Path):
+    path = tmp_path / "value.txt"
+    path.write_text("same")
+    fs = Filesystem(tmp_path)
+    revision = hashlib.sha256(b"same").hexdigest()
+
+    if operation == "write":
+        result = await fs.write(path, "same", expected_hash=revision)
+    else:
+        result = await fs.patch(
+            path,
+            [{"old": "same", "new": "same"}],
+            expected_hash=revision,
+        )
+
+    assert result["history_recorded"] is False
+    assert (await fs.history(path))["items"] == []
 
 
 @pytest.mark.asyncio

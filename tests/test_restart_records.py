@@ -64,6 +64,60 @@ def test_origin_result_is_durable_and_finalization_is_idempotent(tmp_path, monke
         history.close()
 
 
+def test_restart_poll_preserves_record_and_output_warnings(tmp_path):
+    from mypr_mcp.transport import workspace_id
+
+    ident = "c" * 32
+    ticket_id = "d" * 32
+    root = tmp_path / ".mypr" / "runs"
+    root.mkdir(parents=True)
+    record = {
+        "id": ident,
+        "kind": "execution",
+        "generation": "old",
+        "state": "succeeded",
+        "restart_id": ticket_id,
+        "client_id": "client",
+        "connection_id": "connection",
+        "warnings": [
+            {"code": "output_incomplete", "text": "output may be missing"},
+            *[{"code": f"prior_{index}", "text": "prior warning"} for index in range(4)],
+        ],
+        "truncated": True,
+    }
+    (root / f"{ident}.json").write_text(json.dumps(record))
+    (root / f"{ident}.jsonl").write_bytes(b"broken journal line\n")
+    restart._write_ticket(
+        tmp_path,
+        {
+            "id": ticket_id,
+            "state": "succeeded",
+            "workspace_id": workspace_id(tmp_path),
+            "target": {"python": "/usr/bin/python", "package_root": "/tmp", "version": "1"},
+            "origin": {"exec_id": ident},
+            "new_generation": "new",
+        },
+    )
+
+    page = poll_restart(tmp_path, ident)
+    codes = [warning["code"] for warning in page["warnings"]]
+    assert codes[:2] == ["output_incomplete", "journal_corrupt"]
+    assert len(page["warnings"]) == 4
+    assert page["warnings_truncated"] is True
+
+    history = History(tmp_path)
+    try:
+        history.record("execution", record)
+        history.mark_storage_evicted([f".mypr/runs/{ident}.jsonl"])
+    finally:
+        history.close()
+    expired = poll_restart(tmp_path, ident)
+    expired_codes = [warning["code"] for warning in expired["warnings"]]
+    assert expired_codes[:2] == ["output_incomplete", "output_expired"]
+    assert len(expired["warnings"]) == 4
+    assert expired["warnings_truncated"] is True
+
+
 def test_restart_request_matches_uses_surrogate_safe_source_digest(tmp_path):
     ident = "f" * 32
     source = "await ws.tasks.start(asyncio.sleep(0))\ud800"

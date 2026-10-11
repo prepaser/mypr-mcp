@@ -9,6 +9,10 @@ import time
 import pytest
 
 from mypr_mcp import history_maintenance
+from mypr_mcp.execution_records import (
+    MAX_EXECUTION_RECORD_BYTES,
+    execution_record_bytes,
+)
 from mypr_mcp.history import History
 from mypr_mcp.history_maintenance import vacuum_if_worthwhile
 from mypr_mcp.json_utils import SOURCE_HASH_ENCODING, source_sha256
@@ -237,8 +241,14 @@ def test_history_gc_accepts_execution_records_above_old_compaction_limit(tmp_pat
     runs = tmp_path / ".mypr" / "runs"
     runs.mkdir(parents=True)
     ident = "large-source"
-    source = "x" * (16 * 1024 * 1024 + 1)
+    source = "x" * (MAX_MESSAGE - 16)
     assert len(source.encode()) < MAX_MESSAGE
+    assert len(
+        execution_record_bytes(
+            {"id": ident, "state": "succeeded", "code": source, "output": "body"}
+        )
+    ) > MAX_MESSAGE
+    assert len(source.encode()) < MAX_EXECUTION_RECORD_BYTES
     (runs / f"{ident}.json").write_text(
         json.dumps({"id": ident, "state": "succeeded", "code": source, "output": "body"})
     )

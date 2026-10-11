@@ -331,7 +331,7 @@ class Filesystem:
             old_stat = result.pop("_old_stat", None)
             new_stat = result.pop("_new_stat", None)
             if history_enabled:
-                await self._record_history(
+                result["history_recorded"] = await self._record_history(
                     resolved,
                     display,
                     old,
@@ -339,7 +339,6 @@ class Filesystem:
                     old_stat=old_stat,
                     new_stat=new_stat,
                 )
-                result["history_recorded"] = self._history_resource(resolved) is not None
             if operation_cancelled:
                 raise asyncio.CancelledError
             return result
@@ -439,7 +438,7 @@ class Filesystem:
             old_stat = result.pop("_old_stat", None)
             new_stat = result.pop("_new_stat", None)
             if history_enabled:
-                await self._record_history(
+                result["history_recorded"] = await self._record_history(
                     resolved,
                     display,
                     old,
@@ -447,7 +446,6 @@ class Filesystem:
                     old_stat=old_stat,
                     new_stat=new_stat,
                 )
-                result["history_recorded"] = self._history_resource(resolved) is not None
             if operation_cancelled:
                 raise asyncio.CancelledError
             return result
@@ -1266,12 +1264,15 @@ class Filesystem:
         *,
         old_stat: os.stat_result | None = None,
         new_stat: os.stat_result | None = None,
-    ) -> None:
+    ) -> bool:
         resource = self._history_resource(path)
-        if resource is None or old == new:
-            return
-        _validate_history_size(old, new, display)
+        if resource is None:
+            return False
         store = self._history_store()
+        if old == new:
+            history = await store.history(resource, limit=1)
+            return bool(history["items"])
+        _validate_history_size(old, new, display)
         try:
             _, cancelled = await finish_owned(store.record_bytes(resource, (old, new)))
         except RevisionIndexOutcomeUnknown as exc:
@@ -1301,6 +1302,7 @@ class Filesystem:
             ) from exc
         if cancelled:
             raise asyncio.CancelledError
+        return True
 
     async def image(
         self,
@@ -1432,7 +1434,7 @@ class Filesystem:
             old_stat = result.pop("_old_stat", None)
             new_stat = result.pop("_new_stat", None)
             if history_enabled and not dry_run:
-                await self._record_history(
+                result["history_recorded"] = await self._record_history(
                     resolved,
                     display,
                     old,
@@ -1440,7 +1442,6 @@ class Filesystem:
                     old_stat=old_stat,
                     new_stat=new_stat,
                 )
-                result["history_recorded"] = self._history_resource(resolved) is not None
             if operation_cancelled:
                 raise asyncio.CancelledError
             return result

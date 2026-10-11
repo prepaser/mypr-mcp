@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Any
 
 from .client_ids import ADJECTIVES, ANIMALS
+from .execution_records import (
+    execution_record_bytes,
+    read_execution_record,
+)
 from .file_io import read_bytes
 from .history_maintenance import vacuum_if_worthwhile
 from .json_utils import SOURCE_HASH_ENCODING, json_text, sha256_text, source_sha256
 from .shell_records import load_metadata, recovery_warnings, terminal_fields
-from .transport import MAX_MESSAGE
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
@@ -35,7 +38,6 @@ _MAX_HISTORY_WARNINGS = 8
 _MAX_WARNING_TEXT = 256
 _MAX_HISTORY_GC_ITEMS = 1000
 _MAX_HISTORY_JSON_RETRIES = 64
-_MAX_EXECUTION_RECORD_BYTES = MAX_MESSAGE
 _MAX_SCAN_METADATA_BYTES = 1 * 1024 * 1024
 _DAY = 24 * 60 * 60
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "reset", "complete", "completed"}
@@ -980,16 +982,7 @@ class History:
             path = self.root / ".mypr" / "runs" / f"{ident}.json"
             temporary = path.with_suffix(path.suffix + ".tmp")
             try:
-                payload = json.loads(
-                    read_bytes(
-                        path,
-                        max_bytes=_MAX_EXECUTION_RECORD_BYTES,
-                        follow_symlinks=False,
-                    ).decode("utf-8")
-                )
-                if not isinstance(payload, dict):
-                    mark_failed(ident, "execution JSON is not an object")
-                    continue
+                payload = read_execution_record(path)
                 if payload.get("id", ident) != ident:
                     mark_failed(ident, "execution JSON ID does not match its history ID")
                     continue
@@ -1042,7 +1035,7 @@ class History:
                 try:
                     with os.fdopen(descriptor, "wb") as stream:
                         descriptor = -1
-                        stream.write(_dump(compact).encode("utf-8"))
+                        stream.write(execution_record_bytes(compact))
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.replace(temporary, path)

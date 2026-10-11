@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from mypr_mcp.history import History
 from mypr_mcp.runtime import Runtime
 
@@ -66,9 +68,39 @@ async def test_cell_events_ignore_idle_stale_generations_and_late_completion(wor
         assert rec["done"].is_set()
         assert runtime.active == {}
         assert "".join(item["text"] for item in rec["events"]) == "last output"
+        assert rec["truncated"] is False
+        assert not rec.get("warnings")
         records = runtime.history.logs(cursor=0)["events"]
         assert records[-1]["event"] == "succeeded"
     finally:
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
+        runtime.history.close()
+
+
+@pytest.mark.parametrize("state", ["succeeded", "failed", "cancelled"])
+async def test_terminal_fallback_persists_incomplete_output_warning(tmp_path, state):
+    runtime = Runtime(tmp_path)
+    runtime.history = History(tmp_path)
+    runtime.healthy = True
+    (runtime.root / "runs").mkdir()
+    try:
+        rec = await runtime.admit_execution("client", None, {"code": "print('output')"})
+        rec["warnings"] = [{"code": f"prior_{n}", "text": "prior warning"} for n in range(4)]
+        await runtime._dispatch({
+            "op": "cell_terminal", "exec_id": rec["id"],
+            "generation": runtime.generation, "state": state,
+        })
+        warm = await runtime.poll(rec["id"], wait_ms=0)
+        runtime.execs.pop(rec["id"], None)
+        cold = await runtime.poll(rec["id"], wait_ms=0)
+        for result in (warm, cold):
+            assert result["state"] == state
+            assert result["truncated"] is True
+            assert result["warnings"][0]["code"] == "output_incomplete"
+            assert len(result["warnings"]) == 4
+            assert result["warnings_truncated"] is True
+        assert runtime.history.get(rec["id"])["warnings"][0]["code"] == "output_incomplete"
+    finally:
+        await runtime.shells.close()
         runtime.history.close()

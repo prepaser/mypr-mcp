@@ -82,6 +82,45 @@ async def test_apply_replace_bounds_stale_source_reads(tmp_path: Path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_apply_replace_preserves_and_bounds_cleanup_warnings(
+    tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "value.txt"
+    target.write_text("old\n")
+    fs = Filesystem(tmp_path)
+    plan_id = ChangePlanStore(tmp_path, "replace").create(
+        {
+            "history": False,
+            "operations": [
+                {
+                    "input": "value.txt",
+                    "display": "value.txt",
+                    "old": b"old\n",
+                    "new": b"new\n",
+                    "matches": 1,
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        text_replace,
+        "_commit",
+        lambda *args, **kwargs: {"warnings": ["commit warning"]},
+    )
+
+    def fail_remove(_store, _ident):
+        raise OSError("x" * 1000)
+
+    monkeypatch.setattr(ChangePlanStore, "remove", fail_remove)
+    result = await fs.apply_replace(plan_id)
+
+    assert result["warnings"][0] == "commit warning"
+    assert result["warnings"][1].startswith("replacement plan cleanup failed: ")
+    assert result["warnings"][1].endswith("x" * 512)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_apply_waits_for_commit_before_releasing_lock(tmp_path: Path, monkeypatch):
     path = tmp_path / "one.txt"
     path.write_text("old\n")

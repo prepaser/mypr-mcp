@@ -866,25 +866,32 @@ async def _reload_manager(record: dict[str, Any], *, force: bool) -> dict[str, A
 
 
 async def _reload_all(global_path: Path, *, force: bool) -> dict[str, Any]:
-    from .runtime_registry import list_managers
+    from .runtime_registry import list_managers_page
 
-    try:
-        records = list_managers(global_path)
-    except (OSError, RuntimeError) as exc:
-        return {
-            "global_path": str(global_path),
-            "managers": [],
-            "ok": False,
-            "status": "error",
-            "error": f"manager registry unavailable: {exc}",
-        }
     semaphore = asyncio.Semaphore(4)
 
     async def run(record):
         async with semaphore:
             return await _reload_manager(record, force=force)
 
-    results = await asyncio.gather(*(run(record) for record in records))
+    results = []
+    try:
+        cursor = None
+        while True:
+            page = list_managers_page(global_path, cursor=cursor)
+            records = page["records"]
+            results.extend(await asyncio.gather(*(run(record) for record in records)))
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+    except (OSError, RuntimeError) as exc:
+        return {
+            "global_path": str(global_path),
+            "managers": results,
+            "ok": False,
+            "status": "error",
+            "error": f"manager registry unavailable: {exc}",
+        }
     return {
         "global_path": str(global_path),
         "managers": results,

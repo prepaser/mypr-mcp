@@ -28,6 +28,7 @@ from .config import MAX_WAIT_MS, ConfigStore
 from .config_runtime import RuntimeConfig
 from .dependency_service import DependencyService
 from .diagnostics import RPCError, error_info, error_response, safe_error
+from .execution_records import execution_record_bytes, read_execution_record
 from .file_io import open_regular, read_bytes
 from .git_api import Git
 from .history import History
@@ -106,7 +107,7 @@ _UNHANDLED = object()
 
 def _write_json(path, data):
     temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(data))
+    temp.write_bytes(execution_record_bytes(data))
     temp.replace(path)
 
 
@@ -132,16 +133,12 @@ def _persist_execution(
 
 def _load_execution(path):
     try:
-        with open_regular(path) as stream:
-            raw = stream.read(MAX_MESSAGE + 1)
+        record = read_execution_record(path)
     except FileNotFoundError:
         raise
     except OSError as exc:
         raise ValueError(f"execution record is unreadable: {exc}") from exc
-    if len(raw) > MAX_MESSAGE:
-        raise ValueError("execution record exceeds its size limit")
-    record = json.loads(raw)
-    if not isinstance(record, dict) or not isinstance(record.get("state"), str):
+    if not isinstance(record.get("state"), str):
         raise ValueError("execution record must be an object with a string state")
     return record
 
@@ -839,11 +836,13 @@ class Runtime:
             )
         )
 
-    async def finish(self, rec, state, error=None):
-        task = asyncio.create_task(self._finish(rec, state, error))
+    async def finish(self, rec, state, error=None, *, output_incomplete=False):
+        task = asyncio.create_task(
+            self._finish(rec, state, error, output_incomplete=output_incomplete)
+        )
         return await await_completion(task)
 
-    async def _finish(self, rec, state, error=None):
+    async def _finish(self, rec, state, error=None, *, output_incomplete=False):
         async with self.execution_lock(rec):
             waiter = self.submit_waiters.get(rec.get("msg_id"))
             if waiter is not None and not waiter.done():
@@ -866,6 +865,17 @@ class Runtime:
                 finished=time.time(),
                 **({"error_info": structured_error} if structured_error is not None else {}),
             )
+            if output_incomplete:
+                warning = {
+                    "code": "output_incomplete",
+                    "text": "Cell completion used fallback RPC; preceding output may be missing.",
+                }
+                warnings = list(rec.get("warnings", []))
+                fields["truncated"] = True
+                fields["warnings"] = [warning, *[item for item in warnings if item != warning]][:4]
+                fields["warnings_truncated"] = (
+                    rec.get("warnings_truncated", False) or len(warnings) >= 4
+                )
             candidate = {**self.public_record(rec), **fields}
             try:
                 await self.persist_execution(candidate, event=state)
@@ -2025,7 +2035,9 @@ class Runtime:
             rec["error_truncated"] = req.get("error_truncated", False)
             if isinstance(req.get("error_info"), dict):
                 rec["error_info"] = req["error_info"]
-            await self.finish(rec, req["state"], req.get("error"))
+            await self.finish(
+                rec, req["state"], req.get("error"), output_incomplete=True
+            )
             return None
         if op == "execute":
             if not self.workspace_available():
@@ -3650,6 +3662,7 @@ class Runtime:
                 record["kind"],
                 candidate,
                 event=full["state"] if previous != full["state"] else None,
+                preserve_updated=previous == full["state"],
                 critical=True,
             )
             record.update(fields)

@@ -168,7 +168,10 @@ async def test_reload_all_reports_identity_and_capability_errors(tmp_path: Path,
         "global_path": str(tmp_path / "global.toml"),
         "capabilities": ["config"],
     }
-    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers", lambda path: [record])
+    monkeypatch.setattr(
+        "mypr_mcp.runtime_registry.list_managers_page",
+        lambda path, **kwargs: {"records": [record], "next_cursor": None},
+    )
 
     async def rpc(path, **request):
         return {
@@ -186,11 +189,104 @@ async def test_reload_all_reports_identity_and_capability_errors(tmp_path: Path,
 
 
 @pytest.mark.asyncio
+async def test_reload_all_continues_through_registry_pages(tmp_path: Path, monkeypatch):
+    records = [
+        {
+            "workspace": str(tmp_path / f"workspace-{index}"),
+            "workspace_id": f"identity-{index}",
+            "pid": 123 + index,
+            "generation": f"generation-{index}",
+            "socket": str(tmp_path / f"manager-{index}.sock"),
+            "global_path": str(tmp_path / "global.toml"),
+            "capabilities": ["config"],
+        }
+        for index in range(2)
+    ]
+    pages = {
+        None: {"records": [records[0]], "next_cursor": "page-2"},
+        "page-2": {"records": [records[1]], "next_cursor": None},
+    }
+    seen_cursors = []
+
+    def page(_path, *, cursor=None, limit=1024):
+        seen_cursors.append(cursor)
+        return pages[cursor]
+
+    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers_page", page)
+
+    async def rpc(socket_path, **request):
+        record = next(item for item in records if item["socket"] == str(socket_path))
+        if request["op"] == "status":
+            return {
+                "workspace_id": record["workspace_id"],
+                "pid": record["pid"],
+                "generation": record["generation"],
+                "global_path": record["global_path"],
+                "healthy": True,
+                "capabilities": ["config"],
+            }
+        return {"applied": {}}
+
+    monkeypatch.setattr(cli, "rpc", rpc)
+    result = await cli._reload_all(tmp_path / "global.toml", force=False)
+
+    assert result["ok"] is True
+    assert [item["workspace"] for item in result["managers"]] == [
+        records[0]["workspace"],
+        records[1]["workspace"],
+    ]
+    assert seen_cursors == [None, "page-2"]
+
+
+@pytest.mark.asyncio
+async def test_reload_all_preserves_results_when_a_later_page_fails(
+    tmp_path: Path, monkeypatch
+):
+    record = {
+        "workspace": str(tmp_path / "workspace"),
+        "workspace_id": "identity",
+        "pid": 123,
+        "generation": "generation",
+        "socket": str(tmp_path / "manager.sock"),
+        "global_path": str(tmp_path / "global.toml"),
+        "capabilities": ["config"],
+    }
+
+    def page(_path, *, cursor=None, limit=1024):
+        if cursor is None:
+            return {"records": [record], "next_cursor": "page-2"}
+        raise PermissionError("registry changed while paging")
+
+    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers_page", page)
+
+    async def rpc(socket_path, **request):
+        if request["op"] == "status":
+            return {
+                "workspace_id": record["workspace_id"],
+                "pid": record["pid"],
+                "generation": record["generation"],
+                "global_path": record["global_path"],
+                "healthy": True,
+                "capabilities": ["config"],
+            }
+        return {"applied": {}}
+
+    monkeypatch.setattr(cli, "rpc", rpc)
+    result = await cli._reload_all(tmp_path / "global.toml", force=False)
+
+    assert result["ok"] is False
+    assert result["status"] == "error"
+    assert "registry changed while paging" in result["error"]
+    assert result["managers"][0]["workspace"] == record["workspace"]
+    assert result["managers"][0]["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_reload_all_reports_registry_read_failure(tmp_path: Path, monkeypatch):
-    def blocked(_path):
+    def blocked(_path, **kwargs):
         raise PermissionError("registry unavailable")
 
-    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers", blocked)
+    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers_page", blocked)
 
     result = await cli._reload_all(tmp_path / "global.toml", force=False)
 
@@ -219,7 +315,10 @@ async def test_reload_all_propagates_component_outcomes(
         "global_path": str(tmp_path / "global.toml"),
         "capabilities": ["config"],
     }
-    monkeypatch.setattr("mypr_mcp.runtime_registry.list_managers", lambda path: [record])
+    monkeypatch.setattr(
+        "mypr_mcp.runtime_registry.list_managers_page",
+        lambda path, **kwargs: {"records": [record], "next_cursor": None},
+    )
 
     async def rpc(socket_path, **request):
         if request["op"] == "status":
