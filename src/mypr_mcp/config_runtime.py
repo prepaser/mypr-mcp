@@ -379,25 +379,14 @@ class RuntimeConfig:
             or (runtime.resetting and not starting)
         ):
             raise RuntimeError("Workspace changed during configuration reload")
-        message = runtime.kc.session.msg(
-            "execute_request",
-            {
-                "code": "", "silent": True, "store_history": False,
-                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
-            },
-            metadata={
-                "mypr_control": "config_reload", "generation": generation,
-                "config": {"lsp": {
-                    "servers": snapshot.values["lsp"]["servers"],
-                    "revision": snapshot.revision,
-                }},
-                "force": force,
-            },
-        )
-        ident = message["header"]["msg_id"]
-        waiter = asyncio.get_running_loop().create_future()
-        runtime.control_waiters[ident] = waiter
-        try:
+        async with runtime._kernel_control(runtime.kc, {
+            "mypr_control": "config_reload", "generation": generation,
+            "config": {"lsp": {
+                "servers": snapshot.values["lsp"]["servers"],
+                "revision": snapshot.revision,
+            }},
+            "force": force,
+        }) as (message, waiter):
             runtime.kc.shell_channel.send(message)
             async with asyncio.timeout(10):
                 reply = await waiter
@@ -412,5 +401,3 @@ class RuntimeConfig:
             if not isinstance(result, dict) or type(result.get("applied")) is not bool:
                 raise RuntimeError("Kernel returned an invalid configuration result")
             return result
-        finally:
-            runtime.control_waiters.pop(ident, None)

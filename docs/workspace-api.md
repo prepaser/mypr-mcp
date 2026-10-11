@@ -609,6 +609,8 @@ await ws.history.get(exec_id)  # Also accepts a background task ID.
 await ws.history.logs(client_id=ws.client.id, limit=20)
 ```
 
+After a manager restart, an unfinished ordinary shell History record can recover its known terminal outcome from the saved job metadata. Such records include a `history_output_incomplete` warning because History output publication may have failed even though the process completed. The warning does not mean the command should be rerun. Missing or invalid terminal evidence keeps the existing lost/unknown behavior. See [runtime recovery](runtime-lifecycle.md#shell-history-recovery).
+
 History methods accept `limit=1..200` (default 20). Omit `client_id` to include all callers. Continue `list()` with its `next_cursor` until it is null. For logs, reuse the returned cursor with the same filter:
 
 ```python

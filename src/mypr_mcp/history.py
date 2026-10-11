@@ -25,6 +25,7 @@ from .client_ids import ADJECTIVES, ANIMALS
 from .file_io import read_bytes
 from .history_maintenance import vacuum_if_worthwhile
 from .json_utils import SOURCE_HASH_ENCODING, json_text, sha256_text, source_sha256
+from .shell_records import load_metadata, recovery_warnings, terminal_fields
 
 _KINDS = {"execution", "python", "shell", "package", "scan"}
 _ACTIVE_STATES = {"queued", "running", "cancelling"}
@@ -1517,8 +1518,49 @@ class History:
         return result
 
     def recover(self) -> int:
-        """Mark unfinished entities lost after manager startup."""
-        return self.mark_active(error="Manager stopped before completion")
+        """Recover confirmed shell outcomes and mark unfinished entities lost."""
+        return self._recover_shells() + self.mark_active(error="Manager stopped before completion")
+
+    def _recover_shells(self) -> int:
+        self._ensure_open()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, kind, created, updated, data FROM entities "
+                "WHERE kind = 'shell' AND json_valid(data) "
+                "AND json_extract(data, '$.state') IN (?, ?, ?)",
+                sorted(_ACTIVE_STATES),
+            ).fetchall()
+            count = 0
+            for row in rows:
+                record, warning = _decode_entity(row)
+                ident = row["id"]
+                if (
+                    warning is not None
+                    or record.get("id") != ident
+                    or not isinstance(ident, str)
+                    or len(ident) != 32
+                    or any(char not in "0123456789abcdef" for char in ident)
+                ):
+                    continue
+                try:
+                    metadata, warning = load_metadata(
+                        self.root / ".mypr" / "jobs" / f"{ident}.json"
+                    )
+                except OSError:
+                    continue
+                fields = terminal_fields(ident, metadata) if warning is None else None
+                if fields is None:
+                    continue
+                warnings, truncated = recovery_warnings(record, metadata)
+                candidate = {**record, **fields, "warnings": warnings}
+                if truncated:
+                    candidate["warnings_truncated"] = True
+                self.record(
+                    "shell", candidate, event=fields["state"], entity_id=ident,
+                    updated_at=fields["finished"],
+                )
+                count += 1
+            return count
 
     def mark_active(
         self,

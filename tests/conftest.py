@@ -40,7 +40,7 @@ def test_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Iterat
     os.environ["XDG_STATE_HOME"] = str(state)
     os.environ["XDG_DATA_HOME"] = str(data)
     os.environ["XDG_CACHE_HOME"] = str(cache)
-    os.environ["UV_CACHE_DIR"] = "/tmp/mypr-uv-cache"
+    os.environ["UV_CACHE_DIR"] = cache_previous or "/tmp/mypr-uv-cache"
     Path(os.environ["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
     try:
         yield

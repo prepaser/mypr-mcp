@@ -78,6 +78,7 @@ async def test_search_pages_count_matches_and_keep_trailing_context(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_file_listing_respects_ignore_and_hidden_options(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
     (tmp_path / "visible.txt").write_text("visible", encoding="utf-8")
     (tmp_path / "ignored.txt").write_text("ignored", encoding="utf-8")

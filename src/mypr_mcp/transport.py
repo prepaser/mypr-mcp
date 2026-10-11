@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .diagnostics import RPCError
 from .file_io import PersistedFileError, open_regular, read_bytes
+from .rpc_envelope import decode_object
 
 MAX_MESSAGE = 32 * 1024 * 1024
 HANDSHAKE_TIMEOUT = 30
@@ -55,12 +56,7 @@ async def rpc(_socket_path: Path | str | None = None, **request):
         data = await reader.readline()
         if not data:
             raise ConnectionError("Workspace manager disconnected")
-        try:
-            response = json.loads(data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RPCError(
-                "Workspace manager returned invalid RPC data", code="protocol_error"
-            ) from exc
+        response = decode_object(data, "Workspace manager returned invalid RPC data")
         if not response.get("ok"):
             info = response.get("error_info")
             if isinstance(info, dict):
@@ -72,6 +68,11 @@ async def rpc(_socket_path: Path | str | None = None, **request):
                     error_type=info.get("type"),
                 )
             raise RPCError(str(response.get("error", "Workspace manager request failed")))
+        if "result" not in response:
+            raise RPCError(
+                "Workspace manager returned an RPC response without a result",
+                code="protocol_error",
+            )
         return response["result"]
     finally:
         writer.close()
@@ -186,12 +187,7 @@ async def attachment(
             data = await reader.readline()
         if not data:
             raise ConnectionError("Workspace manager disconnected during attach")
-        try:
-            response = json.loads(data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RPCError(
-                "Workspace manager returned invalid attach data", code="protocol_error"
-            ) from exc
+        response = decode_object(data, "Workspace manager returned invalid attach data")
         if not response.get("ok"):
             info = response.get("error_info")
             if isinstance(info, dict):

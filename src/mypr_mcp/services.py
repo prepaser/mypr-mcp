@@ -28,9 +28,10 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
+from . import shell_records
 from .async_utils import finish_owned, wait_owned
-from .config import ConfigSnapshot, ConfigStore, MCPConfig, validate_name, validate_servers
-from .file_io import open_regular, read_bytes
+from .config import ConfigSnapshot, MCPConfig, validate_name, validate_servers
+from .file_io import open_regular
 from .journal import decode_event, read_page
 from .json_utils import json_bytes, json_text
 from .lsp_config import validate_servers as validate_lsp_servers
@@ -759,21 +760,7 @@ class Shells:
 
     @staticmethod
     def _load_persisted_metadata(path: Path) -> tuple[dict[str, Any], dict[str, str] | None]:
-        try:
-            metadata = json.loads(read_bytes(path, max_bytes=1024 * 1024))
-        except (TypeError, ValueError, UnicodeError) as exc:
-            return {}, {
-                "code": "shell_metadata_corrupt",
-                "text": f"Persisted shell metadata is invalid and was omitted: {exc}"[
-                    :_MAX_SHELL_WARNING_TEXT
-                ],
-            }
-        if not isinstance(metadata, dict):
-            return {}, {
-                "code": "shell_metadata_corrupt",
-                "text": "Persisted shell metadata is not an object and was omitted.",
-            }
-        return metadata, None
+        return shell_records.load_metadata(path)
 
     @staticmethod
     def _metadata_warnings(metadata: dict[str, Any]) -> list[dict[str, str]]:
@@ -1583,17 +1570,13 @@ class MCPBridge:
     def __init__(self, workspace: Path, *, global_path=None, snapshot=None):
         self.workspace = Path(workspace).resolve()
         self.workspace_id = workspace_id(self.workspace)
-        self._store = ConfigStore(
-            self.workspace,
-            global_path=global_path,
-            workspace_guard=self._ensure_workspace_identity,
-        )
-        self.config_store = self._store
         self.store = MCPConfig(
             self.workspace,
             global_path=global_path,
             workspace_guard=self._ensure_workspace_identity,
         )
+        self._store = self.store.core
+        self.config_store = self._store
         self._snapshot = snapshot if snapshot is not None else self._load_snapshot()
         self.config, self._revision = self._snapshot_config(self._snapshot)
         self.config = _copy_configs(self.config)
@@ -1849,24 +1832,7 @@ class MCPBridge:
                 if snapshot is not None
                 else await wait_owned(asyncio.to_thread(self._load_snapshot))
             )
-            servers, revision = self._snapshot_config(candidate)
-            servers = _copy_configs(servers)
-            current = self.config
-            added = sorted(set(servers) - set(current))
-            removed = sorted(set(current) - set(servers))
-            updated = sorted(
-                name for name in set(servers) & set(current) if servers[name] != current[name]
-            )
-            changed = set(added) | set(removed) | set(updated)
-            try:
-                connections = await self._block_affected(changed, force)
-                self._commit_config(
-                    servers, revision, set(removed) | set(updated), snapshot=candidate
-                )
-                await self._close_connections_resilient(connections, force)
-                return {"added": added, "updated": updated, "removed": removed}
-            finally:
-                await self._clear_changing(changed)
+            return await self._apply_snapshot_locked(candidate, force)
 
     async def apply_snapshot(self, snapshot, force: bool = False) -> dict[str, list[str]]:
         """Apply an already loaded layered configuration without disk I/O."""
@@ -1876,24 +1842,27 @@ class MCPBridge:
             self._ensure_open()
             self._ensure_workspace_identity()
             candidate = snapshot
-            servers, revision = self._snapshot_config(candidate)
-            servers = _copy_configs(servers)
-            current = self.config
-            added = sorted(set(servers) - set(current))
-            removed = sorted(set(current) - set(servers))
-            updated = sorted(
-                name for name in set(servers) & set(current) if servers[name] != current[name]
+            return await self._apply_snapshot_locked(candidate, force)
+
+    async def _apply_snapshot_locked(self, candidate, force):
+        servers, revision = self._snapshot_config(candidate)
+        servers = _copy_configs(servers)
+        current = self.config
+        added = sorted(set(servers) - set(current))
+        removed = sorted(set(current) - set(servers))
+        updated = sorted(
+            name for name in set(servers) & set(current) if servers[name] != current[name]
+        )
+        changed = set(added) | set(removed) | set(updated)
+        try:
+            connections = await self._block_affected(changed, force)
+            self._commit_config(
+                servers, revision, set(removed) | set(updated), snapshot=candidate
             )
-            changed = set(added) | set(removed) | set(updated)
-            try:
-                connections = await self._block_affected(changed, force)
-                self._commit_config(
-                    servers, revision, set(removed) | set(updated), snapshot=candidate
-                )
-                await self._close_connections_resilient(connections, force)
-                return {"added": added, "updated": updated, "removed": removed}
-            finally:
-                await self._clear_changing(changed)
+            await self._close_connections_resilient(connections, force)
+            return {"added": added, "updated": updated, "removed": removed}
+        finally:
+            await self._clear_changing(changed)
 
     async def close(self) -> None:
         async def cleanup():

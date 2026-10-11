@@ -3099,6 +3099,24 @@ class Runtime:
             self.healthy = False
             self.health_error = f"Restart monitoring failed: {safe_error(exc)}"
 
+    @contextlib.asynccontextmanager
+    async def _kernel_control(self, kc, metadata):
+        message = kc.session.msg(
+            "execute_request",
+            {
+                "code": "", "silent": True, "store_history": False,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
+            },
+            metadata=metadata,
+        )
+        ident = message["header"]["msg_id"]
+        waiter = asyncio.get_running_loop().create_future()
+        self.control_waiters[ident] = waiter
+        try:
+            yield message, waiter
+        finally:
+            self.control_waiters.pop(ident, None)
+
     async def reserve_kernel_lifecycle(self, *, token, current=None, force=False):
         generation = self.generation
         kc = getattr(self, "kc", None)
@@ -3108,58 +3126,48 @@ class Runtime:
             if force:
                 return {"reserved": False, "generation": generation, "token": token}
             raise RuntimeError("Cannot verify live Python tasks; retry with force=True")
-        message = kc.session.msg(
-            "execute_request",
-            {
-                "code": "", "silent": True, "store_history": False,
-                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
-            },
-            metadata={
-                "mypr_control": "lifecycle_reserve",
-                "generation": generation,
-                "exec_id": current["id"] if current is not None else None,
-                "token": token,
-                "force": force,
-            },
-        )
-        ident = message["header"]["msg_id"]
-        waiter = asyncio.get_running_loop().create_future()
-        self.control_waiters[ident] = waiter
-        cleanup_needed = True
-        try:
-            kc.shell_channel.send(message)
-            timeout = 1 if force else 10
-            async with asyncio.timeout(timeout):
-                result = await waiter
-            if result.get("status") != "ok":
-                error = result.get("evalue", "Kernel lifecycle reservation failed")
+        async with self._kernel_control(kc, {
+            "mypr_control": "lifecycle_reserve",
+            "generation": generation,
+            "exec_id": current["id"] if current is not None else None,
+            "token": token,
+            "force": force,
+        }) as (message, waiter):
+            cleanup_needed = True
+            try:
+                kc.shell_channel.send(message)
+                timeout = 1 if force else 10
+                async with asyncio.timeout(timeout):
+                    result = await waiter
+                if result.get("status") != "ok":
+                    error = result.get("evalue", "Kernel lifecycle reservation failed")
+                    cleanup_needed = False
+                    raise RuntimeError(error)
+                lifecycle = result.get("lifecycle")
+                if not isinstance(lifecycle, dict) or lifecycle.get("generation") != generation:
+                    raise RuntimeError("Kernel lifecycle reservation returned invalid state")
                 cleanup_needed = False
-                raise RuntimeError(error)
-            lifecycle = result.get("lifecycle")
-            if not isinstance(lifecycle, dict) or lifecycle.get("generation") != generation:
-                raise RuntimeError("Kernel lifecycle reservation returned invalid state")
-            cleanup_needed = False
-            return lifecycle
-        except BaseException as exc:
-            if cleanup_needed:
-                cleanup = asyncio.create_task(
-                    self.abort_kernel_lifecycle(
-                        current, token=token, generation=generation, timeout=1
+                return lifecycle
+            except BaseException as exc:
+                if cleanup_needed:
+                    cleanup = asyncio.create_task(
+                        self.abort_kernel_lifecycle(
+                            current, token=token, generation=generation, timeout=1
+                        )
                     )
-                )
-                with contextlib.suppress(BaseException):
-                    await asyncio.shield(cleanup)
-            if not isinstance(exc, Exception):
-                raise
-            if force:
-                return {"reserved": False, "generation": generation, "token": token}
-            if isinstance(exc, RuntimeError) and str(exc).startswith(
-                "Workspace has active Python tasks"
-            ):
-                raise
-            raise RuntimeError("Cannot verify live Python tasks; retry with force=True") from exc
-        finally:
-            self.control_waiters.pop(ident, None)
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(cleanup)
+                if not isinstance(exc, Exception):
+                    raise
+                if force:
+                    return {"reserved": False, "generation": generation, "token": token}
+                if isinstance(exc, RuntimeError) and str(exc).startswith(
+                    "Workspace has active Python tasks"
+                ):
+                    raise
+                raise RuntimeError(
+                    "Cannot verify live Python tasks; retry with force=True"
+                ) from exc
 
     async def abort_kernel_lifecycle(
         self, current=None, *, token=None, generation=None, timeout=10  # noqa: ASYNC109
@@ -3177,28 +3185,15 @@ class Runtime:
         exec_id = current["id"] if current is not None else None
         if token is None:
             token = exec_id
-        message = kc.session.msg(
-            "execute_request",
-            {
-                "code": "", "silent": True, "store_history": False,
-                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False,
-            },
-            metadata={
-                "mypr_control": "lifecycle_abort", "generation": generation,
-                "exec_id": exec_id, "token": token,
-            },
-        )
-        ident = message["header"]["msg_id"]
-        waiter = asyncio.get_running_loop().create_future()
-        self.control_waiters[ident] = waiter
-        try:
+        async with self._kernel_control(kc, {
+            "mypr_control": "lifecycle_abort", "generation": generation,
+            "exec_id": exec_id, "token": token,
+        }) as (message, waiter):
             kc.shell_channel.send(message)
             async with asyncio.timeout(timeout):
                 result = await waiter
             if result.get("status") != "ok":
                 raise RuntimeError(result.get("evalue", "Kernel lifecycle recovery failed"))
-        finally:
-            self.control_waiters.pop(ident, None)
 
     async def _register_manager(self):
         from .runtime_registry import register
@@ -3339,39 +3334,25 @@ class Runtime:
     async def cleanup_kernel_resources(self):
         if not self.kc or not self.km or not self.replies or self.replies.done():
             return
-        msg = self.kc.session.msg(
-            "execute_request",
-            {
-                "code": "",
-                "silent": True,
-                "store_history": False,
-                "user_expressions": {},
-                "allow_stdin": False,
-                "stop_on_error": False,
-            },
-            metadata={"mypr_control": "cleanup", "generation": self.generation},
-        )
-        ident = msg["header"]["msg_id"]
-        waiter = asyncio.get_running_loop().create_future()
-        self.control_waiters[ident] = waiter
-        try:
-            self.kc.shell_channel.send(msg)
-            async with asyncio.timeout(10):
-                result = await waiter
-            if result.get("status") != "ok":
-                raise RuntimeError(result.get("evalue", "Kernel resource cleanup failed"))
-        except Exception as exc:
-            if self.history:
-                with contextlib.suppress(Exception):
-                    await self.io(
-                        self.history.append,
-                        "runtime",
-                        "cleanup_warning",
-                        {"error": safe_error(exc)},
-                        critical=True,
-                    )
-        finally:
-            self.control_waiters.pop(ident, None)
+        async with self._kernel_control(
+            self.kc, {"mypr_control": "cleanup", "generation": self.generation}
+        ) as (msg, waiter):
+            try:
+                self.kc.shell_channel.send(msg)
+                async with asyncio.timeout(10):
+                    result = await waiter
+                if result.get("status") != "ok":
+                    raise RuntimeError(result.get("evalue", "Kernel resource cleanup failed"))
+            except Exception as exc:
+                if self.history:
+                    with contextlib.suppress(Exception):
+                        await self.io(
+                            self.history.append,
+                            "runtime",
+                            "cleanup_warning",
+                            {"error": safe_error(exc)},
+                            critical=True,
+                        )
 
     async def close_kernel(self):
         self.healthy = False

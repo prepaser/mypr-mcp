@@ -260,6 +260,37 @@ async def test_kernel_control_uses_a_snapshot_without_manager_rpc(configured_run
     assert runtime.control_waiters == {}
 
 
+async def test_kernel_control_reserve_keeps_waiter_through_nested_abort(configured_runtime):
+    runtime = configured_runtime
+    sent = []
+    active_during_abort = None
+    ids = iter(("reserve-message", "abort-message"))
+
+    def message(_kind, _content, *, metadata):
+        return {"header": {"msg_id": next(ids)}}
+
+    def send(message):
+        nonlocal active_during_abort
+        sent.append(message["header"]["msg_id"])
+        if message["header"]["msg_id"] == "reserve-message":
+            raise OSError("reserve send failed")
+        active_during_abort = set(runtime.control_waiters)
+        runtime.control_waiters["abort-message"].set_result({"status": "ok"})
+
+    runtime.kc = SimpleNamespace(
+        session=SimpleNamespace(msg=message), shell_channel=SimpleNamespace(send=send),
+    )
+    runtime.replies = SimpleNamespace(done=lambda: False)
+    current = {"id": "execution", "generation": runtime.generation}
+
+    with pytest.raises(RuntimeError, match="Cannot verify live Python tasks"):
+        await runtime.reserve_kernel_lifecycle(token="token", current=current)
+
+    assert sent == ["reserve-message", "abort-message"]
+    assert active_during_abort == {"reserve-message", "abort-message"}
+    assert runtime.control_waiters == {}
+
+
 async def test_late_lsp_control_reply_reconciles_after_waiter_timeout(
     configured_runtime, monkeypatch
 ):

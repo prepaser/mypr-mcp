@@ -34,6 +34,7 @@ from .mail_api import MailAPI
 from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
+from .rpc_envelope import decode_object
 from .skill_tools import (
     SkillsWriting,
     _bounded_metadata,
@@ -297,10 +298,7 @@ async def _rpc(op: str, **fields: Any) -> Any:
         raise RPCError(f"workspace manager unavailable: {exc}") from exc
     if not line:
         raise RPCError("workspace manager closed the RPC connection")
-    try:
-        response = json.loads(line)
-    except json.JSONDecodeError as exc:
-        raise RPCError("invalid response from workspace manager") from exc
+    response = decode_object(line, "invalid response from workspace manager")
     if not response.get("ok", False):
         info = response.get("error_info")
         if not isinstance(info, dict):
@@ -309,7 +307,7 @@ async def _rpc(op: str, **fields: Any) -> Any:
             str(response.get("error", "workspace manager request failed")),
             code=info.get("code", "rpc_error"),
             operation=info.get("operation", op),
-            details=info.get("details"),
+            details=info.get("details") if isinstance(info.get("details"), dict) else None,
             error_type=info.get("type"),
         )
     return response.get("result")
