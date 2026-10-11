@@ -28,9 +28,12 @@ def test_web_readiness_reports_provider_references_without_secret_values(monkeyp
         "configured": True,
         "credentials": {"source": "MYPR_KAGI_KEY", "available": True},
         "ready": True,
+        "reason": None,
     }
     assert result["providers"]["brave"]["credentials"]["available"] is False
     assert result["providers"]["tavily"]["configured"] is False
+    assert result["providers"]["brave"]["reason"] == "credentials_missing"
+    assert result["providers"]["tavily"]["reason"] == "provider_unavailable"
     assert secret not in str(result)
     assert result["network_checked"] is False
 
@@ -51,6 +54,31 @@ def test_web_readiness_rejects_locally_invalid_credentials(monkeypatch, value):
         "available": False,
     }
     assert result["providers"]["kagi"]["ready"] is False
+    assert result["providers"]["kagi"]["reason"] == (
+        "credentials_missing" if value == "" else "credentials_invalid"
+    )
+
+
+def test_web_readiness_marks_disabled_provider_unavailable(monkeypatch):
+    monkeypatch.setenv("MYPR_WEB_KEY", "valid-key")
+
+    result = _web_readiness(
+        {
+            "providers": {
+                "kagi": {"enabled": False},
+                "brave": {"api_key_env": "MYPR_WEB_KEY"},
+            }
+        }
+    )
+
+    assert result["providers"]["kagi"] == {
+        "configured": False,
+        "credentials": {},
+        "ready": False,
+        "reason": "provider_unavailable",
+    }
+    assert result["providers"]["brave"]["ready"] is True
+    assert result["providers"]["brave"]["reason"] is None
 
 
 @pytest.mark.asyncio

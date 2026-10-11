@@ -12,6 +12,7 @@ from typing import Any
 from .async_utils import wait_owned
 from .config import validate_web_config
 from .diagnostics import RPCError, safe_error
+from .web_credentials import web_credential_status
 from .web_snapshots import WebSnapshots, page_limit
 from .web_transport import WebTransport, provider_capabilities, validate_request
 
@@ -68,12 +69,23 @@ class WebService:
             definition = self.config["providers"].get(name, {})
             enabled = bool(definition) and definition.get("enabled") is not False
             source = definition.get("api_key_env") if enabled else None
+            status = web_credential_status(os.environ.get(source)) if source else "missing"
             result.append(
                 {
                     "provider": name,
                     "configured": enabled,
                     "api_key_env": source,
                     "key_available": bool(source and os.environ.get(source)),
+                    "ready": enabled and status == "valid",
+                    "reason": (
+                        None
+                        if enabled and status == "valid"
+                        else "provider_unavailable"
+                        if not enabled
+                        else "credentials_invalid"
+                        if status == "invalid"
+                        else "credentials_missing"
+                    ),
                     **provider_capabilities(name),
                 }
             )

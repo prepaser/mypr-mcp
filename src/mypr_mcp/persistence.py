@@ -22,6 +22,7 @@ class _Call:
     kwargs: dict[str, Any]
     result: asyncio.Future[Any]
     queued_at: float
+    operation: str
 
 
 @dataclass(slots=True)
@@ -47,6 +48,7 @@ class PersistenceWorker:
         self._failure = None
         self._on_failure = on_failure
         self.timings = Timings(labels={"queue_wait", "work"})
+        self._operations: dict[str, Timings] = {}
         self._gate = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
         self._task = asyncio.create_task(self._run(), name="mypr:persistence")
@@ -79,7 +81,10 @@ class PersistenceWorker:
             if not self.available:
                 raise self._failure or PersistenceUnavailable("Persistence worker is unavailable")
             result = self._loop.create_future()
-            await self._queue.put(_Call(function, args, kwargs, result, queued_at))
+            operation = getattr(function, "__qualname__", "other")
+            if not isinstance(operation, str) or not operation:
+                operation = "other"
+            await self._queue.put(_Call(function, args, kwargs, result, queued_at, operation[:96]))
             if not self.available:
                 self._fail_pending(
                     self._failure or PersistenceUnavailable("Persistence worker is unavailable")
@@ -107,7 +112,7 @@ class PersistenceWorker:
                 except BaseException as exc:
                     self._fail(current, exc)
                 else:
-                    self._observe(outcome)
+                    self._observe(outcome, current.operation)
                     self._resolve(current, outcome)
                     if cancelled:
                         raise asyncio.CancelledError
@@ -152,9 +157,16 @@ class PersistenceWorker:
             return _Outcome(queue_wait, time.perf_counter() - started, error=exc)
         return _Outcome(queue_wait, time.perf_counter() - started, value=value)
 
-    def _observe(self, outcome: _Outcome) -> None:
+    def _observe(self, outcome: _Outcome, operation: str) -> None:
         self.timings.observe("queue_wait", outcome.queue_wait)
         self.timings.observe("work", outcome.work)
+        if operation not in self._operations and len(self._operations) >= 31:
+            operation = "other"
+        timings = self._operations.get(operation)
+        if timings is None:
+            timings = self._operations[operation] = Timings(labels={"queue_wait", "work"})
+        timings.observe("queue_wait", outcome.queue_wait)
+        timings.observe("work", outcome.work)
 
     @staticmethod
     def _resolve(call: _Call, outcome: _Outcome) -> None:
@@ -172,6 +184,7 @@ class PersistenceWorker:
             "queue_capacity": self._queue.maxsize,
             "queue_wait": timings.get("queue_wait"),
             "work": timings.get("work"),
+            "operations": {name: timing.snapshot() for name, timing in self._operations.items()},
         }
 
     @staticmethod

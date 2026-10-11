@@ -6,6 +6,8 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -17,11 +19,14 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from tomllib import loads
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
+CASE_DEADLINE_SECONDS = 180
+MAX_ERROR_LENGTH = 500
 CASES = {
     "empty": "pass",
     "scalar": "42",
@@ -33,6 +38,14 @@ CASES = {
         "'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgA'"
         "'I/ScL/nwAAAABJRU5ErkJggg=='}, "
         "raw=True)"
+    ),
+    "shell_output": (
+        "import json, sys\n"
+        "job = await ws.shell.start([sys.executable, '-c', "
+        "\"import sys; sys.stdout.write('x' * 262144)\"])\n"
+        "result = await job\n"
+        "print(json.dumps({'returncode': result.get('returncode'), "
+        "'retained_output_bytes': len(job.output().encode('utf-8'))}))"
     ),
 }
 
@@ -153,6 +166,77 @@ async def execute_case(session, name, code):
     return sample
 
 
+def bounded_error(error):
+    text = " ".join(str(error).split()) or type(error).__name__
+    if len(text) > MAX_ERROR_LENGTH:
+        text = text[: MAX_ERROR_LENGTH - 3] + "..."
+    return text
+
+
+def report_failure(report, phase, error):
+    failure = {"phase": phase, "error": bounded_error(error)}
+    report.setdefault("failures", []).append(failure)
+    report["status"] = "failed"
+    if report.get("failure") is None:
+        report["failure"] = failure
+    return failure
+
+
+def source_environment():
+    project = ROOT / "pyproject.toml"
+    source_version = None
+    with contextlib.suppress(OSError, KeyError, TypeError, ValueError):
+        source_version = loads(project.read_text(encoding="utf-8"))["project"]["version"]
+    try:
+        distribution = importlib.metadata.distribution("mypr-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        installed_version = None
+        installed_location = None
+    else:
+        installed_version = distribution.version
+        installed_location = str(distribution.locate_file(""))
+    source_root = (ROOT / "src").resolve()
+    package_root = source_root / "mypr_mcp"
+    venv = (ROOT / ".venv").resolve()
+    try:
+        runner_origin = importlib.util.find_spec("mypr_mcp").origin
+    except (ImportError, AttributeError, ModuleNotFoundError, ValueError):
+        runner_origin = None
+    source_origin_path = (package_root / "__init__.py").resolve()
+    source_origin = str(source_origin_path)
+    runner_source_selected = runner_origin == source_origin
+    manager_source_selected = source_origin_path.is_file()
+    return {
+        "prepared": venv.is_dir() and package_root.is_dir(),
+        "mode": "checkout_source",
+        "code": revision(),
+        "versions": {"source": source_version, "installed": installed_version},
+        "venv": {"path": str(venv), "exists": venv.is_dir()},
+        "source": {
+            "root": str(ROOT),
+            "package_root": str(package_root),
+            "version": source_version,
+            "exists": package_root.is_dir(),
+        },
+        "installed": {
+            "distribution": "mypr-mcp",
+            "version": installed_version,
+            "location": installed_location,
+        },
+        "path_validation": {
+            "python": str(Path(sys.executable).resolve()),
+            "interpreter": str(Path(sys.executable).resolve()),
+            "source_on_pythonpath": str(source_root),
+            "strategy": "PYTHONPATH-precedence",
+            "runner_origin": runner_origin,
+            "manager_origin": source_origin if manager_source_selected else None,
+            "runner_source_selected": runner_source_selected,
+            "manager_source_selected": manager_source_selected,
+            "source_selected": manager_source_selected,
+        },
+    }
+
+
 async def available_output_probe(session, runs):
     samples = []
     code = (
@@ -223,10 +307,13 @@ async def available_output_probe(session, runs):
         finally:
             if polled is None or polled["state"] in {"queued", "running"}:
                 with contextlib.suppress(Exception):
-                    release, _, _ = await request(
-                        session,
-                        "execute",
-                        {"code": "ws.local['perf_gate'].set()", "wait_ms": 1000},
+                    release, _, _ = await asyncio.wait_for(
+                        request(
+                            session,
+                            "execute",
+                            {"code": "ws.local['perf_gate'].set()", "wait_ms": 1000},
+                        ),
+                        5,
                     )
                     result_data(release)
     stage_names = sorted({key for sample in samples for key in sample["timing_ms"]})
@@ -318,17 +405,25 @@ async def stop_manager(workspace, env, manager_ready):
         raise RuntimeError("Could not stop the benchmark manager: " + message)
 
 
-async def run_benchmark(runs, workspace_root):
-    if runs < 1:
-        raise ValueError("--runs must be at least 1")
-    root = await asyncio.to_thread(Path(workspace_root).resolve)
-    state_root = root / ".mypr"
-    await asyncio.to_thread(state_root.mkdir, exist_ok=True)
-    if not (ROOT / ".venv").is_dir():
-        raise RuntimeError("Run this benchmark from a checkout with its project .venv installed")
+def write_report(report, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
+
+async def run_benchmark(runs, workspace_root, output_path=None):
+    root = await asyncio.to_thread(Path(workspace_root).resolve)
+    environment_error = None
+    try:
+        prepared_environment = source_environment()
+    except Exception as exc:
+        prepared_environment = {"prepared": False, "error": bounded_error(exc)}
+        environment_error = exc
     report = {
         "schema": 1,
+        "status": "running",
         "created_at": datetime.now(UTC).isoformat(),
         "revision": revision(),
         "environment": {
@@ -336,65 +431,207 @@ async def run_benchmark(runs, workspace_root):
             "platform": platform.platform(),
             "workspace_root": str(root),
             "runs": runs,
+            "prepared_environment": prepared_environment,
         },
         "cases": {},
+        "failures": [],
+        "failure": None,
     }
-    with tempfile.TemporaryDirectory(prefix="perf-", dir=state_root) as temporary:
-        temporary = Path(temporary)
-        workspace = temporary / "workspace"
-        workspace.mkdir()
-        state = workspace / ".mypr"
-        state.mkdir()
-        (state / "venv").symlink_to(ROOT / ".venv", target_is_directory=True)
-        with tempfile.TemporaryDirectory(prefix="mypr-perf-runtime-") as runtime_dir:
-            env = {
-                **os.environ,
-                "PYTHONPATH": str(ROOT / "src"),
-                "XDG_RUNTIME_DIR": runtime_dir,
-                "NO_COLOR": "1",
-            }
-            parameters = StdioServerParameters(
-                command=sys.executable,
-                args=["-m", "mypr_mcp.cli", "serve"],
-                cwd=str(workspace),
-                env=env,
+    workspace = None
+    env = None
+    manager_ready = False
+    phase = "setup"
+
+    async def checkpoint():
+        if output_path is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(write_report, report, output_path)
+
+    await checkpoint()
+    try:
+        if environment_error is not None:
+            raise RuntimeError("Could not inspect the benchmark environment") from environment_error
+        if runs < 1:
+            raise ValueError("--runs must be at least 1")
+        state_root = root / ".mypr"
+        await asyncio.to_thread(state_root.mkdir, exist_ok=True)
+        if not (ROOT / ".venv").is_dir():
+            raise RuntimeError(
+                "Run this benchmark from a checkout with its project .venv installed"
             )
-            manager_ready = False
-            try:
-                async with stdio_client(parameters) as (reader, writer):
-                    async with ClientSession(reader, writer) as session:
-                        await session.initialize()
-                        init_result = await session.call_tool("init", {})
-                        init = result_data(init_result)
-                        manager_ready = True
-                        report["runtime"] = {
-                            key: value
-                            for key, value in init.get("runtime", {}).items()
-                            if key in {"manager_version", "bridge_version", "protocol_version"}
-                        }
-                        await execute_case(session, "warmup", "pass")
-                        raw = {name: [] for name in CASES}
-                        for _ in range(runs):
-                            for name, code in CASES.items():
-                                raw[name].append(await execute_case(session, name, code))
-                        report["cases"] = {
-                            name: summarize(samples) for name, samples in raw.items()
-                        }
-                        report["available_output_poll"] = await available_output_probe(
-                            session, runs
-                        )
-                        if "performance" in init.get("runtime", {}).get("capabilities", []):
-                            try:
-                                report["runtime_performance"] = await execute_case(
-                                    session,
-                                    "runtime_performance",
-                                    "import json; print(json.dumps(await ws.performance(), "
-                                    "ensure_ascii=False))",
+        with tempfile.TemporaryDirectory(prefix="perf-", dir=state_root) as temporary:
+            temporary = Path(temporary)
+            workspace = temporary / "workspace"
+            workspace.mkdir()
+            state = workspace / ".mypr"
+            state.mkdir()
+            (state / "venv").symlink_to(ROOT / ".venv", target_is_directory=True)
+            with contextlib.ExitStack() as resources:
+                runtime_dir = resources.enter_context(
+                    tempfile.TemporaryDirectory(prefix="mypr-perf-runtime-")
+                )
+                xdg_dir = resources.enter_context(
+                    tempfile.TemporaryDirectory(prefix="mypr-perf-xdg-")
+                )
+                env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("MYPR_")
+                }
+                env.update(
+                    {
+                        "PYTHONPATH": str(ROOT / "src"),
+                        "XDG_RUNTIME_DIR": runtime_dir,
+                        "XDG_CONFIG_HOME": str(Path(xdg_dir) / "config"),
+                        "XDG_STATE_HOME": str(Path(xdg_dir) / "state"),
+                        "XDG_DATA_HOME": str(Path(xdg_dir) / "data"),
+                        "XDG_CACHE_HOME": str(Path(xdg_dir) / "cache"),
+                        "NO_COLOR": "1",
+                    }
+                )
+                parameters = StdioServerParameters(
+                    command=sys.executable,
+                    args=["-m", "mypr_mcp.cli", "serve"],
+                    cwd=str(workspace),
+                    env=env,
+                )
+                primary_error = None
+                cleanup_error = None
+                try:
+                    phase = "frontend_initialize"
+                    report["startup"] = {
+                        "frontend_initialize_ms": None,
+                        "init_ms": None,
+                    }
+                    await checkpoint()
+                    frontend_started = time.perf_counter()
+                    try:
+                        async with stdio_client(parameters) as (reader, writer):
+                            async with ClientSession(reader, writer) as session:
+                                try:
+                                    await asyncio.wait_for(
+                                        session.initialize(), CASE_DEADLINE_SECONDS
+                                    )
+                                finally:
+                                    report["startup"]["frontend_initialize_ms"] = round(
+                                        (time.perf_counter() - frontend_started) * 1000, 3
+                                    )
+                                    await checkpoint()
+                                phase = "init"
+                                init_started = time.perf_counter()
+                                try:
+                                    init_result = await asyncio.wait_for(
+                                        session.call_tool("init", {}), CASE_DEADLINE_SECONDS
+                                    )
+                                finally:
+                                    report["startup"]["init_ms"] = round(
+                                        (time.perf_counter() - init_started) * 1000, 3
+                                    )
+                                    await checkpoint()
+                                init = result_data(init_result)
+                                manager_ready = True
+                                report["runtime"] = {
+                                    key: value
+                                    for key, value in init.get("runtime", {}).items()
+                                    if key
+                                    in {"manager_version", "bridge_version", "protocol_version"}
+                                }
+                                phase = "warmup"
+                                await asyncio.wait_for(
+                                    execute_case(session, "warmup", "pass"), CASE_DEADLINE_SECONDS
                                 )
-                            except Exception as exc:
-                                report["runtime_performance_error"] = str(exc)
-            finally:
-                await stop_manager(workspace, env, manager_ready)
+                                raw = {name: [] for name in CASES}
+                                case_failures = set()
+                                case_aborted = False
+                                for _ in range(runs):
+                                    for name, code in CASES.items():
+                                        phase = f"case:{name}"
+                                        try:
+                                            sample = await asyncio.wait_for(
+                                                execute_case(session, name, code),
+                                                CASE_DEADLINE_SECONDS,
+                                            )
+                                        except Exception as exc:
+                                            failure = report_failure(report, f"case:{name}", exc)
+                                            case_failures.add(name)
+                                            report["cases"][name] = {
+                                                "failed": True,
+                                                "failure": failure,
+                                            }
+                                            await checkpoint()
+                                            case_aborted = True
+                                            break
+                                        else:
+                                            raw[name].append(sample)
+                                            summary = summarize(raw[name])
+                                            report["cases"][name] = summary
+                                            await checkpoint()
+                                    if case_aborted:
+                                        break
+                                for name, samples in raw.items():
+                                    if not samples:
+                                        continue
+                                    summary = summarize(samples)
+                                    if name in case_failures:
+                                        summary["failed"] = True
+                                    report["cases"][name] = summary
+                                if not case_aborted:
+                                    probe_failed = False
+                                    try:
+                                        phase = "available_output_poll"
+                                        report["available_output_poll"] = await asyncio.wait_for(
+                                            available_output_probe(session, runs),
+                                            CASE_DEADLINE_SECONDS,
+                                        )
+                                        await checkpoint()
+                                    except Exception as exc:
+                                        report_failure(report, "available_output_poll", exc)
+                                        probe_failed = True
+                                        await checkpoint()
+                                    capabilities = init.get("runtime", {}).get("capabilities", [])
+                                    if not probe_failed and "performance" in capabilities:
+                                        try:
+                                            phase = "runtime_performance"
+                                            report["runtime_performance"] = await asyncio.wait_for(
+                                                execute_case(
+                                                    session,
+                                                    "runtime_performance",
+                                                    "import json; print(json.dumps("
+                                                    "await ws.performance(), ensure_ascii=False))",
+                                                ),
+                                                CASE_DEADLINE_SECONDS,
+                                            )
+                                            await checkpoint()
+                                        except Exception as exc:
+                                            report["runtime_performance_error"] = bounded_error(exc)
+                                            report_failure(report, "runtime_performance", exc)
+                                            await checkpoint()
+                    except Exception as exc:
+                        primary_error = (phase, exc)
+                    finally:
+                        if report["startup"]["frontend_initialize_ms"] is None:
+                            report["startup"]["frontend_initialize_ms"] = round(
+                                (time.perf_counter() - frontend_started) * 1000, 3
+                            )
+                            await checkpoint()
+                        phase = "cleanup"
+                        try:
+                            await stop_manager(workspace, env, manager_ready)
+                        except Exception as exc:
+                            cleanup_error = exc
+                    if primary_error is not None:
+                        report_failure(report, *primary_error)
+                    if cleanup_error is not None:
+                        report_failure(report, "cleanup", cleanup_error)
+                    await checkpoint()
+                except Exception as exc:
+                    report_failure(report, phase, exc)
+    except Exception as exc:
+        report_failure(report, phase, exc)
+    finally:
+        report["status"] = "failed" if report["failures"] else "succeeded"
+        await checkpoint()
     return report
 
 
@@ -402,31 +639,73 @@ def compare(baseline_path, current_path):
     baseline = json.loads(Path(baseline_path).read_text())
     current = json.loads(Path(current_path).read_text())
     print(f"{'case':<18} {'metric':<22} {'baseline':>12} {'current':>12} {'change':>10}")
-    for name in sorted(set(baseline.get("cases", {})) & set(current.get("cases", {}))):
+
+    def successful_cases(report):
+        cases = report.get("cases", {}) if isinstance(report, dict) else {}
+        if not isinstance(cases, dict):
+            return {}
+        return {
+            name: case
+            for name, case in cases.items()
+            if isinstance(case, dict) and not case.get("failed")
+        }
+
+    baseline_cases = successful_cases(baseline)
+    current_cases = successful_cases(current)
+
+    def metric_value(case, metric, field):
+        value = case.get(metric) if isinstance(case, dict) else None
+        value = value.get(field) if isinstance(value, dict) else None
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    for name in sorted(set(baseline_cases) & set(current_cases)):
+        baseline_case = baseline_cases[name]
+        current_case = current_cases[name]
         for metric, title in (
             ("case_latency_ms", "case median ms"),
             ("request_latency_ms", "request median ms"),
             ("request_latency_ms", "request p95 ms"),
             ("serialized_response_bytes", "response median bytes"),
+            ("call_count", "calls median"),
+            ("call_count", "calls total"),
         ):
-            field = "p95" if title.endswith("p95 ms") else "median"
-            before = baseline["cases"][name][metric][field]
-            after = current["cases"][name][metric][field]
+            field = (
+                "p95"
+                if title.endswith("p95 ms")
+                else "total"
+                if title.endswith("total")
+                else "median"
+            )
+            before = metric_value(baseline_case, metric, field)
+            after = metric_value(current_case, metric, field)
             if before is None or after is None:
                 change = "n/a"
             else:
                 change = f"{(after / before - 1) * 100:+.1f}%" if before else "n/a"
             print(f"{name:<18} {title:<22} {before!s:>12} {after!s:>12} {change:>10}")
-    if "available_output_poll" in baseline and "available_output_poll" in current:
+    if (
+        isinstance(baseline, dict)
+        and isinstance(current, dict)
+        and "available_output_poll" in baseline
+        and "available_output_poll" in current
+    ):
         for metric, title, field in (
             ("request_latency_ms", "poll request median ms", "median"),
             ("request_latency_ms", "poll request p95 ms", "p95"),
             ("serialized_response_bytes", "poll response median bytes", "median"),
         ):
-            before = baseline["available_output_poll"][metric][field]
-            after = current["available_output_poll"][metric][field]
-            change = f"{(after / before - 1) * 100:+.1f}%" if before else "n/a"
+            before = metric_value(baseline.get("available_output_poll"), metric, field)
+            after = metric_value(current.get("available_output_poll"), metric, field)
+            change = (
+                f"{(after / before - 1) * 100:+.1f}%"
+                if before is not None and after is not None and before != 0
+                else "n/a"
+            )
             print(f"{'available_output':<18} {title:<22} {before!s:>12} {after!s:>12} {change:>10}")
+    for label, report in (("baseline", baseline), ("current", current)):
+        failures = report.get("failures", [])
+        if failures:
+            print(f"{label} failures: {len(failures)}")
 
 
 def main():
@@ -443,12 +722,13 @@ def main():
     if args.command == "compare":
         compare(args.baseline, args.current)
         return
-    report = asyncio.run(run_benchmark(args.runs, args.workspace_root))
+    report = asyncio.run(run_benchmark(args.runs, args.workspace_root, args.output))
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(encoded)
+        write_report(report, args.output)
     print(encoded, end="")
+    if report.get("status") != "succeeded":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

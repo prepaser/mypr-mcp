@@ -112,3 +112,89 @@ async def test_reset_does_not_start_after_shutdown_has_begun(tmp_path, monkeypat
         await reset
     assert not started
     assert not runtime.resetting
+
+
+async def test_reset_closes_resources_in_order(tmp_path, monkeypatch):
+    runtime = Runtime(tmp_path)
+    events = []
+
+    async def web_reset():
+        events.append("web.reset")
+
+    async def dependency_close():
+        events.append("dependencies.close")
+
+    async def kernel_close():
+        events.append("kernel")
+
+    async def lose_tasks(*args, **kwargs):
+        events.append("python")
+
+    async def shells_close():
+        events.append("shells")
+
+    async def mcp_close():
+        events.append("mcp")
+
+    runtime.web = SimpleNamespace(reset=web_reset)
+    runtime.dependencies = SimpleNamespace(close=dependency_close)
+    runtime.close_kernel = kernel_close
+    runtime.lose_python_tasks = lose_tasks
+    runtime.close_shells = shells_close
+    runtime.mcp = SimpleNamespace(close=mcp_close)
+
+    await runtime._close_resources("reset")
+
+    assert events == [
+        "web.reset", "dependencies.close", "kernel", "python", "shells", "mcp",
+    ]
+
+
+async def test_reset_cleanup_failure_stops_before_recreation(tmp_path, monkeypatch):
+    runtime = Runtime(tmp_path)
+    events = []
+    started = False
+
+    async def dependency_close():
+        events.append("dependencies")
+        raise RuntimeError("dependency cleanup failed")
+
+    async def start_kernel():
+        nonlocal started
+        started = True
+
+    runtime.web = SimpleNamespace(reset=lambda: asyncio.sleep(0))
+    runtime.dependencies = SimpleNamespace(close=dependency_close)
+    old_mcp = Bridge()
+    runtime.mcp = old_mcp
+    monkeypatch.setattr(runtime, "start_kernel", start_kernel)
+
+    with pytest.raises(RuntimeError, match="dependency cleanup failed"):
+        await runtime.reset(None)
+
+    assert events == ["dependencies"]
+    assert runtime.mcp is old_mcp
+    assert not started
+    assert not runtime.healthy
+
+
+async def test_shutdown_is_safe_to_repeat(tmp_path):
+    runtime = Runtime(tmp_path)
+    calls = []
+
+    async def close(name):
+        calls.append(name)
+
+    runtime.web = SimpleNamespace(close=lambda: close("web"))
+    runtime.close_kernel = lambda: close("kernel")
+    runtime.close_shells = lambda: close("shells")
+    runtime.mcp = SimpleNamespace(close=lambda: close("mcp"))
+    runtime.mail = SimpleNamespace(close=lambda: close("mail"))
+
+    await runtime.shutdown_resources()
+    await runtime.shutdown_resources()
+
+    assert calls == [
+        "web", "kernel", "shells", "mcp", "mail",
+        "web", "kernel", "shells", "mcp", "mail",
+    ]

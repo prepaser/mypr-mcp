@@ -48,3 +48,29 @@ async def test_cancelled_submit_waits_for_accepted_io_and_fifo_order():
 
     assert [name for name, _ in calls] == ["start", "finish", "second", "third"]
     assert len({thread_id for _, thread_id in calls}) == 1
+
+
+async def test_operation_timings_are_bounded_and_exclude_payloads():
+    worker = PersistenceWorker()
+
+    def store(value):
+        return value
+
+    try:
+        assert await worker.call(store, "private-payload") == "private-payload"
+        metrics = worker.performance_snapshot()
+        assert metrics["operations"][store.__qualname__]["work"]["total_count"] == 1
+        assert "private-payload" not in str(metrics)
+        for i in range(40):
+
+            def write():
+                return None
+
+            write.__qualname__ = f"write_{i}"
+            await worker.call(write)
+        metrics = worker.performance_snapshot()
+        assert len(metrics["operations"]) == 32
+        assert metrics["operations"]["other"]["work"]["total_count"] == 10
+        assert metrics["work"]["total_count"] == 41
+    finally:
+        await worker.close()

@@ -628,7 +628,9 @@ Without a cursor, `logs()` returns recent events; `cursor=0` starts at the begin
 
 `await ws.performance()` returns rolling timing summaries for manager, storage, kernel, and bridge work. Each label keeps its latest 256 samples and a `total_count` observed since manager start, with `p50`, `p95`, and `max` in milliseconds. Bridge timing for the most recent completed request appears on the next call; concurrent or disconnected calls may not all be reported. Execution results include `timing_ms` in MCP `_meta` (the Python SDK exposes `result.meta`), outside printed content and `structuredContent`. Request errors raised before a result is produced may lack these timings. Manager and RPC times include requested notification waits and are not overhead-only measurements. Nested spans overlap, so do not sum them to infer unmeasured overhead; kernel round-trip includes IPC and output persistence, not only Python execution. Time outside the MCP server, including host scheduling, external transport, and model execution, is not measured. Samples remain in memory until manager restart.
 
-See [the performance benchmark](../benchmarks/README.md) for reproducible request latency, output size, and before/after comparisons.
+Storage summaries also include `operations`, with queue-wait and work timings grouped by callable name. This map keeps at most 32 labels; additional names share `other`. Arguments, paths, and task IDs are not used as labels. Shell output is persisted in ordered batches of at most 64 events or 256 KiB of serialized event data, allowing one oversized event on its own. Completion is recorded only after all output batches are confirmed.
+
+See [the performance benchmark](../benchmarks/README.md) for reproducible request latency, output size, and before/after comparisons, and [runtime lifecycle](runtime-lifecycle.md) for resource ownership and cleanup order.
 
 `connections` contains connection and activity timestamps, active execution IDs, and owned task IDs. Open IPC connections determine liveness, so a killed client is removed without cancelling its workspace jobs.
 

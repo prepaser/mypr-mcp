@@ -185,7 +185,7 @@ await ws.mail.watch(account=None, mailbox="INBOX") creates a per-client subscrip
     ),
     "web": (
         "Search the web and extract bounded content through configured providers.",
-        """ws.web uses manager-owned API clients for Kagi, Brave, and Tavily. Configure API keys with environment-variable names under the global or workspace [web.providers] tables; key values never enter Python RPC payloads or results. await ws.web.providers() reports configured providers, supported operations, and readiness without making a search request.
+        """ws.web uses manager-owned API clients for Kagi, Brave, and Tavily. Configure API keys with environment-variable names under the global or workspace [web.providers] tables; key values never enter Python RPC payloads or results. await ws.web.providers() reports configured providers, supported operations, and local credential readiness without making a search request. `ready` is true only for an enabled provider whose configured environment value passes local validation; `reason` is null when ready, otherwise `provider_unavailable`, `credentials_missing`, or `credentials_invalid`. This check does not authenticate with the provider or verify network access.
 
 await ws.web.search(query, provider=None, limit=10, options=None, max_bytes=32768) returns normalized title, URL, and snippet records. The common limit accepts 1–1024 results; the selected provider may enforce a lower limit. The provider is selected explicitly, then from web.default_provider, then from the only enabled provider. It never silently falls back or queries multiple providers. Provider-specific options are validated by the manager before a request; use ws.help("web.search") for the live signature.
 

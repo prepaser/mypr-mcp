@@ -1630,7 +1630,10 @@ class Runtime:
         storage = (
             self.persistence.performance_snapshot()
             if self.persistence is not None
-            else {"queue_depth": 0, "queue_capacity": 128, "queue_wait": None, "work": None}
+            else {
+                "queue_depth": 0, "queue_capacity": 128,
+                "queue_wait": None, "work": None, "operations": {},
+            }
         )
         return {
             "manager_dispatch": manager,
@@ -3244,15 +3247,8 @@ class Runtime:
                 for rec in list(self.execs.values()):
                     if rec is not current and rec["state"] not in TERMINAL:
                         await self.finish(rec, "cancelled", "Workspace reset")
-                if self.web is not None:
-                    await self.web.reset()
                 dependencies = getattr(self, "dependencies", None)
-                if dependencies is not None:
-                    await dependencies.close()
-                await self.close_kernel()
-                await self.lose_python_tasks("Workspace reset", state="cancelled")
-                await self.close_shells()
-                await self.mcp.close()
+                await self._close_resources("reset")
                 self._kernel_snapshot = await wait_owned(asyncio.to_thread(self.config_store.load))
                 self.mcp = MCPBridge(
                     self.workspace, global_path=self.config_store.global_path,
@@ -3291,16 +3287,45 @@ class Runtime:
                         )
                 self.resetting = False
 
+    async def _close_resources(self, mode):
+        if mode == "reset":
+            if self.web is not None:
+                await self.web.reset()
+            dependencies = getattr(self, "dependencies", None)
+            if dependencies is not None:
+                await dependencies.close()
+            await self.close_kernel()
+            await self.lose_python_tasks("Workspace reset", state="cancelled")
+            await self.close_shells()
+            await self.mcp.close()
+            return
+        if mode != "shutdown":
+            raise ValueError(f"Unknown resource cleanup mode: {mode}")
+
+        failures = []
+
+        async def close(operation):
+            try:
+                await operation()
+            except Exception as exc:
+                failures.append(exc)
+
+        if self.web is not None:
+            await close(self.web.close)
+        await close(self.close_kernel)
+        with contextlib.suppress(Exception):
+            await self.lose_python_tasks("Manager stopped")
+        if self.dependencies is not None:
+            await close(self.dependencies.close)
+        await close(self.close_shells)
+        await close(self.mcp.close)
+        if self.mail is not None:
+            await close(self.mail.close)
+        if failures:
+            raise ExceptionGroup("Manager resource cleanup failed", failures)
+
     async def shutdown_resources(self):
         async with self._lifecycle_lock:
-            failures = []
-
-            async def close(operation):
-                try:
-                    await operation()
-                except Exception as exc:
-                    failures.append(exc)
-
             for rec in list(self.execs.values()):
                 if rec["state"] not in TERMINAL and not rec.get("restart_id"):
                     with contextlib.suppress(Exception):
@@ -3309,19 +3334,7 @@ class Runtime:
                             "cancelled" if self.restarting else "lost",
                             "Workspace restarted" if self.restarting else "Manager stopped",
                         )
-            if self.web is not None:
-                await close(self.web.close)
-            await close(self.close_kernel)
-            with contextlib.suppress(Exception):
-                await self.lose_python_tasks("Manager stopped")
-            if self.dependencies is not None:
-                await close(self.dependencies.close)
-            await close(self.close_shells)
-            await close(self.mcp.close)
-            if self.mail is not None:
-                await close(self.mail.close)
-            if failures:
-                raise ExceptionGroup("Manager resource cleanup failed", failures)
+            await self._close_resources("shutdown")
 
     async def cleanup_kernel_resources(self):
         if not self.kc or not self.km or not self.replies or self.replies.done():
@@ -3598,19 +3611,28 @@ class Runtime:
         cursor = 0
         while True:
             result = await shells.poll(record["id"], cursor)
+            batch = []
+            size = 0
             for output in result["output"]:
+                item = {
+                    "id": record["id"],
+                    "client_id": record["client_id"],
+                    "connection_id": record["connection_id"],
+                    "exec_id": record["exec_id"],
+                    **output,
+                }
+                cost = len(json_bytes(item))
+                if batch and (len(batch) >= 64 or size + cost > 256 * 1024):
+                    await self.io(
+                        self.history.append_many, record["kind"], "output", batch, critical=True
+                    )
+                    batch = []
+                    size = 0
+                batch.append(item)
+                size += cost
+            if batch:
                 await self.io(
-                    self.history.append,
-                    record["kind"],
-                    "output",
-                    {
-                        "id": record["id"],
-                        "client_id": record["client_id"],
-                        "connection_id": record["connection_id"],
-                        "exec_id": record["exec_id"],
-                        **output,
-                    },
-                    critical=True,
+                    self.history.append_many, record["kind"], "output", batch, critical=True
                 )
             cursor = result["cursor"]
             if result["state"] in TERMINAL:

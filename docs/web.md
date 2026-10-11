@@ -24,7 +24,7 @@ api_key_env = "TAVILY_API_KEY"
 
 Provider entries are complete definitions by name across the global and workspace layers. A workspace entry replaces the matching global entry. An entry with only `enabled = false` disables an inherited provider. No provider is enabled by default. `default_provider` can be empty; in that case the API uses the only enabled provider and reports an ambiguity error when more than one is available.
 
-Apply saved configuration explicitly with `await ws.config.reload()`. A manager reads environment variables from its own process. Changing the environment of an attached client does not update an existing manager; restart the manager after changing a key value. Configuration inspection returns the environment-variable name and availability metadata, never the secret.
+Apply saved configuration explicitly with `await ws.config.reload()`. A manager reads environment variables from its own process. Changing the environment of an attached client does not update an existing manager; restart the manager after changing a key value. Configuration inspection returns the environment-variable name and availability metadata, never the secret. `providers()` reports `key_available` with its existing meaning: the referenced environment variable is present and non-empty. It also reports `ready` and `reason` for local readiness. `ready` is true only when the provider is enabled and the value passes local credential validation. A null `reason` means ready; otherwise it is `provider_unavailable`, `credentials_missing`, or `credentials_invalid`. These fields inspect local configuration and credential format only; they do not authenticate, contact a provider, or verify network access. `doctor()` uses the same readiness predicates and keeps `credentials.available` as the validated-credential boolean.
 
 ## Search
 
@@ -41,7 +41,7 @@ for item in page["results"]:
     print(item["title"], item["url"], item.get("snippet", ""))
 ```
 
-`providers()` does not call a provider. It reports enabled state, key availability, supported operations, provider-specific option names, and configured limits. `search()` accepts a non-empty query, a provider name, 1–1,024 results, an options mapping, and a 4 KiB–1 MiB response page budget. Each provider may enforce a lower documented limit. The default result page is 32 KiB.
+`providers()` does not call a provider. It reports enabled state, key availability, local readiness, supported operations, provider-specific option names, and configured limits. `search()` accepts a non-empty query, a provider name, 1–1,024 results, an options mapping, and a 4 KiB–1 MiB response page budget. Each provider may enforce a lower documented limit. The default result page is 32 KiB.
 
 The provider selection order is the explicit `provider` argument, `web.default_provider`, and the only enabled provider. A missing or ambiguous selection is an error. mypr never silently falls back to another provider, sends the same query to multiple providers, or retries a request whose outcome is unknown. Callers that intentionally want comparison can use `asyncio.gather()` and retain each result's provider name.
 

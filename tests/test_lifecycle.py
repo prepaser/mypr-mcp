@@ -137,8 +137,15 @@ async def test_http_mcp_call_and_cancel(workspace):
         "[mcp.servers.http]\nurl = " + json.dumps(f"http://127.0.0.1:{port}/mcp") + "\n"
     )
     bridge = MCPBridge(workspace)
+    waiting = asyncio.create_task(ready.wait())
     try:
-        await asyncio.wait_for(ready.wait(), 5)
+        done, _ = await asyncio.wait(
+            (waiting, runner), timeout=30, return_when=asyncio.FIRST_COMPLETED
+        )
+        if runner in done:
+            await runner
+            pytest.fail("HTTP test server exited before startup")
+        assert waiting in done, "HTTP test server did not become ready"
         result = await bridge.dispatch(
             "call_tool",
             {
@@ -166,6 +173,8 @@ async def test_http_mcp_call_and_cancel(workspace):
         # The connection remains usable after cancelling its previous request.
         await asyncio.wait_for(bridge.dispatch("list_tools", {"server": "http"}), 5)
     finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
         await bridge.close()
         server.should_exit = True
         await asyncio.wait_for(runner, 10)

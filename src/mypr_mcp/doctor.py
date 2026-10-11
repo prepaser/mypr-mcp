@@ -421,7 +421,8 @@ def _web_readiness(config: dict[str, Any]) -> dict[str, Any]:
             and definition.get("enabled", True) is not False
         )
         variable = definition.get("api_key_env") if enabled else None
-        available = bool(variable and web_credential_status(os.environ.get(variable)) == "valid")
+        status = web_credential_status(os.environ.get(variable)) if variable else "missing"
+        available = bool(variable and status == "valid")
         providers[name] = {
             "configured": enabled,
             "credentials": {
@@ -429,6 +430,15 @@ def _web_readiness(config: dict[str, Any]) -> dict[str, Any]:
                 "available": available,
             } if variable else {},
             "ready": available,
+            "reason": (
+                None
+                if enabled and available
+                else "provider_unavailable"
+                if not enabled
+                else "credentials_invalid"
+                if status == "invalid"
+                else "credentials_missing"
+            ),
         }
     return {
         "configured": any(item["configured"] for item in providers.values()),

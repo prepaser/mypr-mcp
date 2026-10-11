@@ -24,6 +24,38 @@ def result(content="short"):
     }
 
 
+@pytest.mark.asyncio
+async def test_providers_reports_local_credential_readiness_without_changing_key_presence(
+    monkeypatch,
+):
+    monkeypatch.setenv("MYPR_TEST_KAGI_KEY", "valid-key")
+    monkeypatch.setenv("MYPR_INVALID_KEY", "token\n")
+    monkeypatch.setenv("MYPR_DISABLED_KEY", "also-valid")
+    service = WebService(
+        {
+            "providers": {
+                "kagi": {"api_key_env": "MYPR_TEST_KAGI_KEY"},
+                "brave": {"api_key_env": "MYPR_INVALID_KEY"},
+                "tavily": {"enabled": False},
+            }
+        }
+    )
+
+    providers = {item["provider"]: item for item in service.providers()["providers"]}
+
+    assert providers["kagi"]["key_available"] is True
+    assert providers["kagi"]["ready"] is True
+    assert providers["kagi"]["reason"] is None
+    assert providers["brave"]["key_available"] is True
+    assert providers["brave"]["ready"] is False
+    assert providers["brave"]["reason"] == "credentials_invalid"
+    assert providers["tavily"]["configured"] is False
+    assert providers["tavily"]["key_available"] is False
+    assert providers["tavily"]["ready"] is False
+    assert providers["tavily"]["reason"] == "provider_unavailable"
+    await service.close()
+
+
 class Transport:
     def __init__(self, config):
         self.calls = []

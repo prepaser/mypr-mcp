@@ -247,6 +247,14 @@ When upgrading, launching a newer compatible package is enough to reconnect to a
 
 For development, run `uv sync` in the checkout, then launch its `.venv/bin/mypr-mcp` executable from the target workspace.
 
+Before publishing, run the isolated release gate from the checkout:
+
+```sh
+python scripts/check_release.py --output /tmp/mypr-release-check.json
+```
+
+It checks the offline lockfile, builds a wheel, compares its metadata and console entry point with `pyproject.toml`, installs it into a fresh Python 3.14 environment, and exercises stdio startup, client reconnect, manager restart, and saved shell output. It prints bounded JSON and exits with status 1 at the failed phase. The temporary environment and workspace are removed after the check.
+
 To publish a release, update the package version, remove previous distributions, and rebuild:
 
 Set the version in `pyproject.toml` and refresh `uv.lock`. Runtime version reporting reads the installed distribution metadata; source-only development kernels read `pyproject.toml`.
