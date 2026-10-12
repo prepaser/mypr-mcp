@@ -704,57 +704,25 @@ class MailTransport:
         self._epochs.pop(key, None)
         self._retired_connections.discard(key)
 
-    def _get_imap(
-        self, name: str, account: Mapping[str, Any]
-    ) -> tuple[imaplib.IMAP4, threading.RLock]:
-        key = ("imap", name)
+    def _get_cached_connection(
+        self,
+        cache: dict[Any, tuple[Any, threading.RLock]],
+        cache_key: Any,
+        connection_key: tuple[str, ...],
+        connect: Callable[[], Any],
+    ) -> tuple[Any, threading.RLock]:
         with self._guard:
-            existing = self._imap.get(name)
-            if existing is not None:
-                return existing
-            connect_lock, generation = self._begin_connection(key)
-        try:
-            with connect_lock:
-                with self._guard:
-                    existing = self._imap.get(name)
-                    if existing is not None:
-                        return existing
-                conn = _connect_imap(account, self.timeout)
-                value = (conn, threading.RLock())
-                with self._guard:
-                    if self._closed or generation != self._epochs.get(key, 0):
-                        _close_quietly(conn)
-                        code = "service_closed" if self._closed else "reconfigured"
-                        raise MailTransportError(
-                            "mail transport is closed"
-                            if self._closed
-                            else "mail transport was reconfigured",
-                            code=code,
-                        )
-                    existing = self._imap.setdefault(name, value)
-                    if existing is not value:
-                        _close_quietly(conn)
-                    return existing
-        finally:
-            self._end_connection(key)
-
-    def _get_watch_imap(
-        self, name: str, mailbox: str, account: Mapping[str, Any]
-    ) -> tuple[imaplib.IMAP4, threading.RLock]:
-        key = (name, mailbox)
-        connection_key = ("watch", name, mailbox)
-        with self._guard:
-            existing = self._watch_imap.get(key)
+            existing = cache.get(cache_key)
             if existing is not None:
                 return existing
             connect_lock, generation = self._begin_connection(connection_key)
         try:
             with connect_lock:
                 with self._guard:
-                    existing = self._watch_imap.get(key)
+                    existing = cache.get(cache_key)
                     if existing is not None:
                         return existing
-                conn = _connect_imap(account, self.timeout)
+                conn = connect()
                 value = (conn, threading.RLock())
                 with self._guard:
                     if self._closed or generation != self._epochs.get(connection_key, 0):
@@ -766,46 +734,36 @@ class MailTransport:
                             else "mail transport was reconfigured",
                             code=code,
                         )
-                    existing = self._watch_imap.setdefault(key, value)
+                    existing = cache.setdefault(cache_key, value)
                     if existing is not value:
                         _close_quietly(conn)
                     return existing
         finally:
             self._end_connection(connection_key)
 
+    def _get_imap(
+        self, name: str, account: Mapping[str, Any]
+    ) -> tuple[imaplib.IMAP4, threading.RLock]:
+        return self._get_cached_connection(
+            self._imap, name, ("imap", name), lambda: _connect_imap(account, self.timeout)
+        )
+
+    def _get_watch_imap(
+        self, name: str, mailbox: str, account: Mapping[str, Any]
+    ) -> tuple[imaplib.IMAP4, threading.RLock]:
+        return self._get_cached_connection(
+            self._watch_imap,
+            (name, mailbox),
+            ("watch", name, mailbox),
+            lambda: _connect_imap(account, self.timeout),
+        )
+
     def _get_smtp(
         self, name: str, account: Mapping[str, Any]
     ) -> tuple[smtplib.SMTP, threading.RLock]:
-        key = ("smtp", name)
-        with self._guard:
-            existing = self._smtp.get(name)
-            if existing is not None:
-                return existing
-            connect_lock, generation = self._begin_connection(key)
-        try:
-            with connect_lock:
-                with self._guard:
-                    existing = self._smtp.get(name)
-                    if existing is not None:
-                        return existing
-                conn = _connect_smtp(account, self.timeout)
-                value = (conn, threading.RLock())
-                with self._guard:
-                    if self._closed or generation != self._epochs.get(key, 0):
-                        _close_quietly(conn)
-                        code = "service_closed" if self._closed else "reconfigured"
-                        raise MailTransportError(
-                            "mail transport is closed"
-                            if self._closed
-                            else "mail transport was reconfigured",
-                            code=code,
-                        )
-                    existing = self._smtp.setdefault(name, value)
-                    if existing is not value:
-                        _close_quietly(conn)
-                    return existing
-        finally:
-            self._end_connection(key)
+        return self._get_cached_connection(
+            self._smtp, name, ("smtp", name), lambda: _connect_smtp(account, self.timeout)
+        )
 
     def _smtp_ready(self, account: Mapping[str, Any]) -> bool:
         try:

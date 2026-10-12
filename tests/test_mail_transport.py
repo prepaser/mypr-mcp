@@ -347,7 +347,8 @@ def test_reconfigure_reclaims_retired_connection_slots(monkeypatch):
         transport.close()
 
 
-def test_reconfigure_keeps_generation_guard_until_connect_finishes(monkeypatch):
+@pytest.mark.parametrize("kind", ["imap", "watch", "smtp"])
+def test_reconfigure_keeps_generation_guard_until_connect_finishes(monkeypatch, kind):
     from concurrent.futures import ThreadPoolExecutor
 
     import mypr_mcp.mail_transport as module
@@ -355,23 +356,51 @@ def test_reconfigure_keeps_generation_guard_until_connect_finishes(monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
-    class IMAP:
-        def shutdown(self):
-            pass
+    class Connection:
+        closed = False
+
+        def close(self):
+            self.closed = True
 
         def logout(self):
             pass
 
+        def quit(self):
+            pass
+
+    if kind != "smtp":
+        Connection.shutdown = Connection.close
+
+    connected = []
+
     def connect(*_args):
         started.set()
         assert release.wait(5)
-        return IMAP()
+        value = Connection()
+        connected.append(value)
+        return value
 
-    monkeypatch.setattr(module, "_connect_imap", connect)
+    monkeypatch.setattr(
+        module,
+        "_connect_smtp" if kind == "smtp" else "_connect_imap",
+        connect,
+    )
     transport = MailTransport({"accounts": {"old": {}}})
+    if kind == "smtp":
+        get_connection = transport._get_smtp
+        cache = transport._smtp
+        arguments = ("old", {})
+    elif kind == "watch":
+        get_connection = transport._get_watch_imap
+        cache = transport._watch_imap
+        arguments = ("old", "INBOX", {})
+    else:
+        get_connection = transport._get_imap
+        cache = transport._imap
+        arguments = ("old", {})
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            pending = executor.submit(transport._get_imap, "old", {})
+            pending = executor.submit(get_connection, *arguments)
             assert started.wait(2)
             transport.reconfigure({"accounts": {}}, accounts={"old"})
             assert len(transport._connect_locks) == 1
@@ -379,6 +408,8 @@ def test_reconfigure_keeps_generation_guard_until_connect_finishes(monkeypatch):
             release.set()
             with pytest.raises(MailTransportError, match="reconfigured"):
                 pending.result(timeout=2)
+        assert connected and connected[0].closed
+        assert not cache
         assert not transport._connect_locks
         assert not transport._epochs
         assert not transport._connect_refs

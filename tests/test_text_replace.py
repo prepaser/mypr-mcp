@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-import mypr_mcp.patching as patching
+import mypr_mcp.file_transactions as transactions
 import mypr_mcp.text_replace as text_replace
 from mypr_mcp.change_plans import ChangePlanError, ChangePlanStore
 from mypr_mcp.filesystem import Filesystem
@@ -142,7 +142,7 @@ async def test_cancelled_apply_waits_for_commit_before_releasing_lock(tmp_path: 
     entered = threading.Event()
     release = threading.Event()
     calls = 0
-    original = patching._assert_unchanged
+    original = transactions._assert_unchanged
 
     def gated(expected, current):
         nonlocal calls
@@ -153,7 +153,7 @@ async def test_cancelled_apply_waits_for_commit_before_releasing_lock(tmp_path: 
             release.wait(5)
         return result
 
-    monkeypatch.setattr(patching, "_assert_unchanged", gated)
+    monkeypatch.setattr(transactions, "_assert_unchanged", gated)
     task = asyncio.create_task(fs.apply_replace(plan_id))
     await asyncio.to_thread(entered.wait, 2)
     task.cancel()

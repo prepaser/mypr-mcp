@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES, ChangePlanError, ChangePlanStore
-from .filesystem import _to_thread_uncancelled
-from .patching import _commit, _plan, _read_state, _reject_symlink_alias, _State
+from .file_transactions import _commit, _plan, _read_state, _State, _to_thread_uncancelled
+from .patching import _reject_symlink_alias
 
 MAX_DIFF_BYTES = 32 * 1024
 MAX_MATCHES = 10_000

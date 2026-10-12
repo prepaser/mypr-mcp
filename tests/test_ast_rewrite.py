@@ -15,8 +15,8 @@ from mypr_mcp.ast_rewrite import (
     _PlanStore,
     _write_once,
 )
+from mypr_mcp.file_transactions import _sha256
 from mypr_mcp.filesystem import Filesystem
-from mypr_mcp.patching import _sha256
 
 
 class LocalShell:
@@ -129,7 +129,7 @@ async def test_multifile_commit_failure_rolls_back(tmp_path: Path, monkeypatch):
                 raise OSError("injected replace failure")
         return original(source, destination)
 
-    monkeypatch.setattr("mypr_mcp.patching.os.replace", fail_second)
+    monkeypatch.setattr("mypr_mcp.file_transactions.os.replace", fail_second)
     with pytest.raises(OSError, match="injected"):
         await fs.apply_rewrite(preview["plan_id"])
     assert first.read_text(encoding="utf-8") == "foo(1)\n"

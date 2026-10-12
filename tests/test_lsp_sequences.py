@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import mypr_mcp.patching as patching
+import mypr_mcp.file_transactions as transactions
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.lsp_edits import PlannedOperation, sha256
 
@@ -174,7 +174,7 @@ async def test_lsp_guard_precondition_rechecks_after_staging(tmp_path: Path, mon
     origin.write_bytes(b"origin")
     target.write_bytes(b"old")
     fs = Filesystem(tmp_path)
-    original_mkstemp = patching.tempfile.mkstemp
+    original_mkstemp = transactions.tempfile.mkstemp
     changed = False
 
     def mkstemp(*args, **kwargs):
@@ -186,7 +186,7 @@ async def test_lsp_guard_precondition_rechecks_after_staging(tmp_path: Path, mon
         return result
 
     monkeypatch.setattr(
-        patching,
+        transactions,
         "tempfile",
         SimpleNamespace(mkstemp=mkstemp),
     )

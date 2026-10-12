@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mypr_mcp import patching
+from mypr_mcp import file_transactions as transactions
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.lsp_edits import PlannedOperation, sha256
 from mypr_mcp.revisions import RevisionStore
@@ -77,7 +77,7 @@ async def test_lsp_edit_aborts_when_a_parent_directory_changes(tmp_path, monkeyp
     plan = SimpleNamespace(
         operations=[PlannedOperation("update", path, b"old", b"new", sha256(b"old"))]
     )
-    original = patching._read_state
+    original = transactions._read_state
     swapped = False
 
     def read_state(*args, **kwargs):
@@ -89,7 +89,7 @@ async def test_lsp_edit_aborts_when_a_parent_directory_changes(tmp_path, monkeyp
             swapped = True
         return state
 
-    monkeypatch.setattr(patching, "_read_state", read_state)
+    monkeypatch.setattr(transactions, "_read_state", read_state)
     try:
         await Filesystem(workspace)._apply_lsp_plan(plan)
     except RuntimeError as exc:

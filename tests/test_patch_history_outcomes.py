@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import mypr_mcp.patching as patching
+import mypr_mcp.file_transactions as transactions
 from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.revisions import RevisionIndexOutcomeUnknown, RevisionStore
 
@@ -69,7 +69,7 @@ async def test_moved_parent_keeps_replacement_and_cleans_original_temp(tmp_path:
     fs = Filesystem(tmp_path)
     parent = tmp_path / "nested"
     displaced = tmp_path / "displaced"
-    original_mkstemp = patching.tempfile.mkstemp
+    original_mkstemp = transactions.tempfile.mkstemp
     swapped = False
 
     def swap_parent(*args, **kwargs):
@@ -81,7 +81,7 @@ async def test_moved_parent_keeps_replacement_and_cleans_original_temp(tmp_path:
             parent.mkdir()
         return result
 
-    monkeypatch.setattr("mypr_mcp.patching.tempfile.mkstemp", swap_parent)
+    monkeypatch.setattr("mypr_mcp.file_transactions.tempfile.mkstemp", swap_parent)
     with pytest.raises(FileNotFoundError):
         await fs.apply_patch(
             patch_body("*** Add File: nested/new.txt", "+new"),
@@ -99,12 +99,12 @@ def test_artifact_cleanup_preserves_reused_name_in_replacement_parent(tmp_path):
     temporary = parent / "temporary"
     temporary.write_text("owned")
     identity = (temporary.stat().st_dev, temporary.stat().st_ino)
-    descriptor = patching._open_artifact_parent(parent)
+    descriptor = transactions._open_artifact_parent(parent)
     try:
         parent.rename(moved)
         parent.mkdir()
         temporary.write_text("external")
-        patching._remove_artifact(temporary, descriptor, identity)
+        transactions._remove_artifact(temporary, descriptor, identity)
         assert temporary.read_text() == "external"
         assert not (moved / "temporary").exists()
     finally:

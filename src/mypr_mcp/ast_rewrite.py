@@ -21,15 +21,18 @@ from pathlib import Path
 from typing import Any
 
 from .file_io import PersistedFileError, read_bytes
-from .filesystem import _diff_lines, _require_regular, _sha256, _to_thread_uncancelled
-from .patching import (
+from .file_transactions import (
     _commit,
+    _diff_lines,
     _plan,
-    _reject_symlink_alias,
+    _require_regular,
     _set_history_status,
+    _sha256,
     _signature,
     _State,
+    _to_thread_uncancelled,
 )
+from .patching import _reject_symlink_alias
 from .search_backends import _inline_rule, _verify_sg
 
 _MAX_FILES = 100

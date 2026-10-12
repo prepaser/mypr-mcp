@@ -21,8 +21,19 @@ from threading import Lock
 from typing import Any
 from weakref import WeakValueDictionary
 
-from .async_utils import finish_owned, wait_owned
+from .async_utils import finish_owned
 from .change_plans import MAX_FILES, MAX_INPUT_OUTPUT_BYTES
+from .file_transactions import (
+    _check_expected,
+    _diff_lines,
+    _history_blob_limit,
+    _history_size_error,
+    _read_regular,
+    _ReadLimitExceeded,
+    _require_regular,
+    _signature,
+    _to_thread_uncancelled,
+)
 from .revisions import MutationOutcome, RevisionIndexOutcomeUnknown
 
 _PATH_LOCKS: WeakValueDictionary[Path, asyncio.Lock] = WeakValueDictionary()
@@ -200,13 +211,6 @@ class _LspPathPins:
             os.close(fd)
             return
         self._target_fds[path] = fd
-
-
-class _ReadLimitExceeded(ValueError):
-    def __init__(self, path: Path, limit: int) -> None:
-        super().__init__(f"file exceeds {limit} bytes: {path}")
-        self.path = path
-        self.limit = limit
 
 
 class Filesystem:
@@ -540,7 +544,7 @@ class Filesystem:
 
     async def _apply_lsp_plan(self, plan: Any) -> dict[str, Any]:
         """Apply a validated LSP WorkspaceEdit as one CAS transaction."""
-        from .patching import _commit, _plan, _read_state, _set_history_status, _State
+        from .file_transactions import _commit, _plan, _read_state, _set_history_status, _State
 
         operations = getattr(plan, "operations", None)
         if not isinstance(operations, list) or not operations:
@@ -1222,7 +1226,7 @@ class Filesystem:
                 "history_recorded": False,
             }
             if history_store is not None:
-                from .patching import _set_history_status
+                from .file_transactions import _set_history_status
 
                 coverage = [{"path": path, "source": None} for path, *_ in physical_transitions]
                 _set_history_status(result, history_store, coverage)
@@ -1843,19 +1847,8 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-
 def _inode(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
-
-
-def _require_regular(info: os.stat_result, display: str) -> None:
-    if stat.S_ISDIR(info.st_mode):
-        raise IsADirectoryError(display)
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError(f"Path must be a regular file: {display}")
 
 
 def _preflight_input(path: Path, display: str, max_bytes: int) -> None:
@@ -1866,33 +1859,6 @@ def _preflight_input(path: Path, display: str, max_bytes: int) -> None:
     _require_regular(info, display)
     if info.st_size > max_bytes:
         raise ValueError(f"file exceeds max_input_bytes: {display}")
-
-
-def _read_regular(
-    path: Path,
-    display: str,
-    *,
-    max_bytes: int | None = None,
-    nofollow: bool = False,
-) -> tuple[bytes, os.stat_result]:
-    flags = os.O_RDONLY | os.O_NONBLOCK
-    if nofollow:
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        _require_regular(info, display)
-        if max_bytes is not None and info.st_size > max_bytes:
-            raise _ReadLimitExceeded(path, max_bytes)
-        with os.fdopen(fd, "rb") as stream:
-            fd = -1
-            data = stream.read(-1 if max_bytes is None else max_bytes + 1)
-        if max_bytes is not None and len(data) > max_bytes:
-            raise _ReadLimitExceeded(path, max_bytes)
-        return data, info
-    finally:
-        if fd >= 0:
-            os.close(fd)
 
 
 def _read_optional_bytes(
@@ -1962,12 +1928,6 @@ def _read_bytes(path: Path, display: str, start_byte: int, max_bytes: int) -> di
         "next_cursor": end if end < size else None,
         "truncated": end < size,
     }
-
-
-def _check_expected(old: bytes | None, expected_hash: str | None) -> None:
-    if expected_hash is not None and (old is None or _sha256(old) != expected_hash):
-        actual = None if old is None else _sha256(old)
-        raise ValueError(f"Revision mismatch: expected {expected_hash}, got {actual}")
 
 
 def _read_file(
@@ -2299,16 +2259,6 @@ def _bounded_diff(path: str, old: str, new: str, limit: int) -> tuple[str, bool]
     return output.decode("utf-8"), truncated
 
 
-def _diff_lines(value: str) -> list[str]:
-    if not value:
-        return []
-    parts = value.split("\n")
-    lines = [f"{part}\n" for part in parts[:-1]]
-    if parts[-1]:
-        lines.append(parts[-1])
-    return lines
-
-
 def _atomic_write(
     path: Path,
     data: bytes,
@@ -2396,19 +2346,6 @@ def _validate_history_size(old: bytes | None, new: bytes | None, display: str) -
     for data in (old, new):
         if data is not None and len(data) > limit:
             raise _history_size_error(display, limit)
-
-
-def _history_blob_limit() -> int:
-    from .revisions import _MAX_BLOB_BYTES
-
-    return _MAX_BLOB_BYTES
-
-
-def _history_size_error(display: str, limit: int | None = None) -> ValueError:
-    limit = _history_blob_limit() if limit is None else limit
-    return ValueError(
-        f"history for {display} exceeds {limit} bytes; retry with history=False"
-    )
 
 
 def _validate_history_stat_size(info: os.stat_result, display: str) -> None:
@@ -2591,7 +2528,3 @@ def _restore_transition(
             max_bytes=max_bytes,
             mode=None if old_stat is None else stat.S_IMODE(old_stat.st_mode),
         )
-
-
-async def _to_thread_uncancelled(function, *args, **kwargs):
-    return await wait_owned(asyncio.to_thread(function, *args, **kwargs))

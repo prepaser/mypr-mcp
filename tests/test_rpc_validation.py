@@ -115,6 +115,29 @@ async def test_attachment_preserves_optional_result(tmp_path: Path) -> None:
             assert attached.status is None
 
 
+@pytest.mark.parametrize("client", ("transport", "kernel"))
+async def test_one_shot_rpc_cancellation_closes_pending_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client: str
+) -> None:
+    async with fake_peer(tmp_path, b"", wait_for_eof=True) as (path, received, peer_closed):
+        if client == "transport":
+            call = rpc(path, op="status")
+        else:
+            monkeypatch.setenv("MYPR_SOCKET", str(path))
+            call = _rpc("status")
+        task = asyncio.create_task(call)
+        try:
+            await asyncio.wait_for(received.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(peer_closed.wait(), timeout=1)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_attachment_closes_handshake_socket_on_invalid_response(tmp_path: Path) -> None:
     async with fake_peer(tmp_path, b"{\n", wait_for_eof=True) as (
         path,

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .diagnostics import RPCError
 from .file_io import PersistedFileError, open_regular, read_bytes
+from .rpc_client import exchange
 from .rpc_envelope import decode_object
 from .rpc_limits import MAX_HISTORY_RESPONSE_BYTES, MAX_MESSAGE
 
@@ -50,34 +51,29 @@ async def rpc(_socket_path: Path | str | None = None, **request):
         except KeyError as exc:
             raise TypeError("rpc() requires a socket path") from exc
     limit = MAX_HISTORY_RESPONSE_BYTES if request.get("op") == "history_get" else MAX_MESSAGE
-    reader, writer = await asyncio.open_unix_connection(str(_socket_path), limit=limit)
-    try:
-        writer.write(json.dumps(request).encode() + b"\n")
-        await writer.drain()
-        data = await reader.readline()
-        if not data:
-            raise ConnectionError("Workspace manager disconnected")
-        response = decode_object(data, "Workspace manager returned invalid RPC data")
-        if not response.get("ok"):
-            info = response.get("error_info")
-            if isinstance(info, dict):
-                raise RPCError(
-                    str(response.get("error", info.get("message", "RPC request failed"))),
-                    code=str(info.get("code", "rpc_error")),
-                    operation=info.get("operation"),
-                    details=info.get("details") if isinstance(info.get("details"), dict) else None,
-                    error_type=info.get("type"),
-                )
-            raise RPCError(str(response.get("error", "Workspace manager request failed")))
-        if "result" not in response:
+    data = await exchange(
+        _socket_path, lambda: json.dumps(request).encode() + b"\n", limit
+    )
+    if not data:
+        raise ConnectionError("Workspace manager disconnected")
+    response = decode_object(data, "Workspace manager returned invalid RPC data")
+    if not response.get("ok"):
+        info = response.get("error_info")
+        if isinstance(info, dict):
             raise RPCError(
-                "Workspace manager returned an RPC response without a result",
-                code="protocol_error",
+                str(response.get("error", info.get("message", "RPC request failed"))),
+                code=str(info.get("code", "rpc_error")),
+                operation=info.get("operation"),
+                details=info.get("details") if isinstance(info.get("details"), dict) else None,
+                error_type=info.get("type"),
             )
-        return response["result"]
-    finally:
-        writer.close()
-        await writer.wait_closed()
+        raise RPCError(str(response.get("error", "Workspace manager request failed")))
+    if "result" not in response:
+        raise RPCError(
+            "Workspace manager returned an RPC response without a result",
+            code="protocol_error",
+        )
+    return response["result"]
 
 
 def manager_running(workspace: Path) -> bool:

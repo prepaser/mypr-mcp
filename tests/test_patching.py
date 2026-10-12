@@ -245,7 +245,7 @@ async def test_commit_failure_rolls_back_previous_files(tmp_path: Path, monkeypa
             raise OSError("injected replace failure")
         return original(source, destination)
 
-    monkeypatch.setattr("mypr_mcp.patching.os.replace", fail_second)
+    monkeypatch.setattr("mypr_mcp.file_transactions.os.replace", fail_second)
     with pytest.raises(OSError, match="injected"):
         await apply_patch(fs, patch)
     assert (tmp_path / "one.txt").read_text() == "one\n"
@@ -278,7 +278,7 @@ async def test_rollback_preserves_backup_after_external_change(tmp_path: Path, m
             raise OSError("injected replace failure")
         return original(source, destination)
 
-    monkeypatch.setattr("mypr_mcp.patching.os.replace", fail_after_external_change)
+    monkeypatch.setattr("mypr_mcp.file_transactions.os.replace", fail_after_external_change)
     with pytest.raises(RuntimeError, match="rollback was incomplete"):
         await apply_patch(fs, patch)
     backups = await asyncio.to_thread(lambda: list(tmp_path.glob(".*.mypr-backup.*")))
@@ -309,7 +309,7 @@ async def test_move_is_rolled_back_when_a_later_file_fails(tmp_path: Path, monke
             raise OSError("injected later failure")
         return original(source, destination)
 
-    monkeypatch.setattr("mypr_mcp.patching.os.replace", fail_later)
+    monkeypatch.setattr("mypr_mcp.file_transactions.os.replace", fail_later)
     with pytest.raises(OSError, match="injected later"):
         await apply_patch(fs, patch)
     assert (tmp_path / "source.txt").read_text() == "source\n"
@@ -487,7 +487,7 @@ async def test_cancellation_waits_for_worker_and_cleans_staging(tmp_path: Path, 
         release.wait(timeout=5)
         return original(source, destination)
 
-    monkeypatch.setattr("mypr_mcp.patching.os.replace", delayed_replace)
+    monkeypatch.setattr("mypr_mcp.file_transactions.os.replace", delayed_replace)
     task = asyncio.create_task(
         apply_patch(
             fs,

@@ -34,6 +34,7 @@ from .mail_api import MailAPI
 from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
+from .rpc_client import exchange
 from .rpc_envelope import decode_object
 from .rpc_limits import MAX_HISTORY_RESPONSE_BYTES, MAX_MESSAGE
 from .skill_tools import (
@@ -288,14 +289,11 @@ async def _rpc(op: str, **fields: Any) -> Any:
         payload["generation"] = generation
     try:
         limit = MAX_HISTORY_RESPONSE_BYTES if op == "history_get" else RPC_LIMIT
-        reader, writer = await asyncio.open_unix_connection(socket_name, limit=limit)
-        try:
-            writer.write(json.dumps(payload, separators=(",", ":"), default=str).encode() + b"\n")
-            await writer.drain()
-            line = await reader.readline()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+        line = await exchange(
+            socket_name,
+            lambda: json.dumps(payload, separators=(",", ":"), default=str).encode() + b"\n",
+            limit,
+        )
     except (OSError, asyncio.IncompleteReadError) as exc:
         raise RPCError(f"workspace manager unavailable: {exc}") from exc
     if not line:

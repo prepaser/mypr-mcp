@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mypr_mcp import patching
+from mypr_mcp import file_transactions as transactions
 from mypr_mcp.code_tools import MAX_DOCUMENT_BYTES, CodeTools, _LanguageServer
 from mypr_mcp.lsp_edits import EditError
 
@@ -424,7 +424,7 @@ async def test_lsp_pin_cleanup_keeps_replaced_created_parent(tmp_path: Path, mon
     edit = {"documentChanges": [{"kind": "create", "uri": target.as_uri()}]}
     code = CodeTools(tmp_path)
     code._servers["fake"] = _server(origin, edit)
-    original_read_state = patching._read_state
+    original_read_state = transactions._read_state
     swapped = False
 
     def read_state(*args, **kwargs):
@@ -436,7 +436,7 @@ async def test_lsp_pin_cleanup_keeps_replaced_created_parent(tmp_path: Path, mon
             parent.mkdir()
         return state
 
-    monkeypatch.setattr(patching, "_read_state", read_state)
+    monkeypatch.setattr(transactions, "_read_state", read_state)
     try:
         listed = await code.actions("fake", origin, 1, 1)
         prepared = await code.prepare_action(listed["actions"][0]["action_id"])
