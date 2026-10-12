@@ -9,10 +9,7 @@ from typing import Any
 
 from .file_io import read_bytes
 from .json_utils import json_bytes
-from .transport import MAX_MESSAGE
-
-# One submission, one terminal report, and bounded manager metadata.
-MAX_EXECUTION_RECORD_BYTES = 2 * MAX_MESSAGE + 64 * 1024
+from .rpc_limits import MAX_EXECUTION_RECORD_BYTES
 
 
 def execution_record_bytes(record: Mapping[str, Any]) -> bytes:

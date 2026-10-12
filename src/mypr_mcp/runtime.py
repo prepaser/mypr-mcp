@@ -868,7 +868,7 @@ class Runtime:
             if output_incomplete:
                 warning = {
                     "code": "output_incomplete",
-                    "text": "Cell completion used fallback RPC; preceding output may be missing.",
+                    "text": "Cell output could not be fully confirmed before completion.",
                 }
                 warnings = list(rec.get("warnings", []))
                 fields["truncated"] = True
@@ -2028,6 +2028,7 @@ class Runtime:
             if rec is None or rec["generation"] != self.generation:
                 raise ValueError("Unknown current cell")
             if req.get("state") == "reset":
+                rec["_reset_output_incomplete"] = True
                 rec["idle"].set()
                 return None
             if req.get("state") not in TERMINAL:
@@ -3249,8 +3250,10 @@ class Runtime:
                         raise RuntimeError("Workspace manager is stopping")
                     return
                 if current:
-                    with contextlib.suppress(TimeoutError):
+                    try:
                         await asyncio.wait_for(current["idle"].wait(), 3)
+                    except TimeoutError:
+                        current["_reset_output_incomplete"] = True
                 for rec in list(self.execs.values()):
                     if rec is not current and rec["state"] not in TERMINAL:
                         await self.finish(rec, "cancelled", "Workspace reset")
@@ -3276,11 +3279,17 @@ class Runtime:
                     await self.append(
                         current, {"type": "result", "text": "Workspace reset completed"}
                     )
-                    await self.finish(current, "succeeded")
+                    await self.finish(
+                        current, "succeeded",
+                        output_incomplete=current.get("_reset_output_incomplete", False),
+                    )
             except Exception as exc:
                 self.healthy = False
                 if current:
-                    await self.finish(current, "lost", f"Reset failed: {exc}")
+                    await self.finish(
+                        current, "lost", f"Reset failed: {exc}",
+                        output_incomplete=current.get("_reset_output_incomplete", False),
+                    )
                 else:
                     raise
             finally:

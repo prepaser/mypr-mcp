@@ -92,3 +92,36 @@ async def test_restart_fallback_survives_corrupt_cached_mail(tmp_path, monkeypat
     assert result["mail"]["items"][0]["id"] == notice["id"]
     assert result["mail"]["items"][0]["payload_corrupt"] is True
     assert result["mail"]["warnings"][0]["code"] == "mail_notification_payload_corrupt"
+
+
+async def test_restart_fallback_survives_corrupt_send_metadata(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    history = History(workspace)
+    history.reserve_client_id("alice")
+    history.close()
+    store = MailStore(workspace)
+    value = store.persist_draft(
+        "alice", "work", b"From: sender@example.test\r\n\r\nbody\r\n", {}
+    )
+    send = store.create_send("alice", value["id"], "request")
+    with store._tx():
+        store._db.execute(
+            "UPDATE mail_sends SET state='unknown', accepted=? WHERE id=?",
+            ("{", send["id"]),
+        )
+    store.close()
+    exec_id, _ = _restart_fixture(workspace)
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+
+    async def no_network(*args):
+        return None
+
+    monkeypatch.setattr(bridge, "_recover_restart", no_network)
+    result = await bridge.request("poll", exec_id=exec_id, wait_ms=0)
+
+    assert result["state"] == "succeeded"
+    assert result["mail"]["sends"][0]["id"] == send["id"]
+    assert result["mail"]["sends"][0]["outcome_uncertain"] is True
+    assert result["mail"]["warnings"][0]["code"] == "mail_send_metadata_corrupt"

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -157,6 +159,68 @@ async def test_case_failure_stops_cases_skips_probes_and_checkpoints_samples(
     saved = json.loads(output.read_text())
     assert saved["cases"]["empty"]["runs"] == 1
     assert stopped == [True]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_checkpoints_incomplete_report_and_propagates(
+    tmp_path, monkeypatch
+):
+    stopped = []
+
+    class CancelledSession(FakeSession):
+        async def initialize(self):
+            raise asyncio.CancelledError
+
+    prepare(monkeypatch, CancelledSession(), stopped)
+    output = tmp_path / "cancelled.json"
+
+    with pytest.raises(asyncio.CancelledError):
+        await perf.run_benchmark(1, tmp_path, output)
+
+    saved = json.loads(output.read_text())
+    assert saved["status"] == "cancelled"
+    assert saved["incomplete"] is True
+    assert saved["cancellation"] == {"phase": "frontend_initialize"}
+    assert stopped == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_write", [False, True])
+async def test_cancellation_waits_for_initial_checkpoint_write(
+    tmp_path, monkeypatch, fail_first_write
+):
+    monkeypatch.setattr(perf, "source_environment", lambda: {"prepared": True})
+    monkeypatch.setattr(perf, "revision", lambda: {"commit": "test", "dirty": False})
+    output = tmp_path / "cancelled.json"
+    started = threading.Event()
+    release = threading.Event()
+    writes = []
+    write_report = perf.write_report
+
+    def gated_write(report, path):
+        writes.append(report["status"])
+        if len(writes) == 1:
+            started.set()
+            assert release.wait(5)
+            if fail_first_write:
+                raise OSError("checkpoint write failed")
+        write_report(report, path)
+
+    monkeypatch.setattr(perf, "write_report", gated_write)
+    task = asyncio.create_task(perf.run_benchmark(1, tmp_path, output))
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert writes == ["running", "cancelled"]
+    saved = json.loads(output.read_text())
+    assert saved["status"] == "cancelled"
+    assert saved["incomplete"] is True
 
 
 def test_compare_skips_failed_cases_and_handles_missing_probe_values(tmp_path, capsys):

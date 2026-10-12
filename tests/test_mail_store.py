@@ -310,6 +310,70 @@ def test_snapshot_is_bounded_and_detects_pending_send_beyond_preview_page(tmp_pa
         store.close()
 
 
+@pytest.mark.parametrize(
+    "accepted",
+    ["{", pytest.param("[[0]]", id="invalid_recipient")],
+)
+def test_corrupt_send_metadata_keeps_envelope_and_reports_uncertain_outcome(tmp_path, accepted):
+    store = MailStore(tmp_path)
+    try:
+        value = draft(store)
+        send = store.create_send("client", value["id"], "request")
+        with store._tx():
+            store._db.execute(
+                "UPDATE mail_sends SET state='unknown', accepted=?, rejected=?, "
+                "rejected_details=? WHERE id=?",
+                (accepted, "42", "{}", send["id"]),
+            )
+
+        result = store.get_send(send["id"], "client")
+        assert result["id"] == send["id"]
+        assert result["state"] == "unknown"
+        assert result["accepted"] == []
+        assert result["rejected"] == []
+        assert result["rejected_details"] == []
+        assert result["outcome_uncertain"] is True
+        assert [warning["code"] for warning in result["warnings"]] == [
+            "mail_send_metadata_corrupt",
+            "mail_send_metadata_corrupt",
+            "mail_send_metadata_corrupt",
+        ]
+        assert store.sends_for_status() == [result]
+
+        preview = store.snapshot("client")
+        assert preview["sends"][0]["id"] == send["id"]
+        assert preview["sends"][0]["outcome_uncertain"] is True
+        assert preview["warnings"][0]["code"] == "mail_send_metadata_corrupt"
+
+        raw = store._db.execute(
+            "SELECT accepted,rejected,rejected_details FROM mail_sends WHERE id=?",
+            (send["id"],),
+        ).fetchone()
+        assert tuple(raw) == (accepted, "42", "{}")
+    finally:
+        store.close()
+
+
+def test_snapshot_bounds_corrupt_send_warnings(tmp_path):
+    store = MailStore(tmp_path)
+    try:
+        for index in range(2):
+            value = draft(store)
+            send = store.create_send("client", value["id"], f"request-{index}")
+            with store._tx():
+                store._db.execute(
+                    "UPDATE mail_sends SET state='unknown', accepted=?, rejected=?, "
+                    "rejected_details=? WHERE id=?",
+                    ("{", "42", "{}", send["id"]),
+                )
+
+        preview = store.snapshot("client")
+        assert len(preview["warnings"]) == 4
+        assert preview["warnings_truncated"] is True
+    finally:
+        store.close()
+
+
 def test_gc_returns_relative_terminal_mime_and_cleans_rows_after_delete(tmp_path):
     store = MailStore(tmp_path)
     try:

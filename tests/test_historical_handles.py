@@ -102,6 +102,89 @@ async def test_historical_task_concurrent_page_load_is_single_flight(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_historical_task_projects_journal_warnings_without_output(monkeypatch):
+    async def rpc(op, **fields):
+        assert op == "history_task_read"
+        assert fields["cursor"] == 0
+        return {
+            "output": [
+                {"type": "stream", "stream": "stdout", "text": "saved"},
+                {
+                    "type": "warning",
+                    "code": "journal_corrupt",
+                    "text": "Output journal line 2 is corrupt",
+                },
+            ],
+            "cursor": 2,
+            "has_more": False,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(kernel_api, "_rpc", rpc)
+    task = HistoricalTask(_record(output=[], cursor=0))
+
+    page = await task.read(max_bytes=32768)
+    assert page["output"] == "saved"
+    assert page["truncated"] is True
+    assert page["warnings"] == [
+        {"code": "journal_corrupt", "text": "Output journal line 2 is corrupt"}
+    ]
+    assert task._history_event_cursor == 2
+    assert task.status()["truncated"] is True
+    assert task.output(cursor=0)["warnings"] == page["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_historical_task_projects_aggregate_truncation_to_retained_streams():
+    task = HistoricalTask(
+        _record(
+            output=[{"stream": "stdout", "text": "saved"}],
+            cursor=0,
+            has_more=False,
+        )
+        | {"truncated": True}
+    )
+
+    all_page = await task.read(max_bytes=32768)
+    stdout_page = await task.read(stream="stdout", max_bytes=32768)
+    stderr_page = await task.read(stream="stderr", max_bytes=32768)
+
+    assert all_page["truncated"] is True
+    assert stdout_page["truncated"] is True
+    assert stderr_page["truncated"] is True
+    assert task.status()["truncated"] is True
+
+    evicted = HistoricalTask(
+        _record(output=[], cursor=0, has_more=False) | {"output_evicted": True}
+    )
+    assert (await evicted.read(stream="stdout"))["truncated"] is True
+    assert (await evicted.read(stream="stderr"))["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_historical_task_keeps_local_buffer_truncation(monkeypatch):
+    class TinyOutputBuffer(kernel_api.OutputBuffer):
+        def __init__(self, limit=1):
+            super().__init__(limit=1)
+
+    monkeypatch.setattr(kernel_api, "OutputBuffer", TinyOutputBuffer)
+    task = HistoricalTask(
+        _record(
+            output=[{"stream": "stdout", "text": "saved"}],
+            cursor=0,
+            has_more=False,
+        )
+    )
+
+    page = await task.read(max_bytes=32768)
+    stdout_page = await task.read(stream="stdout", max_bytes=32768)
+    assert page["output"] == "s"
+    assert page["truncated"] is True
+    assert stdout_page["output"] == "s"
+    assert stdout_page["truncated"] is True
+
+
+@pytest.mark.asyncio
 async def test_historical_task_reads_more_than_one_megabyte_in_pages(monkeypatch):
     chunk = "x" * (512 * 1024)
 

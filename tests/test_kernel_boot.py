@@ -62,7 +62,7 @@ def test_wheel_kernel_boot_uses_workspace_runtime(tmp_path: Path):
     repository = Path(__file__).parents[1]
     wheel_dir = tmp_path / "wheel"
     wheel_dir.mkdir()
-    build_env = dict(os.environ, UV_CACHE_DIR="/tmp/mypr-uv-cache")
+    build_env = dict(os.environ)
     subprocess.run(
         ["uv", "build", "--no-sources", "--wheel", "--out-dir", str(wheel_dir)],
         cwd=repository,

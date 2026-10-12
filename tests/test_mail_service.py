@@ -267,6 +267,35 @@ async def test_smtp_data_eof_is_persisted_unknown_and_never_retried(tmp_path):
             await service.close()
 
 
+async def test_status_survives_corrupt_send_metadata(tmp_path):
+    service, _ = await make_service(tmp_path)
+    try:
+        value = await draft(service)
+        send = await asyncio.to_thread(service.store.create_send, "alice", value["id"], "request")
+        await asyncio.to_thread(
+            service.store.update_send,
+            send["id"],
+            state="unknown",
+        )
+        with service.store._tx():
+            service.store._db.execute(
+                "UPDATE mail_sends SET accepted=?, rejected_details=? WHERE id=?",
+                ("{", "{}", send["id"]),
+            )
+
+        inspected = await service.dispatch("get_send", "alice", {"send_id": send["id"]})
+        assert inspected["id"] == send["id"]
+        assert inspected["outcome_uncertain"] is True
+        result = await service.dispatch("status", "alice")
+        pending = result["pending_sends"]
+        assert pending[0]["id"] == send["id"]
+        assert pending[0]["state"] == "unknown"
+        assert pending[0]["outcome_uncertain"] is True
+        assert len(pending[0]["warnings"]) == 2
+    finally:
+        await service.close()
+
+
 async def test_forward_includes_complete_large_body_and_original_attachment(tmp_path, monkeypatch):
     service, _ = await make_service(tmp_path)
     original = EmailMessage(policy=policy.SMTP)

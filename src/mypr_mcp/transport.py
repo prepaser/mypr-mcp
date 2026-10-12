@@ -10,8 +10,8 @@ from pathlib import Path
 from .diagnostics import RPCError
 from .file_io import PersistedFileError, open_regular, read_bytes
 from .rpc_envelope import decode_object
+from .rpc_limits import MAX_HISTORY_RESPONSE_BYTES, MAX_MESSAGE
 
-MAX_MESSAGE = 32 * 1024 * 1024
 HANDSHAKE_TIMEOUT = 30
 
 
@@ -49,7 +49,8 @@ async def rpc(_socket_path: Path | str | None = None, **request):
             _socket_path = request.pop("path")
         except KeyError as exc:
             raise TypeError("rpc() requires a socket path") from exc
-    reader, writer = await asyncio.open_unix_connection(str(_socket_path), limit=MAX_MESSAGE)
+    limit = MAX_HISTORY_RESPONSE_BYTES if request.get("op") == "history_get" else MAX_MESSAGE
+    reader, writer = await asyncio.open_unix_connection(str(_socket_path), limit=limit)
     try:
         writer.write(json.dumps(request).encode() + b"\n")
         await writer.drain()

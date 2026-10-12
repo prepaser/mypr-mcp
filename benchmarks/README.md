@@ -12,6 +12,8 @@ Each case reports MCP call counts, serialized response bytes, end-to-end case la
 
 The runner writes a JSON report even when startup, initialization, a case, or cleanup fails, and exits with status 1 for a failed report. Samples are checkpointed after each completed case, so a partial report remains useful. A failed case stops the remaining cases and skips the probes; a stateful operation is never retried after an uncertain timeout. Per-case deadlines prevent a stalled manager from blocking the complete report. The benchmark removes inherited `MYPR_*` variables and isolates XDG config, state, data, and runtime directories before starting its manager; it keeps the conventional UV cache and does not prepare dependencies or modify the checkout's lock or package metadata.
 
+A cancelled run propagates cancellation after checkpointing a report with `status: "cancelled"`, `incomplete: true`, and the phase where cancellation occurred.
+
 Compare saved reports with:
 
 ```sh

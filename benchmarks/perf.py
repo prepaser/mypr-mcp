@@ -24,6 +24,8 @@ from tomllib import loads
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from mypr_mcp.async_utils import wait_owned
+
 ROOT = Path(__file__).resolve().parents[1]
 CASE_DEADLINE_SECONDS = 180
 MAX_ERROR_LENGTH = 500
@@ -441,15 +443,22 @@ async def run_benchmark(runs, workspace_root, output_path=None):
     env = None
     manager_ready = False
     phase = "setup"
+    cancelled = False
+    cancellation_phase = None
 
     async def checkpoint():
         if output_path is None:
             return
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(write_report, report, output_path)
+        task = asyncio.current_task()
+        cancellations = task.cancelling() if task is not None else 0
+        try:
+            await wait_owned(asyncio.to_thread(write_report, report, output_path))
+        except Exception:
+            if task is not None and task.cancelling() > cancellations:
+                raise asyncio.CancelledError from None
 
-    await checkpoint()
     try:
+        await checkpoint()
         if environment_error is not None:
             raise RuntimeError("Could not inspect the benchmark environment") from environment_error
         if runs < 1:
@@ -607,6 +616,9 @@ async def run_benchmark(runs, workspace_root, output_path=None):
                                             report["runtime_performance_error"] = bounded_error(exc)
                                             report_failure(report, "runtime_performance", exc)
                                             await checkpoint()
+                    except asyncio.CancelledError:
+                        cancellation_phase = phase
+                        raise
                     except Exception as exc:
                         primary_error = (phase, exc)
                     finally:
@@ -625,12 +637,26 @@ async def run_benchmark(runs, workspace_root, output_path=None):
                     if cleanup_error is not None:
                         report_failure(report, "cleanup", cleanup_error)
                     await checkpoint()
+                except asyncio.CancelledError:
+                    if primary_error is not None:
+                        report_failure(report, *primary_error)
+                    if cleanup_error is not None:
+                        report_failure(report, "cleanup", cleanup_error)
+                    cancellation_phase = cancellation_phase or phase
+                    raise
                 except Exception as exc:
                     report_failure(report, phase, exc)
+    except asyncio.CancelledError:
+        cancelled = True
+        report["status"] = "cancelled"
+        report["incomplete"] = True
+        report["cancellation"] = {"phase": cancellation_phase or phase}
+        raise
     except Exception as exc:
         report_failure(report, phase, exc)
     finally:
-        report["status"] = "failed" if report["failures"] else "succeeded"
+        if not cancelled:
+            report["status"] = "failed" if report["failures"] else "succeeded"
         await checkpoint()
     return report
 

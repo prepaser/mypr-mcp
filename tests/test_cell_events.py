@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import mypr_mcp.runtime as runtime_module
 from mypr_mcp.history import History
 from mypr_mcp.runtime import Runtime
 
@@ -75,6 +76,52 @@ async def test_cell_events_ignore_idle_stale_generations_and_late_completion(wor
     finally:
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
+        runtime.history.close()
+
+
+@pytest.mark.parametrize("completion", ["ordered", "timeout", "fallback"])
+@pytest.mark.parametrize("failed_reset", [False, True])
+async def test_reset_preserves_output_completeness(tmp_path, monkeypatch, completion, failed_reset):
+    runtime = Runtime(tmp_path)
+    runtime.history = History(tmp_path)
+    runtime.healthy = True
+    (runtime.root / "runs").mkdir()
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def start_kernel():
+        if failed_reset:
+            raise OSError("kernel start failed")
+
+    monkeypatch.setattr(runtime, "_close_resources", noop)
+    monkeypatch.setattr(runtime, "start_kernel", start_kernel)
+    monkeypatch.setattr(runtime, "_register_manager", noop)
+    monkeypatch.setattr(runtime, "new_shells", lambda: runtime.shells)
+    monkeypatch.setattr(runtime_module, "MCPBridge", lambda *args, **kwargs: runtime.mcp)
+    monkeypatch.setattr(runtime_module, "ScanService", lambda *args: runtime.scans)
+    try:
+        rec = await runtime.admit_execution("client", None, {"code": "await ws.reset()"})
+        await runtime.append(rec, {"type": "stream", "stream": "stdout", "text": "saved"})
+        if completion == "ordered":
+            rec["idle"].set()
+        elif completion == "fallback":
+            await runtime._dispatch({
+                "op": "cell_terminal", "exec_id": rec["id"],
+                "generation": runtime.generation, "state": "reset",
+            })
+        await runtime.reset(rec)
+        warm = await runtime.poll(rec["id"], wait_ms=0)
+        runtime.execs.pop(rec["id"], None)
+        cold = await runtime.poll(rec["id"], wait_ms=0)
+        for result in (warm, cold, runtime.history.get(rec["id"])):
+            assert result["state"] == ("lost" if failed_reset else "succeeded")
+            assert result["truncated"] is (completion != "ordered")
+            codes = [item["code"] for item in result.get("warnings", [])]
+            assert ("output_incomplete" in codes) is (completion != "ordered")
+        assert warm["output"][0]["text"] == "saved"
+    finally:
+        await runtime.shells.close()
         runtime.history.close()
 
 

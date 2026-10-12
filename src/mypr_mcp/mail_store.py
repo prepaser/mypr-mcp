@@ -24,6 +24,14 @@ _DAY = 24 * 60 * 60
 _UNSET = object()
 _MAX_NOTIFICATION_WARNINGS = 4
 _MAX_WARNING_TEXT = 256
+_SEND_METADATA_FIELDS = {
+    "accepted": lambda value: isinstance(value, list)
+    and all(isinstance(item, str) for item in value),
+    "rejected": lambda value: isinstance(value, list)
+    and all(isinstance(item, str) for item in value),
+    "rejected_details": lambda value: isinstance(value, list)
+    and all(isinstance(item, Mapping) for item in value),
+}
 
 
 class MailStore:
@@ -1634,9 +1642,17 @@ class MailStore:
             "watches_more": len(watches) > 5,
             "sends_more": len(sends) > 3,
         }
-        if notifications.get("warnings"):
-            preview["warnings"] = notifications["warnings"]
-        if notifications.get("warnings_truncated"):
+        warnings = list(notifications.get("warnings", ()))
+        warnings_truncated = bool(notifications.get("warnings_truncated"))
+        for send in sends:
+            for warning in send.get("warnings", ()):
+                if len(warnings) < _MAX_NOTIFICATION_WARNINGS:
+                    warnings.append(warning)
+                else:
+                    warnings_truncated = True
+        if warnings:
+            preview["warnings"] = warnings[:_MAX_NOTIFICATION_WARNINGS]
+        if warnings_truncated:
             preview["warnings_truncated"] = True
         while len(_json_bytes(preview)) > 4096 and preview["items"]:
             preview["items"].pop()
@@ -1656,9 +1672,9 @@ class MailStore:
                 "watches_more": len(watches) > 0,
                 "sends_more": len(sends) > 0,
             }
-            if notifications.get("warnings"):
-                preview["warnings"] = notifications["warnings"]
-            if notifications.get("warnings_truncated"):
+            if warnings:
+                preview["warnings"] = warnings[:_MAX_NOTIFICATION_WARNINGS]
+            if warnings_truncated:
                 preview["warnings_truncated"] = True
         return preview
 
@@ -1759,21 +1775,46 @@ class MailStore:
     def _send_row(row: sqlite3.Row | None) -> dict[str, Any]:
         if row is None:
             raise ValueError("send record no longer exists")
-        return {
+        result = {
             "id": row["id"],
             "draft_id": row["draft_id"],
             "client_id": row["client_id"],
             "request_id": row["request_id"],
             "state": row["state"],
             "stage": row["stage"],
-            "accepted": json.loads(row["accepted"]),
-            "rejected": json.loads(row["rejected"]),
-            "rejected_details": json.loads(row["rejected_details"]),
             "error": row["error"],
             "warning": row["warning"],
             "created_at": row["created"],
             "updated_at": row["updated"],
         }
+        warnings = []
+        for field, valid in _SEND_METADATA_FIELDS.items():
+            try:
+                value = json.loads(row[field])
+            except (TypeError, ValueError, UnicodeError):
+                value = []
+                valid_value = False
+            else:
+                valid_value = valid(value)
+                if not valid_value:
+                    value = []
+            result[field] = value
+            if not valid_value:
+                warnings.append(
+                    {
+                        "code": "mail_send_metadata_corrupt",
+                        "text": (
+                            f"Mail send {row['id']} {field} metadata is invalid and was omitted."
+                            [: _MAX_WARNING_TEXT]
+                        ),
+                    }
+                )
+        if warnings:
+            result["outcome_uncertain"] = True
+            result["warnings"] = warnings[:_MAX_NOTIFICATION_WARNINGS]
+            if len(warnings) > _MAX_NOTIFICATION_WARNINGS:
+                result["warnings_truncated"] = True
+        return result
 
 
 class _Transaction:
@@ -1818,11 +1859,18 @@ def _compact_watch(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _compact_send(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         key: value[key]
         for key in ("id", "draft_id", "state", "error", "warning", "created_at", "updated_at")
         if key in value
     }
+    if value.get("outcome_uncertain"):
+        result["outcome_uncertain"] = True
+    if value.get("warnings"):
+        result["warnings"] = list(value["warnings"])
+    if value.get("warnings_truncated"):
+        result["warnings_truncated"] = True
+    return result
 
 
 def _json_bytes(value: Any) -> bytes:

@@ -35,6 +35,7 @@ from .media_tools import Documents
 from .modules import ModuleManager
 from .network_tools import NetworkTools
 from .rpc_envelope import decode_object
+from .rpc_limits import MAX_HISTORY_RESPONSE_BYTES, MAX_MESSAGE
 from .skill_tools import (
     SkillsWriting,
     _bounded_metadata,
@@ -67,7 +68,7 @@ _client_context: contextvars.ContextVar[ClientInfo | None] = contextvars.Context
 _exec_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mypr_exec_context", default=None
 )
-RPC_LIMIT = 32 * 1024 * 1024
+RPC_LIMIT = MAX_MESSAGE
 HISTORY_OUTPUT_LIMIT = 64 * 1024
 _REPORT_DRAIN_TIMEOUT = 5.0
 _REPORT_RPC_TIMEOUT = 10.0
@@ -286,7 +287,8 @@ async def _rpc(op: str, **fields: Any) -> Any:
     if generation is not None:
         payload["generation"] = generation
     try:
-        reader, writer = await asyncio.open_unix_connection(socket_name, limit=RPC_LIMIT)
+        limit = MAX_HISTORY_RESPONSE_BYTES if op == "history_get" else RPC_LIMIT
+        reader, writer = await asyncio.open_unix_connection(socket_name, limit=limit)
         try:
             writer.write(json.dumps(payload, separators=(",", ":"), default=str).encode() + b"\n")
             await writer.drain()
@@ -1157,19 +1159,36 @@ class HistoricalTask(TaskHandle):
         output = record.get("output", "")
         if isinstance(output, list):
             for event in output:
-                if not isinstance(event, Mapping) or not event.get("text"):
+                if not isinstance(event, Mapping):
                     continue
-                text = str(event["text"])
-                self._buffer.write(text)
-                stream = event.get("stream")
-                self._streams[stream if stream in self._streams else "stdout"].write(text)
+                self._consume_event(event)
         elif output:
             text = str(output)
             self._buffer.write(text)
             self._streams["stdout"].write(text)
-        self._buffer.truncated = bool(
+        self._buffer.truncated |= bool(
             record.get("truncated") or record.get("output_truncated") or self._output_evicted
         )
+        self._propagate_truncation()
+
+    def _propagate_truncation(self) -> None:
+        if not self._buffer.truncated:
+            return
+        for stream in self._streams.values():
+            stream.truncated = True
+
+    def _consume_event(self, event: Mapping[str, Any]) -> None:
+        if event.get("type") == "warning":
+            self._merge_warnings([event])
+            if event.get("code") in {"journal_truncated", "journal_corrupt"}:
+                self._buffer.truncated = True
+            return
+        if not event.get("text"):
+            return
+        text = str(event["text"])
+        self._buffer.write(text)
+        stream = event.get("stream")
+        self._streams[stream if stream in self._streams else "stdout"].write(text)
 
     def _merge_warnings(self, values: Any, truncated: Any = False) -> None:
         if not isinstance(values, list):
@@ -1226,21 +1245,14 @@ class HistoricalTask(TaskHandle):
             if result.get("has_more") and next_cursor == self._history_event_cursor:
                 raise RPCError("persisted task output cursor did not advance")
             for event in events:
-                if not isinstance(event, Mapping) or not event.get("text"):
+                if not isinstance(event, Mapping):
                     continue
-                text = str(event["text"])
-                self._buffer.write(text)
-                stream = event.get("stream")
-                if stream in self._streams:
-                    self._streams[stream].write(text)
-                else:
-                    self._streams["stdout"].write(text)
+                self._consume_event(event)
             progressed = next_cursor != self._history_event_cursor
             self._history_event_cursor = next_cursor
             self._history_has_more = bool(result.get("has_more")) and progressed
             self._buffer.truncated |= bool(result.get("truncated"))
-            for stream in self._streams.values():
-                stream.truncated |= bool(result.get("truncated"))
+            self._propagate_truncation()
             return bool(events)
 
     def _output_buffer_for(self, stream: str | None) -> OutputBuffer:
@@ -1272,6 +1284,15 @@ class HistoricalTask(TaskHandle):
             result["warnings_truncated"] = True
         if self._output_evicted:
             result["output_evicted"] = True
+        return result
+
+    def output(self, cursor: int | None = None) -> str | dict[str, Any]:
+        result = super().output(cursor)
+        if isinstance(result, dict):
+            if self._warnings:
+                result["warnings"] = list(self._warnings)
+            if self._warnings_truncated:
+                result["warnings_truncated"] = True
         return result
 
     async def expect(
@@ -1334,6 +1355,7 @@ class HistoricalTask(TaskHandle):
             "read_only": True,
             "result_persisted": self._saved_result_available,
             "result_warning": self._result_warning,
+            "truncated": self._buffer.truncated,
             **({"warnings": list(self._warnings)} if self._warnings else {}),
             **({"warnings_truncated": True} if self._warnings_truncated else {}),
             **({"output_evicted": True} if self._output_evicted else {}),
