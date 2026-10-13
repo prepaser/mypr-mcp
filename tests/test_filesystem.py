@@ -35,6 +35,22 @@ async def test_write_read_and_revision(tmp_path: Path):
     assert (tmp_path / "src/example.py").read_text() == "new"
 
 
+@pytest.mark.parametrize(
+    "path,text,encoding,error,message",
+    [
+        (None, "text", "no-such-encoding", TypeError, "not 'NoneType'"),
+        (1, "\ud800", "utf-8", TypeError, "not 'int'"),
+        ("\x00bad", "\ud800", "utf-8", ValueError, "embedded null"),
+    ],
+)
+async def test_write_validates_path_before_encoding(
+    tmp_path: Path, path, text, encoding, error, message
+):
+    fs = Filesystem(tmp_path)
+    with pytest.raises(error, match=message):
+        await fs.write(path, text, encoding=encoding)
+
+
 async def test_read_long_utf8_line_returns_byte_cursor(tmp_path: Path):
     fs = Filesystem(tmp_path)
     content = "가나다😀" * 20 + "\n끝\n"

@@ -370,11 +370,12 @@ class HTMLExtractor:
         )
         if snapshot["size"] > _MAX_SNAPSHOT_BYTES:
             raise HTMLToolError("HTML result exceeds the in-memory snapshot limit")
+        page = self._page(snapshot, 0, max_bytes)
         key = (owner, ident)
         self._snapshots[key] = snapshot
         self._snapshot_bytes += snapshot["size"]
         self._prune()
-        return self._page(snapshot, 0, max_bytes)
+        return page
 
     def clear(self) -> None:
         self._generation += 1

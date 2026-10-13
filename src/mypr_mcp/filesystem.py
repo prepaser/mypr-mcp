@@ -308,44 +308,15 @@ class Filesystem:
             raise TypeError("overwrite, create_parents, and history must be booleans")
         resolved, display = self._path(path)
         encoded = text.encode(encoding)
-        if history:
-            _validate_history_target(resolved, display)
-        resource = self._history_resource(resolved) if history else None
-        history_enabled = resource is not None
-        async with AsyncExitStack() as stack:
-            if resource is not None:
-                await stack.enter_async_context(self._history_store().transaction(resource))
-            lock = self._lock(resolved)
-            await lock.acquire()
-            stack.callback(lock.release)
-            result, operation_cancelled = await finish_owned(
-                asyncio.to_thread(
-                    _write_file,
-                    resolved,
-                    display,
-                    encoded,
-                    expected_hash,
-                    overwrite,
-                    create_parents,
-                    history_enabled,
-                    _MUTATION_OUTCOME.get(),
-                )
-            )
-            old = result.pop("_old", None)
-            old_stat = result.pop("_old_stat", None)
-            new_stat = result.pop("_new_stat", None)
-            if history_enabled:
-                result["history_recorded"] = await self._record_history(
-                    resolved,
-                    display,
-                    old,
-                    encoded,
-                    old_stat=old_stat,
-                    new_stat=new_stat,
-                )
-            if operation_cancelled:
-                raise asyncio.CancelledError
-            return result
+        return await self._write_data(
+            resolved,
+            display,
+            encoded,
+            expected_hash=expected_hash,
+            overwrite=overwrite,
+            create_parents=create_parents,
+            history=history,
+        )
 
     async def _write_owned(
         self,
@@ -415,6 +386,29 @@ class Filesystem:
         ):
             raise TypeError("overwrite, create_parents, and history must be booleans")
         resolved, display = self._path(path)
+        return await self._write_data(
+            resolved,
+            display,
+            data,
+            expected_hash=expected_hash,
+            overwrite=overwrite,
+            create_parents=create_parents,
+            history=history,
+            history_transaction=history_transaction,
+        )
+
+    async def _write_data(
+        self,
+        resolved: Path,
+        display: str,
+        data: bytes,
+        *,
+        expected_hash: str | None = None,
+        overwrite: bool = False,
+        create_parents: bool = False,
+        history: bool = True,
+        history_transaction: bool = False,
+    ) -> dict[str, Any]:
         if history:
             _validate_history_target(resolved, display)
         resource = self._history_resource(resolved) if history else None

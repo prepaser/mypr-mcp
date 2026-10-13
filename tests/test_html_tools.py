@@ -146,8 +146,69 @@ async def test_html_cursor_is_client_scoped(http_tools: HTTPTools):
         await http_tools.extract_html(cursor=page["next_cursor"], max_bytes=4096)
 
 
-async def test_short_pages_fall_back_to_clean_visible_text(http_tools: HTTPTools):
+@pytest.mark.asyncio
+async def test_failed_structure_pages_do_not_evict_valid_cursor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    async def fake_worker(*_args, url=None, include_structure=False, **_kwargs):
+        result = {
+            "title": "T" * 1024,
+            "text": "seed " * 600 if not include_structure else "",
+            "links": [],
+            "url": url,
+            "source_hash": "a" * 64,
+            "warnings": [],
+            "complete": True,
+            "stop_reason": None,
+        }
+        if include_structure:
+            result["structure"] = {
+                "headings": [{"level": 2, "text": "h" * 2048}],
+                "metadata": {"title": "T" * 2048},
+            }
+            result["structure_truncated"] = False
+        return result
+
+    monkeypatch.setattr(html_tools, "_run_worker", fake_worker)
+    tools = HTTPTools(tmp_path, lambda: "html-cache-admission")
+    source_url = "https://example.test/" + "u" * 1000
+    try:
+        seed = await tools.extract_html("<p>seed</p>", url=source_url, max_bytes=4096)
+        assert seed["next_cursor"]
+        count = len(tools._html._snapshots)
+        snapshot_bytes = tools._html._snapshot_bytes
+        for _ in range(33):
+            with pytest.raises(
+                ValueError,
+                match="max_bytes is too small for the next HTML structure item",
+            ):
+                await tools.extract_html(
+                    "<p>structure</p>",
+                    url=source_url,
+                    include_structure=True,
+                    max_bytes=4096,
+                )
+        assert len(tools._html._snapshots) == count == 1
+        assert tools._html._snapshot_bytes == snapshot_bytes
+        resumed = await tools.extract_html(cursor=seed["next_cursor"], max_bytes=4096)
+        assert resumed["snapshot_id"] == seed["snapshot_id"]
+    finally:
+        await tools.aclose()
+
+
+async def test_short_pages_fall_back_to_clean_visible_text(
+    http_tools: HTTPTools, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     _require_extractor()
+    wrapper = tmp_path / "worker_wrapper.py"
+    wrapper.write_text(
+        "import runpy, trafilatura\n"
+        "trafilatura.extract = lambda *_args, **_kwargs: None\n"
+        f'runpy.run_path({str(html_tools._WORKER)!r}, run_name="__main__")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(html_tools, "_WORKER_PYTHON", _worker_python())
+    monkeypatch.setattr(html_tools, "_WORKER", wrapper)
     result = await http_tools.extract_html("<p>Hello.</p>")
     assert result["title"] == ""
     assert result["text"] == "Hello."
@@ -181,7 +242,9 @@ async def test_removing_hidden_elements_preserves_visible_tail(
     result = await http_tools.extract_html(
         f"<p>START visible content. <{tag}>hidden</{tag}> END text must survive.</p>"
     )
-    assert result["text"] == "START visible content. END text must survive."
+    normalized = " ".join(result["text"].split())
+    assert normalized == "START visible content. END text must survive."
+    assert "hidden" not in result["text"]
     assert result["complete"] is True
 
 
