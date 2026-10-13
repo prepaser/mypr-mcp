@@ -691,7 +691,10 @@ def _page(
             break
         selected.append(items[offset])
         offset += 1
-    return response(selected, offset)
+    result = response(selected, offset)
+    if len(json.dumps(result, separators=(",", ":")).encode()) > max_bytes:
+        raise DocumentToolError("Document page metadata exceeds the page output limit")
+    return result
 
 
 def _file_revision(path: Path, limit: int) -> str:

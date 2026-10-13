@@ -1,11 +1,86 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from test_timer_restart import _restart_fixture
 
 from mypr_mcp.bridge import ConnectionBridge
 from mypr_mcp.history import History
 from mypr_mcp.mail_store import MailStore
+
+
+async def test_restart_fallback_skips_legacy_mail_preview_without_migration(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    history = History(workspace)
+    history.reserve_client_id("alice")
+    history.close()
+    store = MailStore(workspace)
+    store.close()
+
+    database = workspace / ".mypr" / "history.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE mail_watches RENAME TO mail_watches_current")
+        connection.execute(
+            """
+            CREATE TABLE mail_watches (
+                id TEXT PRIMARY KEY NOT NULL,
+                client_id TEXT NOT NULL,
+                account TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                uidvalidity INTEGER,
+                last_uid INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                created REAL NOT NULL,
+                updated REAL NOT NULL,
+                UNIQUE(client_id, account, mailbox)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO mail_watches(
+                id,client_id,account,mailbox,uidvalidity,last_uid,state,error,created,updated
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            ("legacy-watch", "alice", "work", "INBOX", 7, 3, "watching", None, 1, 1),
+        )
+        connection.execute("DROP TABLE mail_watches_current")
+        connection.commit()
+
+    exec_id, _ = _restart_fixture(workspace)
+    bridge = ConnectionBridge(workspace)
+    bridge.client_id = "alice"
+
+    async def no_network(*args):
+        return None
+
+    monkeypatch.setattr(bridge, "_recover_restart", no_network)
+    result = await bridge.request("poll", exec_id=exec_id, wait_ms=0)
+
+    assert result["state"] == "succeeded"
+    assert result["exec_id"] == exec_id
+    assert "mail" not in result
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_watches)")}
+        row = connection.execute(
+            "SELECT id,client_id,account,mailbox,last_uid FROM mail_watches"
+        ).fetchone()
+    assert "endpoint_identity" not in columns
+    assert row == ("legacy-watch", "alice", "work", "INBOX", 3)
+
+    migrated = MailStore(workspace)
+    try:
+        watch = migrated.get_watch("legacy-watch", "alice")
+    finally:
+        migrated.close()
+    assert watch is not None
+    assert watch["endpoint_identity"] == ""
+    assert watch["last_uid"] == 3
 
 
 @pytest.mark.parametrize("initialized", [False, True])

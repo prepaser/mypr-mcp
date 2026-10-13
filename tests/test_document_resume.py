@@ -10,6 +10,32 @@ from mypr_mcp.filesystem import Filesystem
 from mypr_mcp.media_tools import Documents
 
 
+def _empty_snapshot(path: str, items: list | None = None) -> dict:
+    return {
+        "id": "a" * 32,
+        "source": {"path": path, "revision": "b" * 64, "size_bytes": 0, "format": "docx"},
+        "items": [] if items is None else items,
+        "complete": True,
+        "truncated": False,
+        "warnings": [],
+    }
+
+
+@pytest.mark.parametrize("items, offset", [([], 0), ([{"type": "paragraph", "text": "x"}], 1)])
+def test_page_rejects_oversized_empty_or_exhausted_metadata(tmp_path, items, offset):
+    store = document_tools._ResultStore(tmp_path)
+    path = "/" + "/".join(["\x01" * 249] * 12) + "/empty.docx"
+    with pytest.raises(document_tools.DocumentToolError, match="metadata"):
+        document_tools._page(store, _empty_snapshot(path, items), offset, 16_384)
+
+
+def test_page_allows_bounded_empty_metadata(tmp_path):
+    store = document_tools._ResultStore(tmp_path)
+    page = document_tools._page(store, _empty_snapshot("empty.docx"), 0, 16_384)
+    assert page["items"] == []
+    assert len(json.dumps(page, separators=(",", ":")).encode()) <= 16_384
+
+
 def _tsv(words: list[str]) -> bytes:
     rows = [
         "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"

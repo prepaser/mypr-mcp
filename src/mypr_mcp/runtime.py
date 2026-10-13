@@ -926,12 +926,21 @@ class Runtime:
                 return
 
     async def run_queue(self):
+        def unavailable():
+            if self.restarting:
+                return "cancelled", "Workspace restarted"
+            if self.stopping.is_set():
+                return "lost", "Manager stopped"
+            if not self.healthy:
+                return "lost", self.health_error or "Kernel unavailable"
+            return None
+
         while True:
             rec = await self.queue.get()
             if rec["state"] in TERMINAL or self.resetting:
                 continue
-            if not self.healthy:
-                await self.finish(rec, "lost", self.health_error or "Kernel unavailable")
+            if failure := unavailable():
+                await self.finish(rec, *failure)
                 continue
             try:
                 context = {
@@ -952,9 +961,17 @@ class Runtime:
                 )
                 rec["msg_id"] = msg["header"]["msg_id"]
                 self.by_msg[rec["msg_id"]] = rec
-                await self.update_execution(
+                promoted = await self.update_execution(
                     rec, {"state": "running", "started": time.time()}, event="running"
                 )
+                failure = unavailable()
+                if not promoted or rec["state"] in TERMINAL or self.resetting or failure:
+                    if self.by_msg.get(rec["msg_id"]) is rec:
+                        self.by_msg.pop(rec["msg_id"])
+                    rec.pop("msg_id", None)
+                    if failure and rec["state"] not in TERMINAL and not self.resetting:
+                        await self.finish(rec, *failure)
+                    continue
                 submitted = asyncio.get_running_loop().create_future()
                 self.submit_waiters[rec["msg_id"]] = submitted
                 try:

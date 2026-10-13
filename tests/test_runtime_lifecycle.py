@@ -198,3 +198,138 @@ async def test_shutdown_is_safe_to_repeat(tmp_path):
         "web", "kernel", "shells", "mcp", "mail",
         "web", "kernel", "shells", "mcp", "mail",
     ]
+
+
+@pytest.mark.parametrize("transition", [None, "stopping", "restarting"])
+async def test_queue_does_not_send_terminal_execution(tmp_path, transition):
+    runtime = Runtime(tmp_path)
+    runtime.healthy = True
+    persisting, release, waiting, drained = (asyncio.Event() for _ in range(4))
+    state = "lost" if transition == "stopping" else "cancelled"
+    saved = []
+    sent = []
+
+    class Lock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                waiting.set()
+            return await super().acquire()
+
+    class Queue(asyncio.Queue):
+        async def get(self):
+            if self.empty():
+                drained.set()
+            return await super().get()
+
+    async def persist(record, event=None, **kwargs):
+        if event == state:
+            persisting.set()
+            await release.wait()
+        saved.append((record["state"], event))
+
+    def send(message):
+        sent.append(message)
+        runtime.submit_waiters[message["header"]["msg_id"]].set_result(None)
+
+    runtime.persist_execution = persist
+    runtime.queue = Queue()
+    runtime.kc = SimpleNamespace(
+        session=SimpleNamespace(msg=lambda *args, **kwargs: {"header": {"msg_id": "message"}}),
+        shell_channel=SimpleNamespace(send=send),
+    )
+    rec = await runtime.admit_execution("client", None, {"code": "side_effect()"})
+    rec["_persist_lock"] = Lock()
+    finish = asyncio.create_task(runtime.finish(rec, state))
+    worker = None
+    try:
+        await asyncio.wait_for(persisting.wait(), 2)
+        worker = asyncio.create_task(runtime.run_queue())
+        await asyncio.wait_for(waiting.wait(), 2)
+        if transition == "stopping":
+            runtime.stopping.set()
+        elif transition == "restarting":
+            runtime.restarting = "restart"
+        release.set()
+        await asyncio.wait_for(finish, 2)
+        await asyncio.wait_for(drained.wait(), 2)
+        assert sent == []
+        assert saved == [("queued", "queued"), (state, state)]
+        assert rec["state"] == state
+        assert rec["done"].is_set()
+        assert runtime.by_msg == runtime.submit_waiters == runtime.active == {}
+    finally:
+        release.set()
+        if worker is not None:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        await asyncio.gather(finish, return_exceptions=True)
+
+
+@pytest.mark.parametrize("transition", ["stopping", "restarting", "unhealthy"])
+@pytest.mark.parametrize("phase", ["queued", "promoting"])
+async def test_queue_terminalizes_execution_when_promotion_becomes_unavailable(
+    tmp_path, transition, phase
+):
+    runtime = Runtime(tmp_path)
+    runtime.healthy = True
+    promoted, drained = asyncio.Event(), asyncio.Event()
+    saved = []
+    sent = []
+
+    class Queue(asyncio.Queue):
+        async def get(self):
+            if self.empty():
+                drained.set()
+            return await super().get()
+
+    def transition_runtime():
+        if transition == "stopping":
+            runtime.stopping.set()
+        elif transition == "restarting":
+            runtime.restarting = "restart"
+        else:
+            runtime.healthy = False
+            runtime.health_error = "Kernel failed"
+
+    async def persist(record, event=None, **kwargs):
+        saved.append((record["state"], event))
+        if event == "running" and phase == "promoting":
+            transition_runtime()
+            promoted.set()
+
+    def send(message):
+        sent.append(message)
+        runtime.submit_waiters[message["header"]["msg_id"]].set_result(None)
+
+    runtime.persist_execution = persist
+    runtime.queue = Queue()
+    runtime.kc = SimpleNamespace(
+        session=SimpleNamespace(msg=lambda *args, **kwargs: {"header": {"msg_id": "message"}}),
+        shell_channel=SimpleNamespace(send=send),
+    )
+    rec = await runtime.admit_execution("client", None, {"code": "side_effect()"})
+    if phase == "queued":
+        transition_runtime()
+    worker = asyncio.create_task(runtime.run_queue())
+    try:
+        if phase == "promoting":
+            await asyncio.wait_for(promoted.wait(), 2)
+        await asyncio.wait_for(drained.wait(), 2)
+        state = "cancelled" if transition == "restarting" else "lost"
+        error = {
+            "stopping": "Manager stopped",
+            "restarting": "Workspace restarted",
+            "unhealthy": "Kernel failed",
+        }[transition]
+        assert sent == []
+        expected = [("queued", "queued")]
+        if phase == "promoting":
+            expected.append(("running", "running"))
+        assert saved == [*expected, (state, state)]
+        assert rec["state"] == state
+        assert rec["error"] == error
+        assert rec["done"].is_set()
+        assert runtime.by_msg == runtime.submit_waiters == runtime.active == {}
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)

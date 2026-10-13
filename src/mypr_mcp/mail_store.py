@@ -1695,8 +1695,9 @@ class MailStore:
             ).fetchone()
             if exists is None:
                 return None
-            snapshot = store.snapshot(client_id, offline=offline)
-            return snapshot
+            return store.snapshot(client_id, offline=offline)
+        except (IndexError, sqlite3.Error):
+            return None
         finally:
             store.close()
 
