@@ -14,6 +14,8 @@ from .rpc_envelope import decode_object
 from .rpc_limits import MAX_HISTORY_RESPONSE_BYTES, MAX_MESSAGE
 
 HANDSHAKE_TIMEOUT = 30
+UNIX_SOCKET_PATH_MAX_BYTES = 107
+_KERNEL_IPC_CHANNEL_COUNT = 5
 
 
 def workspace_id(workspace: Path) -> str:
@@ -42,6 +44,22 @@ def socket_path(workspace: Path) -> Path:
     root.chmod(0o700)
     key = hashlib.sha256(f"workspace:{workspace_id(workspace)}".encode()).hexdigest()[:32]
     return root / f"{key}.sock"
+
+
+def validate_ipc_socket_paths(path: Path) -> None:
+    kernel = path.with_suffix(".kernel")
+    candidates = [path]
+    channel = 1
+    for _ in range(_KERNEL_IPC_CHANNEL_COUNT):
+        while os.path.exists(f"{kernel}-{channel}"):
+            channel += 1
+        candidates.append(Path(f"{kernel}-{channel}"))
+        channel += 1
+    if any(len(os.fsencode(candidate)) > UNIX_SOCKET_PATH_MAX_BYTES for candidate in candidates):
+        raise RuntimeError(
+            "XDG_RUNTIME_DIR is too long for the manager and kernel Unix sockets; "
+            "shorten XDG_RUNTIME_DIR"
+        )
 
 
 async def rpc(_socket_path: Path | str | None = None, **request):

@@ -2971,7 +2971,12 @@ class CodeTools:
                     if clean is None:
                         dropped = True
                         continue
-                    clean["range"] = _range(clean["range"], text, server.position_encoding)
+                    converted_range, range_status = _coordinate_range(
+                        clean["range"], text, server.position_encoding
+                    )
+                    clean["range"] = converted_range
+                    if range_status != "converted":
+                        clean["range_status"] = range_status
                     diagnostics.append(clean)
                 item = {
                     "uri": uri,

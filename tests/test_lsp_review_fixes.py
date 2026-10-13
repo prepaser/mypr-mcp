@@ -503,6 +503,76 @@ async def test_workspace_diagnostics_rejects_non_progressing_oversized_item(tmp_
 
 
 @pytest.mark.asyncio
+async def test_workspace_diagnostics_preserves_report_when_source_disappears(
+    tmp_path: Path,
+):
+    path = tmp_path / "sample.py"
+    healthy = tmp_path / "healthy.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    healthy.write_text("value = 2\n", encoding="utf-8")
+    server = _server(tmp_path)
+    server.capabilities = {"diagnosticProvider": {"workspaceDiagnostics": True}}
+    server.position_encoding = "utf-16"
+    server.documents = {}
+
+    async def workspace_diagnostics(_previous):
+        reports = [
+            {
+                "uri": path.as_uri(),
+                "kind": "full",
+                "version": 1,
+                "resultId": "gone-source",
+                "items": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 5},
+                    },
+                    "message": "source disappeared",
+                }],
+            },
+            {
+                "uri": healthy.as_uri(),
+                "kind": "full",
+                "version": 1,
+                "resultId": "healthy",
+                "items": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 5},
+                    },
+                    "message": "healthy source",
+                }],
+            },
+        ]
+        path.unlink()
+        return {"items": reports}
+
+    server.workspace_diagnostics = workspace_diagnostics
+    server.aclose = _async_noop
+    code = CodeTools(tmp_path)
+    code._servers["demo"] = server
+    code._definitions = {"demo": {"command": ["demo"], "languages": ["python"], "timeout": 1}}
+    try:
+        result = await code.workspace_diagnostics("demo")
+        missing, normal = result["reports"]
+        diagnostic = missing["diagnostics"][0]
+        assert diagnostic["message"] == "source disappeared"
+        assert diagnostic["range"] is None
+        assert diagnostic["range_status"] == "source_unavailable"
+        healthy_diagnostic = normal["diagnostics"][0]
+        assert healthy_diagnostic["message"] == "healthy source"
+        assert healthy_diagnostic["range"] == {
+            "start": {"line": 1, "character": 1},
+            "end": {"line": 1, "character": 6},
+        }
+        assert "range_status" not in healthy_diagnostic
+        assert missing["truncated"] is False
+        assert normal["truncated"] is False
+    finally:
+        await code.aclose()
+
+
+@pytest.mark.asyncio
 async def test_code_actions_rejects_oversized_empty_result_metadata(tmp_path: Path):
     workspace = tmp_path
     for _index in range(18):

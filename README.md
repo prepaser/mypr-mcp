@@ -64,6 +64,8 @@ Symlink and bind-mount aliases of the same directory connect to the same workspa
 
 Clients must run as the same OS user and be able to reach the runtime socket. When using separate mount namespaces or containers, share the runtime directory (`$XDG_RUNTIME_DIR/mypr`, or `/tmp/mypr-<uid>/mypr` when unset). The recorded socket also allows discovery when clients use different runtime-directory settings, provided that socket remains accessible. An unreachable existing manager is reported instead of launching a duplicate.
 
+On Linux, each Unix socket pathname is limited to 107 bytes. The manager and kernel append their workspace identifier and channel suffixes beneath the runtime directory, so use a short `XDG_RUNTIME_DIR`. New-manager startup reports an actionable error if these paths exceed the limit. A recorded, accessible socket can still reconnect to an existing manager when the current runtime-directory setting is longer.
+
 Stop the manager before moving a workspace, then start it at the new location. A same-filesystem rename preserves directory identity, but Python objects, venv entry points, and external MCP configurations can contain old absolute paths; these are not rewritten automatically. If the original directory is moved or replaced while running, new attachments and cells are rejected with a restart instruction. Status and stop remain available through the discovered socket.
 
 ## MCP tools
@@ -249,7 +251,7 @@ When upgrading, launching a newer compatible package is enough to reconnect to a
 
 For development, run `uv sync` in the checkout, then launch its `.venv/bin/mypr-mcp` executable from the target workspace.
 
-Before publishing, run the isolated release gate from the checkout:
+After changing the version in `pyproject.toml`, run `uv lock` to refresh the project entry in `uv.lock`. Then run the isolated release gate from the checkout before publishing:
 
 ```sh
 python scripts/check_release.py --output /tmp/mypr-release-check.json

@@ -48,7 +48,13 @@ from .storage import Storage
 from .task_results import load_result, store_result
 from .timers import TimerStore
 from .timings import Timings
-from .transport import MAX_MESSAGE, ensure_workspace_identity, socket_path, workspace_id
+from .transport import (
+    MAX_MESSAGE,
+    ensure_workspace_identity,
+    socket_path,
+    validate_ipc_socket_paths,
+    workspace_id,
+)
 from .web_service import WebService
 
 TERMINAL = {"succeeded", "failed", "cancelled", "lost"}
@@ -272,6 +278,7 @@ class Runtime:
         self.root.mkdir(exist_ok=True)
         self.workspace_id = workspace_id(self.workspace)
         self.socket = socket_path(self.workspace)
+        validate_ipc_socket_paths(self.socket)
         self.generation = uuid.uuid4().hex
         self.timings = Timings(
             labels={
@@ -715,6 +722,7 @@ class Runtime:
 
     async def start_kernel(self):
         self.check_persistence()
+        validate_ipc_socket_paths(self.socket)
         if self.dependencies is not None:
             await prepare_core(self.dependencies)
         self.settings.reset_lsp_generation(self.generation)

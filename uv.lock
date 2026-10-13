@@ -538,7 +538,7 @@ wheels = [
 
 [[package]]
 name = "mypr-mcp"
-version = "1.5.3"
+version = "1.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx2", extra = ["http2", "socks"] },
